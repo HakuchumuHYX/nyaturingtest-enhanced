@@ -6,8 +6,8 @@
 
 ## 配置指南
 
-如果你想使用本插件，建议先从原项目安装所需的依赖。
-如果你是Windows系统，可能会出现运行报错，可以带着你的错误日志在[这里](https://gemini.google.com)或是与之类似的地方求助。
+如果你想使用本插件，建议先从原项目安装所需的依赖。  
+如果你是Windows系统，可能会出现运行报错，可以带着你的错误日志在[这里](https://gemini.google.com)或是与之类似的地方求助。  
 本插件的配置参数与原项目一致，详细说明请查阅[原项目文档](https://github.com/shadow3aaa/nonebot-plugin-nyaturingtest/blob/master/README.md)。
 
 ## 功能变更
