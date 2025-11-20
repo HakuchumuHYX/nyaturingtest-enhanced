@@ -1,4 +1,3 @@
-import asyncio
 from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass
@@ -141,8 +140,11 @@ class Session:
         """
         self.__search_result = None
 
-        # [新增] 记录上次活跃时间，用于计算冷却
+        # [新增] 记录群组上次活跃时间，用于长时间无消息后的状态重置
         self._last_activity_time = datetime.now()
+
+        # [新增] 记录 BOT 上次发言时间，用于计算“贤者时间”
+        self._last_speak_time = datetime.min
 
         # [新增] 活跃回复计数器，用于计算疲劳值
         self._active_count = 0
@@ -187,6 +189,7 @@ class Session:
         self.__bubble_willing_sum = 0.0
         self._active_count = 0
         self._last_activity_time = datetime.now()
+        self._last_speak_time = datetime.min
         await self.save_session()  # 保存重置后的状态
 
     async def calm_down(self):
@@ -200,6 +203,8 @@ class Session:
         self.__chatting_state = _ChattingState.ILDE  # 强制冷却
         self._active_count = 0
         self._last_activity_time = datetime.now()
+        # 强制更新发言时间，让它进入贤者模式
+        self._last_speak_time = datetime.now()
         await self.save_session()  # 保存冷静后的状态
 
     def get_session_file_path(self) -> str:
@@ -240,6 +245,7 @@ class Session:
                     for msg in self.last_response
                 ],
                 "chatting_state": self.__chatting_state.value,
+                "last_speak_time": self._last_speak_time.isoformat(),  # 保存发言时间
             }
 
             # 使用 anyio 异步写入文件，防止阻塞事件循环
@@ -274,6 +280,13 @@ class Session:
             self.global_emotion.valence = emotion_data.get("valence", 0.0)
             self.global_emotion.arousal = emotion_data.get("arousal", 0.0)
             self.global_emotion.dominance = emotion_data.get("dominance", 0.0)
+
+            # 恢复上次发言时间
+            if "last_speak_time" in session_data:
+                try:
+                    self._last_speak_time = datetime.fromisoformat(session_data["last_speak_time"])
+                except:
+                    pass
 
             # 恢复全局短时记忆
             if "global_memory" in session_data:
@@ -779,7 +792,7 @@ class Session:
             if not isinstance(willing, dict):
                 willing = {}
 
-            # [逻辑优化 - 强力降温 + 疲劳机制]
+            # [逻辑优化 - 强力降温 + 疲劳机制 + 贤者时间]
 
             # 1. 提升回潜水的意愿 (idle_chance)
             idle_chance = float(willing.get("0", 0.0)) * 1.5
@@ -802,20 +815,30 @@ class Session:
 
             match self.__chatting_state:
                 case _ChattingState.ILDE:
+                    # [关键修复] 贤者时间检查
+                    # 如果距离上次说话不到 180秒 (3分钟)，强制降低活跃意愿
+                    # 这意味着 Bot 就算被重置为潜水，也不会马上“仰卧起坐”
+                    seconds_since_speak = (datetime.now() - self._last_speak_time).total_seconds()
+                    if seconds_since_speak < 180:
+                        logger.debug(f"Bot 处于贤者时间 ({seconds_since_speak:.0f}s < 180s)，强制压制对话欲望")
+                        chat_chance *= 0.1  # 极其严厉的惩罚
+                        self.__bubble_willing_sum = 0.0  # 清空冒泡条
+
                     if chat_chance >= random_value:
                         self.__chatting_state = _ChattingState.ACTIVE
                         self.__bubble_willing_sum = 0.0
                     elif self.__bubble_willing_sum >= random_value:
                         self.__chatting_state = _ChattingState.BUBBLE
                         self.__bubble_willing_sum = 0.0
+
                 case _ChattingState.BUBBLE:
                     if chat_chance >= random_value:
                         self.__chatting_state = _ChattingState.ACTIVE
                     elif idle_chance >= random_value:
                         self.__chatting_state = _ChattingState.ILDE
+
                 case _ChattingState.ACTIVE:
-                    # [核心优化] 引入疲劳系数
-                    # 每多聊一句(self._active_count)，想潜水的概率就增加 0.15
+                    # [疲劳判定]
                     fatigue_factor = self._active_count * 0.15
                     final_idle_chance = (idle_chance * 1.2) + fatigue_factor
 
@@ -825,7 +848,7 @@ class Session:
                     if final_idle_chance >= random_value:
                         logger.info(f"Bot 聊累了(已聊{self._active_count}轮)，主动进入潜水状态")
                         self.__chatting_state = _ChattingState.ILDE
-                        self._active_count = 0  # 重置计数器
+                        self._active_count = 0
 
             logger.debug(f"反馈阶段更新对话状态：{self.__chatting_state!s}")
             logger.debug("反馈阶段结束")
@@ -1060,9 +1083,12 @@ class Session:
                 after_compress=enable_update_hippo,
             )
 
-            # [新增] 如果这一轮 Bot 确实说话了，增加疲劳计数
+            # [新增] 如果这一轮 Bot 确实说话了，更新计数和时间
             if self.__chatting_state == _ChattingState.ACTIVE:
                 self._active_count += 1
+
+            # 记录最后一次发言时间
+            self._last_speak_time = datetime.now()
 
         else:
             self.long_term_memory.add_texts(

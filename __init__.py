@@ -62,14 +62,11 @@ class GroupState:
     )
     messages_chunk: list[MMessage] = field(default_factory=list)
 
-    # [关键优化] 使用 default_factory 确保每个群组拥有独立的 LLMClient 实例
-    # 这样每个群组都有自己的 HTTP 连接池，互不阻塞
     client: LLMClient = field(
         default_factory=lambda: LLMClient(
             client=AsyncOpenAI(
                 api_key=plugin_config.nyaturingtest_chat_openai_api_key,
                 base_url=plugin_config.nyaturingtest_chat_openai_base_url,
-                # 显式配置 httpx 客户端，增加最大连接数，防止高并发下阻塞
                 http_client=httpx.AsyncClient(
                     limits=httpx.Limits(max_keepalive_connections=20, max_connections=50),
                     timeout=120.0
@@ -78,22 +75,17 @@ class GroupState:
         )
     )
 
-    # 保护 messages_chunk，极快
     data_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    # 保护 session 状态和 LLM 调用，较慢
     session_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
 _tasks: set[asyncio.Task] = set()
-
-# [新增] 全局 HTTP 客户端，复用连接池 (用于下载图片)
 _GLOBAL_HTTP_CLIENT: httpx.AsyncClient | None = None
 
 
 def get_http_client() -> httpx.AsyncClient:
     global _GLOBAL_HTTP_CLIENT
     if _GLOBAL_HTTP_CLIENT is None:
-        # 配置更长的超时和重试，复用连接
         ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLSv1_2)
         ssl_context.set_ciphers("ALL:@SECLEVEL=1")
         _GLOBAL_HTTP_CLIENT = httpx.AsyncClient(
@@ -104,16 +96,58 @@ def get_http_client() -> httpx.AsyncClient:
     return _GLOBAL_HTTP_CLIENT
 
 
+# [新增] 智能断句辅助函数
+def _smart_split_text(text: str, max_chars: int = 40) -> list[str]:
+    """
+    将长文本切分为多条消息，模拟人类说话习惯
+    :param text: 原始文本
+    :param max_chars: 触发切分的阈值（小于此长度不切分）
+    :return: 切分后的文本列表
+    """
+    text = text.strip()
+    if not text:
+        return []
+
+    # 如果文本本身很短，直接返回
+    if len(text) < max_chars:
+        return [text]
+
+    # 使用正则按标点符号切分 (保留句尾标点)
+    # 匹配：句号、感叹号、问号、波浪号、换行符
+    # (?<=...) 是后向断言，表示在这些符号后面进行切割
+    raw_parts = re.split(r'(?<=[。！？!?.~\n])\s*', text)
+
+    final_parts = []
+    current_buffer = ""
+
+    for part in raw_parts:
+        part = part.strip()
+        if not part:
+            continue
+
+        # 简单的合并逻辑：如果当前缓冲 + 下一句还是很短，就拼在一起，避免发出由 1-2 个字组成的刷屏消息
+        # 比如 "嗯。" "好的。" 这种可以拼成 "嗯。好的。"
+        if len(current_buffer) + len(part) < 15:
+            current_buffer += part
+        else:
+            if current_buffer:
+                final_parts.append(current_buffer)
+            current_buffer = part
+
+    if current_buffer:
+        final_parts.append(current_buffer)
+
+    # 如果切分结果为空（极端情况），返回原文本
+    return final_parts if final_parts else [text]
+
+
 async def spawn_state(state: GroupState):
     """
-    启动后台任务循环检查是否要回复 (已优化并发)
+    启动后台任务循环检查是否要回复
     """
     while True:
-        # 随机等待，模拟人类阅读/打字延迟
         await asyncio.sleep(random.uniform(5.0, 10.0))
 
-        # 1. 快照阶段：极速获取数据并清空缓冲区
-        # 只占用极短时间的 data_lock，不阻塞用户发送新消息
         current_chunk = []
         async with state.data_lock:
             if state.bot is None or state.event is None:
@@ -122,12 +156,9 @@ async def spawn_state(state: GroupState):
                 continue
 
             logger.debug(f"Snapshotting {len(state.messages_chunk)} messages for processing")
-            # 复制并清空，实现“快照”
             current_chunk = state.messages_chunk.copy()
             state.messages_chunk.clear()
 
-        # 2. 处理阶段：在 Session 锁中慢速思考
-        # 此时 data_lock 已释放，新消息可以无阻碍进入 messages_chunk
         async with state.session_lock:
             try:
                 responses = await state.session.update(
@@ -136,25 +167,34 @@ async def spawn_state(state: GroupState):
 
                 if responses:
                     for response in responses:
-                        msg_content = ""
+                        raw_content = ""
                         reply_id = None
 
                         if isinstance(response, str):
-                            msg_content = response
+                            raw_content = response
                         elif isinstance(response, dict):
-                            msg_content = response.get("content", "")
+                            raw_content = response.get("content", "")
                             reply_id = response.get("reply_to")
 
-                        if not msg_content:
+                        if not raw_content:
                             continue
 
-                        msg_to_send = Message(msg_content)
-                        if reply_id:
-                            msg_to_send.insert(0, MessageSegment.reply(int(reply_id)))
+                        # [修改] 使用断句逻辑
+                        # 如果内容较长，这里会返回一个列表 ['第一句', '第二句']
+                        msg_parts = _smart_split_text(raw_content)
 
-                        await state.bot.send(message=msg_to_send, event=state.event)
-                        # 发送间隔，避免刷屏过快
-                        await asyncio.sleep(random.uniform(1.0, 2.0))
+                        for i, part in enumerate(msg_parts):
+                            msg_to_send = Message(part)
+
+                            # [核心逻辑] 只在第一条消息挂载回复引用
+                            if reply_id and i == 0:
+                                msg_to_send.insert(0, MessageSegment.reply(int(reply_id)))
+
+                            await state.bot.send(message=msg_to_send, event=state.event)
+
+                            # [模拟] 如果还有下一句，稍微等一下再发，模拟打字/思考间隔
+                            if i < len(msg_parts) - 1:
+                                await asyncio.sleep(random.uniform(1.0, 3.0))
 
             except Exception as e:
                 logger.error(f"Error in processing cycle: {e}")
@@ -215,10 +255,8 @@ list_groups_pm = on_command(
 )
 
 
-# 辅助函数：确保群组状态已初始化
 def ensure_group_state(group_id: int):
     if group_id not in group_states:
-        # 只有允许的群组才初始化
         allowed_groups = plugin_config.nyaturingtest_enabled_groups
         if group_id not in allowed_groups:
             return None
@@ -232,8 +270,6 @@ def ensure_group_state(group_id: int):
         task.add_done_callback(_tasks.discard)
     return group_states[group_id]
 
-
-# --- 修改所有 Admin 命令，使用 session_lock 防止与 LLM 思考冲突 ---
 
 @get_presets.handle()
 async def handle_get_presets(event: GroupMessageEvent):
@@ -253,7 +289,6 @@ async def do_get_presets(matcher: type[Matcher], group_id: int):
     state = ensure_group_state(group_id)
     if not state:
         return
-    # 使用 session_lock
     async with state.session_lock:
         presets = state.session.presets()
     msg = "可选的预设:\n"
@@ -283,7 +318,6 @@ async def do_set_presets(matcher: type[Matcher], group_id: int, file: str):
     state = ensure_group_state(group_id)
     if not state:
         return
-    # 使用 session_lock
     async with state.session_lock:
         if await state.session.load_preset(filename=file):
             await matcher.finish(f"预设已加载: {file}")
@@ -342,7 +376,6 @@ async def do_set_role(matcher: type[Matcher], group_id: int, name: str, role: st
     state = ensure_group_state(group_id)
     if not state:
         return
-    # 使用 session_lock
     async with state.session_lock:
         await state.session.set_role(name=name, role=role)
     await matcher.finish(f"角色已设为: {name}\n设定: {role}")
@@ -365,7 +398,6 @@ async def do_get_role(matcher: type[Matcher], group_id: int):
     state = ensure_group_state(group_id)
     if not state:
         return
-    # 使用 session_lock
     async with state.session_lock:
         role = state.session.role()
     await matcher.finish(f"当前角色: {role}")
@@ -388,9 +420,8 @@ async def do_calm_down(matcher: type[Matcher], group_id: int):
     state = ensure_group_state(group_id)
     if not state:
         return
-    # 使用 session_lock
     async with state.session_lock:
-        state.session.calm_down()
+        await state.session.calm_down()
     await matcher.finish("已老实")
 
 
@@ -411,7 +442,6 @@ async def do_reset(matcher: type[Matcher], group_id: int):
     state = ensure_group_state(group_id)
     if not state:
         return
-    # 使用 session_lock
     async with state.session_lock:
         await state.session.reset()
     await matcher.finish("已重置会话")
@@ -434,7 +464,6 @@ async def do_status(matcher: type[Matcher], group_id: int):
     state = ensure_group_state(group_id)
     if not state:
         return
-    # 使用 session_lock
     async with state.session_lock:
         status_msg = state.session.status()
     await matcher.finish(status_msg)
@@ -466,15 +495,11 @@ async def llm_response(client: LLMClient, message: str) -> str:
 @auto_chat.handle()
 async def handle_auto_chat(bot: Bot, event: GroupMessageEvent):
     group_id = event.group_id
-
-    # 初始化或获取 State
     state = ensure_group_state(group_id)
     if not state:
         return
 
     user_id = event.get_user_id()
-
-    # 在锁外进行消息解析
     bot_name = state.session.name()
 
     message_content = await message2BotMessage(
@@ -483,14 +508,12 @@ async def handle_auto_chat(bot: Bot, event: GroupMessageEvent):
     if not message_content:
         return
 
-    # 获取用户的昵称
     try:
         user_info = await bot.get_group_member_info(group_id=group_id, user_id=int(user_id))
         nickname = user_info.get("card") or user_info.get("nickname") or str(user_id)
     except Exception:
         nickname = str(user_id)
 
-    # 使用 data_lock，这是一个极快的锁
     async with state.data_lock:
         state.event = event
         state.bot = bot
@@ -525,20 +548,15 @@ async def message2BotMessage(bot_name: str, group_id: int, message: Message, bot
                 key = key.group(1) if key else None
 
                 image_bytes = None
-
-                # 尝试读缓存
                 if key and cache_path.joinpath(key).exists():
                     async with await anyio.open_file(cache_path.joinpath(key), "rb") as f:
                         image_bytes = await f.read()
                 else:
-                    # [优化] 使用全局 HTTP Client 下载
                     client = get_http_client()
                     try:
                         resp = await client.get(url)
                         resp.raise_for_status()
                         image_bytes = resp.content
-
-                        # 写入缓存
                         if key:
                             async with await anyio.open_file(cache_path.joinpath(key), "wb") as f:
                                 await f.write(image_bytes)
@@ -552,7 +570,6 @@ async def message2BotMessage(bot_name: str, group_id: int, message: Message, bot
                 is_sticker = seg.data.get("sub_type") == 1
                 image_base64 = base64.b64encode(image_bytes).decode("utf-8")
 
-                # 调用 VLM 识别 (现在很快了)
                 description = await image_manager.get_image_description(
                     image_base64=image_base64, is_sticker=is_sticker
                 )
@@ -603,7 +620,6 @@ async def message2BotMessage(bot_name: str, group_id: int, message: Message, bot
 
         return ""
 
-    # [核心优化] 创建所有任务并发执行
     tasks = [process_segment(seg) for seg in message]
     results = await asyncio.gather(*tasks)
 
@@ -621,7 +637,6 @@ async def cleanup_tasks():
         if not task.done():
             task.cancel()
 
-    # 等待任务取消完成（可选）
     if _tasks:
         await asyncio.gather(*_tasks, return_exceptions=True)
     logger.info("后台任务已清理")
