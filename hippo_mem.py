@@ -112,7 +112,7 @@ class HippoMemory:
 
         try:
             # 2. 切割文本 (BAAI/bge-m3上限为8192tokens)
-            texts = _split_text_by_tokens(self._cache, self.tokenizer, max_tokens=4096, overlap=200)
+            texts = _split_text_by_tokens(self._cache, self.tokenizer, max_tokens=2048, overlap=200)
 
             if not texts:
                 return
@@ -148,7 +148,7 @@ class HippoMemory:
         logger.debug(f"查询文本: {queries}")
         splited_queries = []
         for query in queries:
-            splited_queries += _split_text_by_tokens(query, self.tokenizer, max_tokens=8192, overlap=100)
+            splited_queries += _split_text_by_tokens(query, self.tokenizer, max_tokens=2048, overlap=100)
         logger.debug(f"分割后的查询: {splited_queries}")
         results = self.hippo.retrieve(queries=splited_queries, num_to_retrieve=k)
         # make ruff happy
@@ -159,7 +159,7 @@ class HippoMemory:
 
 
 def _split_text_by_tokens(
-    text: str, tokenizer, max_tokens=8192, overlap=100
+    text: str, tokenizer, max_tokens=2048, overlap=100
 ) -> list[str]:
     """
     按照指定的最大 token 数量和重叠数量将文本分割成多个块

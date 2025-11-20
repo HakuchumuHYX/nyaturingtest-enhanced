@@ -69,24 +69,35 @@ class Session:
     群聊会话
     """
 
-    def __init__(self, siliconflow_api_key: str, id: str = "global", name: str = "terminus"):
+    def __init__(
+        self,
+        siliconflow_api_key: str,
+        id: str = "global",
+        name: str = "terminus",
+        http_client: httpx.AsyncClient | None = None # [修改] 新增参数
+    ):
         self.id = id
         """
         会话ID，用于持久化时的标识
         """
 
-        # [优化] 为记忆压缩模块也配置高性能的 HTTP 客户端
-        memory_http_client = httpx.AsyncClient(
-            limits=httpx.Limits(max_keepalive_connections=5, max_connections=10),
-            timeout=60.0
-        )
+        # [优化] 优先使用传入的全局客户端，如果没有则回退到新建局部客户端
+        # 这样设计既能享受性能提升，又能防止未传入 client 时报错
+        if http_client:
+            self._client_instance = http_client
+        else:
+            logger.debug(f"[Session {id}] 未传入全局 HTTP 客户端，创建局部客户端")
+            self._client_instance = httpx.AsyncClient(
+                limits=httpx.Limits(max_keepalive_connections=5, max_connections=10),
+                timeout=60.0
+            )
 
         self.global_memory: Memory = Memory(
             llm_client=LLMClient(
                 client=AsyncOpenAI(
                     api_key=plugin_config.nyaturingtest_siliconflow_api_key,
                     base_url="https://api.siliconflow.cn/v1",
-                    http_client=memory_http_client
+                    http_client=self._client_instance # [修改] 使用实例变量
                 )
             )
         )
@@ -291,11 +302,8 @@ class Session:
 
             # 恢复全局短时记忆
             if "global_memory" in session_data:
-                # [优化] 恢复时也注入优化后的客户端
-                memory_http_client = httpx.AsyncClient(
-                    limits=httpx.Limits(max_keepalive_connections=5, max_connections=10),
-                    timeout=60.0
-                )
+                # [优化] 恢复时直接使用 self._client_instance (它在 __init__ 中已经被正确赋值了)
+                # 不需要在这里重新 new 一个 httpx.AsyncClient
                 try:
                     self.global_memory = Memory(
                         compressed_message=session_data["global_memory"].get("compressed_history", ""),
@@ -304,19 +312,19 @@ class Session:
                             client=AsyncOpenAI(
                                 api_key=plugin_config.nyaturingtest_siliconflow_api_key,
                                 base_url="https://api.siliconflow.cn/v1",
-                                http_client=memory_http_client
+                                http_client=self._client_instance # [修改] 使用实例变量
                             )
                         ),
                     )
                 except Exception as e:
                     logger.error(f"[Session {self.id}] 恢复全局短时记忆失败: {e}")
-                    # 重新初始化
+                    # 重新初始化 (依然使用实例变量)
                     self.global_memory = Memory(
                         llm_client=LLMClient(
                             client=AsyncOpenAI(
                                 api_key=plugin_config.nyaturingtest_siliconflow_api_key,
                                 base_url="https://api.siliconflow.cn/v1",
-                                http_client=memory_http_client
+                                http_client=self._client_instance # [修改] 使用实例变量
                             )
                         )
                     )
@@ -445,36 +453,29 @@ class Session:
         tasks = []
 
         # 任务A: 如果需要更新索引，则添加索引任务
-        index_needed = False
         if self.__update_hippo:
             self.__update_hippo = False
             if self.long_term_memory._cache:
-                logger.info("正在构建长期记忆索引(HippoRAG)...")
-                index_needed = True
-                tasks.append(run_sync(self.long_term_memory.index)())
+                logger.info("正在后台构建长期记忆索引(HippoRAG)...")
+                # 使用 asyncio.create_task 启动后台任务，不等待其完成
+                # 注意：这里需要确保 hippo_mem 内部是线程安全的，或者接受偶尔的竞态
+                asyncio.create_task(run_sync(self.long_term_memory.index)())
 
         # 任务B: 检索任务 (总是执行)
         # retrieve 也是 CPU 密集型任务(图游走)，放入线程池
         logger.debug("正在检索长期记忆...")
         tasks.append(run_sync(self.long_term_memory.retrieve)(retrieve_messages, k=2))
 
-        # 2. 并发执行所有任务
+        # 2. 执行任务 (现在只等待 retrieve)
         try:
             results = await asyncio.gather(*tasks)
 
-            # 3. 提取结果
-            long_term_memory = []
-            if index_needed:
-                # results[0]是index的返回值，results[1]是retrieve的返回值
-                logger.info("长期记忆索引构建完成")
-                long_term_memory = results[1]
-            else:
-                # results[0]是retrieve的返回值
-                long_term_memory = results[0]
+            # 3. 提取结果 (因为 index 移除了，results[0] 直接就是检索结果)
+            long_term_memory = results[0]
 
             logger.debug(f"搜索到的相关记忆：{long_term_memory}")
         except Exception as e:
-            logger.error(f"检索/索引阶段发生错误: {e}")
+            logger.error(f"检索阶段发生错误: {e}")
             traceback.print_exc()
             long_term_memory = []
 
@@ -814,6 +815,8 @@ class Session:
             random_value = random.uniform(0.5, 0.9)
             logger.debug(f"意愿转变随机值：{random_value}")
 
+            current_fatigue_factor = self._active_count * 0.15 if self.__chatting_state == _ChattingState.ACTIVE else 0.0
+
             match self.__chatting_state:
                 case _ChattingState.ILDE:
                     # [关键修复] 贤者时间检查
@@ -850,6 +853,15 @@ class Session:
                         logger.info(f"Bot 聊累了(已聊{self._active_count}轮)，主动进入潜水状态")
                         self.__chatting_state = _ChattingState.ILDE
                         self._active_count = 0
+
+            logger.info(
+                f"[DECISION DEBUG] "
+                f"状态: {self.__chatting_state.name} | "
+                f"对话意愿(Chat): {chat_chance:.2f} | "
+                f"潜水意愿(Idle): {idle_chance:.2f} | "
+                f"疲劳值(Count): {self._active_count} (Factor: {current_fatigue_factor:.2f}) | "
+                f"随机阈值: {random_value:.2f}"
+            )
 
             logger.debug(f"反馈阶段更新对话状态：{self.__chatting_state!s}")
             logger.debug("反馈阶段结束")
@@ -915,6 +927,12 @@ class Session:
 
 - **绝对禁止使用 Emoji 表情**（如😀、🤔、😅等）。
 - **语言风格**：不要重复复述他人的话，不要使用翻译腔，像真实用户一样交流。
+- **【关键】断句格式**：
+  - 你的回复可能会被拆分成多条消息发送。因此，**请务必在每个完整的短句或意群结束后，加上句号“。”、问号“？”、感叹号“！”或换行符**。
+  - **严禁**输出长达 20 字以上却中间没有任何结束标点（只有逗号或空格）的长难句。
+  - 例子：
+    - 错误：我觉得这件事很有趣因为上次我们也遇到了类似的情况当时大家都笑死
+    - 正确：我觉得这件事很有趣。因为上次我们也遇到了类似的情况。当时大家都笑死了。
 - **回复格式**：如果回复是针对某条特定消息的，请在 `target_id` 中填入该消息的 ID。如果是通用发言，`target_id` 留空。
 - **状态机规则**：
   - **冒泡状态(1)**：说明你之前在潜水。如果历史记录里没有你的发言，可以发一句简短的、符合人设的话（如“围观”等），或者什么都不发。
@@ -1053,10 +1071,13 @@ class Session:
                     messages_chunk=messages_chunk,
                     llm=llm,
                 )
+                # [关键修复 1] 如果冒泡成功（说话了），立即进入活跃状态
+                if reply_messages:
+                    self.__chatting_state = _ChattingState.ACTIVE
+
             case _ChattingState.ACTIVE:
                 logger.debug("nyabot对话中...")
-                # [逻辑优化] Chill Mode 概率随疲劳值增加
-                # 聊得越久，越容易触发“已读不回”
+                # Chill Mode 概率随疲劳值增加
                 chill_prob = 0.3 + (self._active_count * 0.05)
                 if random.random() < chill_prob:
                     logger.debug(f"Chill Mode触发 (概率{chill_prob:.2f}): 暂时不回消息")
@@ -1084,9 +1105,8 @@ class Session:
                 after_compress=enable_update_hippo,
             )
 
-            # [新增] 如果这一轮 Bot 确实说话了，更新计数和时间
-            if self.__chatting_state == _ChattingState.ACTIVE:
-                self._active_count += 1
+            # [关键修复 2] 只要说话了，就增加疲劳值 (去掉 if state == ACTIVE 的限制)
+            self._active_count += 1
 
             # 记录最后一次发言时间
             self._last_speak_time = datetime.now()
@@ -1101,7 +1121,7 @@ class Session:
         if self.__chatting_state == _ChattingState.ILDE:
             self._active_count = 0
 
-        # [修改] 异步保存会话
+        # 异步保存会话
         await self.save_session()
 
         return reply_messages

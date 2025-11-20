@@ -11,6 +11,7 @@ from nonebot import logger
 import nonebot_plugin_localstore as store
 import numpy as np
 from PIL import Image
+from nonebot.utils import run_sync
 
 from .config import plugin_config
 from .vlm import SiliconFlowVLM
@@ -111,7 +112,7 @@ class ImageManager:
         """
         image_bytes = base64.b64decode(image_base64)
         # 计算图片的SHA256哈希值
-        image_hash = _calculate_image_hash(image_bytes)
+        image_hash = await _calculate_image_hash(image_bytes)
         # 检查缓存
         cache = IMAGE_CACHE_DIR.joinpath(f"{image_hash}.json")
         if cache.exists():
@@ -161,7 +162,7 @@ class ImageManager:
 """
 
         if image_format.upper() == "GIF":
-            gif_transfromed = _transform_gif(image_base64)
+            gif_transfromed = await _transform_gif(image_base64)
             if not gif_transfromed:
                 logger.error("GIF转换失败")
                 return None
@@ -209,6 +210,7 @@ class ImageManager:
         return result
 
 
+@run_sync
 def _transform_gif(gif_base64: str, similarity_threshold: float = 1000.0, max_frames: int = 15) -> str | None:
     """将GIF转换为水平拼接的静态图像, 跳过相似的帧"""
     try:
@@ -296,6 +298,7 @@ def _transform_gif(gif_base64: str, similarity_threshold: float = 1000.0, max_fr
         return None
 
 
+@run_sync
 def _calculate_image_hash(image: bytes) -> str:
     """
     计算图片的SHA256哈希值

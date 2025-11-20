@@ -33,17 +33,6 @@ from .image_manager import IMAGE_CACHE_DIR, image_manager
 from .mem import Message as MMessage
 from .session import Session
 
-__plugin_meta__ = PluginMetadata(
-    name="NYATuringTest",
-    description="群聊特化llm聊天机器人，具有长期记忆和情绪模拟能力",
-    usage="群聊特化llm聊天机器人，具有长期记忆和情绪模拟能力",
-    type="application",
-    homepage="https://github.com/shadow3aaa/nonebot-plugin-nyaturingtest",
-    config=Config,
-    supported_adapters={"~onebot.v11"},
-    extra={"author": "shadow3aaa <shadow3aaaa@gmail.com>"},
-)
-
 
 async def is_group_message(event: Event) -> bool:
     return isinstance(event, GroupMessageEvent)
@@ -53,24 +42,41 @@ async def is_private_message(event: Event) -> bool:
     return isinstance(event, PrivateMessageEvent)
 
 
+# [修改] 提前定义全局客户端变量
+_GLOBAL_HTTP_CLIENT: httpx.AsyncClient | None = None
+
+
+# [修改] 优化连接池配置
+def get_http_client() -> httpx.AsyncClient:
+    global _GLOBAL_HTTP_CLIENT
+    if _GLOBAL_HTTP_CLIENT is None:
+        ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLSv1_2)
+        ssl_context.set_ciphers("ALL:@SECLEVEL=1")
+        _GLOBAL_HTTP_CLIENT = httpx.AsyncClient(
+            verify=ssl_context,
+            timeout=30.0,
+            # [优化] 增大连接池限制，防止多群组/多图片时阻塞
+            limits=httpx.Limits(max_keepalive_connections=50, max_connections=100)
+        )
+    return _GLOBAL_HTTP_CLIENT
+
+
 @dataclass
 class GroupState:
     event: Event | None = None
     bot: Bot | None = None
     session: Session = field(
-        default_factory=lambda: Session(siliconflow_api_key=plugin_config.nyaturingtest_siliconflow_api_key)
+        default_factory=lambda: Session(siliconflow_api_key=plugin_config.nyaturingtest_siliconflow_api_key, http_client=get_http_client())
     )
     messages_chunk: list[MMessage] = field(default_factory=list)
 
+    # [优化] 复用全局 HTTP 客户端，减少 SSL 握手开销
     client: LLMClient = field(
         default_factory=lambda: LLMClient(
             client=AsyncOpenAI(
                 api_key=plugin_config.nyaturingtest_chat_openai_api_key,
                 base_url=plugin_config.nyaturingtest_chat_openai_base_url,
-                http_client=httpx.AsyncClient(
-                    limits=httpx.Limits(max_keepalive_connections=20, max_connections=50),
-                    timeout=120.0
-                )
+                http_client=get_http_client()  # 使用全局单例
             )
         )
     )
@@ -80,23 +86,9 @@ class GroupState:
 
 
 _tasks: set[asyncio.Task] = set()
-_GLOBAL_HTTP_CLIENT: httpx.AsyncClient | None = None
 
 
-def get_http_client() -> httpx.AsyncClient:
-    global _GLOBAL_HTTP_CLIENT
-    if _GLOBAL_HTTP_CLIENT is None:
-        ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLSv1_2)
-        ssl_context.set_ciphers("ALL:@SECLEVEL=1")
-        _GLOBAL_HTTP_CLIENT = httpx.AsyncClient(
-            verify=ssl_context,
-            timeout=30.0,
-            limits=httpx.Limits(max_keepalive_connections=20, max_connections=50)
-        )
-    return _GLOBAL_HTTP_CLIENT
-
-
-# [新增] 智能断句辅助函数
+# 智能断句辅助函数
 def _smart_split_text(text: str, max_chars: int = 40) -> list[str]:
     """
     将长文本切分为多条消息，模拟人类说话习惯
@@ -146,6 +138,7 @@ async def spawn_state(state: GroupState):
     启动后台任务循环检查是否要回复
     """
     while True:
+        # 这一层是轮询等待，模拟阅读延迟
         await asyncio.sleep(random.uniform(5.0, 10.0))
 
         current_chunk = []
@@ -166,7 +159,10 @@ async def spawn_state(state: GroupState):
                 )
 
                 if responses:
-                    for response in responses:
+                    # 获取总回复数，用于判断最后一句
+                    total_responses = len(responses)
+
+                    for r_idx, response in enumerate(responses):
                         raw_content = ""
                         reply_id = None
 
@@ -179,22 +175,24 @@ async def spawn_state(state: GroupState):
                         if not raw_content:
                             continue
 
-                        # [修改] 使用断句逻辑
-                        # 如果内容较长，这里会返回一个列表 ['第一句', '第二句']
+                        # 智能断句
                         msg_parts = _smart_split_text(raw_content)
 
                         for i, part in enumerate(msg_parts):
                             msg_to_send = Message(part)
 
-                            # [核心逻辑] 只在第一条消息挂载回复引用
-                            if reply_id and i == 0:
+                            # 只在第一条消息的第一段挂载回复引用
+                            if reply_id and r_idx == 0 and i == 0:
                                 msg_to_send.insert(0, MessageSegment.reply(int(reply_id)))
 
                             await state.bot.send(message=msg_to_send, event=state.event)
 
-                            # [模拟] 如果还有下一句，稍微等一下再发，模拟打字/思考间隔
-                            if i < len(msg_parts) - 1:
-                                await asyncio.sleep(random.uniform(1.0, 3.0))
+                            # 统一延时逻辑
+                            # 只要不是“整个批次”的最后一条消息，就延时
+                            if i < len(msg_parts) - 1 or r_idx < total_responses - 1:
+                                delay = random.uniform(1.5, 3.0)
+                                logger.debug(f"模拟打字等待 {delay:.2f}s...")
+                                await asyncio.sleep(delay)
 
             except Exception as e:
                 logger.error(f"Error in processing cycle: {e}")
@@ -262,7 +260,11 @@ def ensure_group_state(group_id: int):
             return None
 
         group_states[group_id] = GroupState(
-            session=Session(id=f"{group_id}", siliconflow_api_key=plugin_config.nyaturingtest_siliconflow_api_key)
+            session=Session(
+                id=f"{group_id}",  # 必须传，否则所有群混在一起
+                siliconflow_api_key=plugin_config.nyaturingtest_siliconflow_api_key,
+                http_client=get_http_client()  # 必须传，否则无法复用连接池
+            )
         )
         global _tasks
         task = asyncio.create_task(spawn_state(state=group_states[group_id]))
@@ -552,6 +554,7 @@ async def message2BotMessage(bot_name: str, group_id: int, message: Message, bot
                     async with await anyio.open_file(cache_path.joinpath(key), "rb") as f:
                         image_bytes = await f.read()
                 else:
+                    # [优化] 此处复用全局客户端，避免频繁创建连接
                     client = get_http_client()
                     try:
                         resp = await client.get(url)
@@ -631,7 +634,7 @@ driver = get_driver()
 
 @driver.on_shutdown
 async def cleanup_tasks():
-    """清理后台任务"""
+    """清理后台任务与资源"""
     logger.info("正在清理后台会话任务...")
     for task in _tasks:
         if not task.done():
@@ -639,4 +642,12 @@ async def cleanup_tasks():
 
     if _tasks:
         await asyncio.gather(*_tasks, return_exceptions=True)
+
+    # [新增] 清理全局 HTTP 客户端
+    global _GLOBAL_HTTP_CLIENT
+    if _GLOBAL_HTTP_CLIENT:
+        await _GLOBAL_HTTP_CLIENT.aclose()
+        _GLOBAL_HTTP_CLIENT = None
+        logger.info("全局 HTTP 客户端已关闭")
+
     logger.info("后台任务已清理")
