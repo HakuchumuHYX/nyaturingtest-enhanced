@@ -144,6 +144,9 @@ class Session:
         # [新增] 记录上次活跃时间，用于计算冷却
         self._last_activity_time = datetime.now()
 
+        # [新增] 活跃回复计数器，用于计算疲劳值
+        self._active_count = 0
+
         # 从文件加载会话状态（如果存在）
         self.load_session()
 
@@ -182,6 +185,7 @@ class Session:
         self.chat_summary = ""
         self.__chatting_state = _ChattingState.ILDE
         self.__bubble_willing_sum = 0.0
+        self._active_count = 0
         self._last_activity_time = datetime.now()
         await self.save_session()  # 保存重置后的状态
 
@@ -194,6 +198,7 @@ class Session:
         self.global_emotion.dominance = 0.0
         self.profiles = {}
         self.__chatting_state = _ChattingState.ILDE  # 强制冷却
+        self._active_count = 0
         self._last_activity_time = datetime.now()
         await self.save_session()  # 保存冷静后的状态
 
@@ -235,7 +240,6 @@ class Session:
                     for msg in self.last_response
                 ],
                 "chatting_state": self.__chatting_state.value,
-                # 甚至可以保存 last_activity_time，不过重启后重置为now也没关系
             }
 
             # 使用 anyio 异步写入文件，防止阻塞事件循环
@@ -405,6 +409,9 @@ class Session:
 {self.global_memory.access().compressed_history}
 
 现状认识：{self.chat_summary}
+
+状态: {self.__chatting_state}
+疲劳度(对话轮数): {self._active_count}
 """
 
     async def __search_stage(self):
@@ -772,7 +779,7 @@ class Session:
             if not isinstance(willing, dict):
                 willing = {}
 
-            # [逻辑优化 - 强力降温]
+            # [逻辑优化 - 强力降温 + 疲劳机制]
 
             # 1. 提升回潜水的意愿 (idle_chance)
             idle_chance = float(willing.get("0", 0.0)) * 1.5
@@ -807,8 +814,18 @@ class Session:
                     elif idle_chance >= random_value:
                         self.__chatting_state = _ChattingState.ILDE
                 case _ChattingState.ACTIVE:
-                    if (idle_chance * 1.2) >= random_value:
+                    # [核心优化] 引入疲劳系数
+                    # 每多聊一句(self._active_count)，想潜水的概率就增加 0.15
+                    fatigue_factor = self._active_count * 0.15
+                    final_idle_chance = (idle_chance * 1.2) + fatigue_factor
+
+                    logger.debug(
+                        f"活跃退出判定: 基础意愿{idle_chance:.2f} + 疲劳({self._active_count}轮){fatigue_factor:.2f} = {final_idle_chance:.2f} (阈值: {random_value:.2f})")
+
+                    if final_idle_chance >= random_value:
+                        logger.info(f"Bot 聊累了(已聊{self._active_count}轮)，主动进入潜水状态")
                         self.__chatting_state = _ChattingState.ILDE
+                        self._active_count = 0  # 重置计数器
 
             logger.debug(f"反馈阶段更新对话状态：{self.__chatting_state!s}")
             logger.debug("反馈阶段结束")
@@ -872,11 +889,11 @@ class Session:
 
 ## 2. 必须遵守的限制：
 
-- **除非人设允许，否则绝对禁止使用 Emoji 表情**（如😀、🤔、😅等）。
+- **绝对禁止使用 Emoji 表情**（如😀、🤔、😅等）。
 - **语言风格**：不要重复复述他人的话，不要使用翻译腔，像真实用户一样交流。
 - **回复格式**：如果回复是针对某条特定消息的，请在 `target_id` 中填入该消息的 ID。如果是通用发言，`target_id` 留空。
 - **状态机规则**：
-  - **冒泡状态(1)**：说明你之前在潜水。如果历史记录里没有你的发言，可以发一句简短的、符合人设的话（如“偷看”等），或者什么都不发。
+  - **冒泡状态(1)**：说明你之前在潜水。如果历史记录里没有你的发言，可以发一句简短的、符合人设的话（如“围观”等），或者什么都不发。
   - **对话状态(2)**：说明你正在活跃。请根据你的人设判断是否需要回复，**不需要对每一句话都回应**。
 
 ## 3. 输入信息
@@ -990,9 +1007,9 @@ class Session:
                 logger.info(f"会话已冷却 ({time_since_last_active:.0f}s > 300s)，状态重置为 [潜水]")
                 self.__chatting_state = _ChattingState.ILDE
                 self.__bubble_willing_sum = 0.0
+                self._active_count = 0  # 重置计数器
 
-        # 更新活跃时间 (每次处理新消息都算一次活跃检查，但只有真正发言了才算高唤醒？
-        # 这里我们只要被触发了 update，就认为 Bot 的大脑“动”了一下，重置计时器合理)
+        # 更新活跃时间
         self._last_activity_time = now
 
         # 检索阶段 (并行化优化已生效)
@@ -1014,9 +1031,11 @@ class Session:
                 )
             case _ChattingState.ACTIVE:
                 logger.debug("nyabot对话中...")
-                # [逻辑优化] 即使在活跃状态，也有 30% 的概率直接无视这一波消息
-                if random.random() < 0.3:
-                    logger.debug("nyabot决定虽然在活跃状态，但暂时不回消息 (Chill Mode)")
+                # [逻辑优化] Chill Mode 概率随疲劳值增加
+                # 聊得越久，越容易触发“已读不回”
+                chill_prob = 0.3 + (self._active_count * 0.05)
+                if random.random() < chill_prob:
+                    logger.debug(f"Chill Mode触发 (概率{chill_prob:.2f}): 暂时不回消息")
                     reply_messages = None
                 else:
                     reply_messages = await self.__chat_stage(
@@ -1040,12 +1059,20 @@ class Session:
                    reply_messages],
                 after_compress=enable_update_hippo,
             )
+
+            # [新增] 如果这一轮 Bot 确实说话了，增加疲劳计数
+            if self.__chatting_state == _ChattingState.ACTIVE:
+                self._active_count += 1
+
         else:
             self.long_term_memory.add_texts(
                 texts=[f"'{msg.user_name}':'{msg.content}'" for msg in messages_chunk],
             )
-
             await self.global_memory.update(messages_chunk, after_compress=enable_update_hippo)
+
+        # 如果状态被重置为 ILDE，重置计数器
+        if self.__chatting_state == _ChattingState.ILDE:
+            self._active_count = 0
 
         # [修改] 异步保存会话
         await self.save_session()
