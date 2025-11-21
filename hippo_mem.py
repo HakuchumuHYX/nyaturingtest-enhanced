@@ -1,6 +1,7 @@
 from datetime import datetime
 import os
 import shutil
+import numpy as np  # [新增] 引入 numpy 以便做更严谨的判断(如果需要)
 
 from hipporag import HippoRAG
 from nonebot import logger
@@ -23,13 +24,13 @@ def _get_tokenizer():
 
 class HippoMemory:
     def __init__(
-        self,
-        llm_model: str,
-        llm_base_url: str,
-        llm_api_key: str,
-        embedding_api_key: str,
-        persist_directory: str = "./hippo_index",
-        collection_name: str = "hippo_collection",
+            self,
+            llm_model: str,
+            llm_base_url: str,
+            llm_api_key: str,
+            embedding_api_key: str,
+            persist_directory: str = "./hippo_index",
+            collection_name: str = "hippo_collection",
     ):
         # 确保存储目录存在
         os.makedirs(persist_directory, exist_ok=True)
@@ -119,7 +120,7 @@ class HippoMemory:
 
             logger.info(f"开始构建索引，共 {len(texts)} 条文本段...")
 
-            # 3. 执行索引（这是最耗时的部分，会由 run_sync 在线程池中执行）
+            # 3. 执行索引
             self.hippo.index(texts)
 
             logger.info(f"已成功索引 {len(texts)} 条缓存文本")
@@ -138,28 +139,52 @@ class HippoMemory:
         检索与查询相关的文本
 
         Args:
-            query: 查询文本
+            queries: 查询文本列表
             k: 返回的最大结果数
 
         Returns:
             包含检索结果的Document列表
         """
+        # [关键修复] 检查索引是否为空
+        # HippoRAG 的 passage_embeddings 为空时会导致 numpy shape mismatch (0,) vs (1024,)
+        try:
+            if hasattr(self.hippo, "passage_embeddings"):
+                # 如果 embedding 是 None 或者长度为 0
+                if self.hippo.passage_embeddings is None or len(self.hippo.passage_embeddings) == 0:
+                    # 静默返回，因为这在刚启动时很正常
+                    return []
+        except Exception:
+            # 如果访问属性出错，也直接返回空以保平安
+            return []
+
         # 切割(BAAI/bge-m3上限为8192tokens)
         logger.debug(f"查询文本: {queries}")
         splited_queries = []
         for query in queries:
             splited_queries += _split_text_by_tokens(query, self.tokenizer, max_tokens=2048, overlap=100)
-        logger.debug(f"分割后的查询: {splited_queries}")
-        results = self.hippo.retrieve(queries=splited_queries, num_to_retrieve=k)
-        # make ruff happy
-        assert isinstance(results, list)
-        docs = [doc for result in results for doc in result.docs]
-        # 去重
-        return list(set(docs))
+
+        # logger.debug(f"分割后的查询: {splited_queries}")
+
+        try:
+            results = self.hippo.retrieve(queries=splited_queries, num_to_retrieve=k)
+            # make ruff happy
+            assert isinstance(results, list)
+            docs = [doc for result in results for doc in result.docs]
+            # 去重
+            return list(set(docs))
+        except ValueError as e:
+            # 双重保险：捕获 numpy 的 shapes mismatch 错误
+            if "shapes" in str(e) and "not aligned" in str(e):
+                logger.warning("长期记忆索引为空，跳过检索")
+                return []
+            raise e
+        except Exception as e:
+            logger.error(f"检索过程发生未知错误: {e}")
+            return []
 
 
 def _split_text_by_tokens(
-    text: str, tokenizer, max_tokens=2048, overlap=100
+        text: str, tokenizer, max_tokens=2048, overlap=100
 ) -> list[str]:
     """
     按照指定的最大 token 数量和重叠数量将文本分割成多个块
@@ -171,6 +196,8 @@ def _split_text_by_tokens(
     Returns:
         分割后的文本块列表
     """
+    if not text:
+        return []
     tokens = tokenizer.encode(text, add_special_tokens=False)
     chunks = []
     start = 0
