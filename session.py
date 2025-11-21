@@ -70,19 +70,18 @@ class Session:
     """
 
     def __init__(
-        self,
-        siliconflow_api_key: str,
-        id: str = "global",
-        name: str = "terminus",
-        http_client: httpx.AsyncClient | None = None # [修改] 新增参数
+            self,
+            siliconflow_api_key: str,
+            id: str = "global",
+            name: str = "terminus",
+            http_client: httpx.AsyncClient | None = None
     ):
         self.id = id
         """
         会话ID，用于持久化时的标识
         """
 
-        # [优化] 优先使用传入的全局客户端，如果没有则回退到新建局部客户端
-        # 这样设计既能享受性能提升，又能防止未传入 client 时报错
+        # 优先使用传入的全局客户端
         if http_client:
             self._client_instance = http_client
         else:
@@ -97,7 +96,7 @@ class Session:
                 client=AsyncOpenAI(
                     api_key=plugin_config.nyaturingtest_siliconflow_api_key,
                     base_url="https://api.siliconflow.cn/v1",
-                    http_client=self._client_instance # [修改] 使用实例变量
+                    http_client=self._client_instance
                 )
             )
         )
@@ -152,13 +151,13 @@ class Session:
         """
         self.__search_result = None
 
-        # [新增] 记录群组上次活跃时间，用于长时间无消息后的状态重置
+        # 记录群组上次活跃时间，用于长时间无消息后的状态重置
         self._last_activity_time = datetime.now()
 
-        # [新增] 记录 BOT 上次发言时间，用于计算“贤者时间”
+        # 记录 BOT 上次发言时间，用于计算“贤者时间”
         self._last_speak_time = datetime.min
 
-        # [新增] 活跃回复计数器，用于计算疲劳值
+        # 活跃回复计数器，用于计算疲劳值
         self._active_count = 0
 
         # 从文件加载会话状态（如果存在）
@@ -302,8 +301,6 @@ class Session:
 
             # 恢复全局短时记忆
             if "global_memory" in session_data:
-                # [优化] 恢复时直接使用 self._client_instance (它在 __init__ 中已经被正确赋值了)
-                # 不需要在这里重新 new 一个 httpx.AsyncClient
                 try:
                     self.global_memory = Memory(
                         compressed_message=session_data["global_memory"].get("compressed_history", ""),
@@ -312,19 +309,19 @@ class Session:
                             client=AsyncOpenAI(
                                 api_key=plugin_config.nyaturingtest_siliconflow_api_key,
                                 base_url="https://api.siliconflow.cn/v1",
-                                http_client=self._client_instance # [修改] 使用实例变量
+                                http_client=self._client_instance
                             )
                         ),
                     )
                 except Exception as e:
                     logger.error(f"[Session {self.id}] 恢复全局短时记忆失败: {e}")
-                    # 重新初始化 (依然使用实例变量)
+                    # 重新初始化
                     self.global_memory = Memory(
                         llm_client=LLMClient(
                             client=AsyncOpenAI(
                                 api_key=plugin_config.nyaturingtest_siliconflow_api_key,
                                 base_url="https://api.siliconflow.cn/v1",
-                                http_client=self._client_instance # [修改] 使用实例变量
+                                http_client=self._client_instance
                             )
                         )
                     )
@@ -433,7 +430,7 @@ class Session:
 现状认识：{self.chat_summary}
 
 状态: {self.__chatting_state}
-疲劳度(对话轮数): {self._active_count}
+疲劳度(气泡计数): {self._active_count}
 """
 
     async def __search_stage(self):
@@ -457,22 +454,16 @@ class Session:
             self.__update_hippo = False
             if self.long_term_memory._cache:
                 logger.info("正在后台构建长期记忆索引(HippoRAG)...")
-                # 使用 asyncio.create_task 启动后台任务，不等待其完成
-                # 注意：这里需要确保 hippo_mem 内部是线程安全的，或者接受偶尔的竞态
                 asyncio.create_task(run_sync(self.long_term_memory.index)())
 
         # 任务B: 检索任务 (总是执行)
-        # retrieve 也是 CPU 密集型任务(图游走)，放入线程池
         logger.debug("正在检索长期记忆...")
         tasks.append(run_sync(self.long_term_memory.retrieve)(retrieve_messages, k=2))
 
-        # 2. 执行任务 (现在只等待 retrieve)
+        # 2. 执行任务
         try:
             results = await asyncio.gather(*tasks)
-
-            # 3. 提取结果 (因为 index 移除了，results[0] 直接就是检索结果)
             long_term_memory = results[0]
-
             logger.debug(f"搜索到的相关记忆：{long_term_memory}")
         except Exception as e:
             logger.error(f"检索阶段发生错误: {e}")
@@ -488,7 +479,7 @@ class Session:
     @staticmethod
     def _extract_and_parse_json(response: str) -> dict | None:
         """
-        从 LLM 响应中提取并解析 JSON，具有更强的鲁棒性
+        从 LLM 响应中提取并解析 JSON
         """
         try:
             return json.loads(response)
@@ -513,9 +504,30 @@ class Session:
 
         return None
 
+    # [新增] 辅助方法：用于估算实际发送的消息条数 (复用 __init__.py 的逻辑)
+    def _estimate_split_count(self, text: str) -> int:
+        if not text:
+            return 0
+        # 使用与 __init__.py 一致的切分逻辑
+        raw_parts = re.split(r'(?<=[。！？!?.~\n])\s*', text)
+        final_parts = []
+        current_buffer = ""
+        for part in raw_parts:
+            part = part.strip()
+            if not part: continue
+            if len(current_buffer) + len(part) < 15:
+                current_buffer += part
+            else:
+                if current_buffer: final_parts.append(current_buffer)
+                current_buffer = part
+        if current_buffer: final_parts.append(current_buffer)
+
+        # 至少算 1 条
+        return len(final_parts) if final_parts else 1
+
     async def __feedback_stage(self, messages_chunk: list[Message], llm: Callable[[str], Awaitable[str]]):
         """
-        反馈总结阶段 (已增强鲁棒性与容错)
+        反馈总结阶段
         """
         logger.debug("反馈阶段开始")
         reaction_users = self.global_memory.related_users()
@@ -743,10 +755,8 @@ class Session:
             response = await llm(prompt)
             logger.debug(f"反馈阶段llm返回：{response}")
 
-            # [使用鲁棒的解析器]
             response_dict = self._extract_and_parse_json(response)
 
-            # [降级处理]
             if not response_dict:
                 logger.warning("反馈阶段 JSON 解析失败，使用默认值降级处理")
                 response_dict = {}
@@ -821,7 +831,6 @@ class Session:
                 case _ChattingState.ILDE:
                     # [关键修复] 贤者时间检查
                     # 如果距离上次说话不到 180秒 (3分钟)，强制降低活跃意愿
-                    # 这意味着 Bot 就算被重置为潜水，也不会马上“仰卧起坐”
                     seconds_since_speak = (datetime.now() - self._last_speak_time).total_seconds()
                     if seconds_since_speak < 180:
                         logger.debug(f"Bot 处于贤者时间 ({seconds_since_speak:.0f}s < 180s)，强制压制对话欲望")
@@ -876,7 +885,7 @@ class Session:
             llm: Callable[[str], Awaitable[str]],
     ) -> list[dict]:
         """
-        对话阶段 (已增强鲁棒性与容错)
+        对话阶段
         """
         logger.debug("对话阶段开始")
         reaction_users = self.global_memory.related_users()
@@ -897,11 +906,9 @@ class Session:
         else:
             search_stage_result = []
 
-        # 防止 Markdown 断裂的符号变量
         code_start = "```" + "json"
         code_end = "```"
 
-        # [Prompt 优化] 净化版：移除了高冷/敷衍等性格指令，只保留底线规则
         prompt = f"""
 你是QQ群用户 {self.__name}，不是 AI，而是一个有自我认知的真实用户，（你称自己为 "{self.__name}"），你的人设(身份认知)如
 下:
@@ -999,10 +1006,8 @@ class Session:
             response = await llm(prompt)
             logger.debug(f"对话阶段llm返回：{response}")
 
-            # [使用鲁棒的解析器]
             response_dict = self._extract_and_parse_json(response)
 
-            # [降级处理]
             if not response_dict:
                 logger.warning("对话阶段 JSON 解析失败，跳过本次回复")
                 return []
@@ -1012,7 +1017,6 @@ class Session:
 
             logger.debug("对话阶段结束")
 
-            # 格式化返回值：统一为 dict 列表
             final_replies = []
             raw_replies = response_dict.get("reply", [])
 
@@ -1039,7 +1043,7 @@ class Session:
         更新群聊消息
         """
 
-        # [核心修复] 自动冷却逻辑
+        # 自动冷却逻辑
         # 如果距离上次活跃超过 300 秒 (5分钟)，强制重置为潜水状态
         now = datetime.now()
         time_since_last_active = (now - self._last_activity_time).total_seconds()
@@ -1054,7 +1058,7 @@ class Session:
         # 更新活跃时间
         self._last_activity_time = now
 
-        # 检索阶段 (并行化优化已生效)
+        # 检索阶段
         await self.__search_stage()
 
         # 反馈阶段
@@ -1071,7 +1075,7 @@ class Session:
                     messages_chunk=messages_chunk,
                     llm=llm,
                 )
-                # [关键修复 1] 如果冒泡成功（说话了），立即进入活跃状态
+                # 如果冒泡成功（说话了），立即进入活跃状态
                 if reply_messages:
                     self.__chatting_state = _ChattingState.ACTIVE
 
@@ -1105,8 +1109,17 @@ class Session:
                 after_compress=enable_update_hippo,
             )
 
-            # [关键修复 2] 只要说话了，就增加疲劳值 (去掉 if state == ACTIVE 的限制)
-            self._active_count += 1
+            # [修改] 优化疲劳值计算逻辑
+            # 根据实际切分后的气泡数量累加疲劳值
+            # 确保一轮回复全部生成并确认发送后，再统一增加疲劳
+            actual_bubble_count = 0
+            for msg in reply_messages:
+                content = msg.get('content', '')
+                actual_bubble_count += self._estimate_split_count(content)
+
+            self._active_count += actual_bubble_count
+            logger.debug(
+                f"Bot 发言 {len(reply_messages)} 条 (切分为 {actual_bubble_count} 个气泡)，疲劳值 +{actual_bubble_count}")
 
             # 记录最后一次发言时间
             self._last_speak_time = datetime.now()

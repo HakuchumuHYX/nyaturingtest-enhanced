@@ -33,6 +33,17 @@ from .image_manager import IMAGE_CACHE_DIR, image_manager
 from .mem import Message as MMessage
 from .session import Session
 
+__plugin_meta__ = PluginMetadata(
+    name="NYATuringTest",
+    description="群聊特化llm聊天机器人，具有长期记忆和情绪模拟能力",
+    usage="群聊特化llm聊天机器人，具有长期记忆和情绪模拟能力",
+    type="application",
+    homepage="https://github.com/shadow3aaa/nonebot-plugin-nyaturingtest",
+    config=Config,
+    supported_adapters={"~onebot.v11"},
+    extra={"author": "shadow3aaa <shadow3aaaa@gmail.com>"},
+)
+
 
 async def is_group_message(event: Event) -> bool:
     return isinstance(event, GroupMessageEvent)
@@ -42,11 +53,11 @@ async def is_private_message(event: Event) -> bool:
     return isinstance(event, PrivateMessageEvent)
 
 
-# [修改] 提前定义全局客户端变量
+# 提前定义全局客户端变量
 _GLOBAL_HTTP_CLIENT: httpx.AsyncClient | None = None
 
 
-# [修改] 优化连接池配置
+# 优化连接池配置
 def get_http_client() -> httpx.AsyncClient:
     global _GLOBAL_HTTP_CLIENT
     if _GLOBAL_HTTP_CLIENT is None:
@@ -55,7 +66,7 @@ def get_http_client() -> httpx.AsyncClient:
         _GLOBAL_HTTP_CLIENT = httpx.AsyncClient(
             verify=ssl_context,
             timeout=30.0,
-            # [优化] 增大连接池限制，防止多群组/多图片时阻塞
+            # 增大连接池限制
             limits=httpx.Limits(max_keepalive_connections=50, max_connections=100)
         )
     return _GLOBAL_HTTP_CLIENT
@@ -65,18 +76,20 @@ def get_http_client() -> httpx.AsyncClient:
 class GroupState:
     event: Event | None = None
     bot: Bot | None = None
+    # [关键] 确保 Session 初始化时传入了 ID 和 HTTP Client
     session: Session = field(
-        default_factory=lambda: Session(siliconflow_api_key=plugin_config.nyaturingtest_siliconflow_api_key, http_client=get_http_client())
+        default_factory=lambda: Session(siliconflow_api_key=plugin_config.nyaturingtest_siliconflow_api_key,
+                                        http_client=get_http_client())
     )
     messages_chunk: list[MMessage] = field(default_factory=list)
 
-    # [优化] 复用全局 HTTP 客户端，减少 SSL 握手开销
+    # 复用全局 HTTP 客户端
     client: LLMClient = field(
         default_factory=lambda: LLMClient(
             client=AsyncOpenAI(
                 api_key=plugin_config.nyaturingtest_chat_openai_api_key,
                 base_url=plugin_config.nyaturingtest_chat_openai_base_url,
-                http_client=get_http_client()  # 使用全局单例
+                http_client=get_http_client()
             )
         )
     )
@@ -100,13 +113,10 @@ def _smart_split_text(text: str, max_chars: int = 40) -> list[str]:
     if not text:
         return []
 
-    # 如果文本本身很短，直接返回
     if len(text) < max_chars:
         return [text]
 
-    # 使用正则按标点符号切分 (保留句尾标点)
-    # 匹配：句号、感叹号、问号、波浪号、换行符
-    # (?<=...) 是后向断言，表示在这些符号后面进行切割
+    # 使用正则按标点符号切分
     raw_parts = re.split(r'(?<=[。！？!?.~\n])\s*', text)
 
     final_parts = []
@@ -117,8 +127,6 @@ def _smart_split_text(text: str, max_chars: int = 40) -> list[str]:
         if not part:
             continue
 
-        # 简单的合并逻辑：如果当前缓冲 + 下一句还是很短，就拼在一起，避免发出由 1-2 个字组成的刷屏消息
-        # 比如 "嗯。" "好的。" 这种可以拼成 "嗯。好的。"
         if len(current_buffer) + len(part) < 15:
             current_buffer += part
         else:
@@ -129,7 +137,6 @@ def _smart_split_text(text: str, max_chars: int = 40) -> list[str]:
     if current_buffer:
         final_parts.append(current_buffer)
 
-    # 如果切分结果为空（极端情况），返回原文本
     return final_parts if final_parts else [text]
 
 
@@ -138,7 +145,6 @@ async def spawn_state(state: GroupState):
     启动后台任务循环检查是否要回复
     """
     while True:
-        # 这一层是轮询等待，模拟阅读延迟
         await asyncio.sleep(random.uniform(5.0, 10.0))
 
         current_chunk = []
@@ -159,7 +165,6 @@ async def spawn_state(state: GroupState):
                 )
 
                 if responses:
-                    # 获取总回复数，用于判断最后一句
                     total_responses = len(responses)
 
                     for r_idx, response in enumerate(responses):
@@ -179,6 +184,15 @@ async def spawn_state(state: GroupState):
                         msg_parts = _smart_split_text(raw_content)
 
                         for i, part in enumerate(msg_parts):
+                            # [修改] 去除句尾句号逻辑
+                            part = part.strip()
+                            # 如果是以 "。" 结尾，直接去掉
+                            if part.endswith("。"):
+                                part = part[:-1]
+                            # 如果是以 "." 结尾，但不是 ".." 或 "..." (防止误伤英文省略号)
+                            elif part.endswith(".") and not part.endswith(".."):
+                                part = part[:-1]
+
                             msg_to_send = Message(part)
 
                             # 只在第一条消息的第一段挂载回复引用
@@ -188,7 +202,6 @@ async def spawn_state(state: GroupState):
                             await state.bot.send(message=msg_to_send, event=state.event)
 
                             # 统一延时逻辑
-                            # 只要不是“整个批次”的最后一条消息，就延时
                             if i < len(msg_parts) - 1 or r_idx < total_responses - 1:
                                 delay = random.uniform(1.5, 3.0)
                                 logger.debug(f"模拟打字等待 {delay:.2f}s...")
@@ -554,7 +567,7 @@ async def message2BotMessage(bot_name: str, group_id: int, message: Message, bot
                     async with await anyio.open_file(cache_path.joinpath(key), "rb") as f:
                         image_bytes = await f.read()
                 else:
-                    # [优化] 此处复用全局客户端，避免频繁创建连接
+                    # 此处复用全局客户端，避免频繁创建连接
                     client = get_http_client()
                     try:
                         resp = await client.get(url)
@@ -643,7 +656,7 @@ async def cleanup_tasks():
     if _tasks:
         await asyncio.gather(*_tasks, return_exceptions=True)
 
-    # [新增] 清理全局 HTTP 客户端
+    # 清理全局 HTTP 客户端
     global _GLOBAL_HTTP_CLIENT
     if _GLOBAL_HTTP_CLIENT:
         await _GLOBAL_HTTP_CLIENT.aclose()
