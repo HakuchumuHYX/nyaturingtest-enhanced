@@ -435,63 +435,61 @@ class Session:
 
     async def __search_stage(self):
         """
-        检索阶段 (并行优化版 - 节流控制)
+        检索阶段 (并行优化版 - 节流控制 - 支持@和回复)
         """
         logger.debug("检索阶段开始")
 
-        # 获取最近的消息对象
         recent_msgs = self.global_memory.access().messages
 
-        # 准备要检索的 Query
         retrieve_messages = (
                 [f"'{msg.user_name}':'{msg.content}'" for msg in recent_msgs]
                 + [self.global_memory.access().compressed_history]
                 + [self.chat_summary]
         )
 
-        # 1. 定义任务列表
         tasks = []
 
-        # 任务A: 如果需要更新索引，则添加索引任务 (后台运行，不放入 tasks 等待)
         if self.__update_hippo:
             self.__update_hippo = False
             if self.long_term_memory._cache:
                 logger.info("正在后台构建长期记忆索引(HippoRAG)...")
                 asyncio.create_task(run_sync(self.long_term_memory.index)())
 
-        # 2. 检索判断逻辑 [新增优化]
-        # 默认不检索
+        # --- [修改开始] ---
         should_retrieve = False
 
-        # 条件1: 非潜水状态 (冒泡或活跃)
+        # 1. 非潜水状态 (活跃中) -> 总是检索
         if self.__chatting_state != _ChattingState.ILDE:
             should_retrieve = True
 
-        # 条件2: 潜水状态下，检查最近 3 条消息是否有人 @机器人
-        # (防止机器人潜水时被叫没反应，且避免每句话都检索)
+        # 2. 潜水状态 -> 检查最近消息是否有【强关联】
         else:
             if recent_msgs:
                 # 检查最近 3 条消息
                 for msg in list(recent_msgs)[-3:]:
-                    # 注意：message2BotMessage 会将 @ 转换为 " @name " 格式
-                    if f"@{self.__name}" in msg.content:
+                    # 检测 @ (格式: " @name ")
+                    has_at = f"@{self.__name}" in msg.content
+
+                    # 检测 回复 (格式: "[回复 name: ...]")
+                    # 注意：前提是 QQ 昵称和 Bot 设置的 name 一致，否则这里可能匹配不到
+                    has_reply = f"[回复 {self.__name}" in msg.content
+
+                    if has_at or has_reply:
                         should_retrieve = True
                         break
+        # --- [修改结束] ---
 
-        # 任务B: 检索任务
         long_term_memory = []
 
         if should_retrieve:
-            logger.debug(f"触发长期记忆检索 (状态: {self.__chatting_state}, 检索理由: 活跃或被艾特)")
+            logger.debug(f"触发长期记忆检索 (状态: {self.__chatting_state}, 检索理由: 活跃/被艾特/被回复)")
             tasks.append(run_sync(self.long_term_memory.retrieve)(retrieve_messages, k=2))
         else:
-            logger.debug("潜水状态且无强关联，跳过长期记忆检索以节省 Token 并避免报错")
+            logger.debug("潜水状态且无强关联，跳过长期记忆检索")
 
-        # 3. 执行任务
         if tasks:
             try:
                 results = await asyncio.gather(*tasks)
-                # tasks 中只有检索任务这一项 (索引是 create_task 出去的)，所以取 [0]
                 long_term_memory = results[0]
                 logger.debug(f"搜索到的相关记忆：{long_term_memory}")
             except Exception as e:
