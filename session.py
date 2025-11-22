@@ -248,6 +248,7 @@ class Session:
                         "emotion": asdict(profile.emotion),
                         # interactions 是一个 deque，直接序列化
                         "interactions": pickle.dumps(profile.interactions).hex(),
+                        "last_update_time": profile.last_update_time.isoformat(),
                     }
                     for user_id, profile in self.profiles.items()
                 },
@@ -348,6 +349,13 @@ class Session:
                             profile.interactions = deque(profile.interactions)
                     except Exception as e:
                         logger.error(f"[Session {self.id}] 恢复用户 {user_id} 交互记录失败: {e}")
+
+                if "last_update_time" in profile_data:
+                    try:
+                        profile.last_update_time = datetime.fromisoformat(profile_data["last_update_time"])
+                    except ValueError:
+                        # 如果格式错误，默认保持当前时间（即 profile 初始化时的默认值）
+                        pass
 
                 self.profiles[user_id] = profile
 

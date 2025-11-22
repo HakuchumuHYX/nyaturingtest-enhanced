@@ -25,149 +25,88 @@ class PersonProfile:
     """
     交互的记录
     """
+    last_update_time: datetime = field(default_factory=datetime.now)
 
     def push_interaction(self, impression: Impression):
         """
-        添加交互记录
+        添加交互记录 (O(1) 版本的峰值保持模式)
         """
-        self.interactions.appendleft(impression)
+        # 1. 关键步骤：先结算时间衰减
+        # 这会将 self.emotion 更新到“此时此刻”的状态，相当于原逻辑中的 decayed_valence
+        self.update_emotion_tends()
+
+        # 2. 获取新消息的情感输入
+        new_val = impression.delta.get("valence", 0.0)
+        new_aro = impression.delta.get("arousal", 0.0)
+        new_dom = impression.delta.get("dominance", 0.0)
+
+        # 3. 应用峰值保持逻辑 (Peak Hold Logic)
+
+        # --- Valence (愉悦度) ---
+        # 逻辑：如果新情绪比当前更强烈且同向，则更新为新的；如果反向，则抵消。
+        if (self.emotion.valence >= 0 and new_val >= 0) or (self.emotion.valence < 0 and new_val < 0):
+            # 同向（都高兴 或 都难过）：取绝对值更大者（峰值保持）
+            if abs(new_val) > abs(self.emotion.valence):
+                self.emotion.valence = new_val
+            # else: 如果当前情绪比新消息更强烈，保持当前情绪不变（不累加）
+        else:
+            # 反向（高兴时被泼冷水）：互相抵消（算术相加）
+            self.emotion.valence += new_val
+        # 边界截断 [-1, 1]
+        self.emotion.valence = max(-1.0, min(1.0, self.emotion.valence))
+
+        # --- Arousal (唤醒度) ---
+        # 逻辑：唤醒度通常只取最大值。如果你已经很兴奋(0.8)，来个平淡的消息(0.1)不会让你平静下来。
+        # 只有时间会让你平静。
+        self.emotion.arousal = max(self.emotion.arousal, new_aro)
+        # 边界截断 [0, 1]
+        self.emotion.arousal = max(0.0, min(1.0, self.emotion.arousal))
+
+        # --- Dominance (支配度) ---
+        # 逻辑：同 Valence
+        if (self.emotion.dominance >= 0 and new_dom >= 0) or (self.emotion.dominance < 0 and new_dom < 0):
+            if abs(new_dom) > abs(self.emotion.dominance):
+                self.emotion.dominance = new_dom
+        else:
+            self.emotion.dominance += new_dom
+        # 边界截断 [-1, 1]
+        self.emotion.dominance = max(-1.0, min(1.0, self.emotion.dominance))
 
     def merge_old_interactions(self):
-        # 合并过于久远的印象
-        # 5小时之前的印象会被合并
-        old_interactions = [
-            interaction
-            for interaction in self.interactions
-            if (datetime.now() - interaction.timestamp).total_seconds() / 3600 > 5
-        ]
-        if len(old_interactions) > 0:
-            # 总印象
-            valence = 0.0
-            valence_negative = 0.0
-            arousal = 0.0
-            arousal_negative = 0.0
-            dominance = 0.0
-            dominance_negative = 0.0
-
-            now = datetime.now()
-            merged_impression_time: datetime | None = None
-
-            # 从印象中计算得出对这个人的情感倾向
-            for impression in self.interactions:
-                # 将最近的印象时间作为合并印象的时间
-                if merged_impression_time is None or impression.timestamp < merged_impression_time:
-                    merged_impression_time = impression.timestamp
-
-                # 计算距离印象的时间
-                elapsed_time = now - impression.timestamp
-                elapsed_hours = elapsed_time.seconds / 3600.0
-
-                # 衰减印象的愉悦度，无论好坏
-                # 愉悦总是短暂的，厌恶却会在心中挥之不去
-                decayed_valence = decay_valence(elapsed_hours, impression.delta.get("valence", 0.0))
-
-                # 衰减印象的激活度
-                # 在疯狂降临之前，无论是极度恐惧还是极度兴奋，都会很快平复
-                decayed_arousal = decay_arousal(elapsed_hours, impression.delta.get("arousal", 0.0))
-
-                # 衰减印象的支配度
-                # 支配度在日积月累中形成，不会轻易改变
-                decayed_dominance = decay_dominance(elapsed_hours, impression.delta.get("dominance", 0.0))
-
-                # 计算出的情感也是情感
-                if decayed_valence > 0:
-                    valence = max(valence, decayed_valence)
-                else:
-                    valence_negative = min(valence_negative, decayed_valence)
-                if decayed_arousal > 0:
-                    arousal = max(arousal, decayed_arousal)
-                else:
-                    arousal_negative = min(arousal_negative, decayed_arousal)
-                if decayed_dominance > 0:
-                    dominance = max(dominance, decayed_dominance)
-                else:
-                    dominance_negative = min(dominance_negative, decayed_dominance)
-
-            # 合并为一个印象
-            if merged_impression_time is None:
-                return
-
-            merged_impression = Impression(
-                delta={
-                    "valence": valence + valence_negative,
-                    "arousal": arousal + arousal_negative,
-                    "dominance": dominance + dominance_negative,
-                },
-                timestamp=merged_impression_time,
-            )
-
-            # 清除过期的印象
-            self.interactions = deque(
-                [
-                    interaction
-                    for interaction in self.interactions
-                    if (datetime.now() - interaction.timestamp).total_seconds() / 3600 < 5
-                ]
-            )
-            # 添加合并的印象
-            self.interactions.append(merged_impression)
+        """
+        仅清理过期的交互记录，不再重新计算情感 (增量更新 - 清理)
+        """
+        # 这里的逻辑简化为只负责删除过期数据，节省算力
+        # 5小时之前的印象会被移除
+        while len(self.interactions) > 0:
+            # 检查最右侧（最早）的记录
+            last_interaction = self.interactions[-1]
+            if (datetime.now() - last_interaction.timestamp).total_seconds() / 3600 > 5:
+                self.interactions.pop()
+            else:
+                # 因为是按时间顺序存的，如果最老的一个没过期，后面的肯定也没过期
+                break
 
     def update_emotion_tends(self):
         """
-        更新情感倾向
+        随时间流逝衰减情感 (增量更新 - 衰减)
         """
-
-        # 从相识到现在，已经经过了多少岁月？时间恒久流动着，不会停下
         now = datetime.now()
+        # 计算距离上次更新经过了多少小时
+        elapsed_hours = (now - self.last_update_time).total_seconds() / 3600.0
 
-        # 总印象
-        valence = 0.0
-        valence_negative = 0.0
-        arousal = 0.0
-        arousal_negative = 0.0
-        dominance = 0.0
-        dominance_negative = 0.0
+        # 更新时间戳
+        self.last_update_time = now
 
-        # 从印象中计算得出对这个人的情感倾向
-        for impression in self.interactions:
-            # 计算距离印象的时间
-            elapsed_time = now - impression.timestamp
-            elapsed_hours = elapsed_time.seconds / 3600.0
+        # 如果时间极短，跳过计算节省资源
+        if elapsed_hours < 0.001:
+            return
 
-            # 衰减印象的愉悦度，无论好坏
-            # 愉悦总是短暂的，厌恶却会在心中挥之不去
-            decayed_valence = decay_valence(elapsed_hours, impression.delta.get("valence", 0.0))
-
-            # 衰减印象的激活度
-            # 在疯狂降临之前，无论是极度恐惧还是极度兴奋，都会很快平复
-            decayed_arousal = decay_arousal(elapsed_hours, impression.delta.get("arousal", 0.0))
-
-            # 衰减印象的支配度
-            # 支配度在日积月累中形成，不会轻易改变
-            decayed_dominance = decay_dominance(elapsed_hours, impression.delta.get("dominance", 0.0))
-
-            # 计算出的情感也是情感
-            if decayed_valence > 0:
-                valence = max(valence, decayed_valence)
-            else:
-                valence_negative = min(valence_negative, decayed_valence)
-
-            if decayed_arousal > 0:
-                arousal = max(arousal, decayed_arousal)
-            else:
-                arousal_negative = min(arousal_negative, decayed_arousal)
-
-            if decayed_dominance > 0:
-                dominance = max(dominance, decayed_dominance)
-            else:
-                dominance_negative = min(dominance_negative, decayed_dominance)
-
-        # 于第七日赐以尊严
-        self.emotion = EmotionState(
-            valence=valence + valence_negative,
-            arousal=arousal + arousal_negative,
-            dominance=dominance + dominance_negative,
-        )
+        # 对当前情感状态应用时间衰减
+        # 直接调用同文件下定义的 decay_xxx 函数
+        self.emotion.valence = decay_valence(elapsed_hours, self.emotion.valence)
+        self.emotion.arousal = decay_arousal(elapsed_hours, self.emotion.arousal)
+        self.emotion.dominance = decay_dominance(elapsed_hours, self.emotion.dominance)
 
 
 def decay_valence(
