@@ -489,6 +489,35 @@ class Session:
             mem_history=long_term_memory,
         )
 
+        # [优化三] 新增：检查消息是否与机器人强相关
+    def _check_relevance(self, messages: list[Message]) -> bool:
+        """
+        检查这一批消息中是否有与机器人强相关的内容
+        判定标准：
+        1. 包含 @机器人
+        2. 包含 机器人的名字
+        3. 是对机器人的回复
+        """
+        for msg in messages:
+            content = msg.content
+            # 1. 检查名字出现在文本中
+            if self.__name in content:
+                return True
+
+            # 2. 检查 @ (NoneBot 的 segment 转换为了 " @name ")
+            # 这里的检测稍微宽松一点，防止昵称匹配失败
+            if f"@{self.__name}" in content:
+                return True
+
+            # 3. 检查回复 (格式 [回复 name: ...])
+            if f"[回复 {self.__name}" in content:
+                return True
+
+            # 4. (可选) 如果消息极短（例如 "早"），且群里刚聊过，可能也需要关注？
+            # 为了省钱，这里暂时采取严格模式：必须叫名字才理。
+
+        return False
+
     @staticmethod
     def _extract_and_parse_json(response: str) -> dict | None:
         """
@@ -540,9 +569,58 @@ class Session:
 
     async def __feedback_stage(self, messages_chunk: list[Message], llm: Callable[[str], Awaitable[str]]):
         """
-        反馈总结阶段
+        反馈总结阶段 (集成优化三(修正版)：节流 + 好奇心机制 + 时区修复)
         """
         logger.debug("反馈阶段开始")
+
+        # ================= [优化三(修正版)：节流 + 好奇心机制] =================
+        should_skip_llm = False
+
+        # 只有在【潜水状态】下才尝试节流
+        if self.__chatting_state == _ChattingState.ILDE:
+            # 1. 基础检查：是否强相关 (被@、被叫名字)
+            is_relevant = self._check_relevance(messages_chunk)
+
+            if is_relevant:
+                should_skip_llm = False
+            else:
+                # 2. 【新增】好奇心机制 (Lucky Draw)
+                # 即使无关，也有 3% 的概率触发 LLM 分析
+                curiosity_rate = 0.03
+                if random.random() < curiosity_rate:
+                    logger.debug("触发随机好奇心：虽然没叫我，但我决定通过 LLM 看看大家在聊什么")
+                    should_skip_llm = False
+                else:
+                    should_skip_llm = True
+
+        if should_skip_llm:
+            logger.debug(f"触发节流：潜水状态且消息无强关联 ({len(messages_chunk)}条)，跳过 LLM 分析")
+
+            # --- 执行“低成本”的本地更新 ---
+
+            for message in messages_chunk:
+                if message.user_name not in self.profiles:
+                    self.profiles[message.user_name] = PersonProfile(user_id=message.user_name)
+
+                # [修复] 使用带时区的时间，防止后续计算报错
+                self.profiles[message.user_name].push_interaction(
+                    Impression(timestamp=datetime.now().astimezone(), delta={})
+                )
+
+            # 3. 加快冒泡积累速度
+            self.__bubble_willing_sum += 0.02 * len(messages_chunk)
+
+            # 尝试触发冒泡
+            random_value = random.uniform(0.8, 1.0)
+            if self.__bubble_willing_sum > random_value:
+                logger.debug(
+                    f"潜水观察积累意愿({self.__bubble_willing_sum:.2f}) > {random_value:.2f}，自动转入冒泡状态")
+                self.__chatting_state = _ChattingState.BUBBLE
+                self.__bubble_willing_sum = 0.0
+
+            return
+        # ================= [优化三 结束] =================
+
         reaction_users = self.global_memory.related_users()
         related_profiles = [profile for profile in self.profiles.values() if profile.user_id in reaction_users]
         related_profiles_json = json.dumps(
@@ -817,8 +895,9 @@ class Session:
                     self.profiles[message.user_name] = PersonProfile(user_id=message.user_name)
 
                 delta = emotion_tends[index] if index < len(emotion_tends) else {}
+                # [修复] 使用带时区的时间
                 self.profiles[message.user_name].push_interaction(
-                    Impression(timestamp=datetime.now(), delta=delta)
+                    Impression(timestamp=datetime.now().astimezone(), delta=delta)
                 )
 
             # 更新对用户的情感
@@ -867,8 +946,13 @@ class Session:
             match self.__chatting_state:
                 case _ChattingState.ILDE:
                     # [关键修复] 贤者时间检查
-                    # 如果距离上次说话不到 180秒 (3分钟)，强制降低活跃意愿
-                    seconds_since_speak = (datetime.now() - self._last_speak_time).total_seconds()
+                    # 判断 _last_speak_time 是否带时区，以决定 now 是否要带时区
+                    if self._last_speak_time.tzinfo is not None:
+                        now_aware = datetime.now().astimezone()
+                        seconds_since_speak = (now_aware - self._last_speak_time).total_seconds()
+                    else:
+                        seconds_since_speak = (datetime.now() - self._last_speak_time).total_seconds()
+
                     if seconds_since_speak < 180:
                         logger.debug(f"Bot 处于贤者时间 ({seconds_since_speak:.0f}s < 180s)，强制压制对话欲望")
                         chat_chance *= 0.1  # 极其严厉的惩罚
@@ -915,6 +999,7 @@ class Session:
         except Exception as e:
             logger.error(f"反馈阶段发生未捕获异常: {e}")
             traceback.print_exc()
+
 
     async def __chat_stage(
             self,
@@ -1172,7 +1257,6 @@ class Session:
             self._active_count = 0
 
         # 异步保存会话
-        await self.save_session()
+        asyncio.create_task(self.save_session())
 
         return reply_messages
-    

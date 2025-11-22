@@ -35,17 +35,6 @@ from .image_manager import IMAGE_CACHE_DIR, image_manager
 from .mem import Message as MMessage
 from .session import Session
 
-__plugin_meta__ = PluginMetadata(
-    name="NYATuringTest",
-    description="群聊特化llm聊天机器人，具有长期记忆和情绪模拟能力",
-    usage="群聊特化llm聊天机器人，具有长期记忆和情绪模拟能力",
-    type="application",
-    homepage="https://github.com/shadow3aaa/nonebot-plugin-nyaturingtest",
-    config=Config,
-    supported_adapters={"~onebot.v11"},
-    extra={"author": "shadow3aaa <shadow3aaaa@gmail.com>"},
-)
-
 
 async def is_group_message(event: Event) -> bool:
     return isinstance(event, GroupMessageEvent)
