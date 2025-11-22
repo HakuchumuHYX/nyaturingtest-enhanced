@@ -24,8 +24,10 @@ from nonebot.params import CommandArg
 from nonebot.permission import SUPERUSER
 from nonebot.plugin import PluginMetadata
 from openai import AsyncOpenAI
+from tortoise import Tortoise
 
 require("nonebot_plugin_localstore")
+import nonebot_plugin_localstore as store
 
 from .client import LLMClient
 from .config import Config, plugin_config
@@ -160,6 +162,9 @@ async def spawn_state(state: GroupState):
 
         async with state.session_lock:
             try:
+                # 【关键修改】确保 Session 已从数据库加载
+                await state.session.load_session()
+
                 responses = await state.session.update(
                     messages_chunk=current_chunk, llm=lambda x: llm_response(state.client, x)
                 )
@@ -305,6 +310,8 @@ async def do_get_presets(matcher: type[Matcher], group_id: int):
     if not state:
         return
     async with state.session_lock:
+        # 【关键修改】确保 Session 已加载
+        await state.session.load_session()
         presets = state.session.presets()
     msg = "可选的预设:\n"
     for preset in presets:
@@ -334,6 +341,8 @@ async def do_set_presets(matcher: type[Matcher], group_id: int, file: str):
     if not state:
         return
     async with state.session_lock:
+        # 【关键修改】确保 Session 已加载
+        await state.session.load_session()
         if await state.session.load_preset(filename=file):
             await matcher.finish(f"预设已加载: {file}")
         else:
@@ -392,6 +401,8 @@ async def do_set_role(matcher: type[Matcher], group_id: int, name: str, role: st
     if not state:
         return
     async with state.session_lock:
+        # 【关键修改】确保 Session 已加载
+        await state.session.load_session()
         await state.session.set_role(name=name, role=role)
     await matcher.finish(f"角色已设为: {name}\n设定: {role}")
 
@@ -414,6 +425,8 @@ async def do_get_role(matcher: type[Matcher], group_id: int):
     if not state:
         return
     async with state.session_lock:
+        # 【关键修改】确保 Session 已加载
+        await state.session.load_session()
         role = state.session.role()
     await matcher.finish(f"当前角色: {role}")
 
@@ -436,6 +449,8 @@ async def do_calm_down(matcher: type[Matcher], group_id: int):
     if not state:
         return
     async with state.session_lock:
+        # 【关键修改】确保 Session 已加载
+        await state.session.load_session()
         await state.session.calm_down()
     await matcher.finish("已老实")
 
@@ -458,6 +473,8 @@ async def do_reset(matcher: type[Matcher], group_id: int):
     if not state:
         return
     async with state.session_lock:
+        # 【关键修改】确保 Session 已加载
+        await state.session.load_session()
         await state.session.reset()
     await matcher.finish("已重置会话")
 
@@ -480,6 +497,8 @@ async def do_status(matcher: type[Matcher], group_id: int):
     if not state:
         return
     async with state.session_lock:
+        # 【关键修改】确保 Session 已加载
+        await state.session.load_session()
         status_msg = state.session.status()
     await matcher.finish(status_msg)
 
@@ -515,7 +534,11 @@ async def handle_auto_chat(bot: Bot, event: GroupMessageEvent):
         return
 
     user_id = event.get_user_id()
-    bot_name = state.session.name()
+
+    # 【关键修改】获取名字前，先确保加载
+    async with state.session_lock:
+        await state.session.load_session()
+        bot_name = state.session.name()
 
     message_content = await message2BotMessage(
         bot_name=bot_name, group_id=group_id, message=event.original_message, bot=bot
@@ -643,6 +666,27 @@ async def message2BotMessage(bot_name: str, group_id: int, message: Message, bot
 
 
 driver = get_driver()
+
+
+@driver.on_startup
+async def init_db():
+    import os
+    # 数据库文件路径
+    db_path = os.path.join(store.get_plugin_data_dir(), "nyabot.sqlite")
+
+    # 初始化 Tortoise
+    await Tortoise.init(
+        db_url=f'sqlite://{db_path}',
+        modules={'models': [f'{__package__}.models']}  # 自动指向刚才创建的 models.py
+    )
+    # 自动生成表结构
+    await Tortoise.generate_schemas()
+    logger.info(f"数据库已连接: {db_path}")
+
+
+@driver.on_shutdown
+async def close_db():
+    await Tortoise.close_connections()
 
 
 @driver.on_shutdown
