@@ -182,6 +182,16 @@ class HippoMemory:
             logger.error(f"检索过程发生未知错误: {e}")
             return []
 
+    @property
+    def pending_count(self) -> int:
+        """
+        返回缓存中等待索引的文本行数/条数
+        """
+        if not self._cache:
+            return 0
+        # 简单通过换行符计算积累了多少条记忆
+        return len(self._cache.strip().split('\n'))
+
 
 def _split_text_by_tokens(
         text: str, tokenizer, max_tokens=2048, overlap=100

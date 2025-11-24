@@ -158,6 +158,9 @@ class Session:
         # 记录 BOT 上次发言时间，用于计算“贤者时间”
         self._last_speak_time = datetime.min
 
+        # [新增] 记录上次构建长期记忆索引的时间
+        self._last_hippo_index_time = datetime.now()
+
         # 活跃回复计数器，用于计算疲劳值
         self._active_count = 0
 
@@ -224,6 +227,22 @@ class Session:
         保存会话状态到数据库 (增量更新逻辑)
         """
         try:
+            # ================= [新增优化: 强制持久化长期记忆] =================
+            # 在保存会话时，如果发现长期记忆缓存中有未索引的内容，
+            # 强制触发一次索引构建，防止潜水期间积累的记忆因程序关闭而丢失。
+
+            # 直接检查 _cache 是否有内容 (兼容未修改 hippo_mem.py 的情况)
+            raw_cache = getattr(self.long_term_memory, "_cache", "")
+            if raw_cache and raw_cache.strip():
+                logger.info(f"[Session {self.id}] 保存会话：检测到待索引记忆，正在强制构建索引...")
+                try:
+                    # 使用 run_sync 确保在异步环境中正确调用同步的 index 方法
+                    # 这是一个较重的操作，但对于数据安全性是必须的
+                    await run_sync(self.long_term_memory.index)()
+                except Exception as e:
+                    logger.error(f"[Session {self.id}] 保存时构建长期记忆索引失败: {e}")
+            # ================= [新增结束] =================
+
             # 1. 保存/更新 Session 主体
             session_db, created = await SessionModel.update_or_create(
                 id=self.id,
@@ -252,15 +271,13 @@ class Session:
                     }
                 )
                 # 注意：Interaction Log 我们不再这里保存，因为它是只读的历史记录，
-                # 且在优化一中已不再参与核心计算。
-                # 如果需要保存，应在 push_interaction 处实时写入 DB。
-                # 为了性能，此处省略。
+                # 且在优化中已不再参与核心计算。
 
             # 3. 保存短时记忆 (Global Message)
             recent_msgs = self.global_memory.access().messages
             if recent_msgs:
                 # 简单策略：全量替换最近的消息（用于重启恢复）
-                # 清理旧的
+                # 先清理旧的
                 await GlobalMessageModel.filter(session=session_db).delete()
 
                 bulk_msgs = []
@@ -421,12 +438,13 @@ class Session:
 
     async def __search_stage(self):
         """
-        检索阶段 (并行优化版 - 节流控制 - 支持@和回复)
+        检索阶段 (并行优化版 - 节流控制 - 支持@和回复 - 懒加载索引)
         """
         logger.debug("检索阶段开始")
 
         recent_msgs = self.global_memory.access().messages
 
+        # 构造检索用的查询文本列表
         retrieve_messages = (
                 [f"'{msg.user_name}':'{msg.content}'" for msg in recent_msgs]
                 + [self.global_memory.access().compressed_history]
@@ -435,13 +453,58 @@ class Session:
 
         tasks = []
 
-        if self.__update_hippo:
-            self.__update_hippo = False
-            if self.long_term_memory._cache:
-                logger.info("正在后台构建长期记忆索引(HippoRAG)...")
-                asyncio.create_task(run_sync(self.long_term_memory.index)())
+        # ================= [优化修改开始: 长期记忆构建节流] =================
+        # 1. 设定阈值
+        CACHE_THRESHOLD = 30  # 数量阈值：积压超过 30 条
+        TIME_THRESHOLD = 900  # 时间阈值：距离上次索引超过 900 秒 (15分钟)
 
-        # --- [修改开始] ---
+        # 2. 获取当前状态
+        # 获取积压数量 (兼容性写法)
+        raw_cache = getattr(self.long_term_memory, "_cache", "")
+        pending_count = len(raw_cache.strip().split('\n')) if raw_cache and raw_cache.strip() else 0
+
+        # 获取时间间隔
+        now = datetime.now()
+        # 防止时区问题报错，统一用 naive time 做差值 (只要保证 _last_hippo_index_time 初始化时也是 naive 即可)
+        if self._last_hippo_index_time.tzinfo and not now.tzinfo:
+            now = now.astimezone()
+        time_since_last_index = (now - self._last_hippo_index_time).total_seconds()
+
+        should_index = False
+
+        # --- 触发策略 ---
+
+        # 策略A: 活跃状态 (ACTIVE/BUBBLE) -> 保持实时更新，保证记忆的新鲜度
+        if self.__chatting_state != _ChattingState.ILDE:
+            should_index = True
+
+        # 策略B: 潜水状态 + 积压过多 -> 强制清理
+        elif pending_count >= CACHE_THRESHOLD:
+            logger.info(f"潜水状态缓存积压过大 ({pending_count}/{CACHE_THRESHOLD})，强制触发索引构建")
+            should_index = True
+
+        # 策略C: 潜水状态 + 积压太久 -> 定时清理 (防止慢群长时间不记忆)
+        elif pending_count > 0 and time_since_last_index >= TIME_THRESHOLD:
+            logger.info(f"潜水状态缓存已积压 {time_since_last_index:.0f}秒 (> {TIME_THRESHOLD}s)，触发定时索引构建")
+            should_index = True
+
+        # 执行索引逻辑
+        if should_index and pending_count > 0:
+            # 重置外部标记
+            self.__update_hippo = False
+            # [关键] 更新上次索引时间
+            self._last_hippo_index_time = datetime.now()
+
+            logger.info(
+                f"触发长期记忆构建 (状态:{self.__chatting_state}, 积压:{pending_count}条, 距上次:{time_since_last_index:.0f}s)...")
+            # 放入后台任务执行
+            asyncio.create_task(run_sync(self.long_term_memory.index)())
+        else:
+            if pending_count > 0:
+                logger.debug(f"潜水节流中：暂不构建长期记忆索引 (积压 {pending_count}条 / {time_since_last_index:.0f}s)")
+        # ================= [优化修改结束] =================
+
+        # --- [检索逻辑 (Retrieve)] ---
         should_retrieve = False
 
         # 1. 非潜水状态 (活跃中) -> 总是检索
@@ -457,13 +520,11 @@ class Session:
                     has_at = f"@{self.__name}" in msg.content
 
                     # 检测 回复 (格式: "[回复 name: ...]")
-                    # 注意：前提是 QQ 昵称和 Bot 设置的 name 一致，否则这里可能匹配不到
                     has_reply = f"[回复 {self.__name}" in msg.content
 
                     if has_at or has_reply:
                         should_retrieve = True
                         break
-        # --- [修改结束] ---
 
         long_term_memory = []
 
@@ -476,10 +537,12 @@ class Session:
         if tasks:
             try:
                 results = await asyncio.gather(*tasks)
-                long_term_memory = results[0]
-                logger.debug(f"搜索到的相关记忆：{long_term_memory}")
+                if results:
+                    long_term_memory = results[0]
+                    logger.debug(f"搜索到的相关记忆：{long_term_memory}")
             except Exception as e:
                 logger.error(f"检索阶段发生错误: {e}")
+                import traceback
                 traceback.print_exc()
                 long_term_memory = []
 
@@ -489,7 +552,6 @@ class Session:
             mem_history=long_term_memory,
         )
 
-        # [优化三] 新增：检查消息是否与机器人强相关
     def _check_relevance(self, messages: list[Message]) -> bool:
         """
         检查这一批消息中是否有与机器人强相关的内容
