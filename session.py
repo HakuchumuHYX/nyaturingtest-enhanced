@@ -105,9 +105,9 @@ class Session:
         全局短时记忆
         """
         self.long_term_memory: HippoMemory = HippoMemory(
-            llm_model="Qwen/Qwen2.5-14B-Instruct",
-            llm_api_key=plugin_config.nyaturingtest_chat_openai_api_key,
-            llm_base_url=plugin_config.nyaturingtest_chat_openai_base_url,
+            llm_model="Qwen/Qwen2.5-32B-Instruct",
+            llm_api_key=plugin_config.nyaturingtest_siliconflow_api_key,
+            llm_base_url="https://api.siliconflow.cn/v1",
             embedding_api_key=siliconflow_api_key,
             persist_directory=f"{store.get_plugin_data_dir()}/hippo_index_{id}",
         )
