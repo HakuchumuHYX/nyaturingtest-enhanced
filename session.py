@@ -994,11 +994,11 @@ class Session:
                         f"活跃退出判定: 基础意愿{idle_chance:.2f} + 疲劳({self._active_count}轮){fatigue_factor:.2f} = {final_idle_chance:.2f} (阈值: {random_value:.2f})")
 
                     if final_idle_chance >= random_value:
-                        logger.info(f"Bot 聊累了(已聊{self._active_count}轮)，主动进入潜水状态")
+                        logger.debug(f"Bot 聊累了(已聊{self._active_count}轮)，主动进入潜水状态")
                         self.__chatting_state = _ChattingState.ILDE
                         self._active_count = 0
 
-            logger.info(
+            logger.debug(
                 f"[DECISION DEBUG] "
                 f"状态: {self.__chatting_state.name} | "
                 f"对话意愿(Chat): {chat_chance:.2f} | "
@@ -1078,7 +1078,7 @@ class Session:
     - 正确：我觉得这件事很有趣。因为上次我们也遇到了类似的情况。当时大家都笑死了。
 - **回复格式**：如果回复是针对某条特定消息的，请在 `target_id` 中填入该消息的 ID。如果是通用发言，`target_id` 留空。
 - **状态机规则**：
-  - **冒泡状态(1)**：说明你之前在潜水。如果历史记录里没有你的发言，可以发一句简短的、符合人设的话（如“围观”等），或者什么都不发。
+  - **冒泡状态(1)**：说明你之前在潜水。如果历史记录里没有你的发言，可以发一句简短的、符合人设的话，或者什么都不发。
   - **对话状态(2)**：说明你正在活跃。请根据你的人设判断是否需要回复，**不需要对每一句话都回应**。
 
 ## 3. 输入信息
