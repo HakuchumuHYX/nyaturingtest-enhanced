@@ -912,8 +912,22 @@ class Session:
             # 更新长期记忆
             analyze_result = response_dict.get("analyze_result", [])
             if isinstance(analyze_result, list) and analyze_result:
-                self.long_term_memory.add_texts(analyze_result)
-                logger.debug(f"反馈阶段更新长期记忆：{analyze_result}")
+                # [修复] 数据清洗：确保所有元素都是字符串
+                sanitized_result = []
+                for item in analyze_result:
+                    if isinstance(item, str):
+                        sanitized_result.append(item)
+                    elif isinstance(item, dict):
+                        # 如果 LLM 返回了字典，强制转为 JSON 字符串，防止报错
+                        sanitized_result.append(json.dumps(item, ensure_ascii=False))
+                    else:
+                        # 其他情况直接转字符串
+                        sanitized_result.append(str(item))
+
+                # 只有清洗后列表不为空才添加
+                if sanitized_result:
+                    self.long_term_memory.add_texts(sanitized_result)
+                    logger.debug(f"反馈阶段更新长期记忆：{sanitized_result}")
 
             # 更新对话状态
             willing = response_dict.get("willing", {})
