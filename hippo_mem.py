@@ -137,7 +137,7 @@ class HippoMemory:
             self._cache = content_to_index + self._cache
             # 抛出异常
             raise e
-        
+
     def retrieve(self, queries: list[str], k: int = 5) -> list[str]:
         """
         检索与查询相关的文本

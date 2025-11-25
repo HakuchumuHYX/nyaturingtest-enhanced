@@ -9,7 +9,7 @@ class LLMClient:
         response = await self.client.chat.completions.create(
             messages=[{"role": "user", "content": prompt}],
             model=model,
-            temperature=0.7,
+            temperature=0.8,
             timeout=60,
         )
         return response.choices[0].message.content
