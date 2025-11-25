@@ -991,18 +991,18 @@ class Session:
             # [逻辑优化 - 强力降温 + 疲劳机制 + 贤者时间]
 
             # 1. 提升回潜水的意愿 (idle_chance)
-            idle_chance = float(willing.get("0", 0.0)) * 1.5
+            idle_chance = float(willing.get("0", 0.0)) * 1.2
             if idle_chance > 1.0: idle_chance = 1.0
             logger.debug(f"nyabot潜水意愿(修正后)：{idle_chance}")
 
             # 2. 降低冒泡意愿 (bubble_chance)
             bubble_chance = float(willing.get("1", 0.0))
-            self.__bubble_willing_sum += bubble_chance * 0.5
+            self.__bubble_willing_sum += bubble_chance * 0.6
             logger.debug(f"nyabot本次冒泡意愿：{bubble_chance}")
             logger.debug(f"nyabot冒泡意愿累计(修正后)：{self.__bubble_willing_sum}")
 
             # 3. 降低对话意愿 (chat_chance)
-            chat_chance = float(willing.get("2", 0.0)) * 0.7
+            chat_chance = float(willing.get("2", 0.0)) * 0.8
             logger.debug(f"nyabot对话意愿(修正后)：{chat_chance}")
 
             # 4. 提高状态转换的门槛
@@ -1023,7 +1023,7 @@ class Session:
 
                     if seconds_since_speak < 180:
                         logger.debug(f"Bot 处于贤者时间 ({seconds_since_speak:.0f}s < 180s)，强制压制对话欲望")
-                        chat_chance *= 0.1  # 极其严厉的惩罚
+                        chat_chance *= 0.5  # 极其严厉的惩罚
                         self.__bubble_willing_sum = 0.0  # 清空冒泡条
 
                     if chat_chance >= random_value:
@@ -1121,9 +1121,15 @@ class Session:
   - 2：对话状态
 
 ## 2. 必须遵守的限制：
-
+- **【绝对禁止】称呼全名**：
+  - 严禁在回复中带上对方的长名片、群头衔或全名！这是最愚蠢的行为。
+  - **正确做法**：直接说内容，或者用“你”指代。如果必须称呼，只用对方名字中亲昵的一个或两个字。
+  - 错误示例：“@某高校心理学研一ATRI 你说得对。”
+  - 正确示例：“你说得对。” / “确实。” / “摸摸你。”
 - **绝对禁止使用 Emoji 表情**（如😀、🤔、😅等）。
-- **语言风格**：不要重复复述他人的话，不要使用翻译腔，像真实用户一样交流。
+- **语言风格**：
+  - 不要重复复述他人的话，不要使用翻译腔，像真实用户一样交流。
+  - 像在手机上打字一样，使用口语化的短句。
 - **【关键】断句格式**：
   - 你的回复可能会被拆分成多条消息发送。因此，**请务必在每个完整的短句或意群结束后，加上句号“。”、问号“？”、感叹号“！”或换行符**。
   - **严禁**输出长达 20 字以上却中间没有任何结束标点（只有逗号或空格）的长难句。
@@ -1272,7 +1278,7 @@ class Session:
             case _ChattingState.ACTIVE:
                 logger.debug("nyabot对话中...")
                 # Chill Mode 概率随疲劳值增加
-                chill_prob = 0.3 + (self._active_count * 0.05)
+                chill_prob = 0.2 + (self._active_count * 0.05)
                 if random.random() < chill_prob:
                     logger.debug(f"Chill Mode触发 (概率{chill_prob:.2f}): 暂时不回消息")
                     reply_messages = None
