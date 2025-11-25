@@ -222,26 +222,24 @@ class Session:
         self._last_speak_time = datetime.now()
         await self.save_session()  # 保存冷静后的状态
 
-    async def save_session(self):
+    async def save_session(self, force_index: bool = False):
         """
         保存会话状态到数据库 (增量更新逻辑)
+        :param force_index: 是否强制构建长期记忆索引 (默认为 False，防止每条消息都触发索引)
         """
         try:
-            # ================= [新增优化: 强制持久化长期记忆] =================
-            # 在保存会话时，如果发现长期记忆缓存中有未索引的内容，
-            # 强制触发一次索引构建，防止潜水期间积累的记忆因程序关闭而丢失。
-
-            # 直接检查 _cache 是否有内容 (兼容未修改 hippo_mem.py 的情况)
-            raw_cache = getattr(self.long_term_memory, "_cache", "")
-            if raw_cache and raw_cache.strip():
-                logger.info(f"[Session {self.id}] 保存会话：检测到待索引记忆，正在强制构建索引...")
-                try:
-                    # 使用 run_sync 确保在异步环境中正确调用同步的 index 方法
-                    # 这是一个较重的操作，但对于数据安全性是必须的
-                    await run_sync(self.long_term_memory.index)()
-                except Exception as e:
-                    logger.error(f"[Session {self.id}] 保存时构建长期记忆索引失败: {e}")
-            # ================= [新增结束] =================
+            # ================= [修改优化: 仅在指定时强制持久化] =================
+            # 只有当 force_index 为 True (例如关机时) 且有积压记忆时，才强制索引
+            if force_index:
+                # 直接检查 _cache 是否有内容
+                raw_cache = getattr(self.long_term_memory, "_cache", "")
+                if raw_cache and raw_cache.strip():
+                    logger.info(f"[Session {self.id}] 收到强制保存指令：检测到待索引记忆，正在构建索引...")
+                    try:
+                        await run_sync(self.long_term_memory.index)()
+                    except Exception as e:
+                        logger.error(f"[Session {self.id}] 强制构建长期记忆索引失败: {e}")
+            # ================= [修改结束] =================
 
             # 1. 保存/更新 Session 主体
             session_db, created = await SessionModel.update_or_create(
@@ -267,19 +265,13 @@ class Session:
                         "valence": profile.emotion.valence,
                         "arousal": profile.emotion.arousal,
                         "dominance": profile.emotion.dominance,
-                        # Tortoise 的 save 会自动更新 last_update_time (auto_now=True)
                     }
                 )
-                # 注意：Interaction Log 我们不再这里保存，因为它是只读的历史记录，
-                # 且在优化中已不再参与核心计算。
 
             # 3. 保存短时记忆 (Global Message)
             recent_msgs = self.global_memory.access().messages
             if recent_msgs:
-                # 简单策略：全量替换最近的消息（用于重启恢复）
-                # 先清理旧的
                 await GlobalMessageModel.filter(session=session_db).delete()
-
                 bulk_msgs = []
                 for msg in recent_msgs:
                     bulk_msgs.append(GlobalMessageModel(

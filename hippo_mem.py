@@ -107,33 +107,37 @@ class HippoMemory:
         """
         对缓存的文本进行索引，整理到长期记忆
         """
-        # 1. 检查缓存是否为空，为空直接返回，不要输出日志（防止刷屏）
-        if not self._cache or not self._cache.strip():
+        # 1. [修改] 先检查并“快照”取走当前缓存
+        content_to_index = self._cache
+        if not content_to_index or not content_to_index.strip():
             return
 
+        # 2. [修改] 立即清空缓存，让主程序看到的 pending_count 归零
+        self._cache = ""
+
         try:
-            # 2. 切割文本 (BAAI/bge-m3上限为8192tokens)
-            texts = _split_text_by_tokens(self._cache, self.tokenizer, max_tokens=2048, overlap=200)
+            # 3. 使用快照数据进行切分
+            texts = _split_text_by_tokens(content_to_index, self.tokenizer, max_tokens=2048, overlap=200)
 
             if not texts:
                 return
 
             logger.info(f"开始构建索引，共 {len(texts)} 条文本段...")
 
-            # 3. 执行索引
+            # 4. 执行索引 (耗时操作)
             self.hippo.index(texts)
 
             logger.info(f"已成功索引 {len(texts)} 条缓存文本")
 
-            # 4. 只有索引成功后，才清空缓存
-            self._cache = ""
-
         except Exception as e:
-            # 5. 捕获异常，保留 self._cache 不清空，以便下次重试
-            logger.error(f"HippoRAG 索引构建失败，缓存已保留: {e}")
-            # 抛出异常供 session.py 捕获感知
+            # 5. [修改] 发生错误时进行“回滚”
+            # 将取出的数据加回到缓存的最前面，防止数据丢失
+            # 注意：此时 self._cache 可能已经有了新进来的消息，所以是 content + self._cache
+            logger.error(f"HippoRAG 索引构建失败，正在回滚缓存: {e}")
+            self._cache = content_to_index + self._cache
+            # 抛出异常
             raise e
-
+        
     def retrieve(self, queries: list[str], k: int = 5) -> list[str]:
         """
         检索与查询相关的文本

@@ -682,6 +682,29 @@ async def close_db():
 async def cleanup_tasks():
     """清理后台任务与资源"""
     logger.info("正在清理后台会话任务...")
+
+    # ================= [新增: 关机前强制保存并索引] =================
+    logger.info("正在执行关机前的数据持久化 (强制构建长期记忆索引)...")
+    save_tasks = []
+    # group_states 是全局变量，存储了所有活跃群组的状态
+    for group_id, state in group_states.items():
+        async with state.session_lock:
+            # 只有已经加载过的 session 才需要保存
+            if state.session._loaded:
+                logger.info(f"正在保存群 {group_id} 的会话状态...")
+                # 关键点：这里传入 force_index=True
+                save_tasks.append(state.session.save_session(force_index=True))
+
+    if save_tasks:
+        try:
+            # 并发执行所有群的保存任务，加快关机速度
+            await asyncio.gather(*save_tasks)
+            logger.info(f"成功保存了 {len(save_tasks)} 个群组的会话状态")
+        except Exception as e:
+            logger.error(f"关机保存过程中发生错误: {e}")
+    # ================= [新增结束] =================
+
+    # 取消后台轮询任务
     for task in _tasks:
         if not task.done():
             task.cancel()
