@@ -580,7 +580,7 @@ class Session:
         )
         search_stage_result = self.__search_result.mem_history if self.__search_result else []
 
-        # [修改] 使用 prompts 模块
+        # 使用 prompts 模块
         prompt = get_chat_prompt(
             self.__name, self.__role, self.__chatting_state.value,
             self.global_memory.access().compressed_history,
@@ -595,11 +595,20 @@ class Session:
             response = await llm(prompt)
             logger.debug(f"对话阶段llm返回：{response}")
 
-            # [修改] 使用 utils 解析
+            # 使用 utils 解析
             response_dict = extract_and_parse_json(response)
 
-            if not response_dict:
+            if response_dict is None:
                 logger.warning("对话阶段 JSON 解析失败，跳过本次回复")
+                return []
+
+            # 容错处理
+            if isinstance(response_dict, list):
+                logger.warning(f"对话阶段 LLM 返回了 list 而不是 dict，尝试自动修正。内容: {response_dict}")
+                response_dict = {"reply": response_dict, "debug_reason": "自动修正:LLM返回了纯列表"}
+
+            if not isinstance(response_dict, dict):
+                logger.error(f"对话阶段 LLM 返回数据类型错误: {type(response_dict)}，无法处理。内容: {response_dict}")
                 return []
 
             logger.debug(f"对话阶段回复内容：{response_dict.get('reply', [])}")
