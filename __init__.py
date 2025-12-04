@@ -674,11 +674,6 @@ async def init_db():
 
 
 @driver.on_shutdown
-async def close_db():
-    await Tortoise.close_connections()
-
-
-@driver.on_shutdown
 async def cleanup_tasks():
     """清理后台任务与资源"""
     logger.info("正在清理后台会话任务...")
@@ -718,5 +713,9 @@ async def cleanup_tasks():
         await _GLOBAL_HTTP_CLIENT.aclose()
         _GLOBAL_HTTP_CLIENT = None
         logger.info("全局 HTTP 客户端已关闭")
+
+    logger.info("正在关闭数据库连接...")
+    await Tortoise.close_connections()
+    logger.info("数据库连接已关闭")
 
     logger.info("后台任务已清理")

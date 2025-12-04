@@ -1,3 +1,4 @@
+# session.py
 import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass
@@ -23,7 +24,7 @@ from .presets import PRESETS
 from .profile import PersonProfile
 from .models import SessionModel, UserProfileModel, InteractionLogModel, GlobalMessageModel
 
-# [新增] 导入拆分后的模块
+# 导入拆分后的模块
 from .utils import extract_and_parse_json, estimate_split_count, check_relevance
 from .prompts import get_feedback_prompt, get_chat_prompt
 
@@ -105,6 +106,26 @@ class Session:
         self._active_count = 0
         self._loaded = False
 
+        # [关键新增] 互斥锁，防止 Index 和 Retrieve 并发导致 C++ 引擎崩溃
+        self._hippo_lock = asyncio.Lock()
+
+    # [新增] 线程安全的索引方法封装
+    async def _safe_index(self):
+        async with self._hippo_lock:
+            try:
+                await run_sync(self.long_term_memory.index)()
+            except Exception as e:
+                logger.error(f"后台索引构建失败: {e}")
+
+    # [新增] 线程安全的检索方法封装
+    async def _safe_retrieve(self, retrieve_messages, k=2):
+        async with self._hippo_lock:
+            try:
+                return await run_sync(self.long_term_memory.retrieve)(retrieve_messages, k=k)
+            except Exception as e:
+                logger.error(f"检索执行失败: {e}")
+                return []
+
     async def set_role(self, name: str, role: str):
         # [修改] 注释掉重置逻辑，允许动态调整人设而不丢失记忆
         # await self.reset()
@@ -149,10 +170,8 @@ class Session:
                 raw_cache = getattr(self.long_term_memory, "_cache", "")
                 if raw_cache and raw_cache.strip():
                     logger.info(f"[Session {self.id}] 收到强制保存指令：检测到待索引记忆，正在构建索引...")
-                    try:
-                        await run_sync(self.long_term_memory.index)()
-                    except Exception as e:
-                        logger.error(f"[Session {self.id}] 强制构建长期记忆索引失败: {e}")
+                    # [修改] 使用线程安全的索引方法
+                    await self._safe_index()
 
             session_db, created = await SessionModel.update_or_create(
                 id=self.id,
@@ -195,9 +214,13 @@ class Session:
 
             logger.debug(f"[Session {self.id}] 数据库保存成功")
         except Exception as e:
-            logger.error(f"[Session {self.id}] 数据库保存失败: {e}")
-            import traceback
-            traceback.print_exc()
+            error_msg = str(e)
+            if "no active connection" in error_msg or "closed database" in error_msg:
+                logger.warning(f"[Session {self.id}] 放弃保存：数据库连接已关闭")
+            else:
+                logger.error(f"[Session {self.id}] 数据库保存失败: {e}")
+                import traceback
+                traceback.print_exc()
 
     async def load_session(self):
         if self._loaded:
@@ -280,7 +303,10 @@ class Session:
         self.long_term_memory.add_texts(preset.bot_self)
 
         try:
-            await run_sync(self.long_term_memory.index)()
+            # [修改] 使用安全索引方法 (或直接在该上下文中加锁)
+            # 这里的 run_sync 是阻塞的，我们加上锁保护
+            async with self._hippo_lock:
+                await run_sync(self.long_term_memory.index)()
         except Exception as e:
             logger.error(f"预设索引构建失败: {e}")
 
@@ -319,8 +345,8 @@ class Session:
                 + [self.global_memory.access().compressed_history]
                 + [self.chat_summary]
         )
-        tasks = []
 
+        # 1. 判断是否需要索引 (但不立即执行)
         CACHE_THRESHOLD = 30
         TIME_THRESHOLD = 900
         raw_cache = getattr(self.long_term_memory, "_cache", "")
@@ -340,16 +366,7 @@ class Session:
             logger.info(f"潜水状态缓存已积压 {time_since_last_index:.0f}秒 (> {TIME_THRESHOLD}s)，触发定时索引构建")
             should_index = True
 
-        if should_index and pending_count > 0:
-            self.__update_hippo = False
-            self._last_hippo_index_time = datetime.now()
-            logger.info(
-                f"触发长期记忆构建 (状态:{self.__chatting_state}, 积压:{pending_count}条, 距上次:{time_since_last_index:.0f}s)...")
-            asyncio.create_task(run_sync(self.long_term_memory.index)())
-        else:
-            if pending_count > 0:
-                logger.debug(f"潜水节流中：暂不构建长期记忆索引 (积压 {pending_count}条 / {time_since_last_index:.0f}s)")
-
+        # 2. 判断是否需要检索
         should_retrieve = False
         if self.__chatting_state != _ChattingState.ILDE:
             should_retrieve = True
@@ -363,31 +380,37 @@ class Session:
                         break
 
         long_term_memory = []
+
+        # 3. [关键调整] 优先执行检索 (Retrieve)
         if should_retrieve:
             logger.debug(f"触发长期记忆检索 (状态: {self.__chatting_state}, 检索理由: 活跃/被艾特/被回复)")
-            tasks.append(run_sync(self.long_term_memory.retrieve)(retrieve_messages, k=2))
+            # [修改] 使用 _safe_retrieve，这会获取锁，确保此时没有 Index 在运行
+            long_term_memory = await self._safe_retrieve(retrieve_messages, k=2)
+            if long_term_memory:
+                logger.debug(f"搜索到的相关记忆：{long_term_memory}")
         else:
             logger.debug("潜水状态且无强关联，跳过长期记忆检索")
 
-        if tasks:
-            try:
-                results = await asyncio.gather(*tasks)
-                if results:
-                    long_term_memory = results[0]
-                    logger.debug(f"搜索到的相关记忆：{long_term_memory}")
-            except Exception as e:
-                logger.error(f"检索阶段发生错误: {e}")
-                import traceback
-                traceback.print_exc()
-                long_term_memory = []
+        self.__search_result = _SearchResult(mem_history=long_term_memory)
+
+        # 4. [关键调整] 后执行索引 (Index)
+        # 检索完成后，我们再把索引任务扔到后台去慢慢跑，这样不会阻塞当前回复，也不会并发冲突
+        if should_index and pending_count > 0:
+            self.__update_hippo = False
+            self._last_hippo_index_time = datetime.now()
+            logger.info(
+                f"触发长期记忆构建 (状态:{self.__chatting_state}, 积压:{pending_count}条, 距上次:{time_since_last_index:.0f}s)...")
+            # [修改] 使用 _safe_index，它会在后台排队等待锁
+            asyncio.create_task(self._safe_index())
+        else:
+            if pending_count > 0:
+                logger.debug(f"潜水节流中：暂不构建长期记忆索引 (积压 {pending_count}条 / {time_since_last_index:.0f}s)")
 
         logger.debug("检索阶段结束")
-        self.__search_result = _SearchResult(mem_history=long_term_memory)
 
     async def __feedback_stage(self, messages_chunk: list[Message], llm: Callable[[str], Awaitable[str]]):
         logger.debug("反馈阶段开始")
 
-        # [修改] 使用 utils 中的函数判断相关性
         should_skip_llm = False
         if self.__chatting_state == _ChattingState.ILDE:
             is_relevant = check_relevance(self.__name, messages_chunk)
@@ -425,7 +448,6 @@ class Session:
         )
         search_stage_result = self.__search_result.mem_history if self.__search_result else []
 
-        # [修改] 使用 prompts 模块生成 prompt
         prompt = get_feedback_prompt(
             self.__name, self.__role, self.__chatting_state.value,
             self.global_memory.access().compressed_history,
@@ -436,139 +458,150 @@ class Session:
             related_profiles_json, search_stage_result, self.chat_summary
         )
 
-        try:
-            response = await llm(prompt)
-            logger.debug(f"反馈阶段llm返回：{response}")
+        # [修改] 增加重试机制，防止 JSON 解析失败 (如 "0风险" 错误)
+        MAX_RETRIES = 2
+        response_dict = {}
 
-            # [修改] 使用 utils 解析
-            response_dict = extract_and_parse_json(response)
+        for attempt in range(MAX_RETRIES + 1):
+            try:
+                if attempt > 0:
+                    logger.warning(f"反馈阶段 JSON 解析失败 (原因: 格式错误或幻觉)，正在进行第 {attempt}/{MAX_RETRIES} 次重试...")
 
-            if not response_dict:
-                logger.warning("反馈阶段 JSON 解析失败，使用默认值降级处理")
+                response = await llm(prompt)
+                logger.debug(f"反馈阶段llm返回 (尝试 {attempt}): {response}")
+
+                parsed = extract_and_parse_json(response)
+                if parsed:
+                    response_dict = parsed
+                    # 简单的校验：确保关键字段存在
+                    if "emotion_tends" in response_dict or "willing" in response_dict:
+                        break  # 解析成功且内容看起来正常，跳出循环
+            except Exception as e:
+                logger.error(f"反馈阶段 LLM 请求或解析发生异常: {e}")
+
+            if attempt == MAX_RETRIES:
+                logger.error(f"反馈阶段重试 {MAX_RETRIES} 次后仍失败，执行降级处理。")
                 response_dict = {}
 
-            new_emotion = response_dict.get("new_emotion", {})
-            self.global_emotion.valence = new_emotion.get("valence", self.global_emotion.valence)
-            self.global_emotion.arousal = new_emotion.get("arousal", self.global_emotion.arousal)
-            self.global_emotion.dominance = new_emotion.get("dominance", self.global_emotion.dominance)
-            logger.debug(f"反馈阶段更新情感：{self.global_emotion}")
+        # 数据处理部分保持不变
+        new_emotion = response_dict.get("new_emotion", {})
+        self.global_emotion.valence = new_emotion.get("valence", self.global_emotion.valence)
+        self.global_emotion.arousal = new_emotion.get("arousal", self.global_emotion.arousal)
+        self.global_emotion.dominance = new_emotion.get("dominance", self.global_emotion.dominance)
+        logger.debug(f"反馈阶段更新情感：{self.global_emotion}")
 
-            emotion_tends = response_dict.get("emotion_tends", [])
-            if not isinstance(emotion_tends, list):
-                emotion_tends = []
+        emotion_tends = response_dict.get("emotion_tends", [])
+        if not isinstance(emotion_tends, list):
+            emotion_tends = []
 
-            target_len = len(messages_chunk)
-            current_len = len(emotion_tends)
-            if current_len != target_len:
-                if current_len < target_len:
-                    defaults = [{"valence": 0.0, "arousal": 0.0, "dominance": 0.0} for _ in
-                                range(target_len - current_len)]
-                    emotion_tends.extend(defaults)
-                else:
-                    emotion_tends = emotion_tends[:target_len]
+        target_len = len(messages_chunk)
+        current_len = len(emotion_tends)
+        if current_len != target_len:
+            if current_len < target_len:
+                defaults = [{"valence": 0.0, "arousal": 0.0, "dominance": 0.0} for _ in
+                            range(target_len - current_len)]
+                emotion_tends.extend(defaults)
+            else:
+                emotion_tends = emotion_tends[:target_len]
 
-            for index, message in enumerate(messages_chunk):
-                if message.user_name not in self.profiles:
-                    self.profiles[message.user_name] = PersonProfile(user_id=message.user_name)
-                delta = emotion_tends[index] if index < len(emotion_tends) else {}
-                self.profiles[message.user_name].push_interaction(
-                    Impression(timestamp=datetime.now().astimezone(), delta=delta)
-                )
-
-            for profile in self.profiles.values():
-                profile.update_emotion_tends()
-                profile.merge_old_interactions()
-
-            self.chat_summary = str(response_dict.get("summary", self.chat_summary))
-            logger.debug(f"反馈阶段更新聊天总结：{self.chat_summary}")
-
-            analyze_result = response_dict.get("analyze_result", [])
-            if isinstance(analyze_result, list) and analyze_result:
-                sanitized_result = []
-                for item in analyze_result:
-                    if isinstance(item, str):
-                        sanitized_result.append(item)
-                    elif isinstance(item, dict):
-                        sanitized_result.append(json.dumps(item, ensure_ascii=False))
-                    else:
-                        sanitized_result.append(str(item))
-                if sanitized_result:
-                    self.long_term_memory.add_texts(sanitized_result)
-                    logger.debug(f"反馈阶段更新长期记忆：{sanitized_result}")
-
-            willing = response_dict.get("willing", {})
-            if not isinstance(willing, dict):
-                willing = {}
-
-            idle_chance = float(willing.get("0", 0.0)) * 1.2
-            if idle_chance > 1.0: idle_chance = 1.0
-            logger.debug(f"nyabot潜水意愿(修正后)：{idle_chance}")
-
-            bubble_chance = float(willing.get("1", 0.0))
-            self.__bubble_willing_sum += bubble_chance * 0.9
-            logger.debug(f"nyabot本次冒泡意愿：{bubble_chance}")
-            logger.debug(f"nyabot冒泡意愿累计(修正后)：{self.__bubble_willing_sum}")
-
-            chat_chance = float(willing.get("2", 0.0)) * 0.9
-            logger.debug(f"nyabot对话意愿(修正后)：{chat_chance}")
-
-            random_value = random.uniform(0.5, 0.9)
-            logger.debug(f"意愿转变随机值：{random_value}")
-
-            current_fatigue_factor = self._active_count * 0.15 if self.__chatting_state == _ChattingState.ACTIVE else 0.0
-
-            match self.__chatting_state:
-                case _ChattingState.ILDE:
-                    if self._last_speak_time.tzinfo is not None:
-                        now_aware = datetime.now().astimezone()
-                        seconds_since_speak = (now_aware - self._last_speak_time).total_seconds()
-                    else:
-                        seconds_since_speak = (datetime.now() - self._last_speak_time).total_seconds()
-
-                    if seconds_since_speak < 90:
-                        logger.debug(f"Bot 处于贤者时间 ({seconds_since_speak:.0f}s < 90s)，强制压制对话欲望")
-                        chat_chance *= 0.5
-                        self.__bubble_willing_sum = 0.0
-
-                    if chat_chance >= random_value:
-                        self.__chatting_state = _ChattingState.ACTIVE
-                        self.__bubble_willing_sum = 0.0
-                    elif self.__bubble_willing_sum >= random_value:
-                        self.__chatting_state = _ChattingState.BUBBLE
-                        self.__bubble_willing_sum = 0.0
-
-                case _ChattingState.BUBBLE:
-                    if chat_chance >= random_value:
-                        self.__chatting_state = _ChattingState.ACTIVE
-                    elif idle_chance >= random_value:
-                        self.__chatting_state = _ChattingState.ILDE
-
-                case _ChattingState.ACTIVE:
-                    fatigue_factor = self._active_count * 0.15
-                    final_idle_chance = (idle_chance * 1.2) + fatigue_factor
-                    logger.debug(
-                        f"活跃退出判定: 基础意愿{idle_chance:.2f} + 疲劳({self._active_count}轮){fatigue_factor:.2f} = {final_idle_chance:.2f} (阈值: {random_value:.2f})")
-
-                    if final_idle_chance >= random_value:
-                        logger.debug(f"Bot 聊累了(已聊{self._active_count}轮)，主动进入潜水状态")
-                        self.__chatting_state = _ChattingState.ILDE
-                        self._active_count = 0
-
-            logger.debug(
-                f"[DECISION DEBUG] "
-                f"状态: {self.__chatting_state.name} | "
-                f"对话意愿(Chat): {chat_chance:.2f} | "
-                f"潜水意愿(Idle): {idle_chance:.2f} | "
-                f"疲劳值(Count): {self._active_count} (Factor: {current_fatigue_factor:.2f}) | "
-                f"随机阈值: {random_value:.2f}"
+        for index, message in enumerate(messages_chunk):
+            if message.user_name not in self.profiles:
+                self.profiles[message.user_name] = PersonProfile(user_id=message.user_name)
+            delta = emotion_tends[index] if index < len(emotion_tends) else {}
+            self.profiles[message.user_name].push_interaction(
+                Impression(timestamp=datetime.now().astimezone(), delta=delta)
             )
 
-            logger.debug(f"反馈阶段更新对话状态：{self.__chatting_state!s}")
-            logger.debug("反馈阶段结束")
+        for profile in self.profiles.values():
+            profile.update_emotion_tends()
+            profile.merge_old_interactions()
 
-        except Exception as e:
-            logger.error(f"反馈阶段发生未捕获异常: {e}")
-            traceback.print_exc()
+        self.chat_summary = str(response_dict.get("summary", self.chat_summary))
+        logger.debug(f"反馈阶段更新聊天总结：{self.chat_summary}")
+
+        analyze_result = response_dict.get("analyze_result", [])
+        if isinstance(analyze_result, list) and analyze_result:
+            sanitized_result = []
+            for item in analyze_result:
+                if isinstance(item, str):
+                    sanitized_result.append(item)
+                elif isinstance(item, dict):
+                    sanitized_result.append(json.dumps(item, ensure_ascii=False))
+                else:
+                    sanitized_result.append(str(item))
+            if sanitized_result:
+                self.long_term_memory.add_texts(sanitized_result)
+                logger.debug(f"反馈阶段更新长期记忆：{sanitized_result}")
+
+        willing = response_dict.get("willing", {})
+        if not isinstance(willing, dict):
+            willing = {}
+
+        idle_chance = float(willing.get("0", 0.0)) * 1.2
+        if idle_chance > 1.0: idle_chance = 1.0
+        logger.debug(f"nyabot潜水意愿(修正后)：{idle_chance}")
+
+        bubble_chance = float(willing.get("1", 0.0))
+        self.__bubble_willing_sum += bubble_chance * 0.9
+        logger.debug(f"nyabot本次冒泡意愿：{bubble_chance}")
+        logger.debug(f"nyabot冒泡意愿累计(修正后)：{self.__bubble_willing_sum}")
+
+        chat_chance = float(willing.get("2", 0.0)) * 0.9
+        logger.debug(f"nyabot对话意愿(修正后)：{chat_chance}")
+
+        random_value = random.uniform(0.5, 0.9)
+        logger.debug(f"意愿转变随机值：{random_value}")
+
+        current_fatigue_factor = self._active_count * 0.15 if self.__chatting_state == _ChattingState.ACTIVE else 0.0
+
+        match self.__chatting_state:
+            case _ChattingState.ILDE:
+                if self._last_speak_time.tzinfo is not None:
+                    now_aware = datetime.now().astimezone()
+                    seconds_since_speak = (now_aware - self._last_speak_time).total_seconds()
+                else:
+                    seconds_since_speak = (datetime.now() - self._last_speak_time).total_seconds()
+
+                if seconds_since_speak < 90:
+                    logger.debug(f"Bot 处于贤者时间 ({seconds_since_speak:.0f}s < 90s)，强制压制对话欲望")
+                    chat_chance *= 0.5
+                    self.__bubble_willing_sum = 0.0
+
+                if chat_chance >= random_value:
+                    self.__chatting_state = _ChattingState.ACTIVE
+                    self.__bubble_willing_sum = 0.0
+                elif self.__bubble_willing_sum >= random_value:
+                    self.__chatting_state = _ChattingState.BUBBLE
+                    self.__bubble_willing_sum = 0.0
+
+            case _ChattingState.BUBBLE:
+                if chat_chance >= random_value:
+                    self.__chatting_state = _ChattingState.ACTIVE
+                elif idle_chance >= random_value:
+                    self.__chatting_state = _ChattingState.ILDE
+
+            case _ChattingState.ACTIVE:
+                fatigue_factor = self._active_count * 0.15
+                final_idle_chance = (idle_chance * 1.2) + fatigue_factor
+                logger.debug(
+                    f"活跃退出判定: 基础意愿{idle_chance:.2f} + 疲劳({self._active_count}轮){fatigue_factor:.2f} = {final_idle_chance:.2f} (阈值: {random_value:.2f})")
+
+                if final_idle_chance >= random_value:
+                    logger.debug(f"Bot 聊累了(已聊{self._active_count}轮)，主动进入潜水状态")
+                    self.__chatting_state = _ChattingState.ILDE
+                    self._active_count = 0
+
+        logger.debug(
+            f"[DECISION DEBUG] "
+            f"状态: {self.__chatting_state.name} | "
+            f"对话意愿(Chat): {chat_chance:.2f} | "
+            f"潜水意愿(Idle): {idle_chance:.2f} | "
+            f"疲劳值(Count): {self._active_count} (Factor: {current_fatigue_factor:.2f}) | "
+            f"随机阈值: {random_value:.2f}"
+        )
+
+        logger.debug(f"反馈阶段更新对话状态：{self.__chatting_state!s}")
+        logger.debug("反馈阶段结束")
 
     async def __chat_stage(self, messages_chunk: list[Message], llm: Callable[[str], Awaitable[str]]) -> list[dict]:
         logger.debug("对话阶段开始")
@@ -580,7 +613,6 @@ class Session:
         )
         search_stage_result = self.__search_result.mem_history if self.__search_result else []
 
-        # 使用 prompts 模块
         prompt = get_chat_prompt(
             self.__name, self.__role, self.__chatting_state.value,
             self.global_memory.access().compressed_history,
@@ -595,14 +627,13 @@ class Session:
             response = await llm(prompt)
             logger.debug(f"对话阶段llm返回：{response}")
 
-            # 使用 utils 解析
             response_dict = extract_and_parse_json(response)
 
             if response_dict is None:
                 logger.warning("对话阶段 JSON 解析失败，跳过本次回复")
                 return []
 
-            # 容错处理
+            # 容错处理：如果返回的是列表
             if isinstance(response_dict, list):
                 logger.warning(f"对话阶段 LLM 返回了 list 而不是 dict，尝试自动修正。内容: {response_dict}")
                 response_dict = {"reply": response_dict, "debug_reason": "自动修正:LLM返回了纯列表"}
@@ -682,7 +713,6 @@ class Session:
             msgs_to_mem.extend(
                 [Message(user_name=self.__name, content=msg['content'], time=datetime.now()) for msg in reply_messages])
 
-            # [修改] 使用 utils 中的函数计算疲劳
             actual_bubble_count = sum(estimate_split_count(msg.get('content', '')) for msg in reply_messages)
             self._active_count += actual_bubble_count
             logger.debug(

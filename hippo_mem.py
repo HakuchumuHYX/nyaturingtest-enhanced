@@ -1,13 +1,15 @@
+import gc
+import time
 from datetime import datetime
 import os
 import shutil
-import numpy as np  # [新增] 引入 numpy 以便做更严谨的判断(如果需要)
+# import numpy as np
 
 from hipporag import HippoRAG
 from nonebot import logger
 from transformers.models.auto.tokenization_auto import AutoTokenizer
 
-# [新增] 全局分词器变量，防止多实例重复加载占用内存
+# 全局分词器变量
 _GLOBAL_TOKENIZER = None
 
 
@@ -35,31 +37,77 @@ class HippoMemory:
         # 确保存储目录存在
         os.makedirs(persist_directory, exist_ok=True)
 
-        # 初始化HippoRAG
+        # 初始化参数保存
         self.persist_directory = persist_directory
         self.collection_name = collection_name
+        self.llm_model = llm_model
+        self.llm_base_url = llm_base_url
+        self.llm_api_key = llm_api_key
+        self.embedding_api_key = embedding_api_key
+        self.embedding_base_url = "https://api.siliconflow.cn/v1"
 
-        # 使用HippoRAG初始化记忆库
-        try:
-            self.hippo = HippoRAG(
-                llm_model_name=llm_model,
-                llm_base_url=llm_base_url,
-                llm_api_key=llm_api_key,
-                embedding_model_name="BAAI/bge-m3",
-                embedding_api_key=embedding_api_key,
-                embedding_base_url="https://api.siliconflow.cn/v1",
-                save_dir=persist_directory,
-            )
-            logger.info(f"已创建/加载新的HippoRAG集合: {collection_name}")
-        except Exception as e:
-            logger.error(f"Failed to create HippoRAG collection: {e}")
+        # 尝试初始化
+        self._init_hipporag()
 
         # 用于跟踪上次清理的时间
         self._last_forget = datetime.now()
         # 缓存要索引的文本
         self._cache = ""
-        # [修改] 使用全局单例初始化分词器
+        # 使用全局单例初始化分词器
         self.tokenizer = _get_tokenizer()
+
+    def _init_hipporag(self, retry: bool = True) -> bool:
+        """
+        尝试初始化 HippoRAG 实例 (带自动修复功能)
+        """
+        try:
+            self.hippo = HippoRAG(
+                llm_model_name=self.llm_model,
+                llm_base_url=self.llm_base_url,
+                llm_api_key=self.llm_api_key,
+                embedding_model_name="BAAI/bge-m3",
+                embedding_api_key=self.embedding_api_key,
+                embedding_base_url=self.embedding_base_url,
+                save_dir=self.persist_directory,
+            )
+            logger.info(f"已创建/加载 HippoRAG 集合: {self.collection_name}")
+            return True
+        except Exception as e:
+            error_msg = str(e)
+
+            # 检测文件损坏错误
+            if retry and ("Ran out of input" in error_msg or "EOFError" in error_msg or "unpickling" in error_msg):
+                logger.warning(f"检测到 HippoRAG 索引文件损坏 ({error_msg})，正在准备自动修复...")
+
+                # 1. 强制断开引用 & GC
+                if hasattr(self, 'hippo'):
+                    del self.hippo
+                import gc
+                import time
+                gc.collect()
+                time.sleep(1.0)  # 给 Windows 一点时间释放锁
+
+                if os.path.exists(self.persist_directory):
+                    try:
+                        shutil.rmtree(self.persist_directory, ignore_errors=True)
+                        logger.info("已清理损坏的索引目录")
+
+                        if os.path.exists(self.persist_directory):
+                            logger.warning("目录删除似乎未完全生效，再次尝试...")
+                            time.sleep(1.0)
+                            shutil.rmtree(self.persist_directory, ignore_errors=True)
+
+                    except Exception as rm_e:
+                        logger.error(f"删除损坏目录失败: {rm_e}")
+                        return False
+
+                logger.info("正在尝试重新构建索引...")
+                return self._init_hipporag(retry=False)
+
+            logger.error(f"HippoRAG 初始化失败: {e}")
+            if hasattr(self, 'hippo'):
+                delattr(self, 'hippo')
+            return False
 
     def _now_str(self) -> str:
         """返回当前时间的 ISO 格式字符串"""
@@ -77,28 +125,14 @@ class HippoMemory:
                 logger.error(f"Failed to delete persist directory: {e}")
         else:
             logger.warning(f"Persist directory {self.persist_directory} does not exist.")
-        # 重新创建索引
-        try:
-            self.hippo = HippoRAG(
-                llm_model_name=self.hippo.global_config.llm_name,
-                llm_base_url=self.hippo.global_config.llm_base_url,
-                llm_api_key=self.hippo.global_config.llm_api_key,
-                embedding_model_name=self.hippo.global_config.embedding_model_name,
-                embedding_api_key=self.hippo.global_config.embedding_api_key,
-                embedding_base_url=self.hippo.global_config.embedding_base_url,
-                save_dir=self.persist_directory,
-            )
-        except Exception as e:
-            logger.error(f"Failed to recreate HippoRAG collection: {e}")
-            return
+
+        # 重新初始化
+        self._init_hipporag()
         logger.info("已清除所有记忆")
 
     def add_texts(self, texts: list[str]) -> None:
         """
         添加文本到缓存
-
-        Args:
-            texts: 要添加的文本列表
         """
         for text in texts:
             self._cache += text + "\n"
@@ -107,16 +141,23 @@ class HippoMemory:
         """
         对缓存的文本进行索引，整理到长期记忆
         """
-        # 1. [修改] 先检查并“快照”取走当前缓存
+        # 1. 检查 HippoRAG 是否初始化成功
+        if not hasattr(self, 'hippo'):
+            logger.warning("HippoRAG 未初始化，尝试重新初始化...")
+            if not self._init_hipporag():
+                logger.error("HippoRAG 重新初始化失败，跳过本次索引构建 (数据保留在缓存中)")
+                return
+
+        # 2. 先检查并“快照”取走当前缓存
         content_to_index = self._cache
         if not content_to_index or not content_to_index.strip():
             return
 
-        # 2. [修改] 立即清空缓存，让主程序看到的 pending_count 归零
+        # 3. 立即清空缓存
         self._cache = ""
 
         try:
-            # 3. 使用快照数据进行切分
+            # 4. 使用快照数据进行切分
             texts = _split_text_by_tokens(content_to_index, self.tokenizer, max_tokens=2048, overlap=200)
 
             if not texts:
@@ -124,50 +165,37 @@ class HippoMemory:
 
             logger.info(f"开始构建索引，共 {len(texts)} 条文本段...")
 
-            # 4. 执行索引 (耗时操作)
+            # 5. 执行索引 (耗时操作)
             self.hippo.index(texts)
 
             logger.info(f"已成功索引 {len(texts)} 条缓存文本")
 
         except Exception as e:
-            # 5. [修改] 发生错误时进行“回滚”
-            # 将取出的数据加回到缓存的最前面，防止数据丢失
-            # 注意：此时 self._cache 可能已经有了新进来的消息，所以是 content + self._cache
+            # 6. 发生错误时进行“回滚”
             logger.error(f"HippoRAG 索引构建失败，正在回滚缓存: {e}")
             self._cache = content_to_index + self._cache
-            # 抛出异常
-            raise e
+            # 不抛出异常
 
     def retrieve(self, queries: list[str], k: int = 5) -> list[str]:
         """
         检索与查询相关的文本
-
-        Args:
-            queries: 查询文本列表
-            k: 返回的最大结果数
-
-        Returns:
-            包含检索结果的Document列表
         """
-        # [关键修复] 检查索引是否为空
-        # HippoRAG 的 passage_embeddings 为空时会导致 numpy shape mismatch (0,) vs (1024,)
+        # 检查实例是否存在
+        if not hasattr(self, 'hippo'):
+            if not self._init_hipporag():
+                return []
+
         try:
+            # 检查索引是否为空
             if hasattr(self.hippo, "passage_embeddings"):
-                # 如果 embedding 是 None 或者长度为 0
                 if self.hippo.passage_embeddings is None or len(self.hippo.passage_embeddings) == 0:
-                    # 静默返回，因为这在刚启动时很正常
                     return []
         except Exception:
-            # 如果访问属性出错，也直接返回空以保平安
             return []
 
-        # 切割(BAAI/bge-m3上限为8192tokens)
-        logger.debug(f"查询文本: {queries}")
         splited_queries = []
         for query in queries:
             splited_queries += _split_text_by_tokens(query, self.tokenizer, max_tokens=2048, overlap=100)
-
-        # logger.debug(f"分割后的查询: {splited_queries}")
 
         try:
             results = self.hippo.retrieve(queries=splited_queries, num_to_retrieve=k)
@@ -177,9 +205,8 @@ class HippoMemory:
             # 去重
             return list(set(docs))
         except ValueError as e:
-            # 双重保险：捕获 numpy 的 shapes mismatch 错误
             if "shapes" in str(e) and "not aligned" in str(e):
-                logger.warning("长期记忆索引为空，跳过检索")
+                logger.warning("长期记忆索引为空或数据对齐错误，跳过检索")
                 return []
             raise e
         except Exception as e:
@@ -193,7 +220,6 @@ class HippoMemory:
         """
         if not self._cache:
             return 0
-        # 简单通过换行符计算积累了多少条记忆
         return len(self._cache.strip().split('\n'))
 
 
@@ -202,13 +228,6 @@ def _split_text_by_tokens(
 ) -> list[str]:
     """
     按照指定的最大 token 数量和重叠数量将文本分割成多个块
-    Args:
-        text: 要分割的文本
-        tokenizer: 用于分割文本的分词器
-        max_tokens: 每个块的最大 token 数量
-        overlap: 重叠的 token 数量
-    Returns:
-        分割后的文本块列表
     """
     if not text:
         return []
