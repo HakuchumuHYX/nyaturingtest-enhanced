@@ -1,8 +1,62 @@
-# utils.py
 import json
 import re
-from nonebot import logger  # [修正] 使用 nonebot 的 logger 以保持格式统一
+import ssl
+import httpx
+from nonebot import logger
 from .mem import Message
+
+# 全局客户端变量
+_GLOBAL_HTTP_CLIENT: httpx.AsyncClient | None = None
+
+
+def get_http_client() -> httpx.AsyncClient:
+    """获取全局优化的 HTTP 客户端"""
+    global _GLOBAL_HTTP_CLIENT
+    if _GLOBAL_HTTP_CLIENT is None:
+        ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLSv1_2)
+        ssl_context.set_ciphers("ALL:@SECLEVEL=1")
+        _GLOBAL_HTTP_CLIENT = httpx.AsyncClient(
+            verify=ssl_context,
+            timeout=30.0,
+            limits=httpx.Limits(max_keepalive_connections=50, max_connections=100)
+        )
+    return _GLOBAL_HTTP_CLIENT
+
+
+async def close_http_client():
+    """关闭全局 HTTP 客户端"""
+    global _GLOBAL_HTTP_CLIENT
+    if _GLOBAL_HTTP_CLIENT:
+        await _GLOBAL_HTTP_CLIENT.aclose()
+        _GLOBAL_HTTP_CLIENT = None
+        logger.info("全局 HTTP 客户端已关闭")
+
+
+def smart_split_text(text: str, max_chars: int = 40) -> list[str]:
+    """智能断句逻辑"""
+    text = text.strip()
+    if not text:
+        return []
+
+    if len(text) < max_chars:
+        return [text]
+
+    raw_parts = re.split(r'(?<=[。！？!?.~\n])\s*', text)
+    final_parts = []
+    current_buffer = ""
+
+    for part in raw_parts:
+        part = part.strip()
+        if not part: continue
+
+        if len(current_buffer) + len(part) < 15:
+            current_buffer += part
+        else:
+            if current_buffer: final_parts.append(current_buffer)
+            current_buffer = part
+
+    if current_buffer: final_parts.append(current_buffer)
+    return final_parts if final_parts else [text]
 
 
 def extract_and_parse_json(response: str) -> dict | None:
