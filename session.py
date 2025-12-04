@@ -84,7 +84,7 @@ class Session:
             )
         )
         self.long_term_memory: HippoMemory = HippoMemory(
-            llm_model="Qwen/Qwen2.5-32B-Instruct",
+            llm_model="Qwen/Qwen3-32B",
             llm_api_key=plugin_config.nyaturingtest_siliconflow_api_key,
             llm_base_url="https://api.siliconflow.cn/v1",
             embedding_api_key=siliconflow_api_key,
