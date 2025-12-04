@@ -97,7 +97,7 @@ class Memory:
 {history_messages}
 """
         try:
-            response = await self.__llm_client.generate_response(prompt, model="Qwen/Qwen3-8B")
+            response = await self.__llm_client.generate_response(prompt, model="Qwen/Qwen3-8B", temperature=0.3)
             if after_compress:
                 after_compress()
             if response:

@@ -22,7 +22,11 @@ from .utils import get_http_client, smart_split_text
 async def llm_response(client: LLMClient, message: str) -> str:
     """封装 LLM 调用"""
     try:
-        result = await client.generate_response(prompt=message, model=plugin_config.nyaturingtest_chat_openai_model)
+        result = await client.generate_response(
+            prompt=message,
+            model=plugin_config.nyaturingtest_chat_openai_model,
+            temperature=1.3
+        )
         return result if result else ""
     except Exception as e:
         logger.error(f"LLM Error: {e}")
