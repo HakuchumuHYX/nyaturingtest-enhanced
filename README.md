@@ -71,7 +71,7 @@
 更改了feedback逻辑，以轻微降低智能的代价大幅降低了token使用。  
 更改了长期记忆索引的逻辑，大幅降低了token使用。  
 目前的token用量大约在先前的20%左右，即处理大概2k条消息总共消耗6-7Mtoken。  
-建议：.env文件中配置的对话用大模型用优质一点的（作为参考，我用的是DeepSeek-V3），会更加智能。  
+建议：.env文件中配置的对话用大模型用优质一点的（作为参考，我用的是DeepSeek-V3.2），会更加智能。  
 
 ## Special Thanks
 [G指导](https://gemini.google.com)
