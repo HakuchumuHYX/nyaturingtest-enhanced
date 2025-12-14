@@ -79,7 +79,7 @@ class ImageManager:
             # [关键修改] 使用账单中确认可用的模型，确保稳定且支持 JSON 指令
             self._vlm = SiliconFlowVLM(
                 api_key=plugin_config.nyaturingtest_siliconflow_api_key,
-                model="zai-org/GLM-4.5V",
+                model="zai-org/GLM-4.6V",
             )
             IMAGE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
             self._initialized = True

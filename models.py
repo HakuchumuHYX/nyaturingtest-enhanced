@@ -3,8 +3,8 @@ from tortoise import fields, models
 
 class SessionModel(models.Model):
     """会话表 (对应 Session)"""
-    id = fields.CharField(pk=True, max_length=50)  # 例如 "group_123456"
-    name = fields.CharField(max_length=50, default="terminus")
+    id = fields.CharField(pk=True, max_length=255)  # 例如 "group_123456"
+    name = fields.CharField(max_length=255, default="terminus")
     role = fields.TextField(default="一个男性人类")
     # 全局情绪 VAD
     valence = fields.FloatField(default=0.0)
@@ -25,7 +25,7 @@ class UserProfileModel(models.Model):
     # 联合主键难以处理，这里使用自增ID，加唯一索引
     id = fields.IntField(pk=True)
     session = fields.ForeignKeyField("models.SessionModel", related_name="profiles")
-    user_id = fields.CharField(max_length=50)  # QQ号
+    user_id = fields.CharField(max_length=255)  # QQ号
 
     # 情绪 VAD
     valence = fields.FloatField(default=0.0)
@@ -60,10 +60,10 @@ class GlobalMessageModel(models.Model):
     """全局短时记忆表 (替代 global_memory 中的 messages)"""
     id = fields.IntField(pk=True)
     session = fields.ForeignKeyField("models.SessionModel", related_name="messages")
-    user_name = fields.CharField(max_length=50)
+    user_name = fields.CharField(max_length=255)
     content = fields.TextField()
     time = fields.DatetimeField(auto_now_add=True)
-    msg_id = fields.CharField(max_length=50, default="")
+    msg_id = fields.CharField(max_length=255, default="")
 
     class Meta:
         table = "nyabot_global_messages"
