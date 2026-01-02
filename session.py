@@ -1,4 +1,4 @@
-# session.py
+# nyaturingtest/session.py
 import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass
@@ -17,7 +17,7 @@ from openai import AsyncOpenAI
 from .client import LLMClient
 from .config import plugin_config
 from .emotion import EmotionState
-from .hippo_mem import HippoMemory
+from .vector_mem import VectorMemory
 from .impression import Impression
 from .mem import Memory, Message
 from .presets import PRESETS
@@ -83,13 +83,12 @@ class Session:
                 )
             )
         )
-        self.long_term_memory: HippoMemory = HippoMemory(
-            llm_model="Qwen/Qwen3-32B",
-            llm_api_key=plugin_config.nyaturingtest_siliconflow_api_key,
-            llm_base_url="https://api.siliconflow.cn/v1",
-            embedding_api_key=siliconflow_api_key,
-            persist_directory=f"{store.get_plugin_data_dir()}/hippo_index_{id}",
+
+        self.long_term_memory: VectorMemory = VectorMemory(
+            api_key=plugin_config.nyaturingtest_siliconflow_api_key,
+            persist_directory=f"{store.get_plugin_data_dir()}/vector_index_{id}",
         )
+
         self.__name = name
         self.profiles: dict[str, PersonProfile] = {}
         self.global_emotion: EmotionState = EmotionState()
@@ -102,33 +101,10 @@ class Session:
         self.__search_result = None
         self._last_activity_time = datetime.now()
         self._last_speak_time = datetime.min
-        self._last_hippo_index_time = datetime.now()
         self._active_count = 0
         self._loaded = False
 
-        # [关键新增] 互斥锁，防止 Index 和 Retrieve 并发导致 C++ 引擎崩溃
-        self._hippo_lock = asyncio.Lock()
-
-    # [新增] 线程安全的索引方法封装
-    async def _safe_index(self):
-        async with self._hippo_lock:
-            try:
-                await run_sync(self.long_term_memory.index)()
-            except Exception as e:
-                logger.error(f"后台索引构建失败: {e}")
-
-    # [新增] 线程安全的检索方法封装
-    async def _safe_retrieve(self, retrieve_messages, k=2):
-        async with self._hippo_lock:
-            try:
-                return await run_sync(self.long_term_memory.retrieve)(retrieve_messages, k=k)
-            except Exception as e:
-                logger.error(f"检索执行失败: {e}")
-                return []
-
     async def set_role(self, name: str, role: str):
-        # [修改] 注释掉重置逻辑，允许动态调整人设而不丢失记忆
-        # await self.reset()
         self.__role = role
         self.__name = name
         await self.save_session()
@@ -166,13 +142,6 @@ class Session:
 
     async def save_session(self, force_index: bool = False):
         try:
-            if force_index:
-                raw_cache = getattr(self.long_term_memory, "_cache", "")
-                if raw_cache and raw_cache.strip():
-                    logger.info(f"[Session {self.id}] 收到强制保存指令：检测到待索引记忆，正在构建索引...")
-                    # [修改] 使用线程安全的索引方法
-                    await self._safe_index()
-
             session_db, created = await SessionModel.update_or_create(
                 id=self.id,
                 defaults={
@@ -297,18 +266,10 @@ class Session:
 
         preset = PRESETS[filename]
         await self.set_role(preset.name, preset.role)
-        self.long_term_memory.add_texts(preset.knowledges)
-        self.long_term_memory.add_texts(preset.relationships)
-        self.long_term_memory.add_texts(preset.events)
-        self.long_term_memory.add_texts(preset.bot_self)
 
-        try:
-            # [修改] 使用安全索引方法 (或直接在该上下文中加锁)
-            # 这里的 run_sync 是阻塞的，我们加上锁保护
-            async with self._hippo_lock:
-                await run_sync(self.long_term_memory.index)()
-        except Exception as e:
-            logger.error(f"预设索引构建失败: {e}")
+        to_add = (preset.knowledges + preset.relationships +
+                  preset.events + preset.bot_self)
+        await run_sync(self.long_term_memory.add_texts)(to_add)
 
         logger.info(f"加载预设：{filename} 成功")
         return True
@@ -346,27 +307,6 @@ class Session:
                 + [self.chat_summary]
         )
 
-        # 1. 判断是否需要索引 (但不立即执行)
-        CACHE_THRESHOLD = 30
-        TIME_THRESHOLD = 900
-        raw_cache = getattr(self.long_term_memory, "_cache", "")
-        pending_count = len(raw_cache.strip().split('\n')) if raw_cache and raw_cache.strip() else 0
-        now = datetime.now()
-        if self._last_hippo_index_time.tzinfo and not now.tzinfo:
-            now = now.astimezone()
-        time_since_last_index = (now - self._last_hippo_index_time).total_seconds()
-
-        should_index = False
-        if self.__chatting_state != _ChattingState.ILDE:
-            should_index = True
-        elif pending_count >= CACHE_THRESHOLD:
-            logger.info(f"潜水状态缓存积压过大 ({pending_count}/{CACHE_THRESHOLD})，强制触发索引构建")
-            should_index = True
-        elif pending_count > 0 and time_since_last_index >= TIME_THRESHOLD:
-            logger.info(f"潜水状态缓存已积压 {time_since_last_index:.0f}秒 (> {TIME_THRESHOLD}s)，触发定时索引构建")
-            should_index = True
-
-        # 2. 判断是否需要检索
         should_retrieve = False
         if self.__chatting_state != _ChattingState.ILDE:
             should_retrieve = True
@@ -381,43 +321,27 @@ class Session:
 
         long_term_memory = []
 
-        # 3. [关键调整] 优先执行检索 (Retrieve)
         if should_retrieve:
-            logger.debug(f"触发长期记忆检索 (状态: {self.__chatting_state}, 检索理由: 活跃/被艾特/被回复)")
-            # [修改] 使用 _safe_retrieve，这会获取锁，确保此时没有 Index 在运行
-            long_term_memory = await self._safe_retrieve(retrieve_messages, k=2)
+            logger.debug(f"触发长期记忆检索 (状态: {self.__chatting_state})")
+            long_term_memory = await run_sync(self.long_term_memory.retrieve)(retrieve_messages, k=2)
             if long_term_memory:
                 logger.debug(f"搜索到的相关记忆：{long_term_memory}")
         else:
             logger.debug("潜水状态且无强关联，跳过长期记忆检索")
 
         self.__search_result = _SearchResult(mem_history=long_term_memory)
-
-        # 4. [关键调整] 后执行索引 (Index)
-        # 检索完成后，我们再把索引任务扔到后台去慢慢跑，这样不会阻塞当前回复，也不会并发冲突
-        if should_index and pending_count > 0:
-            self.__update_hippo = False
-            self._last_hippo_index_time = datetime.now()
-            logger.info(
-                f"触发长期记忆构建 (状态:{self.__chatting_state}, 积压:{pending_count}条, 距上次:{time_since_last_index:.0f}s)...")
-            # [修改] 使用 _safe_index，它会在后台排队等待锁
-            asyncio.create_task(self._safe_index())
-        else:
-            if pending_count > 0:
-                logger.debug(f"潜水节流中：暂不构建长期记忆索引 (积压 {pending_count}条 / {time_since_last_index:.0f}s)")
-
         logger.debug("检索阶段结束")
 
-    async def __feedback_stage(self, messages_chunk: list[Message], llm: Callable[[str], Awaitable[str]]):
+    async def __feedback_stage(self, messages_chunk: list[Message], llm: Callable[[str], Awaitable[str]], is_relevant: bool):
         logger.debug("反馈阶段开始")
 
         should_skip_llm = False
         if self.__chatting_state == _ChattingState.ILDE:
-            is_relevant = check_relevance(self.__name, messages_chunk)
             if is_relevant:
                 should_skip_llm = False
+                logger.debug("检测到强关联（被@或回复），跳过潜水节流检查")
             else:
-                curiosity_rate = 0.03
+                curiosity_rate = 0.08
                 if random.random() < curiosity_rate:
                     logger.debug("触发随机好奇心：虽然没叫我，但我决定通过 LLM 看看大家在聊什么")
                     should_skip_llm = False
@@ -432,7 +356,7 @@ class Session:
                 self.profiles[message.user_name].push_interaction(
                     Impression(timestamp=datetime.now().astimezone(), delta={})
                 )
-            self.__bubble_willing_sum += 0.02 * len(messages_chunk)
+            self.__bubble_willing_sum += 0.03 * len(messages_chunk)
             random_value = random.uniform(0.8, 1.0)
             if self.__bubble_willing_sum > random_value:
                 logger.debug(f"潜水观察积累意愿({self.__bubble_willing_sum:.2f}) > {random_value:.2f}，自动转入冒泡状态")
@@ -458,14 +382,14 @@ class Session:
             related_profiles_json, search_stage_result, self.chat_summary
         )
 
-        # [修改] 增加重试机制，防止 JSON 解析失败 (如 "0风险" 错误)
         MAX_RETRIES = 2
         response_dict = {}
 
         for attempt in range(MAX_RETRIES + 1):
             try:
                 if attempt > 0:
-                    logger.warning(f"反馈阶段 JSON 解析失败 (原因: 格式错误或幻觉)，正在进行第 {attempt}/{MAX_RETRIES} 次重试...")
+                    logger.warning(
+                        f"反馈阶段 JSON 解析失败 (原因: 格式错误或幻觉)，正在进行第 {attempt}/{MAX_RETRIES} 次重试...")
 
                 response = await llm(prompt)
                 logger.debug(f"反馈阶段llm返回 (尝试 {attempt}): {response}")
@@ -473,9 +397,8 @@ class Session:
                 parsed = extract_and_parse_json(response)
                 if parsed:
                     response_dict = parsed
-                    # 简单的校验：确保关键字段存在
                     if "emotion_tends" in response_dict or "willing" in response_dict:
-                        break  # 解析成功且内容看起来正常，跳出循环
+                        break
             except Exception as e:
                 logger.error(f"反馈阶段 LLM 请求或解析发生异常: {e}")
 
@@ -483,7 +406,6 @@ class Session:
                 logger.error(f"反馈阶段重试 {MAX_RETRIES} 次后仍失败，执行降级处理。")
                 response_dict = {}
 
-        # 数据处理部分保持不变
         new_emotion = response_dict.get("new_emotion", {})
         self.global_emotion.valence = new_emotion.get("valence", self.global_emotion.valence)
         self.global_emotion.arousal = new_emotion.get("arousal", self.global_emotion.arousal)
@@ -530,26 +452,27 @@ class Session:
                 else:
                     sanitized_result.append(str(item))
             if sanitized_result:
-                self.long_term_memory.add_texts(sanitized_result)
+                await run_sync(self.long_term_memory.add_texts)(sanitized_result)
                 logger.debug(f"反馈阶段更新长期记忆：{sanitized_result}")
 
         willing = response_dict.get("willing", {})
         if not isinstance(willing, dict):
             willing = {}
 
-        idle_chance = float(willing.get("0", 0.0)) * 1.2
+        idle_chance = float(willing.get("0", 0.0))
         if idle_chance > 1.0: idle_chance = 1.0
         logger.debug(f"nyabot潜水意愿(修正后)：{idle_chance}")
 
         bubble_chance = float(willing.get("1", 0.0))
-        self.__bubble_willing_sum += bubble_chance * 0.9
+        self.__bubble_willing_sum += bubble_chance
         logger.debug(f"nyabot本次冒泡意愿：{bubble_chance}")
         logger.debug(f"nyabot冒泡意愿累计(修正后)：{self.__bubble_willing_sum}")
 
-        chat_chance = float(willing.get("2", 0.0)) * 0.9
+        chat_chance = float(willing.get("2", 0.0))
         logger.debug(f"nyabot对话意愿(修正后)：{chat_chance}")
 
-        random_value = random.uniform(0.5, 0.9)
+        # [修改] 降低门槛
+        random_value = random.uniform(0.3, 0.7)
         logger.debug(f"意愿转变随机值：{random_value}")
 
         current_fatigue_factor = self._active_count * 0.15 if self.__chatting_state == _ChattingState.ACTIVE else 0.0
@@ -590,6 +513,14 @@ class Session:
                     logger.debug(f"Bot 聊累了(已聊{self._active_count}轮)，主动进入潜水状态")
                     self.__chatting_state = _ChattingState.ILDE
                     self._active_count = 0
+
+        #  强制修正逻辑
+        if is_relevant:
+            # 如果被@了，但经过计算后依然是潜水状态，强制改为冒泡状态
+            if self.__chatting_state == _ChattingState.ILDE:
+                logger.info("检测到被@或回复，强制将状态从 [潜水] 修正为 [冒泡]")
+                self.__chatting_state = _ChattingState.BUBBLE
+                self.__bubble_willing_sum = 0.0
 
         logger.debug(
             f"[DECISION DEBUG] "
@@ -633,7 +564,6 @@ class Session:
                 logger.warning("对话阶段 JSON 解析失败，跳过本次回复")
                 return []
 
-            # 容错处理：如果返回的是列表
             if isinstance(response_dict, list):
                 logger.warning(f"对话阶段 LLM 返回了 list 而不是 dict，尝试自动修正。内容: {response_dict}")
                 response_dict = {"reply": response_dict, "debug_reason": "自动修正:LLM返回了纯列表"}
@@ -680,8 +610,12 @@ class Session:
 
         self._last_activity_time = now
 
+        #  计算是否强相关（被@或被回复）
+        is_relevant = check_relevance(self.__name, messages_chunk)
+
         await self.__search_stage()
-        await self.__feedback_stage(messages_chunk=messages_chunk, llm=llm)
+        #  传递 is_relevant
+        await self.__feedback_stage(messages_chunk=messages_chunk, llm=llm, is_relevant=is_relevant)
 
         reply_messages = None
         match self.__chatting_state:
@@ -696,6 +630,12 @@ class Session:
             case _ChattingState.ACTIVE:
                 logger.debug("nyabot对话中...")
                 chill_prob = 0.1 + (self._active_count * 0.05)
+
+                # [修改] 如果强相关，强制跳过 Chill Mode
+                if is_relevant:
+                    logger.debug("检测到被@或回复，强制跳过 Chill Mode")
+                    chill_prob = 0.0
+
                 if random.random() < chill_prob:
                     logger.debug(f"Chill Mode触发 (概率{chill_prob:.2f}): 暂时不回消息")
                     reply_messages = None
@@ -719,7 +659,8 @@ class Session:
                 f"Bot 发言 {len(reply_messages)} 条 (切分为 {actual_bubble_count} 个气泡)，疲劳值 +{actual_bubble_count}")
             self._last_speak_time = datetime.now()
 
-        self.long_term_memory.add_texts(text_to_add)
+        await run_sync(self.long_term_memory.add_texts)(text_to_add)
+
         await self.global_memory.update(msgs_to_mem, after_compress=enable_update_hippo)
 
         if self.__chatting_state == _ChattingState.ILDE:
