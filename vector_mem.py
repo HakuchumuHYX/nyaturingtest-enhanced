@@ -1,3 +1,4 @@
+# nyaturingtest/vector_mem.py
 import os
 import hashlib
 import logging
@@ -36,6 +37,7 @@ class SiliconFlowEmbeddingFunction(EmbeddingFunction):
         }
 
         try:
+            # trust_env=False 强制直连，防止代理配置错误
             with httpx.Client(timeout=30.0, trust_env=False) as client:
                 response = client.post(self.api_url, headers=headers, json=payload)
                 response.raise_for_status()
@@ -44,6 +46,7 @@ class SiliconFlowEmbeddingFunction(EmbeddingFunction):
         except Exception as e:
             logger.error(f"Embedding API 请求失败: {e}")
             raise e  # 抛出异常以便在上层看到具体的错误堆栈
+
 
 class VectorMemory:
     def __init__(self, api_key: str, persist_directory: str):
@@ -71,16 +74,21 @@ class VectorMemory:
         if not valid_texts:
             return
 
-        # [关键优化] 使用内容哈希作为ID，实现幂等性（重复添加不会重复存储）
-        ids = [hashlib.md5(t.encode('utf-8')).hexdigest() for t in valid_texts]
+        # 列表内部去重：使用 dict.fromkeys 保持顺序并去重
+        # 如果 valid_texts 里有 ["A", "A"]，这里会变成 ["A"]
+        # 从而避免生成重复 ID 导致的 "Expected IDs to be unique" 错误
+        unique_texts = list(dict.fromkeys(valid_texts))
+
+        # 使用内容哈希作为ID
+        ids = [hashlib.md5(t.encode('utf-8')).hexdigest() for t in unique_texts]
 
         try:
             # 使用 upsert：存在则更新，不存在则插入
             self.collection.upsert(
-                documents=valid_texts,
+                documents=unique_texts,
                 ids=ids
             )
-            logger.debug(f"已处理 {len(valid_texts)} 条长期记忆 (Upsert)")
+            logger.debug(f"已处理 {len(unique_texts)} 条长期记忆 (Upsert)")
         except Exception as e:
             logger.error(f"VectorMemory add_texts 失败: {e}")
 
