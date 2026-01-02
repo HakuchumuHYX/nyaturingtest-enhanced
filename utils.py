@@ -33,29 +33,26 @@ async def close_http_client():
 
 
 def smart_split_text(text: str, max_chars: int = 40) -> list[str]:
-    """智能断句逻辑"""
+    """
+    [修改版] 严格断句逻辑：
+    只要遇到句号、问号、感叹号等标点，强制进行切分，不合并短句。
+    """
     text = text.strip()
     if not text:
         return []
 
-    if len(text) < max_chars:
-        return [text]
-
+    # 正则：匹配标点符号 [。！？!?.~\n]，(?<=...) 为后视断言，保留标点在前半句
     raw_parts = re.split(r'(?<=[。！？!?.~\n])\s*', text)
+
     final_parts = []
-    current_buffer = ""
 
     for part in raw_parts:
         part = part.strip()
-        if not part: continue
+        if not part:
+            continue
 
-        if len(current_buffer) + len(part) < 15:
-            current_buffer += part
-        else:
-            if current_buffer: final_parts.append(current_buffer)
-            current_buffer = part
+        final_parts.append(part)
 
-    if current_buffer: final_parts.append(current_buffer)
     return final_parts if final_parts else [text]
 
 
@@ -81,7 +78,7 @@ def extract_and_parse_json(response: str) -> dict | None:
     if match:
         json_str = match.group(1)
         try:
-            # [细节保留] 修复 LLM 常见的 JSON 尾部逗号错误 (例如 {"a":1,} )
+            #  修复 LLM 常见的 JSON 尾部逗号错误 (例如 {"a":1,} )
             json_str = re.sub(r",\s*([\]}])", r"\1", json_str)
             return json.loads(json_str)
         except json.JSONDecodeError:
@@ -92,25 +89,19 @@ def extract_and_parse_json(response: str) -> dict | None:
 
 def estimate_split_count(text: str) -> int:
     """
-    估算实际发送的消息条数 (复用 __init__.py 的逻辑)
+    估算实际发送的消息条数
     """
     if not text:
         return 0
-    # 使用与 __init__.py 一致的切分逻辑
+
     raw_parts = re.split(r'(?<=[。！？!?.~\n])\s*', text)
     final_parts = []
-    current_buffer = ""
+
     for part in raw_parts:
         part = part.strip()
         if not part: continue
-        if len(current_buffer) + len(part) < 15:
-            current_buffer += part
-        else:
-            if current_buffer: final_parts.append(current_buffer)
-            current_buffer = part
-    if current_buffer: final_parts.append(current_buffer)
+        final_parts.append(part)
 
-    # 至少算 1 条
     return len(final_parts) if final_parts else 1
 
 
@@ -120,15 +111,10 @@ def check_relevance(bot_name: str, messages: list[Message]) -> bool:
     """
     for msg in messages:
         content = msg.content
-        # 1. 检查名字出现在文本中
         if bot_name in content:
             return True
-
-        # 2. 检查 @ (NoneBot 的 segment 转换为了 " @name ")
         if f"@{bot_name}" in content:
             return True
-
-        # 3. 检查回复 (格式 [回复 name: ...])
         if f"[回复 {bot_name}" in content:
             return True
 
