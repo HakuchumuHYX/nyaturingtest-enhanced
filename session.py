@@ -104,6 +104,19 @@ class Session:
         self._active_count = 0
         self._loaded = False
 
+    def _sanitize(self, text: str) -> str:
+        """
+        清洗字符串，移除 surrogate 等非法 Unicode 字符，防止 SQLite 报错
+        """
+        if not text:
+            return ""
+        try:
+            # 忽略无法编码为 utf-8 的字符（如代理对）
+            return text.encode('utf-8', 'ignore').decode('utf-8')
+        except Exception:
+            # 如果发生其他错误，返回空字符串或原始字符串的 repr，防止崩溃
+            return ""
+
     async def set_role(self, name: str, role: str):
         self.__role = role
         self.__name = name
@@ -142,15 +155,16 @@ class Session:
 
     async def save_session(self, force_index: bool = False):
         try:
+            # 对所有字符串字段使用 self._sanitize 进行清洗
             session_db, created = await SessionModel.update_or_create(
                 id=self.id,
                 defaults={
-                    "name": self.__name,
-                    "role": self.__role,
+                    "name": self._sanitize(self.__name),
+                    "role": self._sanitize(self.__role),
                     "valence": self.global_emotion.valence,
                     "arousal": self.global_emotion.arousal,
                     "dominance": self.global_emotion.dominance,
-                    "chat_summary": self.chat_summary,
+                    "chat_summary": self._sanitize(self.chat_summary),
                     "last_speak_time": self._last_speak_time,
                     "chatting_state": self.__chatting_state.value
                 }
@@ -174,8 +188,8 @@ class Session:
                 for msg in recent_msgs:
                     bulk_msgs.append(GlobalMessageModel(
                         session=session_db,
-                        user_name=msg.user_name,
-                        content=msg.content,
+                        user_name=self._sanitize(msg.user_name),
+                        content=self._sanitize(msg.content),
                         time=msg.time,
                         msg_id=msg.id
                     ))
