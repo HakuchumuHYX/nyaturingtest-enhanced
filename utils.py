@@ -41,8 +41,8 @@ def smart_split_text(text: str, max_chars: int = 40) -> list[str]:
     if not text:
         return []
 
-    # 正则：匹配标点符号 [。！？!?.~\n]，(?<=...) 为后视断言，保留标点在前半句
-    raw_parts = re.split(r'(?<=[。！？!?.~\n])\s*', text)
+    # 正则：匹配标点符号 [。！？!?~\n]，(?<=...) 为后视断言，保留标点在前半句
+    raw_parts = re.split(r'(?<=[。！？!?~\n])\s*', text)
 
     final_parts = []
 

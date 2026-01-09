@@ -485,7 +485,7 @@ class Session:
         chat_chance = float(willing.get("2", 0.0))
         logger.debug(f"nyabot对话意愿(修正后)：{chat_chance}")
 
-        # [修改] 降低门槛
+        # 降低门槛
         random_value = random.uniform(0.3, 0.7)
         logger.debug(f"意愿转变随机值：{random_value}")
 
@@ -499,7 +499,7 @@ class Session:
                 else:
                     seconds_since_speak = (datetime.now() - self._last_speak_time).total_seconds()
 
-                if seconds_since_speak < 90:
+                if seconds_since_speak < 30:
                     logger.debug(f"Bot 处于贤者时间 ({seconds_since_speak:.0f}s < 90s)，强制压制对话欲望")
                     chat_chance *= 0.5
                     self.__bubble_willing_sum = 0.0
