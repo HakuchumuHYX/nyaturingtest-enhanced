@@ -1,3 +1,4 @@
+# nyaturingtest/presets.py
 from dataclasses import asdict, dataclass, field
 import json
 import os
@@ -15,6 +16,10 @@ class RolePreset:
     role: str
     """
     角色人设
+    """
+    aliases: list[str] = field(default_factory=list)
+    """
+    角色别名列表
     """
     knowledges: list[str] = field(default_factory=list)
     """
@@ -41,6 +46,7 @@ class RolePreset:
 _猫娘预设 = RolePreset(
     name="喵喵",
     role="一个可爱的群猫娘，群里的其它人是你的主人，你无条件服从你的主人",
+    aliases=["猫猫", "小猫"],  # [示例] 默认别名
     knowledges=[
         "猫娘是类人生物",
         "猫娘有猫耳和猫尾巴，其它外表特征和人一样",

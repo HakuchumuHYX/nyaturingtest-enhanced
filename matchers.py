@@ -1,4 +1,4 @@
-# matchers.py
+# nyaturingtest/matchers.py
 from datetime import datetime
 from nonebot import on_command, on_message, logger
 from nonebot.adapters.onebot.v11 import (
@@ -340,11 +340,13 @@ async def handle_auto_chat(bot: Bot, event: GroupMessageEvent):
     async with state.data_lock:
         state.event = event
         state.bot = bot
+        # 构建消息时，传入 user_id
         state.messages_chunk.append(
             MMessage(
                 time=datetime.now(),
                 user_name=nickname,
                 content=message_content,
                 id=str(event.message_id),
+                user_id=str(user_id)  # 传递 QQ 号
             )
         )

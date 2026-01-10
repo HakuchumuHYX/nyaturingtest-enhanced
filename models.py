@@ -1,3 +1,4 @@
+# nyaturingtest/models.py
 from tortoise import fields, models
 
 
@@ -61,6 +62,7 @@ class GlobalMessageModel(models.Model):
     id = fields.IntField(pk=True)
     session = fields.ForeignKeyField("models.SessionModel", related_name="messages")
     user_name = fields.CharField(max_length=255)
+    user_id = fields.CharField(max_length=255, default="")
     content = fields.TextField()
     time = fields.DatetimeField(auto_now_add=True)
     msg_id = fields.CharField(max_length=255, default="")

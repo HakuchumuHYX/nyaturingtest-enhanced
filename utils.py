@@ -1,3 +1,4 @@
+# nyaturingtest/utils.py
 import json
 import re
 import ssl
@@ -105,17 +106,30 @@ def estimate_split_count(text: str) -> int:
     return len(final_parts) if final_parts else 1
 
 
-def check_relevance(bot_name: str, messages: list[Message]) -> bool:
+def check_relevance(bot_name: str, aliases: list[str], messages: list[Message]) -> bool:
     """
     检查这一批消息中是否有与机器人强相关的内容
+    支持检查 bot_name 和 aliases (别名)
     """
+    # 合并主名和别名作为所有触发词
+    triggers = [bot_name]
+    if aliases:
+        triggers.extend(aliases)
+
+    # 过滤掉空字符串，防止误触
+    triggers = [t for t in triggers if t and t.strip()]
+
     for msg in messages:
         content = msg.content
-        if bot_name in content:
-            return True
-        if f"@{bot_name}" in content:
-            return True
-        if f"[回复 {bot_name}" in content:
-            return True
+        for trigger in triggers:
+            # 1. 直接包含名字
+            if trigger in content:
+                return True
+            # 2. @名字 (虽然OneBot通常转ID，但防止手动输入)
+            if f"@{trigger}" in content:
+                return True
+            # 3. 回复引用
+            if f"[回复 {trigger}" in content:
+                return True
 
     return False

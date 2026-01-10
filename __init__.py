@@ -7,6 +7,7 @@ import nonebot_plugin_localstore as store
 
 from .state_manager import cleanup_global_resources
 from . import matchers
+from . import memory_query
 
 driver = get_driver()
 

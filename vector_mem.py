@@ -2,6 +2,7 @@
 import os
 import hashlib
 import logging
+import uuid  # [新增]
 from typing import List
 import httpx
 import chromadb
@@ -27,7 +28,6 @@ class SiliconFlowEmbeddingFunction(EmbeddingFunction):
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json"
         }
-        # 移除换行符
         cleaned_input = [text.replace("\n", " ") for text in input]
 
         payload = {
@@ -37,7 +37,6 @@ class SiliconFlowEmbeddingFunction(EmbeddingFunction):
         }
 
         try:
-            # trust_env=False 强制直连，防止代理配置错误
             with httpx.Client(timeout=30.0, trust_env=False) as client:
                 response = client.post(self.api_url, headers=headers, json=payload)
                 response.raise_for_status()
@@ -45,7 +44,7 @@ class SiliconFlowEmbeddingFunction(EmbeddingFunction):
                 return [item["embedding"] for item in data["data"]]
         except Exception as e:
             logger.error(f"Embedding API 请求失败: {e}")
-            raise e  # 抛出异常以便在上层看到具体的错误堆栈
+            raise e
 
 
 class VectorMemory:
@@ -65,7 +64,7 @@ class VectorMemory:
 
     def add_texts(self, texts: List[str]):
         """
-        添加记忆文本，自动去重
+        添加记忆文本
         """
         if not texts:
             return
@@ -74,21 +73,16 @@ class VectorMemory:
         if not valid_texts:
             return
 
-        # 列表内部去重：使用 dict.fromkeys 保持顺序并去重
-        # 如果 valid_texts 里有 ["A", "A"]，这里会变成 ["A"]
-        # 从而避免生成重复 ID 导致的 "Expected IDs to be unique" 错误
-        unique_texts = list(dict.fromkeys(valid_texts))
-
-        # 使用内容哈希作为ID
-        ids = [hashlib.md5(t.encode('utf-8')).hexdigest() for t in unique_texts]
+        # [修改] 使用 UUID 生成随机 ID，允许重复内容入库（因为它们代表不同时刻的记忆）
+        ids = [str(uuid.uuid4()) for _ in valid_texts]
 
         try:
-            # 使用 upsert：存在则更新，不存在则插入
-            self.collection.upsert(
-                documents=unique_texts,
+            # [修改] 使用 add 而不是 upsert，因为 ID 是唯一的
+            self.collection.add(
+                documents=valid_texts,
                 ids=ids
             )
-            logger.debug(f"已处理 {len(unique_texts)} 条长期记忆 (Upsert)")
+            logger.debug(f"已处理 {len(valid_texts)} 条长期记忆 (Add)")
         except Exception as e:
             logger.error(f"VectorMemory add_texts 失败: {e}")
 

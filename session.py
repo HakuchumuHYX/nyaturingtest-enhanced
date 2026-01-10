@@ -23,8 +23,6 @@ from .mem import Memory, Message
 from .presets import PRESETS
 from .profile import PersonProfile
 from .models import SessionModel, UserProfileModel, InteractionLogModel, GlobalMessageModel
-
-# 导入拆分后的模块
 from .utils import extract_and_parse_json, estimate_split_count, check_relevance
 from .prompts import get_feedback_prompt, get_chat_prompt
 
@@ -90,6 +88,7 @@ class Session:
         )
 
         self.__name = name
+        self.__aliases: list[str] = []  # [新增] 别名列表
         self.profiles: dict[str, PersonProfile] = {}
         self.global_emotion: EmotionState = EmotionState()
         self.last_response: list[Message] = []
@@ -130,6 +129,7 @@ class Session:
 
     async def reset(self):
         self.__name = "terminus"
+        self.__aliases = []  # 重置时清空别名
         self.__role = "一个男性人类"
         await self.global_memory.clear()
         self.long_term_memory.clear()
@@ -173,7 +173,7 @@ class Session:
             for user_id, profile in self.profiles.items():
                 await UserProfileModel.update_or_create(
                     session=session_db,
-                    user_id=user_id,
+                    user_id=str(user_id),
                     defaults={
                         "valence": profile.emotion.valence,
                         "arousal": profile.emotion.arousal,
@@ -189,6 +189,8 @@ class Session:
                     bulk_msgs.append(GlobalMessageModel(
                         session=session_db,
                         user_name=self._sanitize(msg.user_name),
+                        # [新增] 保存 user_id，确保不为空
+                        user_id=str(msg.user_id) if msg.user_id else "",
                         content=self._sanitize(msg.content),
                         time=msg.time,
                         msg_id=msg.id
@@ -255,7 +257,8 @@ class Session:
                 time=msg_db.time,
                 user_name=msg_db.user_name,
                 content=msg_db.content,
-                id=msg_db.msg_id
+                id=msg_db.msg_id,
+                user_id=msg_db.user_id if msg_db.user_id else ""
             ))
 
         self.global_memory = Memory(
@@ -281,6 +284,10 @@ class Session:
         preset = PRESETS[filename]
         await self.set_role(preset.name, preset.role)
 
+        # 加载别名
+        self.__aliases = preset.aliases
+        logger.info(f"预设别名加载: {self.__aliases}")
+
         to_add = (preset.knowledges + preset.relationships +
                   preset.events + preset.bot_self)
         await run_sync(self.long_term_memory.add_texts)(to_add)
@@ -295,7 +302,7 @@ class Session:
         )
         return f"""
 名字：{self.__name}
-
+别名: {self.__aliases}
 设定：{self.__role}
 
 情感状态：V:{self.global_emotion.valence:.2f} A:{self.global_emotion.arousal:.2f} D:{self.global_emotion.dominance:.2f}
@@ -327,10 +334,13 @@ class Session:
         else:
             if recent_msgs:
                 for msg in list(recent_msgs)[-3:]:
-                    has_at = f"@{self.__name}" in msg.content
-                    has_reply = f"[回复 {self.__name}" in msg.content
-                    if has_at or has_reply:
-                        should_retrieve = True
+                    # 使用 check_relevance 判断是否有人叫 Bot
+                    triggers = [self.__name] + self.__aliases
+                    for t in triggers:
+                        if t and (f"@{t}" in msg.content or f"[回复 {t}" in msg.content):
+                            should_retrieve = True
+                            break
+                    if should_retrieve:
                         break
 
         long_term_memory = []
@@ -346,14 +356,15 @@ class Session:
         self.__search_result = _SearchResult(mem_history=long_term_memory)
         logger.debug("检索阶段结束")
 
-    async def __feedback_stage(self, messages_chunk: list[Message], llm: Callable[[str], Awaitable[str]], is_relevant: bool):
+    async def __feedback_stage(self, messages_chunk: list[Message], llm: Callable[[str], Awaitable[str]],
+                               is_relevant: bool):
         logger.debug("反馈阶段开始")
 
         should_skip_llm = False
         if self.__chatting_state == _ChattingState.ILDE:
             if is_relevant:
                 should_skip_llm = False
-                logger.debug("检测到强关联（被@或回复），跳过潜水节流检查")
+                logger.debug("检测到强关联（被@或回复或触发关键词），跳过潜水节流检查")
             else:
                 curiosity_rate = 0.08
                 if random.random() < curiosity_rate:
@@ -365,9 +376,12 @@ class Session:
         if should_skip_llm:
             logger.debug(f"触发节流：潜水状态且消息无强关联 ({len(messages_chunk)}条)，跳过 LLM 分析")
             for message in messages_chunk:
-                if message.user_name not in self.profiles:
-                    self.profiles[message.user_name] = PersonProfile(user_id=message.user_name)
-                self.profiles[message.user_name].push_interaction(
+                # 使用 user_id
+                uid = getattr(message, "user_id", message.user_name)
+
+                if uid not in self.profiles:
+                    self.profiles[uid] = PersonProfile(user_id=uid)
+                self.profiles[uid].push_interaction(
                     Impression(timestamp=datetime.now().astimezone(), delta={})
                 )
             self.__bubble_willing_sum += 0.03 * len(messages_chunk)
@@ -378,8 +392,10 @@ class Session:
                 self.__bubble_willing_sum = 0.0
             return
 
+        # 使用 ID 获取相关画像
         reaction_users = self.global_memory.related_users()
         related_profiles = [profile for profile in self.profiles.values() if profile.user_id in reaction_users]
+
         related_profiles_json = json.dumps(
             [{"user_name": p.user_id, "emotion_tends_to_user": asdict(p.emotion)} for p in related_profiles],
             ensure_ascii=False, indent=2
@@ -441,10 +457,13 @@ class Session:
                 emotion_tends = emotion_tends[:target_len]
 
         for index, message in enumerate(messages_chunk):
-            if message.user_name not in self.profiles:
-                self.profiles[message.user_name] = PersonProfile(user_id=message.user_name)
+            # 使用 user_id
+            uid = getattr(message, "user_id", message.user_name)
+
+            if uid not in self.profiles:
+                self.profiles[uid] = PersonProfile(user_id=uid)
             delta = emotion_tends[index] if index < len(emotion_tends) else {}
-            self.profiles[message.user_name].push_interaction(
+            self.profiles[uid].push_interaction(
                 Impression(timestamp=datetime.now().astimezone(), delta=delta)
             )
 
@@ -550,8 +569,11 @@ class Session:
 
     async def __chat_stage(self, messages_chunk: list[Message], llm: Callable[[str], Awaitable[str]]) -> list[dict]:
         logger.debug("对话阶段开始")
+
+        # 使用 ID
         reaction_users = self.global_memory.related_users()
         related_profiles = [profile for profile in self.profiles.values() if profile.user_id in reaction_users]
+
         related_profiles_json = json.dumps(
             [{"user_name": p.user_id, "emotion_tends_to_user": asdict(p.emotion)} for p in related_profiles],
             ensure_ascii=False, indent=2
@@ -624,8 +646,8 @@ class Session:
 
         self._last_activity_time = now
 
-        #  计算是否强相关（被@或被回复）
-        is_relevant = check_relevance(self.__name, messages_chunk)
+        # 计算是否强相关：传入 aliases
+        is_relevant = check_relevance(self.__name, self.__aliases, messages_chunk)
 
         await self.__search_stage()
         #  传递 is_relevant
@@ -645,7 +667,7 @@ class Session:
                 logger.debug("nyabot对话中...")
                 chill_prob = 0.1 + (self._active_count * 0.05)
 
-                # [修改] 如果强相关，强制跳过 Chill Mode
+                # 如果强相关，强制跳过 Chill Mode
                 if is_relevant:
                     logger.debug("检测到被@或回复，强制跳过 Chill Mode")
                     chill_prob = 0.0
@@ -664,8 +686,10 @@ class Session:
 
         if reply_messages:
             text_to_add.extend([f"'{self.__name}':'{msg['content']}'" for msg in reply_messages])
+            # Bot 发言自带 ID
             msgs_to_mem.extend(
-                [Message(user_name=self.__name, content=msg['content'], time=datetime.now()) for msg in reply_messages])
+                [Message(user_name=self.__name, content=msg['content'], time=datetime.now(), user_id=self.id) for msg in
+                 reply_messages])
 
             actual_bubble_count = sum(estimate_split_count(msg.get('content', '')) for msg in reply_messages)
             self._active_count += actual_bubble_count
