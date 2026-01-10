@@ -94,8 +94,16 @@ async def handle_query_memory(bot: Bot, event: GroupMessageEvent, args: Message 
                 f"Evaluation of {target_name}"
             ]
 
+            # 构造过滤条件：如果已知 user_id，则精准过滤
+            search_filter = None
+            if target_id:
+                search_filter = {"user_id": target_id}
+
             if hasattr(state.session, 'long_term_memory'):
-                vector_records = await run_sync(state.session.long_term_memory.retrieve)(search_queries, k=6)
+                # 传入 where 参数进行过滤
+                vector_records = await run_sync(state.session.long_term_memory.retrieve)(
+                    search_queries, k=6, where=search_filter
+                )
                 if vector_records:
                     logger.debug(f"查询记忆: 成功检索到 {len(vector_records)} 条向量记录")
         except Exception as e:

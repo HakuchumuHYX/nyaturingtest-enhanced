@@ -85,7 +85,8 @@ async def cleanup_global_resources():
 
     if save_tasks:
         try:
-            await asyncio.wait_for(asyncio.gather(*save_tasks, return_exceptions=True), timeout=15.0)
+            # 增加超时时间，防止数据较多时保存中断
+            await asyncio.wait_for(asyncio.gather(*save_tasks, return_exceptions=True), timeout=60.0)
             logger.info(f"会话保存完毕")
         except Exception as e:
             logger.error(f"关机保存错误: {e}")

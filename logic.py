@@ -37,8 +37,6 @@ async def llm_response(client: LLMClient, message: str) -> str:
 
 async def message2BotMessage(bot_name: str, group_id: int, message: Message, bot: Bot) -> str:
     """将 OneBot 消息转换为 Bot 可读文本"""
-
-    # ... (保持原有的 message2BotMessage 代码不变) ...
     async def process_segment(seg: MessageSegment) -> str:
         if seg.type == "text":
             return f"{seg.data.get('text', '')}"
@@ -139,57 +137,58 @@ async def spawn_state(state: GroupState):
             current_chunk = state.messages_chunk.copy()
             state.messages_chunk.clear()
 
-        # 2. 准备 Session 数据
+        # 扩大锁范围，确保 Session 在 update 期间不会被 reset 或修改
         async with state.session_lock:
+            # 2. 准备 Session 数据
             await state.session.load_session()
 
-        # 3. 执行核心逻辑
-        try:
-            responses = await state.session.update(
-                messages_chunk=current_chunk,
-                llm=lambda x: llm_response(state.client, x)
-            )
+            # 3. 执行核心逻辑
+            try:
+                responses = await state.session.update(
+                    messages_chunk=current_chunk,
+                    llm=lambda x: llm_response(state.client, x)
+                )
 
-            if responses:
-                total = len(responses)
-                for r_idx, response in enumerate(responses):
-                    raw_content = ""
-                    reply_id = None
-                    if isinstance(response, str):
-                        raw_content = response
-                    elif isinstance(response, dict):
-                        raw_content = response.get("content", "")
-                        reply_id = response.get("reply_to")
+                if responses:
+                    total = len(responses)
+                    for r_idx, response in enumerate(responses):
+                        raw_content = ""
+                        reply_id = None
+                        if isinstance(response, str):
+                            raw_content = response
+                        elif isinstance(response, dict):
+                            raw_content = response.get("content", "")
+                            reply_id = response.get("reply_to")
 
-                    if not raw_content: continue
+                        if not raw_content: continue
 
-                    msg_parts = smart_split_text(raw_content)
-                    for i, part in enumerate(msg_parts):
-                        part = part.strip()
-                        if part.endswith("。"):
-                            part = part[:-1]
-                        elif part.endswith(".") and not part.endswith(".."):
-                            part = part[:-1]
+                        msg_parts = smart_split_text(raw_content)
+                        for i, part in enumerate(msg_parts):
+                            part = part.strip()
+                            if part.endswith("。"):
+                                part = part[:-1]
+                            elif part.endswith(".") and not part.endswith(".."):
+                                part = part[:-1]
 
-                        msg_to_send = Message(part)
-                        if reply_id and r_idx == 0 and i == 0:
-                            msg_to_send.insert(0, MessageSegment.reply(int(reply_id)))
+                            msg_to_send = Message(part)
+                            if reply_id and r_idx == 0 and i == 0:
+                                msg_to_send.insert(0, MessageSegment.reply(int(reply_id)))
 
-                        try:
-                            await state.bot.send(message=msg_to_send, event=state.event)
-                        except ActionFailed as e:
-                            if e.retcode == 1200 or "120" in str(e):
-                                logger.warning(f"风控拦截 (1200), 冷却中...")
-                                await asyncio.sleep(random.uniform(5.0, 10.0))
-                            else:
-                                logger.error(f"发送失败: {e}")
-                        except Exception as e:
-                            logger.error(f"发送未知错误: {e}")
+                            try:
+                                await state.bot.send(message=msg_to_send, event=state.event)
+                            except ActionFailed as e:
+                                if e.retcode == 1200 or "120" in str(e):
+                                    logger.warning(f"风控拦截 (1200), 冷却中...")
+                                    await asyncio.sleep(random.uniform(5.0, 10.0))
+                                else:
+                                    logger.error(f"发送失败: {e}")
+                            except Exception as e:
+                                logger.error(f"发送未知错误: {e}")
 
-                        if i < len(msg_parts) - 1 or r_idx < total - 1:
-                            await asyncio.sleep(random.uniform(3.0, 6.0))
+                            if i < len(msg_parts) - 1 or r_idx < total - 1:
+                                await asyncio.sleep(random.uniform(3.0, 6.0))
 
-        except Exception as e:
-            logger.error(f"Processing cycle error: {e}")
-            traceback.print_exc()
-            continue
+            except Exception as e:
+                logger.error(f"Processing cycle error: {e}")
+                traceback.print_exc()
+                continue

@@ -25,7 +25,7 @@ class PersonProfile:
     """
     交互的记录
     """
-    last_update_time: datetime = field(default_factory=datetime.now)
+    last_update_time: datetime = field(default_factory=lambda: datetime.now().astimezone())
     """
     上次更新情感的时间
     """
@@ -74,28 +74,18 @@ class PersonProfile:
         if not self.interactions:
             return
 
-        # 【修复】获取当前时间，并根据印象的时间戳类型决定是否带时区
-        now = datetime.now()
-        first_impression = self.interactions[-1]  # 最老的一条
-
-        # 如果印象里的时间带时区（来自数据库），则 now 也必须带时区
-        if first_impression.timestamp.tzinfo is not None:
-            now = datetime.now().astimezone()
+        # 统一使用带时区的时间，防止 TypeError
+        now = datetime.now().astimezone()
 
         while len(self.interactions) > 0:
             last_interaction = self.interactions[-1]
 
-            # 二次防御：防止队列里混合了带时区和不带时区的数据
             current_interaction_time = last_interaction.timestamp
-            current_now = now
+            # 确保交互记录的时间也是 aware 的，如果不是则假设为本地时间
+            if current_interaction_time.tzinfo is None:
+                current_interaction_time = current_interaction_time.astimezone()
 
-            # 如果类型不匹配，临时转换 current_now 以适应
-            if current_interaction_time.tzinfo is None and current_now.tzinfo is not None:
-                current_now = current_now.replace(tzinfo=None)
-            elif current_interaction_time.tzinfo is not None and current_now.tzinfo is None:
-                current_now = current_now.astimezone()
-
-            if (current_now - current_interaction_time).total_seconds() / 3600 > 5:
+            if (now - current_interaction_time).total_seconds() / 3600 > 5:
                 self.interactions.pop()
             else:
                 break
@@ -104,12 +94,12 @@ class PersonProfile:
         """
         随时间流逝衰减情感 (增量更新 - 衰减)
         """
-        # 【修复】处理时区不一致问题
-        # 如果 last_update_time 来自数据库（带时区），则 now 也要带时区
-        if self.last_update_time.tzinfo is not None:
-            now = datetime.now().astimezone()
-        else:
-            now = datetime.now()
+        # [修复] 统一使用带时区的时间
+        now = datetime.now().astimezone()
+
+        if self.last_update_time.tzinfo is None:
+            # 如果之前的记录没有时区，强制转换为带时区
+            self.last_update_time = self.last_update_time.astimezone()
 
         # 计算距离上次更新经过了多少小时
         elapsed_hours = (now - self.last_update_time).total_seconds() / 3600.0

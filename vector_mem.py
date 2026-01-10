@@ -2,8 +2,8 @@
 import os
 import hashlib
 import logging
-import uuid  # [新增]
-from typing import List
+import uuid
+from typing import List, Dict, Any
 import httpx
 import chromadb
 from chromadb.api.types import Documents, EmbeddingFunction, Embeddings
@@ -62,31 +62,42 @@ class VectorMemory:
         )
         logger.info(f"VectorMemory 已加载，路径: {self.persist_directory}")
 
-    def add_texts(self, texts: List[str]):
+    # 增加 metadatas 参数
+    def add_texts(self, texts: List[str], metadatas: List[dict] | None = None):
         """
-        添加记忆文本
+        添加记忆文本，支持元数据
         """
         if not texts:
             return
 
-        valid_texts = [t for t in texts if t and t.strip()]
-        if not valid_texts:
+        valid_data = []
+        for i, t in enumerate(texts):
+            if t and t.strip():
+                # 如果有元数据就带上，没有就给空字典
+                meta = metadatas[i] if metadatas and i < len(metadatas) else {}
+                valid_data.append((t, meta))
+
+        if not valid_data:
             return
 
-        # [修改] 使用 UUID 生成随机 ID，允许重复内容入库（因为它们代表不同时刻的记忆）
-        ids = [str(uuid.uuid4()) for _ in valid_texts]
+        valid_texts = [d[0] for d in valid_data]
+        valid_metadatas = [d[1] for d in valid_data]
+
+        # 使用 MD5 哈希作为 ID，防止重复存储相同的记忆/预设
+        ids = [hashlib.md5(t.encode('utf-8')).hexdigest() for t in valid_texts]
 
         try:
-            # [修改] 使用 add 而不是 upsert，因为 ID 是唯一的
             self.collection.add(
                 documents=valid_texts,
+                metadatas=valid_metadatas,  # 存入元数据
                 ids=ids
             )
-            logger.debug(f"已处理 {len(valid_texts)} 条长期记忆 (Add)")
+            logger.debug(f"已存入 {len(valid_texts)} 条记忆 (含元数据)")
         except Exception as e:
             logger.error(f"VectorMemory add_texts 失败: {e}")
 
-    def retrieve(self, queries: List[str], k: int = 5) -> List[str]:
+    # 返回类型改为 List[dict] 以便携带元数据
+    def retrieve(self, queries: List[str], k: int = 5, where: dict | None = None) -> List[Dict[str, Any]]:
         if not queries:
             return []
 
@@ -94,18 +105,31 @@ class VectorMemory:
         if not unique_queries:
             return []
 
-        results_set = set()
+        results_list = []
+        seen_contents = set()
+
         try:
             query_results = self.collection.query(
                 query_texts=unique_queries,
-                n_results=k
+                n_results=k,
+                where=where  # 传递过滤条件，例如 {"user_id": "123456"}
             )
+
+            # 解析 ChromaDB 的返回格式 (documents 和 metadatas 都是二维列表)
             if query_results['documents']:
-                for doc_list in query_results['documents']:
-                    for doc in doc_list:
-                        if doc:
-                            results_set.add(doc)
-            return list(results_set)
+                for i, doc_list in enumerate(query_results['documents']):
+                    meta_list = query_results['metadatas'][i] if query_results['metadatas'] else []
+
+                    for j, doc in enumerate(doc_list):
+                        if doc and doc not in seen_contents:
+                            meta = meta_list[j] if meta_list and j < len(meta_list) else {}
+                            results_list.append({
+                                "content": doc,
+                                "metadata": meta
+                            })
+                            seen_contents.add(doc)
+
+            return results_list
         except Exception as e:
             logger.error(f"VectorMemory retrieve 失败: {e}")
             return []

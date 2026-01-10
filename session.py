@@ -13,6 +13,7 @@ from nonebot import logger
 import nonebot_plugin_localstore as store
 from nonebot.utils import run_sync
 from openai import AsyncOpenAI
+from tortoise.transactions import in_transaction
 
 from .client import LLMClient
 from .config import plugin_config
@@ -88,7 +89,7 @@ class Session:
         )
 
         self.__name = name
-        self.__aliases: list[str] = []  # [新增] 别名列表
+        self.__aliases: list[str] = []  # 别名列表
         self.profiles: dict[str, PersonProfile] = {}
         self.global_emotion: EmotionState = EmotionState()
         self.last_response: list[Message] = []
@@ -115,6 +116,15 @@ class Session:
         except Exception:
             # 如果发生其他错误，返回空字符串或原始字符串的 repr，防止崩溃
             return ""
+
+    def _escape_for_prompt(self, text: str) -> str:
+        """
+        转义 Prompt 中的特殊字符，防止注入
+        """
+        if not text:
+            return ""
+        # 替换双引号为单引号，或者转义，防止截断 JSON 或 Prompt
+        return text.replace('"', '\\"').replace('\n', ' ')
 
     async def set_role(self, name: str, role: str):
         self.__role = role
@@ -183,19 +193,21 @@ class Session:
 
             recent_msgs = self.global_memory.access().messages
             if recent_msgs:
-                await GlobalMessageModel.filter(session=session_db).delete()
-                bulk_msgs = []
-                for msg in recent_msgs:
-                    bulk_msgs.append(GlobalMessageModel(
-                        session=session_db,
-                        user_name=self._sanitize(msg.user_name),
-                        # [新增] 保存 user_id，确保不为空
-                        user_id=str(msg.user_id) if msg.user_id else "",
-                        content=self._sanitize(msg.content),
-                        time=msg.time,
-                        msg_id=msg.id
-                    ))
-                await GlobalMessageModel.bulk_create(bulk_msgs)
+                # 使用事务防止删除后写入失败导致数据丢失
+                async with in_transaction():
+                    await GlobalMessageModel.filter(session=session_db).delete()
+                    bulk_msgs = []
+                    for msg in recent_msgs:
+                        bulk_msgs.append(GlobalMessageModel(
+                            session=session_db,
+                            user_name=self._sanitize(msg.user_name),
+                            # [新增] 保存 user_id，确保不为空
+                            user_id=str(msg.user_id) if msg.user_id else "",
+                            content=self._sanitize(msg.content),
+                            time=msg.time,
+                            msg_id=msg.id
+                        ))
+                    await GlobalMessageModel.bulk_create(bulk_msgs)
 
             logger.debug(f"[Session {self.id}] 数据库保存成功")
         except Exception as e:
@@ -290,7 +302,11 @@ class Session:
 
         to_add = (preset.knowledges + preset.relationships +
                   preset.events + preset.bot_self)
-        await run_sync(self.long_term_memory.add_texts)(to_add)
+
+        # [修改] 为预设内容打上 "preset" 标签
+        metadatas = [{"source": "preset", "type": "rule"} for _ in to_add]
+
+        await run_sync(self.long_term_memory.add_texts)(to_add, metadatas=metadatas)
 
         logger.info(f"加载预设：{filename} 成功")
         return True
@@ -347,8 +363,23 @@ class Session:
 
         if should_retrieve:
             logger.debug(f"触发长期记忆检索 (状态: {self.__chatting_state})")
-            long_term_memory = await run_sync(self.long_term_memory.retrieve)(retrieve_messages, k=2)
-            if long_term_memory:
+
+            # retrieve 现在返回包含 metadata 的字典列表
+            raw_results = await run_sync(self.long_term_memory.retrieve)(retrieve_messages, k=2)
+
+            # 解析元数据并格式化输出给 LLM
+            if raw_results:
+                formatted_results = []
+                for item in raw_results:
+                    content = item.get("content", "")
+                    meta = item.get("metadata", {})
+                    source = meta.get("source", "unknown")
+
+                    # 关键修改：将标签显式展示给 LLM
+                    prefix = "【设定】" if source == "preset" else "【记忆】"
+                    formatted_results.append(f"{prefix} {content}")
+
+                long_term_memory = formatted_results
                 logger.debug(f"搜索到的相关记忆：{long_term_memory}")
         else:
             logger.debug("潜水状态且无强关联，跳过长期记忆检索")
@@ -402,11 +433,14 @@ class Session:
         )
         search_stage_result = self.__search_result.mem_history if self.__search_result else []
 
+        # 对消息内容进行转义，防止Prompt注入
+        formatted_msgs = [f"{msg.user_name}: '{self._escape_for_prompt(msg.content)}'" for msg in messages_chunk]
+
         prompt = get_feedback_prompt(
             self.__name, self.__role, self.__chatting_state.value,
             self.global_memory.access().compressed_history,
             self.global_memory.access().messages,
-            [f"{msg.user_name}: '{msg.content}'" for msg in messages_chunk],
+            formatted_msgs,
             {"valence": self.global_emotion.valence, "arousal": self.global_emotion.arousal,
              "dominance": self.global_emotion.dominance},
             related_profiles_json, search_stage_result, self.chat_summary
@@ -485,7 +519,9 @@ class Session:
                 else:
                     sanitized_result.append(str(item))
             if sanitized_result:
-                await run_sync(self.long_term_memory.add_texts)(sanitized_result)
+                # 聊天中分析出的新记忆，打上 memory 标签
+                mem_meta = [{"source": "memory", "type": "analysis"} for _ in sanitized_result]
+                await run_sync(self.long_term_memory.add_texts)(sanitized_result, metadatas=mem_meta)
                 logger.debug(f"反馈阶段更新长期记忆：{sanitized_result}")
 
         willing = response_dict.get("willing", {})
@@ -580,11 +616,14 @@ class Session:
         )
         search_stage_result = self.__search_result.mem_history if self.__search_result else []
 
+        # 对消息内容进行转义
+        formatted_msgs = [f"[ID:{getattr(msg, 'id', '')}] {msg.user_name}: '{self._escape_for_prompt(msg.content)}'" for msg in messages_chunk]
+
         prompt = get_chat_prompt(
             self.__name, self.__role, self.__chatting_state.value,
             self.global_memory.access().compressed_history,
             self.global_memory.access().messages,
-            [f"[ID:{getattr(msg, 'id', '')}] {msg.user_name}: '{msg.content}'" for msg in messages_chunk],
+            formatted_msgs,
             {"valence": self.global_emotion.valence, "arousal": self.global_emotion.arousal,
              "dominance": self.global_emotion.dominance},
             related_profiles_json, search_stage_result, self.chat_summary
@@ -681,11 +720,26 @@ class Session:
         def enable_update_hippo():
             self.__update_hippo = True
 
-        text_to_add = [f"'{msg.user_name}':'{msg.content}'" for msg in messages_chunk]
+        text_to_add = []
+        metadatas = []
         msgs_to_mem = messages_chunk.copy()
 
+        # 处理用户消息的文本和元数据
+        for msg in messages_chunk:
+            text_to_add.append(f"'{msg.user_name}':'{msg.content}'")
+            # 确保 user_id 为字符串，并作为元数据存入
+            uid = str(msg.user_id) if msg.user_id else ""
+            # 标记为 memory
+            metadatas.append({"user_id": uid, "user_name": msg.user_name, "type": "user_message", "source": "memory"})
+
         if reply_messages:
-            text_to_add.extend([f"'{self.__name}':'{msg['content']}'" for msg in reply_messages])
+            for msg in reply_messages:
+                text_to_add.append(f"'{self.__name}':'{msg['content']}'")
+                # Bot 的回复也存入元数据，使用 Bot 自身的 ID
+                # 标记为 memory
+                metadatas.append(
+                    {"user_id": str(self.id), "user_name": self.__name, "type": "bot_message", "source": "memory"})
+
             # Bot 发言自带 ID
             msgs_to_mem.extend(
                 [Message(user_name=self.__name, content=msg['content'], time=datetime.now(), user_id=self.id) for msg in
@@ -697,7 +751,8 @@ class Session:
                 f"Bot 发言 {len(reply_messages)} 条 (切分为 {actual_bubble_count} 个气泡)，疲劳值 +{actual_bubble_count}")
             self._last_speak_time = datetime.now()
 
-        await run_sync(self.long_term_memory.add_texts)(text_to_add)
+        # 传入 metadatas 以便长期记忆保存 user_id
+        await run_sync(self.long_term_memory.add_texts)(text_to_add, metadatas=metadatas)
 
         await self.global_memory.update(msgs_to_mem, after_compress=enable_update_hippo)
 
