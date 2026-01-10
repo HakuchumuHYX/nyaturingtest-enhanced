@@ -1,4 +1,4 @@
-# state_manager.py
+# nyaturingtest/state_manager.py
 import asyncio
 from dataclasses import dataclass, field
 from nonebot import logger
@@ -35,6 +35,7 @@ class GroupState:
     )
     data_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     session_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    new_message_signal: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 # 全局状态字典

@@ -1,3 +1,4 @@
+# nyaturingtest/image_manager.py
 import base64
 from dataclasses import asdict, dataclass
 import hashlib
@@ -61,6 +62,17 @@ class ImageManager:
             )
             IMAGE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
             self._initialized = True
+            # 简单的内存缓存，存储 id -> ImageWithDescription
+            self._mem_cache: dict[str, ImageWithDescription] = {}
+
+    def get_from_cache(self, key: str) -> ImageWithDescription | None:
+        """从内存缓存或 ID 映射文件中尝试获取描述，避免文件 I/O"""
+        return self._mem_cache.get(key)
+
+    def save_to_cache(self, key: str, data: ImageWithDescription):
+        """保存到内存缓存"""
+        if key and data:
+            self._mem_cache[key] = data
 
     def _extract_json(self, response: str) -> dict | None:
         try:
@@ -81,10 +93,16 @@ class ImageManager:
                 pass
         return None
 
-    async def get_image_description(self, image_base64: str, is_sticker: bool) -> ImageWithDescription | None:
+    async def get_image_description(self, image_base64: str, is_sticker: bool,
+                                    cache_key: str | None = None) -> ImageWithDescription | None:
+        # 1. 如果提供了 cache_key，先检查内存缓存
+        if cache_key and cache_key in self._mem_cache:
+            return self._mem_cache[cache_key]
+
         image_bytes = base64.b64decode(image_base64)
         image_hash = await _calculate_image_hash(image_bytes)
 
+        # 2. 检查基于内容的磁盘缓存
         cache = IMAGE_CACHE_DIR.joinpath(f"{image_hash}.json")
         if cache.exists():
             try:
@@ -93,8 +111,14 @@ class ImageManager:
                     image_with_desc = ImageWithDescription.from_json(image_with_desc_raw)
                     if image_with_desc.is_sticker != is_sticker:
                         image_with_desc.is_sticker = is_sticker
+                        # 更新缓存中的贴纸标记
                         async with await anyio.open_file(cache, "w", encoding="utf-8") as f:
                             await f.write(image_with_desc.to_json())
+
+                    # 命中磁盘缓存后，也更新到内存缓存和 ID 映射
+                    if cache_key:
+                        self._mem_cache[cache_key] = image_with_desc
+
                     return image_with_desc
             except ValueError:
                 logger.warning(f"缓存损坏 {cache}，将重新生成")
@@ -157,8 +181,13 @@ class ImageManager:
             is_sticker=is_sticker,
         )
 
+        # 写入磁盘缓存
         async with await anyio.open_file(cache, "w", encoding="utf-8") as f:
             await f.write(result.to_json())
+
+        # 写入内存缓存
+        if cache_key:
+            self._mem_cache[cache_key] = result
 
         return result
 
@@ -166,7 +195,7 @@ class ImageManager:
 @run_sync
 def _transform_gif(gif_base64: str, similarity_threshold: float = 1000.0, max_frames: int = 15) -> str | None:
     """
-    [优化版] 将GIF转换为水平拼接的静态图像，流式读取防止内存溢出
+    将GIF转换为水平拼接的静态图像，流式读取防止内存溢出
     """
     try:
         gif_data = base64.b64decode(gif_base64)

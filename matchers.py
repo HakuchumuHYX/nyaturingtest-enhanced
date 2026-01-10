@@ -350,3 +350,4 @@ async def handle_auto_chat(bot: Bot, event: GroupMessageEvent):
                 user_id=str(user_id)  # 传递 QQ 号
             )
         )
+        state.new_message_signal.set()

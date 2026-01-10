@@ -35,7 +35,7 @@ async def close_http_client():
 
 def smart_split_text(text: str, max_chars: int = 40) -> list[str]:
     """
-    [修改版] 严格断句逻辑：
+    严格断句逻辑：
     只要遇到句号、问号、感叹号等标点，强制进行切分，不合并短句。
     """
     text = text.strip()
@@ -110,6 +110,7 @@ def check_relevance(bot_name: str, aliases: list[str], messages: list[Message]) 
     """
     检查这一批消息中是否有与机器人强相关的内容
     支持检查 bot_name 和 aliases (别名)
+    增加忽略大小写的提及判定
     """
     # 合并主名和别名作为所有触发词
     triggers = [bot_name]
@@ -120,16 +121,13 @@ def check_relevance(bot_name: str, aliases: list[str], messages: list[Message]) 
     triggers = [t for t in triggers if t and t.strip()]
 
     for msg in messages:
-        content = msg.content
+        # 统一转为小写，实现忽略大小写匹配
+        content = msg.content.lower()
+
         for trigger in triggers:
-            # 1. 直接包含名字
-            if trigger in content:
+            t = trigger.lower()
+            if t in content:
                 return True
-            # 2. @名字 (虽然OneBot通常转ID，但防止手动输入)
-            if f"@{trigger}" in content:
-                return True
-            # 3. 回复引用
-            if f"[回复 {trigger}" in content:
-                return True
+
 
     return False

@@ -201,7 +201,6 @@ class Session:
                         bulk_msgs.append(GlobalMessageModel(
                             session=session_db,
                             user_name=self._sanitize(msg.user_name),
-                            # [新增] 保存 user_id，确保不为空
                             user_id=str(msg.user_id) if msg.user_id else "",
                             content=self._sanitize(msg.content),
                             time=msg.time,
@@ -303,7 +302,7 @@ class Session:
         to_add = (preset.knowledges + preset.relationships +
                   preset.events + preset.bot_self)
 
-        # [修改] 为预设内容打上 "preset" 标签
+        # 为预设内容打上 "preset" 标签
         metadatas = [{"source": "preset", "type": "rule"} for _ in to_add]
 
         await run_sync(self.long_term_memory.add_texts)(to_add, metadatas=metadatas)
@@ -349,15 +348,9 @@ class Session:
             should_retrieve = True
         else:
             if recent_msgs:
-                for msg in list(recent_msgs)[-3:]:
-                    # 使用 check_relevance 判断是否有人叫 Bot
-                    triggers = [self.__name] + self.__aliases
-                    for t in triggers:
-                        if t and (f"@{t}" in msg.content or f"[回复 {t}" in msg.content):
-                            should_retrieve = True
-                            break
-                    if should_retrieve:
-                        break
+                # 调用 check_relevance，保持逻辑统一
+                if check_relevance(self.__name, self.__aliases, list(recent_msgs)[-3:]):
+                    should_retrieve = True
 
         long_term_memory = []
 
@@ -585,10 +578,10 @@ class Session:
 
         #  强制修正逻辑
         if is_relevant:
-            # 如果被@了，但经过计算后依然是潜水状态，强制改为冒泡状态
-            if self.__chatting_state == _ChattingState.ILDE:
-                logger.info("检测到被@或回复，强制将状态从 [潜水] 修正为 [冒泡]")
-                self.__chatting_state = _ChattingState.BUBBLE
+            # 如果被@了，强制改为冒泡状态
+            if self.__chatting_state != _ChattingState.ACTIVE:
+                logger.info(f"检测到被@或回复，强制将状态从 [{self.__chatting_state.name}] 修正为 [对话]")
+                self.__chatting_state = _ChattingState.ACTIVE
                 self.__bubble_willing_sum = 0.0
 
         logger.debug(
