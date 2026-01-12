@@ -7,6 +7,7 @@ from enum import Enum
 import json
 import random
 import traceback
+import uuid
 
 import httpx
 from nonebot import logger
@@ -348,7 +349,6 @@ class Session:
             should_retrieve = True
         else:
             if recent_msgs:
-                # 调用 check_relevance，保持逻辑统一
                 if check_relevance(self.__name, self.__aliases, list(recent_msgs)[-3:]):
                     should_retrieve = True
 
@@ -381,7 +381,7 @@ class Session:
         logger.debug("检索阶段结束")
 
     async def __feedback_stage(self, messages_chunk: list[Message], llm: Callable[[str], Awaitable[str]],
-                               is_relevant: bool):
+                               is_relevant: bool, time_gap: float):
         logger.debug("反馈阶段开始")
 
         should_skip_llm = False
@@ -408,7 +408,25 @@ class Session:
                 self.profiles[uid].push_interaction(
                     Impression(timestamp=datetime.now().astimezone(), delta={})
                 )
-            self.__bubble_willing_sum += 0.03 * len(messages_chunk)
+
+            # === 动态积累逻辑 ===
+            # 计算时间密度因子：间隔越短，因子越大
+            # time_gap 是距离上一批消息的时间。如果群里刷屏，time_gap 会很小。
+            # 逻辑：
+            # Gap < 5s  (High Density) -> Factor ~2.0+
+            # Gap ~ 7s  (Medium)       -> Factor ~1.0
+            # Gap > 60s (Low Density)  -> Factor < 0.2
+
+            density_modifier = 10.0 / (time_gap + 3.0)
+            # 限制范围 [0.1, 2.5]
+            density_modifier = max(0.1, min(2.5, density_modifier))
+
+            increment = 0.03 * len(messages_chunk) * density_modifier
+            self.__bubble_willing_sum += increment
+
+            logger.debug(
+                f"潜水积累: 本次消息{len(messages_chunk)}条, 间隔{time_gap:.1f}s, 密度因子{density_modifier:.2f}, 增加意愿{increment:.2f}")
+
             random_value = random.uniform(0.8, 1.0)
             if self.__bubble_willing_sum > random_value:
                 logger.debug(f"潜水观察积累意愿({self.__bubble_willing_sum:.2f}) > {random_value:.2f}，自动转入冒泡状态")
@@ -578,7 +596,7 @@ class Session:
 
         #  强制修正逻辑
         if is_relevant:
-            # 如果被@了，强制改为冒泡状态
+            # 如果被@了，强制进入对话状态
             if self.__chatting_state != _ChattingState.ACTIVE:
                 logger.info(f"检测到被@或回复，强制将状态从 [{self.__chatting_state.name}] 修正为 [对话]")
                 self.__chatting_state = _ChattingState.ACTIVE
@@ -610,7 +628,8 @@ class Session:
         search_stage_result = self.__search_result.mem_history if self.__search_result else []
 
         # 对消息内容进行转义
-        formatted_msgs = [f"[ID:{getattr(msg, 'id', '')}] {msg.user_name}: '{self._escape_for_prompt(msg.content)}'" for msg in messages_chunk]
+        formatted_msgs = [f"[ID:{getattr(msg, 'id', '')}] {msg.user_name}: '{self._escape_for_prompt(msg.content)}'" for
+                          msg in messages_chunk]
 
         prompt = get_chat_prompt(
             self.__name, self.__role, self.__chatting_state.value,
@@ -665,8 +684,44 @@ class Session:
             traceback.print_exc()
             return []
 
-    async def update(self, messages_chunk: list[Message], llm: Callable[[str], Awaitable[str]]) -> list[dict] | None:
+    async def update(self, messages_chunk: list[Message], llm: Callable[[str], Awaitable[str]], publish: bool = True) -> \
+            list[dict] | None:
+
+        # === 1. 优先处理记忆存储 (无论 publish 是 True 还是 False 都要做) ===
+
+        text_to_add = []
+        metadatas = []
+
+        for msg in messages_chunk:
+            text_to_add.append(f"'{msg.user_name}':'{msg.content}'")
+            uid = str(msg.user_id) if msg.user_id else ""
+
+            # 简单判断一下来源类型
+            metadatas.append({"user_id": uid, "user_name": msg.user_name, "type": "message", "source": "memory"})
+
+        # 存入长期记忆
+        if text_to_add:
+            await run_sync(self.long_term_memory.add_texts)(text_to_add, metadatas=metadatas)
+
+        # 存入短期记忆 (Session 上下文)
+        def enable_update_hippo():
+            self.__update_hippo = True
+
+        await self.global_memory.update(messages_chunk, after_compress=enable_update_hippo)
+
+        # 保存到数据库
+        asyncio.create_task(self.save_session())
+
+        # === 2. 检查是否需要发布回复 ===
+
+        if not publish:
+            logger.debug(f"收到自身回显 ({len(messages_chunk)}条)，仅更新记忆，不触发回复。")
+            return None
+
+        # === 3. 只有 publish=True 才执行下面的 LLM 思考逻辑 ===
+
         now = datetime.now()
+        # 获取距离上一次活跃的时间差
         time_since_last_active = (now - self._last_activity_time).total_seconds()
 
         if time_since_last_active > 300:
@@ -682,8 +737,9 @@ class Session:
         is_relevant = check_relevance(self.__name, self.__aliases, messages_chunk)
 
         await self.__search_stage()
-        #  传递 is_relevant
-        await self.__feedback_stage(messages_chunk=messages_chunk, llm=llm, is_relevant=is_relevant)
+        # 传入 time_gap 供节流逻辑使用
+        await self.__feedback_stage(messages_chunk=messages_chunk, llm=llm, is_relevant=is_relevant,
+                                    time_gap=time_since_last_active)
 
         reply_messages = None
         match self.__chatting_state:
@@ -697,60 +753,19 @@ class Session:
                     self.__chatting_state = _ChattingState.ACTIVE
             case _ChattingState.ACTIVE:
                 logger.debug("nyabot对话中...")
-                chill_prob = 0.1 + (self._active_count * 0.05)
+                # 完全交由 feedback_stage 中的 LLM 意愿判定来决定是否转回 ILDE 状态
 
-                # 如果强相关，强制跳过 Chill Mode
+                # 如果强相关，稍微记录一下日志，但逻辑上都直接进 chat_stage
                 if is_relevant:
-                    logger.debug("检测到被@或回复，强制跳过 Chill Mode")
-                    chill_prob = 0.0
+                    logger.debug("检测到被@或回复，处于活跃状态，继续对话")
 
-                if random.random() < chill_prob:
-                    logger.debug(f"Chill Mode触发 (概率{chill_prob:.2f}): 暂时不回消息")
-                    reply_messages = None
-                else:
-                    reply_messages = await self.__chat_stage(messages_chunk=messages_chunk, llm=llm)
-
-        def enable_update_hippo():
-            self.__update_hippo = True
-
-        text_to_add = []
-        metadatas = []
-        msgs_to_mem = messages_chunk.copy()
-
-        # 处理用户消息的文本和元数据
-        for msg in messages_chunk:
-            text_to_add.append(f"'{msg.user_name}':'{msg.content}'")
-            # 确保 user_id 为字符串，并作为元数据存入
-            uid = str(msg.user_id) if msg.user_id else ""
-            # 标记为 memory
-            metadatas.append({"user_id": uid, "user_name": msg.user_name, "type": "user_message", "source": "memory"})
+                reply_messages = await self.__chat_stage(messages_chunk=messages_chunk, llm=llm)
 
         if reply_messages:
-            for msg in reply_messages:
-                text_to_add.append(f"'{self.__name}':'{msg['content']}'")
-                # Bot 的回复也存入元数据，使用 Bot 自身的 ID
-                # 标记为 memory
-                metadatas.append(
-                    {"user_id": str(self.id), "user_name": self.__name, "type": "bot_message", "source": "memory"})
-
-            # Bot 发言自带 ID
-            msgs_to_mem.extend(
-                [Message(user_name=self.__name, content=msg['content'], time=datetime.now(), user_id=self.id) for msg in
-                 reply_messages])
-
             actual_bubble_count = sum(estimate_split_count(msg.get('content', '')) for msg in reply_messages)
             self._active_count += actual_bubble_count
-            logger.debug(
-                f"Bot 发言 {len(reply_messages)} 条 (切分为 {actual_bubble_count} 个气泡)，疲劳值 +{actual_bubble_count}")
             self._last_speak_time = datetime.now()
+            # 再次保存状态
+            asyncio.create_task(self.save_session())
 
-        # 传入 metadatas 以便长期记忆保存 user_id
-        await run_sync(self.long_term_memory.add_texts)(text_to_add, metadatas=metadatas)
-
-        await self.global_memory.update(msgs_to_mem, after_compress=enable_update_hippo)
-
-        if self.__chatting_state == _ChattingState.ILDE:
-            self._active_count = 0
-
-        asyncio.create_task(self.save_session())
         return reply_messages

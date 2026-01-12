@@ -15,7 +15,8 @@ from .client import LLMClient
 from .config import plugin_config
 from .image_manager import IMAGE_CACHE_DIR, image_manager
 from .mem import Message as MMessage
-from .state_manager import GroupState
+# [修改] 导入 SELF_SENT_MSG_IDS
+from .state_manager import GroupState, SELF_SENT_MSG_IDS
 from .utils import get_http_client, smart_split_text
 
 _IMG_SEMAPHORE = asyncio.Semaphore(3)
@@ -46,10 +47,8 @@ async def message2BotMessage(bot_name: str, group_id: int, message: Message, bot
             async with _IMG_SEMAPHORE:
                 try:
                     url = seg.data.get("url", "")
-                    # 尝试获取 file_unique 作为缓存键
                     file_unique = seg.data.get("file_unique", "")
 
-                    # 如果有唯一 ID，先查内存缓存，跳过下载
                     if file_unique:
                         cached_desc = image_manager.get_from_cache(file_unique)
                         if cached_desc:
@@ -59,7 +58,6 @@ async def message2BotMessage(bot_name: str, group_id: int, message: Message, bot
                             else:
                                 return f"\n[图片] {cached_desc.description}\n"
 
-                    # 缓存未命中，执行下载逻辑
                     cache_path = IMAGE_CACHE_DIR.joinpath("raw")
                     cache_path.mkdir(parents=True, exist_ok=True)
 
@@ -73,10 +71,9 @@ async def message2BotMessage(bot_name: str, group_id: int, message: Message, bot
                     else:
                         client = get_http_client()
                         try:
-                            # 缩短重试和等待时间
                             for _ in range(2):
                                 try:
-                                    resp = await client.get(url, timeout=5.0)  # 缩短超时
+                                    resp = await client.get(url, timeout=5.0)
                                     resp.raise_for_status()
                                     image_bytes = resp.content
                                     break
@@ -95,7 +92,6 @@ async def message2BotMessage(bot_name: str, group_id: int, message: Message, bot
                     is_sticker = seg.data.get("sub_type") == 1
                     image_base64 = base64.b64encode(image_bytes).decode("utf-8")
 
-                    # 传入 file_unique 作为 cache_key
                     description = await image_manager.get_image_description(
                         image_base64=image_base64, is_sticker=is_sticker, cache_key=file_unique
                     )
@@ -143,40 +139,42 @@ async def spawn_state(state: GroupState):
     """后台思考循环"""
     while True:
         try:
-            # 1. 事件驱动模型
-            # 设置一个 timeout 作为心跳 (例如 20秒)，即使没有消息也可以做一些后台检查
             try:
                 await asyncio.wait_for(state.new_message_signal.wait(), timeout=20.0)
             except asyncio.TimeoutError:
-                # 超时意味着长时间没消息，继续循环或进行闲置处理
                 continue
 
-            # 清除信号，准备下一次等待
             state.new_message_signal.clear()
-
-            # 收到信号后，稍微等待一小会儿，以便收集可能连发的短消息
-            await asyncio.sleep(3.0)
+            await asyncio.sleep(2.0)
 
             current_chunk = []
 
-            # 1. 获取消息快照
             async with state.data_lock:
                 if state.bot is None or state.event is None: continue
                 if len(state.messages_chunk) == 0: continue
-                logger.debug(f"Snapshotting {len(state.messages_chunk)} messages")
                 current_chunk = state.messages_chunk.copy()
                 state.messages_chunk.clear()
 
-            # 扩大锁范围，确保 Session 在 update 期间不会被 reset 或修改
+            # 检查是否全是 LLM 自己的回显
+            # 在 matchers.py 中，我们已经规定：
+            # 1. 自己的回显: user_id = bot_self_id
+            # 2. 功能Bot: user_id = "10000" (虚拟ID)
+            # 3. 用户: user_id = 真实QQ
+            bot_self_id = str(state.bot.self_id)
+            is_echo_only = all(str(msg.user_id) == bot_self_id for msg in current_chunk)
+
+            # 如果只有回显 -> Publish=False (只存记忆，不自言自语)
+            # 如果有功能Bot消息或用户消息 -> Publish=True (允许回复)
+            should_publish = not is_echo_only
+
             async with state.session_lock:
-                # 2. 准备 Session 数据
                 await state.session.load_session()
 
-                # 3. 执行核心逻辑
                 try:
                     responses = await state.session.update(
                         messages_chunk=current_chunk,
-                        llm=lambda x: llm_response(state.client, x)
+                        llm=lambda x: llm_response(state.client, x),
+                        publish=should_publish  # [传入控制参数]
                     )
 
                     if responses:
@@ -205,7 +203,14 @@ async def spawn_state(state: GroupState):
                                     msg_to_send.insert(0, MessageSegment.reply(int(reply_id)))
 
                                 try:
-                                    await state.bot.send(message=msg_to_send, event=state.event)
+                                    result = await state.bot.send(message=msg_to_send, event=state.event)
+
+                                    # 记录自己发送的消息ID，用于 matchers.py 识别回显
+                                    if isinstance(result, dict) and "message_id" in result:
+                                        msg_id = str(result["message_id"])
+                                        SELF_SENT_MSG_IDS.append(msg_id)
+                                        logger.debug(f"记录自身发送消息 ID: {msg_id}")
+
                                 except ActionFailed as e:
                                     if e.retcode == 1200 or "120" in str(e):
                                         logger.warning(f"风控拦截 (1200), 冷却中...")
@@ -216,8 +221,6 @@ async def spawn_state(state: GroupState):
                                     logger.error(f"发送未知错误: {e}")
 
                                 if i < len(msg_parts) - 1 or r_idx < total - 1:
-                                    # 3. 动态延迟：根据文本长度决定等待时间，模拟打字
-                                    # 基础延迟 1s + 每字符 0.1s，上限 5s
                                     delay = 1.0 + len(part) * 0.1
                                     delay = min(delay, 5.0)
                                     await asyncio.sleep(delay)
@@ -231,4 +234,4 @@ async def spawn_state(state: GroupState):
             break
         except Exception as e:
             logger.error(f"Spawn loop fatal error: {e}")
-            await asyncio.sleep(5.0)  # 防止死循环刷屏
+            await asyncio.sleep(5.0)

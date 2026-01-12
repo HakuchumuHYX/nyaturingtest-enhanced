@@ -1,5 +1,6 @@
 # nyaturingtest/state_manager.py
 import asyncio
+from collections import deque
 from dataclasses import dataclass, field
 from nonebot import logger
 from nonebot.adapters.onebot.v11 import Bot, Event
@@ -12,6 +13,7 @@ from .mem import Message as MMessage
 from .session import Session
 from .utils import get_http_client, close_http_client
 
+SELF_SENT_MSG_IDS = deque(maxlen=50)
 
 @dataclass
 class GroupState:

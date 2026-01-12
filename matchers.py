@@ -13,9 +13,10 @@ from nonebot.permission import SUPERUSER
 from nonebot.matcher import Matcher
 
 from .config import plugin_config
-from .state_manager import ensure_group_state
+from .state_manager import ensure_group_state, SELF_SENT_MSG_IDS
 from .logic import message2BotMessage
 from .mem import Message as MMessage
+
 
 # ==================== 辅助规则 ====================
 
@@ -26,6 +27,7 @@ async def is_group_message(event: Event) -> bool:
 
 async def is_private_message(event: Event) -> bool:
     return isinstance(event, PrivateMessageEvent)
+
 
 # ==================== 命令定义 ====================
 
@@ -90,6 +92,7 @@ set_presets_pm = on_command(
 list_groups_pm = on_command(
     rule=is_private_message, permission=SUPERUSER, cmd="list_groups", aliases={"群组列表"}, priority=0, block=True
 )
+
 
 # ==================== 处理逻辑 ====================
 
@@ -317,8 +320,6 @@ async def handle_auto_chat(bot: Bot, event: GroupMessageEvent):
     if not state:
         return
 
-    user_id = event.get_user_id()
-
     # 获取 Bot 名字前，先确保加载
     async with state.session_lock:
         await state.session.load_session()
@@ -331,23 +332,53 @@ async def handle_auto_chat(bot: Bot, event: GroupMessageEvent):
     if not message_content:
         return
 
-    try:
-        user_info = await bot.get_group_member_info(group_id=group_id, user_id=int(user_id))
-        nickname = user_info.get("card") or user_info.get("nickname") or str(user_id)
-    except Exception:
-        nickname = str(user_id)
+    user_id = str(event.user_id)
+    msg_id = str(event.message_id)
+    self_id = str(bot.self_id)
+    nickname = ""
+
+    # === 自身消息身份判定 ===
+    if user_id == self_id:
+        # 情况 1: 这是我自己刚才发出去的消息 (ID 在缓存中)
+        if msg_id in SELF_SENT_MSG_IDS:
+            logger.debug(f"检测到自身回显 (Echo): {msg_id} - 将只存不回")
+            # 保持 user_id 为 self_id，这样 logic.py 就能识别出它是 Echo
+            pass
+
+            # 情况 2: 这是另一个进程发的消息
+        else:
+            logger.info(f"捕获到功能Bot消息: {event.get_plain_text()} - 伪装为外部用户")
+            # 将 user_id 改为虚拟 ID，这样 logic.py 就会认为这是“外部消息”，允许回复
+            user_id = "10000"
+            nickname = "系统助手"
+            try:
+                # 尝试获取群名片（辅助）
+                user_info = await bot.get_group_member_info(group_id=group_id, user_id=int(self_id))
+                card = user_info.get("card") or user_info.get("nickname")
+                if card:
+                    nickname = f"Bot({card})"
+            except:
+                pass
+
+    # === 普通用户消息处理 ===
+    if not nickname:
+        try:
+            user_info = await bot.get_group_member_info(group_id=group_id, user_id=int(user_id))
+            nickname = user_info.get("card") or user_info.get("nickname") or str(user_id)
+        except Exception:
+            nickname = str(user_id)
 
     async with state.data_lock:
         state.event = event
         state.bot = bot
-        # 构建消息时，传入 user_id
         state.messages_chunk.append(
             MMessage(
                 time=datetime.now(),
                 user_name=nickname,
                 content=message_content,
-                id=str(event.message_id),
-                user_id=str(user_id)  # 传递 QQ 号
+                id=msg_id,
+                user_id=user_id  # 这里可能是真实ID，self_id(回显)，或 10000(功能Bot)
             )
         )
+        # 无论是什么消息，都触发信号，让 logic.py 去决定是否回复
         state.new_message_signal.set()
