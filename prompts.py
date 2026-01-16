@@ -39,13 +39,14 @@ def get_feedback_prompt(
 
 # Task
 阅读【新收到的消息】，结合上下文，输出一个 JSON 对象更新状态。
+你可以先使用 <think> 标签分析当前的局势、用户意图和你的情感变化，然后输出 JSON。
 
 # Output Requirements (JSON Only)
-请直接输出 JSON，不要包含 markdown 标记或思考过程。JSON 需包含以下字段：
-1. "analyze_result" (Array): 提取新消息中值得永久记住的事实/观点。每项格式: {{ "content": "陈述句", "related_user_id": "用户ID" }}。
-2. "willing" (Float): 更新后的发言意愿 (0.0~1.0)。有人叫你或话题感兴趣则调高，否则调低。
-3. "new_emotion" (Object): 更新后的情绪 {{ "valence": float, "arousal": float, "dominance": float }}。
-4. "emotion_tends" (Array): 对应每条新消息的情绪影响值 (Float, -1.0~1.0)。
+JSON 需包含以下字段：
+1. "analyze_result" (Array): 提取新消息中值得永久记住的事实/观点。
+2. "willing" (Float): 更新后的发言意愿 (0.0~1.0)。
+3. "new_emotion" (Object): 更新后的情绪。
+4. "emotion_tends" (Array): 对应每条新消息的情绪影响值。
 5. "summary" (String): 当前话题的一句话简短摘要。
 """
 
@@ -79,28 +80,28 @@ def get_chat_prompt(
 
 # [IMPORTANT] Emotion & Tone
 - 基础情绪状态: V:{emotion['valence']:.2f}, A:{emotion['arousal']:.2f}
-- **注意**: 上述"基础情绪"是你在收到【新消息】之前的状态。
-- **指令**: 如果【新消息】具有强烈的情感冲击（如挑衅、表白、突发事件），**请立即根据新消息的内容调整你的回复语气**，不必完全受限于旧的基础情绪数值。请展现出真实、即时的情感反应。
+- **指令**: 如果【新消息】具有强烈的情感冲击，**请立即根据消息内容调整你的语气**，不必死板遵守旧的基础情绪数值。
 
 # Task
 根据人设和记忆回复消息。
 
 # Rules
 1. **极致口语化**：像在手机上打字，用短句，不加句号，可用网络缩写。
-2. **拒绝AI味**：严禁“哦，亲爱的”、“听起来不错”等翻译腔。
-3. **思维链**：建议先用 <think>...</think> 标签进行思考（分析对方潜台词、构思回复策略），但这部分不会被发送出去。
-4. **格式**：思考结束后，直接输出 JSON。
+2. **拒绝AI味**：严禁“哦，亲爱的”等翻译腔。
+3. **优先引用**：如果是针对【新消息】中某人的特定发言进行回复，**必须**将该消息的ID填入JSON的 `target_id` 字段，以触发引用回复。
+4. **称呼礼仪**：在回复内容中提到对方时，尽量不要输出完整群名片，最好根据他的群名片起个简短的昵称。如果在记忆里有“你用xx称呼来称呼xx人”的要求，则优先执行该要求。
+5. **思维链**：建议先用 <think>...</think> 标签进行思考。
+6. **格式**：思考结束后，直接输出 JSON。
 
 # Output Requirements (JSON Only)
 JSON 格式如下：
 {{
   "reply": [
     {{
-        "content": "回复内容",
-        "target_id": "目标消息ID(用于引用回复，可为null)"
+        "content": "回复内容（注意称呼礼仪）",
+        "target_id": "目标消息ID（用于引用，非必要不留空）"
     }}
   ],
-  "thought": "简短的内心独白（可选，仅作记录）"
+  "thought": "简短的内心独白"
 }}
 """
-

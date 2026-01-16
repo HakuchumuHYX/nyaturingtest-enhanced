@@ -30,12 +30,9 @@ async def llm_response(client: LLMClient, message: str, json_mode: bool = False)
         if json_mode:
             kwargs["response_format"] = {"type": "json_object"}
 
-        # kwargs["extra_body"] = {"include_reasoning": False}
-
         result = await client.generate_response(
             prompt=message,
             model=plugin_config.nyaturingtest_chat_openai_model,
-            # Qwen 系列建议 Temperature: 0.7 ~ 0.8
             temperature=0.7,
             **kwargs
         )
@@ -198,7 +195,8 @@ async def spawn_state(state: GroupState):
                             raw_content = response
                         elif isinstance(response, dict):
                             raw_content = response.get("content", "")
-                            reply_id = response.get("reply_to")
+                            # 优先读取 'target_id' ，兼容 'reply_to'
+                            reply_id = response.get("target_id") or response.get("reply_to")
 
                         if not raw_content: continue
 
@@ -215,7 +213,11 @@ async def spawn_state(state: GroupState):
                             msg_to_send = Message(part)
                             # 如果是回复某条特定消息，且是第一段，则带上 reply 引用
                             if reply_id and r_idx == 0 and i == 0:
-                                msg_to_send.insert(0, MessageSegment.reply(int(reply_id)))
+                                try:
+                                    msg_to_send.insert(0, MessageSegment.reply(int(reply_id)))
+                                    logger.debug(f"添加引用回复: {reply_id}")
+                                except ValueError:
+                                    logger.warning(f"引用ID无效: {reply_id}")
 
                             try:
                                 result = await state.bot.send(message=msg_to_send, event=state.event)
