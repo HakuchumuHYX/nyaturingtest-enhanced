@@ -2,7 +2,7 @@
 import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import Enum
 import json
 import random
@@ -31,16 +31,13 @@ from .prompts import get_feedback_prompt, get_chat_prompt
 
 @dataclass
 class _SearchResult:
-    """
-    检索阶段的结果
-    """
     mem_history: list[str]
 
 
 class _ChattingState(Enum):
-    ILDE = 0
-    BUBBLE = 1
-    ACTIVE = 2
+    ILDE = 0  # 潜水
+    BUBBLE = 1  # 冒泡
+    ACTIVE = 2  # 活跃
 
     def __str__(self):
         match self:
@@ -54,7 +51,7 @@ class _ChattingState(Enum):
 
 class Session:
     """
-    群聊会话
+    群聊会话 - 拟人化串行版 (真实感优先)
     """
 
     def __init__(
@@ -68,7 +65,6 @@ class Session:
         if http_client:
             self._client_instance = http_client
         else:
-            logger.debug(f"[Session {id}] 未传入全局 HTTP 客户端，创建局部客户端")
             self._client_instance = httpx.AsyncClient(
                 limits=httpx.Limits(max_keepalive_connections=5, max_connections=10),
                 timeout=60.0
@@ -90,41 +86,34 @@ class Session:
         )
 
         self.__name = name
-        self.__aliases: list[str] = []  # 别名列表
+        self.__aliases: list[str] = []
         self.profiles: dict[str, PersonProfile] = {}
         self.global_emotion: EmotionState = EmotionState()
-        self.last_response: list[Message] = []
         self.chat_summary = ""
         self.__role = "一个男性人类"
+
+        # 意愿值系统
+        self.willingness: float = 0.0
         self.__chatting_state = _ChattingState.ILDE
-        self.__bubble_willing_sum = 0.0
-        self.__update_hippo = False
+
         self.__search_result = None
         self._last_activity_time = datetime.now()
         self._last_speak_time = datetime.min
         self._active_count = 0
         self._loaded = False
 
+        # 保持对后台任务的引用，防止被 GC
+        self._background_tasks = set()
+
     def _sanitize(self, text: str) -> str:
-        """
-        清洗字符串，移除 surrogate 等非法 Unicode 字符，防止 SQLite 报错
-        """
-        if not text:
-            return ""
+        if not text: return ""
         try:
-            # 忽略无法编码为 utf-8 的字符（如代理对）
             return text.encode('utf-8', 'ignore').decode('utf-8')
-        except Exception:
-            # 如果发生其他错误，返回空字符串或原始字符串的 repr，防止崩溃
+        except:
             return ""
 
     def _escape_for_prompt(self, text: str) -> str:
-        """
-        转义 Prompt 中的特殊字符，防止注入
-        """
-        if not text:
-            return ""
-        # 替换双引号为单引号，或者转义，防止截断 JSON 或 Prompt
+        if not text: return ""
         return text.replace('"', '\\"').replace('\n', ' ')
 
     async def set_role(self, name: str, role: str):
@@ -140,16 +129,15 @@ class Session:
 
     async def reset(self):
         self.__name = "terminus"
-        self.__aliases = []  # 重置时清空别名
+        self.__aliases = []
         self.__role = "一个男性人类"
         await self.global_memory.clear()
         self.long_term_memory.clear()
         self.profiles = {}
         self.global_emotion = EmotionState()
-        self.last_response = []
         self.chat_summary = ""
         self.__chatting_state = _ChattingState.ILDE
-        self.__bubble_willing_sum = 0.0
+        self.willingness = 0.0
         self._active_count = 0
         self._last_activity_time = datetime.now()
         self._last_speak_time = datetime.min
@@ -159,19 +147,19 @@ class Session:
         self.global_emotion = EmotionState()
         self.profiles = {}
         self.__chatting_state = _ChattingState.ILDE
+        self.willingness = 0.0
         self._active_count = 0
         self._last_activity_time = datetime.now()
-        self._last_speak_time = datetime.now()
         await self.save_session()
 
     async def save_session(self, force_index: bool = False):
         try:
-            # 对所有字符串字段使用 self._sanitize 进行清洗
             session_db, created = await SessionModel.update_or_create(
                 id=self.id,
                 defaults={
                     "name": self._sanitize(self.__name),
                     "role": self._sanitize(self.__role),
+                    "aliases": self.__aliases,  # 保存别名
                     "valence": self.global_emotion.valence,
                     "arousal": self.global_emotion.arousal,
                     "dominance": self.global_emotion.dominance,
@@ -181,6 +169,7 @@ class Session:
                 }
             )
 
+            # 保存用户画像
             for user_id, profile in self.profiles.items():
                 await UserProfileModel.update_or_create(
                     session=session_db,
@@ -191,10 +180,9 @@ class Session:
                         "dominance": profile.emotion.dominance,
                     }
                 )
-
+            # 保存短时消息历史
             recent_msgs = self.global_memory.access().messages
             if recent_msgs:
-                # 使用事务防止删除后写入失败导致数据丢失
                 async with in_transaction():
                     await GlobalMessageModel.filter(session=session_db).delete()
                     bulk_msgs = []
@@ -209,28 +197,27 @@ class Session:
                         ))
                     await GlobalMessageModel.bulk_create(bulk_msgs)
 
+            # [新增] 记忆生命周期管理：1% 概率触发清理，或强制保存时触发
+            if force_index or random.random() < 0.01:
+                # 清理超过 90 天的旧记忆
+                await run_sync(self.long_term_memory.cleanup)(days_retention=90)
+
             logger.debug(f"[Session {self.id}] 数据库保存成功")
         except Exception as e:
-            error_msg = str(e)
-            if "no active connection" in error_msg or "closed database" in error_msg:
-                logger.warning(f"[Session {self.id}] 放弃保存：数据库连接已关闭")
-            else:
-                logger.error(f"[Session {self.id}] 数据库保存失败: {e}")
-                import traceback
-                traceback.print_exc()
+            logger.warning(f"[Session {self.id}] 数据库保存警告: {e}")
 
     async def load_session(self):
-        if self._loaded:
-            return
+        if self._loaded: return
 
         session_db = await SessionModel.filter(id=self.id).first()
         if not session_db:
-            logger.info(f"[Session {self.id}] 数据库中无记录，初始化新会话")
+            logger.info(f"[Session {self.id}] 初始化新会话")
             self._loaded = True
             return
 
         self.__name = session_db.name
         self.__role = session_db.role
+        self.__aliases = session_db.aliases if session_db.aliases else []  # 加载别名
         self.chat_summary = session_db.chat_summary
         self.global_emotion.valence = session_db.valence
         self.global_emotion.arousal = session_db.arousal
@@ -239,25 +226,23 @@ class Session:
             self._last_speak_time = session_db.last_speak_time
         self.__chatting_state = _ChattingState(session_db.chatting_state)
 
+        # [优化] 重启后给一点点初始意愿，防止Bot彻底装死
+        self.willingness = 0.1
+
         self.profiles = {}
         users_db = await UserProfileModel.filter(session=session_db).prefetch_related("interactions")
-
         for user_db in users_db:
             profile = PersonProfile(user_id=user_db.user_id)
             profile.emotion.valence = user_db.valence
             profile.emotion.arousal = user_db.arousal
             profile.emotion.dominance = user_db.dominance
             profile.last_update_time = user_db.last_update_time
-
+            # 加载最近交互
             recent_logs = await user_db.interactions.all().order_by("-timestamp").limit(20)
             for log in reversed(recent_logs):
                 imp = Impression(
                     timestamp=log.timestamp,
-                    delta={
-                        "valence": log.delta_valence,
-                        "arousal": log.delta_arousal,
-                        "dominance": log.delta_dominance
-                    }
+                    delta={"valence": log.delta_valence, "arousal": log.delta_arousal, "dominance": log.delta_dominance}
                 )
                 profile.interactions.append(imp)
             self.profiles[user_db.user_id] = profile
@@ -280,7 +265,7 @@ class Session:
         )
 
         self._loaded = True
-        logger.info(f"[Session {self.id}] 数据库加载完成")
+        logger.info(f"[Session {self.id}] 加载完成 (别名: {self.__aliases})")
 
     def presets(self) -> list[str]:
         return [f"{filename}: {preset.name} {preset.role}" for filename, preset in PRESETS.items() if not preset.hidden]
@@ -288,484 +273,338 @@ class Session:
     async def load_preset(self, filename: str) -> bool:
         if not filename.endswith(".json") and f"{filename}.json" in PRESETS.keys():
             filename = f"{filename}.json"
-
-        if filename not in PRESETS.keys():
-            logger.error(f"不存在的预设：{filename}")
-            return False
+        if filename not in PRESETS.keys(): return False
 
         preset = PRESETS[filename]
         await self.set_role(preset.name, preset.role)
-
-        # 加载别名
         self.__aliases = preset.aliases
-        logger.info(f"预设别名加载: {self.__aliases}")
 
-        to_add = (preset.knowledges + preset.relationships +
-                  preset.events + preset.bot_self)
+        # [修复] 在添加新预设前，删除旧的预设记忆，防止重复
+        await run_sync(self.long_term_memory.delete_by_metadata)({"source": "preset"})
 
-        # 为预设内容打上 "preset" 标签
-        metadatas = [{"source": "preset", "type": "rule"} for _ in to_add]
+        to_add = (preset.knowledges + preset.relationships + preset.events + preset.bot_self)
+        if to_add:
+            metadatas = [{"source": "preset", "type": "rule"} for _ in to_add]
+            await run_sync(self.long_term_memory.add_texts)(to_add, metadatas=metadatas)
 
-        await run_sync(self.long_term_memory.add_texts)(to_add, metadatas=metadatas)
-
-        logger.info(f"加载预设：{filename} 成功")
+        await self.save_session()
         return True
 
     def status(self) -> str:
         recent_messages = self.global_memory.access().messages
-        recent_messages_str = (
-            "\n".join([f"{msg.user_name}: {msg.content}" for msg in recent_messages]) if recent_messages else "没有消息"
-        )
+        recent_str = "\n".join([f"{m.user_name}: {m.content}" for m in recent_messages]) if recent_messages else "无"
         return f"""
 名字：{self.__name}
-别名: {self.__aliases}
 设定：{self.__role}
-
-情感状态：V:{self.global_emotion.valence:.2f} A:{self.global_emotion.arousal:.2f} D:{self.global_emotion.dominance:.2f}
-
-最近消息：
-{recent_messages_str}
-
-过去总结：
-{self.global_memory.access().compressed_history}
-
-现状认识：{self.chat_summary}
-
+意愿值：{self.willingness:.2f}
 状态: {self.__chatting_state}
-疲劳度(气泡计数): {self._active_count}
+情绪：V{self.global_emotion.valence:.2f} A{self.global_emotion.arousal:.2f} D{self.global_emotion.dominance:.2f}
+摘要：{self.chat_summary}
+最近消息：
+{recent_str}
 """
 
-    async def __search_stage(self):
+    async def __search_stage(self, queries: list[str]):
+        """
+        优化检索阶段
+        """
         logger.debug("检索阶段开始")
-        recent_msgs = self.global_memory.access().messages
-        retrieve_messages = (
-                [f"'{msg.user_name}':'{msg.content}'" for msg in recent_msgs]
-                + [self.global_memory.access().compressed_history]
-                + [self.chat_summary]
-        )
 
-        should_retrieve = False
-        if self.__chatting_state != _ChattingState.ILDE:
-            should_retrieve = True
-        else:
-            if recent_msgs:
-                if check_relevance(self.__name, self.__aliases, list(recent_msgs)[-3:]):
-                    should_retrieve = True
+        # 增加当前话题摘要作为检索上下文
+        if self.chat_summary:
+            queries.append(self.chat_summary)
+
+        # 去重并过滤
+        queries = list(set([q for q in queries if q and q.strip()]))
+
+        should_retrieve = self.willingness > 0.3  # 只有意愿尚可时才检索
 
         long_term_memory = []
+        if should_retrieve and queries:
+            logger.debug(f"触发长期记忆检索: {queries}")
 
-        if should_retrieve:
-            logger.debug(f"触发长期记忆检索 (状态: {self.__chatting_state})")
+            raw_results = await run_sync(self.long_term_memory.retrieve)(
+                queries,
+                k=20,
+                where=None
+            )
 
-            # retrieve 现在返回包含 metadata 的字典列表
-            raw_results = await run_sync(self.long_term_memory.retrieve)(retrieve_messages, k=2)
-
-            # 解析元数据并格式化输出给 LLM
             if raw_results:
                 formatted_results = []
                 for item in raw_results:
                     content = item.get("content", "")
                     meta = item.get("metadata", {})
                     source = meta.get("source", "unknown")
-
-                    # 关键修改：将标签显式展示给 LLM
-                    prefix = "【设定】" if source == "preset" else "【记忆】"
+                    # 日期格式化优化
+                    date_str = str(meta.get("date", ""))
+                    prefix = "【设定】" if source == "preset" else f"【记忆/d:{date_str}】"
                     formatted_results.append(f"{prefix} {content}")
 
+                # 按时间倒序排列（虽然 RAG 是按相关性，但这里可以二次排序，或者直接交给 LLM）
                 long_term_memory = formatted_results
-                logger.debug(f"搜索到的相关记忆：{long_term_memory}")
-        else:
-            logger.debug("潜水状态且无强关联，跳过长期记忆检索")
+                logger.debug(f"搜索结果：命中 {len(long_term_memory)} 条")
 
         self.__search_result = _SearchResult(mem_history=long_term_memory)
-        logger.debug("检索阶段结束")
 
-    async def __feedback_stage(self, messages_chunk: list[Message], llm: Callable[[str], Awaitable[str]],
-                               is_relevant: bool, time_gap: float):
-        logger.debug("反馈阶段开始")
+    async def __feedback_stage(self, messages_chunk: list[Message], llm_func: Callable):
+        """
+        反馈阶段：分析情绪、提取记忆、更新摘要
+        """
+        logger.debug(">> 反馈阶段 (Feedback) 开始")
 
-        should_skip_llm = False
-        if self.__chatting_state == _ChattingState.ILDE:
-            if is_relevant:
-                should_skip_llm = False
-                logger.debug("检测到强关联（被@或回复或触发关键词），跳过潜水节流检查")
-            else:
-                curiosity_rate = 0.08
-                if random.random() < curiosity_rate:
-                    logger.debug("触发随机好奇心：虽然没叫我，但我决定通过 LLM 看看大家在聊什么")
-                    should_skip_llm = False
-                else:
-                    should_skip_llm = True
-
-        if should_skip_llm:
-            logger.debug(f"触发节流：潜水状态且消息无强关联 ({len(messages_chunk)}条)，跳过 LLM 分析")
-            for message in messages_chunk:
-                # 使用 user_id
-                uid = getattr(message, "user_id", message.user_name)
-
-                if uid not in self.profiles:
-                    self.profiles[uid] = PersonProfile(user_id=uid)
-                self.profiles[uid].push_interaction(
-                    Impression(timestamp=datetime.now().astimezone(), delta={})
-                )
-
-            # === 动态积累逻辑 ===
-            # 计算时间密度因子：间隔越短，因子越大
-            # time_gap 是距离上一批消息的时间。如果群里刷屏，time_gap 会很小。
-            # 逻辑：
-            # Gap < 5s  (High Density) -> Factor ~2.0+
-            # Gap ~ 7s  (Medium)       -> Factor ~1.0
-            # Gap > 60s (Low Density)  -> Factor < 0.2
-
-            density_modifier = 10.0 / (time_gap + 3.0)
-            # 限制范围 [0.1, 2.5]
-            density_modifier = max(0.1, min(2.5, density_modifier))
-
-            increment = 0.03 * len(messages_chunk) * density_modifier
-            self.__bubble_willing_sum += increment
-
-            logger.debug(
-                f"潜水积累: 本次消息{len(messages_chunk)}条, 间隔{time_gap:.1f}s, 密度因子{density_modifier:.2f}, 增加意愿{increment:.2f}")
-
-            random_value = random.uniform(0.8, 1.0)
-            if self.__bubble_willing_sum > random_value:
-                logger.debug(f"潜水观察积累意愿({self.__bubble_willing_sum:.2f}) > {random_value:.2f}，自动转入冒泡状态")
-                self.__chatting_state = _ChattingState.BUBBLE
-                self.__bubble_willing_sum = 0.0
-            return
-
-        # 使用 ID 获取相关画像
-        reaction_users = self.global_memory.related_users()
-        related_profiles = [profile for profile in self.profiles.values() if profile.user_id in reaction_users]
+        # 1. 准备画像数据
+        reaction_users = list({msg.user_id if msg.user_id else msg.user_name for msg in messages_chunk})
+        related_profiles = [self.profiles.get(uid, PersonProfile(user_id=uid)) for uid in reaction_users]
+        for p in related_profiles:
+            if p.user_id not in self.profiles: self.profiles[p.user_id] = p
 
         related_profiles_json = json.dumps(
             [{"user_name": p.user_id, "emotion_tends_to_user": asdict(p.emotion)} for p in related_profiles],
             ensure_ascii=False, indent=2
         )
-        search_stage_result = self.__search_result.mem_history if self.__search_result else []
+        search_history = self.__search_result.mem_history if self.__search_result else []
 
-        # 对消息内容进行转义，防止Prompt注入
-        formatted_msgs = [f"{msg.user_name}: '{self._escape_for_prompt(msg.content)}'" for msg in messages_chunk]
+        # [修改] 格式化消息时包含 UserID，供 LLM 识别
+        formatted_msgs = [f"[ID:{msg.user_id}] {msg.user_name}: '{self._escape_for_prompt(msg.content)}'" for msg in
+                          messages_chunk]
 
+        # 2. 调用 LLM
         prompt = get_feedback_prompt(
-            self.__name, self.__role, self.__chatting_state.value,
+            self.__name, self.__role, self.willingness,
+            self.__chatting_state.value,
             self.global_memory.access().compressed_history,
             self.global_memory.access().messages,
             formatted_msgs,
-            {"valence": self.global_emotion.valence, "arousal": self.global_emotion.arousal,
-             "dominance": self.global_emotion.dominance},
-            related_profiles_json, search_stage_result, self.chat_summary
+            asdict(self.global_emotion),
+            related_profiles_json, search_history, self.chat_summary
         )
 
-        MAX_RETRIES = 2
         response_dict = {}
+        try:
+            # [Debug] 记录 LLM 原始输出
+            response = await llm_func(prompt, json_mode=True)
+            logger.debug(f"[Feedback LLM Output]:\n{response}")
 
-        for attempt in range(MAX_RETRIES + 1):
-            try:
-                if attempt > 0:
-                    logger.warning(
-                        f"反馈阶段 JSON 解析失败 (原因: 格式错误或幻觉)，正在进行第 {attempt}/{MAX_RETRIES} 次重试...")
+            parsed = extract_and_parse_json(response)
+            if parsed: response_dict = parsed
+        except Exception as e:
+            logger.error(f"反馈阶段 LLM 错误: {e}")
 
-                response = await llm(prompt)
-                logger.debug(f"反馈阶段llm返回 (尝试 {attempt}): {response}")
+        # 3. 更新情绪
+        new_emo = response_dict.get("new_emotion", {})
+        self.global_emotion.valence = new_emo.get("valence", self.global_emotion.valence)
+        self.global_emotion.arousal = new_emo.get("arousal", self.global_emotion.arousal)
+        self.global_emotion.dominance = new_emo.get("dominance", self.global_emotion.dominance)
 
-                parsed = extract_and_parse_json(response)
-                if parsed:
-                    response_dict = parsed
-                    if "emotion_tends" in response_dict or "willing" in response_dict:
-                        break
-            except Exception as e:
-                logger.error(f"反馈阶段 LLM 请求或解析发生异常: {e}")
+        # 4. 更新用户印象 (Emotion Tends)
+        emo_tends = response_dict.get("emotion_tends", [])
+        if isinstance(emo_tends, list):
+            for i, msg in enumerate(messages_chunk):
+                if i >= len(emo_tends): break
+                uid = msg.user_id if msg.user_id else msg.user_name
+                raw_delta = emo_tends[i]
 
-            if attempt == MAX_RETRIES:
-                logger.error(f"反馈阶段重试 {MAX_RETRIES} 次后仍失败，执行降级处理。")
-                response_dict = {}
+                delta = {}
+                if isinstance(raw_delta, (int, float)):
+                    delta = {
+                        "valence": float(raw_delta),
+                        "arousal": abs(float(raw_delta)) * 0.5,
+                        "dominance": 0.0
+                    }
+                elif isinstance(raw_delta, dict):
+                    delta = raw_delta
 
-        new_emotion = response_dict.get("new_emotion", {})
-        self.global_emotion.valence = new_emotion.get("valence", self.global_emotion.valence)
-        self.global_emotion.arousal = new_emotion.get("arousal", self.global_emotion.arousal)
-        self.global_emotion.dominance = new_emotion.get("dominance", self.global_emotion.dominance)
-        logger.debug(f"反馈阶段更新情感：{self.global_emotion}")
+                if uid in self.profiles and delta:
+                    self.profiles[uid].push_interaction(
+                        Impression(timestamp=datetime.now().astimezone(), delta=delta)
+                    )
 
-        emotion_tends = response_dict.get("emotion_tends", [])
-        if not isinstance(emotion_tends, list):
-            emotion_tends = []
+        for p in self.profiles.values():
+            p.update_emotion_tends()
+            p.merge_old_interactions()
 
-        target_len = len(messages_chunk)
-        current_len = len(emotion_tends)
-        if current_len != target_len:
-            if current_len < target_len:
-                defaults = [{"valence": 0.0, "arousal": 0.0, "dominance": 0.0} for _ in
-                            range(target_len - current_len)]
-                emotion_tends.extend(defaults)
-            else:
-                emotion_tends = emotion_tends[:target_len]
-
-        for index, message in enumerate(messages_chunk):
-            # 使用 user_id
-            uid = getattr(message, "user_id", message.user_name)
-
-            if uid not in self.profiles:
-                self.profiles[uid] = PersonProfile(user_id=uid)
-            delta = emotion_tends[index] if index < len(emotion_tends) else {}
-            self.profiles[uid].push_interaction(
-                Impression(timestamp=datetime.now().astimezone(), delta=delta)
-            )
-
-        for profile in self.profiles.values():
-            profile.update_emotion_tends()
-            profile.merge_old_interactions()
-
+        # 5. 更新摘要
         self.chat_summary = str(response_dict.get("summary", self.chat_summary))
-        logger.debug(f"反馈阶段更新聊天总结：{self.chat_summary}")
 
+        # 6. [优化] 记忆提取转为异步后台任务 (Fire-and-forget)
         analyze_result = response_dict.get("analyze_result", [])
         if isinstance(analyze_result, list) and analyze_result:
-            sanitized_result = []
+            # --- [新增逻辑] 计算兜底 User ID ---
+            unique_user_ids = {
+                str(msg.user_id) for msg in messages_chunk
+                if msg.user_id and str(msg.user_id).strip()
+            }
+            # 如果当前对话片段只属于一个用户，那么所有提取出的记忆默认都归他
+            fallback_uid = list(unique_user_ids)[0] if len(unique_user_ids) == 1 else ""
+
+            task = asyncio.create_task(
+                self.__save_long_term_memory(analyze_result, default_user_id=fallback_uid)
+            )
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
+
+        # 7. 更新意愿值 (由 LLM 最终决定)
+        try:
+            new_willing = float(response_dict.get("willing", self.willingness))
+            self.willingness = max(0.0, min(1.0, new_willing))
+        except:
+            pass
+
+        # 8. 简单的状态流转逻辑
+        random_threshold = random.uniform(0.4, 0.7)
+        if self.willingness > random_threshold:
+            if self.__chatting_state == _ChattingState.ILDE:
+                self.__chatting_state = _ChattingState.BUBBLE
+        elif self.willingness < 0.2:
+            self.__chatting_state = _ChattingState.ILDE
+
+        logger.debug(f"<< 反馈结束: 意愿 {self.willingness:.2f}, 状态 {self.__chatting_state}")
+
+    async def __save_long_term_memory(self, analyze_result: list, default_user_id: str = ""):
+        """
+        后台任务：保存长期记忆到向量数据库
+        """
+        try:
+            texts = []
+            metadatas = []
+            today = int(datetime.now().strftime("%Y%m%d"))
+
             for item in analyze_result:
-                if isinstance(item, str):
-                    sanitized_result.append(item)
+                content = ""
+                uid = ""
+
+                # 情况A: LLM 返回了纯字符串 (偷懒格式)
+                if isinstance(item, str) and item.strip():
+                    content = item
+                    uid = default_user_id
+                # 情况B: LLM 返回了字典 (标准格式)
                 elif isinstance(item, dict):
-                    sanitized_result.append(json.dumps(item, ensure_ascii=False))
-                else:
-                    sanitized_result.append(str(item))
-            if sanitized_result:
-                # 聊天中分析出的新记忆，打上 memory 标签
-                mem_meta = [{"source": "memory", "type": "analysis"} for _ in sanitized_result]
-                await run_sync(self.long_term_memory.add_texts)(sanitized_result, metadatas=mem_meta)
-                logger.debug(f"反馈阶段更新长期记忆：{sanitized_result}")
+                    content = item.get("content", "")
+                    uid = str(item.get("related_user_id", ""))
+                    # 如果 LLM 漏填了 ID，尝试使用兜底 ID
+                    if not uid and default_user_id:
+                        uid = default_user_id
 
-        willing = response_dict.get("willing", {})
-        if not isinstance(willing, dict):
-            willing = {}
+                if content:
+                    texts.append(content)
+                    metadatas.append({
+                        "source": "memory",
+                        "type": "event",
+                        "date": today,
+                        "user_id": uid
+                    })
 
-        idle_chance = float(willing.get("0", 0.0))
-        if idle_chance > 1.0: idle_chance = 1.0
-        logger.debug(f"nyabot潜水意愿(修正后)：{idle_chance}")
+            if texts:
+                # 这是一个阻塞IO操作，放入 run_sync
+                await run_sync(self.long_term_memory.add_texts)(texts, metadatas=metadatas)
+                logger.debug(f"[Async] 提取并保存长期记忆 ({len(texts)}条) [兜底ID: {default_user_id}]")
+        except Exception as e:
+            logger.error(f"[Async] 保存记忆失败: {e}")
 
-        bubble_chance = float(willing.get("1", 0.0))
-        self.__bubble_willing_sum += bubble_chance
-        logger.debug(f"nyabot本次冒泡意愿：{bubble_chance}")
-        logger.debug(f"nyabot冒泡意愿累计(修正后)：{self.__bubble_willing_sum}")
-
-        chat_chance = float(willing.get("2", 0.0))
-        logger.debug(f"nyabot对话意愿(修正后)：{chat_chance}")
-
-        # 降低门槛
-        random_value = random.uniform(0.3, 0.7)
-        logger.debug(f"意愿转变随机值：{random_value}")
-
-        current_fatigue_factor = self._active_count * 0.15 if self.__chatting_state == _ChattingState.ACTIVE else 0.0
-
-        match self.__chatting_state:
-            case _ChattingState.ILDE:
-                if self._last_speak_time.tzinfo is not None:
-                    now_aware = datetime.now().astimezone()
-                    seconds_since_speak = (now_aware - self._last_speak_time).total_seconds()
-                else:
-                    seconds_since_speak = (datetime.now() - self._last_speak_time).total_seconds()
-
-                if seconds_since_speak < 30:
-                    logger.debug(f"Bot 处于贤者时间 ({seconds_since_speak:.0f}s < 90s)，强制压制对话欲望")
-                    chat_chance *= 0.5
-                    self.__bubble_willing_sum = 0.0
-
-                if chat_chance >= random_value:
-                    self.__chatting_state = _ChattingState.ACTIVE
-                    self.__bubble_willing_sum = 0.0
-                elif self.__bubble_willing_sum >= random_value:
-                    self.__chatting_state = _ChattingState.BUBBLE
-                    self.__bubble_willing_sum = 0.0
-
-            case _ChattingState.BUBBLE:
-                if chat_chance >= random_value:
-                    self.__chatting_state = _ChattingState.ACTIVE
-                elif idle_chance >= random_value:
-                    self.__chatting_state = _ChattingState.ILDE
-
-            case _ChattingState.ACTIVE:
-                fatigue_factor = self._active_count * 0.15
-                final_idle_chance = (idle_chance * 1.2) + fatigue_factor
-                logger.debug(
-                    f"活跃退出判定: 基础意愿{idle_chance:.2f} + 疲劳({self._active_count}轮){fatigue_factor:.2f} = {final_idle_chance:.2f} (阈值: {random_value:.2f})")
-
-                if final_idle_chance >= random_value:
-                    logger.debug(f"Bot 聊累了(已聊{self._active_count}轮)，主动进入潜水状态")
-                    self.__chatting_state = _ChattingState.ILDE
-                    self._active_count = 0
-
-        #  强制修正逻辑
-        if is_relevant:
-            # 如果被@了，强制进入对话状态
-            if self.__chatting_state != _ChattingState.ACTIVE:
-                logger.info(f"检测到被@或回复，强制将状态从 [{self.__chatting_state.name}] 修正为 [对话]")
-                self.__chatting_state = _ChattingState.ACTIVE
-                self.__bubble_willing_sum = 0.0
-
-        logger.debug(
-            f"[DECISION DEBUG] "
-            f"状态: {self.__chatting_state.name} | "
-            f"对话意愿(Chat): {chat_chance:.2f} | "
-            f"潜水意愿(Idle): {idle_chance:.2f} | "
-            f"疲劳值(Count): {self._active_count} (Factor: {current_fatigue_factor:.2f}) | "
-            f"随机阈值: {random_value:.2f}"
-        )
-
-        logger.debug(f"反馈阶段更新对话状态：{self.__chatting_state!s}")
-        logger.debug("反馈阶段结束")
-
-    async def __chat_stage(self, messages_chunk: list[Message], llm: Callable[[str], Awaitable[str]]) -> list[dict]:
-        logger.debug("对话阶段开始")
-
-        # 使用 ID
-        reaction_users = self.global_memory.related_users()
-        related_profiles = [profile for profile in self.profiles.values() if profile.user_id in reaction_users]
-
-        related_profiles_json = json.dumps(
-            [{"user_name": p.user_id, "emotion_tends_to_user": asdict(p.emotion)} for p in related_profiles],
-            ensure_ascii=False, indent=2
-        )
-        search_stage_result = self.__search_result.mem_history if self.__search_result else []
-
-        # 对消息内容进行转义
-        formatted_msgs = [f"[ID:{getattr(msg, 'id', '')}] {msg.user_name}: '{self._escape_for_prompt(msg.content)}'" for
-                          msg in messages_chunk]
+    async def __chat_stage(self, messages_chunk: list[Message], llm_func: Callable) -> list[dict]:
+        logger.debug(">> 对话阶段 (Chat) 开始")
+        search_history = self.__search_result.mem_history if self.__search_result else []
+        formatted_msgs = [f"[ID:{msg.id}] {msg.user_name}: '{self._escape_for_prompt(msg.content)}'" for msg in
+                          messages_chunk]
 
         prompt = get_chat_prompt(
             self.__name, self.__role, self.__chatting_state.value,
             self.global_memory.access().compressed_history,
             self.global_memory.access().messages,
             formatted_msgs,
-            {"valence": self.global_emotion.valence, "arousal": self.global_emotion.arousal,
-             "dominance": self.global_emotion.dominance},
-            related_profiles_json, search_stage_result, self.chat_summary
+            asdict(self.global_emotion),
+            "{}",
+            search_history, self.chat_summary
         )
 
         try:
-            response = await llm(prompt)
-            logger.debug(f"对话阶段llm返回：{response}")
+            # [Debug] 记录 LLM 原始输出
+            response = await llm_func(prompt, json_mode=True)
+            logger.debug(f"[Chat LLM Output]:\n{response}")
 
-            response_dict = extract_and_parse_json(response)
+            response_data = extract_and_parse_json(response)
 
-            if response_dict is None:
-                logger.warning("对话阶段 JSON 解析失败，跳过本次回复")
+            # 兼容 List 返回类型，自动包装
+            replies = []
+            if isinstance(response_data, dict):
+                replies = response_data.get("reply", [])
+            elif isinstance(response_data, list):
+                # 如果 LLM 直接返回了列表，我们假设这就是回复列表
+                replies = response_data
+                logger.warning("LLM 返回了 List 而非 Object，已自动兼容")
+
+            if not isinstance(replies, list):
                 return []
 
-            if isinstance(response_dict, list):
-                logger.warning(f"对话阶段 LLM 返回了 list 而不是 dict，尝试自动修正。内容: {response_dict}")
-                response_dict = {"reply": response_dict, "debug_reason": "自动修正:LLM返回了纯列表"}
+            if replies:
+                self.willingness = max(0.0, self.willingness - 0.4)
+                self.__chatting_state = _ChattingState.ACTIVE
 
-            if not isinstance(response_dict, dict):
-                logger.error(f"对话阶段 LLM 返回数据类型错误: {type(response_dict)}，无法处理。内容: {response_dict}")
-                return []
-
-            logger.debug(f"对话阶段回复内容：{response_dict.get('reply', [])}")
-            logger.debug(f"对话阶段回复/不回复原因:{response_dict.get('debug_reason', '无原因')}")
-            logger.debug("对话阶段结束")
-
-            final_replies = []
-            raw_replies = response_dict.get("reply", [])
-
-            if isinstance(raw_replies, list):
-                for item in raw_replies:
-                    if isinstance(item, str):
-                        final_replies.append({"content": item, "reply_to": None})
-                    elif isinstance(item, dict):
-                        content = item.get("content", "")
-                        target_id = item.get("target_id")
-                        if not target_id or str(target_id).lower() in ["null", "none", ""]:
-                            target_id = None
-                        final_replies.append({"content": content, "reply_to": target_id})
-
-            return final_replies
-
+            return replies
         except Exception as e:
-            logger.error(f"对话阶段发生未捕获异常: {e}")
-            traceback.print_exc()
+            logger.error(f"对话阶段异常: {e}")
             return []
 
-    async def update(self, messages_chunk: list[Message], llm: Callable[[str], Awaitable[str]], publish: bool = True) -> \
-            list[dict] | None:
+    async def update(self, messages_chunk: list[Message], llm_func: Callable[[str, bool], Awaitable[str]],
+                     publish: bool = True) -> list[dict] | None:
 
-        # === 1. 优先处理记忆存储 (无论 publish 是 True 还是 False 都要做) ===
-
-        text_to_add = []
-        metadatas = []
-
-        for msg in messages_chunk:
-            text_to_add.append(f"'{msg.user_name}':'{msg.content}'")
-            uid = str(msg.user_id) if msg.user_id else ""
-
-            # 简单判断一下来源类型
-            metadatas.append({"user_id": uid, "user_name": msg.user_name, "type": "message", "source": "memory"})
-
-        # 存入长期记忆
-        if text_to_add:
-            await run_sync(self.long_term_memory.add_texts)(text_to_add, metadatas=metadatas)
-
-        # 存入短期记忆 (Session 上下文)
-        def enable_update_hippo():
+        # 1. 更新短时记忆 (Buffer)
+        def enable_hippo():
             self.__update_hippo = True
 
-        await self.global_memory.update(messages_chunk, after_compress=enable_update_hippo)
-
-        # 保存到数据库
+        await self.global_memory.update(messages_chunk, after_compress=enable_hippo)
         asyncio.create_task(self.save_session())
 
-        # === 2. 检查是否需要发布回复 ===
+        if not publish: return None
 
-        if not publish:
-            logger.debug(f"收到自身回显 ({len(messages_chunk)}条)，仅更新记忆，不触发回复。")
-            return None
-
-        # === 3. 只有 publish=True 才执行下面的 LLM 思考逻辑 ===
-
+        # 2. 意愿值计算 (确定性逻辑)
+        # 时间衰减
         now = datetime.now()
-        # 获取距离上一次活跃的时间差
-        time_since_last_active = (now - self._last_activity_time).total_seconds()
-
-        if time_since_last_active > 300:
-            if self.__chatting_state != _ChattingState.ILDE:
-                logger.info(f"会话已冷却 ({time_since_last_active:.0f}s > 300s)，状态重置为 [潜水]")
-                self.__chatting_state = _ChattingState.ILDE
-                self.__bubble_willing_sum = 0.0
-                self._active_count = 0
-
+        seconds_passed = (now - self._last_activity_time).total_seconds()
+        decay = (seconds_passed / 60.0) * 0.05  # 每分钟衰减 0.05
+        self.willingness = max(0.0, self.willingness - decay)
         self._last_activity_time = now
 
-        # 计算是否强相关：传入 aliases
+        # 触发增益
         is_relevant = check_relevance(self.__name, self.__aliases, messages_chunk)
+        if is_relevant:
+            self.willingness = max(self.willingness, 0.95)  # 被叫名字，意愿值设为较高
+            logger.info("检测到强关联，意愿值提升")
+        else:
+            # 即使没叫我，如果有新消息，也稍微增加一点好奇心
+            self.willingness = min(1.0, self.willingness + 0.05 * len(messages_chunk))
 
-        await self.__search_stage()
-        # 传入 time_gap 供节流逻辑使用
-        await self.__feedback_stage(messages_chunk=messages_chunk, llm=llm, is_relevant=is_relevant,
-                                    time_gap=time_since_last_active)
+        # 3. 节流判断 (Gatekeeper)
+        if self.willingness < 0.3 and not is_relevant:
+            logger.debug(f"意愿值过低 ({self.willingness:.2f}) 且无强关联，跳过响应")
+            return None
 
-        reply_messages = None
-        match self.__chatting_state:
-            case _ChattingState.ILDE:
-                logger.debug("nyabot潜水中...")
-                reply_messages = None
-            case _ChattingState.BUBBLE:
-                logger.debug("nyabot冒泡中...")
-                reply_messages = await self.__chat_stage(messages_chunk=messages_chunk, llm=llm)
-                if reply_messages:
-                    self.__chatting_state = _ChattingState.ACTIVE
-            case _ChattingState.ACTIVE:
-                logger.debug("nyabot对话中...")
-                # 完全交由 feedback_stage 中的 LLM 意愿判定来决定是否转回 ILDE 状态
+        # 4. 检索阶段 (提取关键词)
+        # 混合“最近消息”和“当前话题摘要”来生成检索词，提高命中率
+        queries = [msg.content for msg in messages_chunk[-2:]]
+        if self.chat_summary and len(self.chat_summary) > 5:
+            queries.append(self.chat_summary)
+        await self.__search_stage(queries)
 
-                # 如果强相关，稍微记录一下日志，但逻辑上都直接进 chat_stage
-                if is_relevant:
-                    logger.debug("检测到被@或回复，处于活跃状态，继续对话")
+        # 5. [拟人化] 串行执行 (先思考/反馈，再决定是否说话)
+        # 这种模式延迟较高，但情绪反应最真实，不会出现"被骂了还笑嘻嘻"的情况
+        logger.debug("🐢 启用拟人化串行模式: Feedback -> Check -> Chat")
 
-                reply_messages = await self.__chat_stage(messages_chunk=messages_chunk, llm=llm)
+        # 5.1 反馈与思考 (LLM 更新情绪、提取记忆、最终决定意愿)
+        # 这一步会更新 self.global_emotion 和 self.willingness
+        await self.__feedback_stage(messages_chunk, llm_func)
+
+        # 5.2 再次检查意愿 (Feedback 阶段可能会根据新消息调整意愿)
+        # 如果 Feedback 后意愿降低(比如觉得无聊)，则停止回复
+        if self.willingness < 0.4:
+            return None
+
+        # 5.3 对话执行
+        # 此时 Chat 阶段使用的是 Feedback 更新后的最新情绪
+        reply_messages = await self.__chat_stage(messages_chunk, llm_func)
 
         if reply_messages:
-            actual_bubble_count = sum(estimate_split_count(msg.get('content', '')) for msg in reply_messages)
-            self._active_count += actual_bubble_count
             self._last_speak_time = datetime.now()
-            # 再次保存状态
             asyncio.create_task(self.save_session())
 
         return reply_messages

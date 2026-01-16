@@ -45,7 +45,7 @@ get_status_pm = on_command(
     rule=is_private_message, permission=SUPERUSER, cmd="status", aliases={"状态"}, priority=0, block=True
 )
 
-auto_chat = on_message(rule=is_group_message, priority=1, block=False)
+auto_chat = on_message(rule=is_group_message, priority=99, block=False)
 
 set_role = on_command(
     rule=is_group_message, permission=SUPERUSER, cmd="set_role", aliases={"设置角色"}, priority=0, block=True
@@ -337,28 +337,17 @@ async def handle_auto_chat(bot: Bot, event: GroupMessageEvent):
     self_id = str(bot.self_id)
     nickname = ""
 
-    # === 自身消息身份判定 ===
+    # === 自身消息身份判定优化 ===
+    # 只要消息发送者 ID 是 Bot 自己，就严格视为回显（Echo），不进行任何伪装
     if user_id == self_id:
-        # 情况 1: 这是我自己刚才发出去的消息 (ID 在缓存中)
         if msg_id in SELF_SENT_MSG_IDS:
-            logger.debug(f"检测到自身回显 (Echo): {msg_id} - 将只存不回")
-            # 保持 user_id 为 self_id，这样 logic.py 就能识别出它是 Echo
-            pass
-
-            # 情况 2: 这是另一个进程发的消息
+            logger.debug(f"检测到自身回显 (Echo): {msg_id}")
         else:
-            logger.info(f"捕获到功能Bot消息: {event.get_plain_text()} - 伪装为外部用户")
-            # 将 user_id 改为虚拟 ID，这样 logic.py 就会认为这是“外部消息”，允许回复
-            user_id = "10000"
-            nickname = "系统助手"
-            try:
-                # 尝试获取群名片（辅助）
-                user_info = await bot.get_group_member_info(group_id=group_id, user_id=int(self_id))
-                card = user_info.get("card") or user_info.get("nickname")
-                if card:
-                    nickname = f"Bot({card})"
-            except:
-                pass
+            logger.debug(f"检测到非本机发送的自身消息 (可能是其他插件或端): {msg_id}")
+
+        # 保持 user_id 不变，这样 logic.py 会识别出这是 bot 自己的消息
+        # 从而只将其存入记忆，而不会触发回复
+        pass
 
     # === 普通用户消息处理 ===
     if not nickname:
@@ -377,8 +366,8 @@ async def handle_auto_chat(bot: Bot, event: GroupMessageEvent):
                 user_name=nickname,
                 content=message_content,
                 id=msg_id,
-                user_id=user_id  # 这里可能是真实ID，self_id(回显)，或 10000(功能Bot)
+                user_id=user_id
             )
         )
-        # 无论是什么消息，都触发信号，让 logic.py 去决定是否回复
+        # 无论是什么消息，都触发信号，让 logic.py 去处理
         state.new_message_signal.set()

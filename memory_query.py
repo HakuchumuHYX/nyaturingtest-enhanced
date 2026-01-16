@@ -57,12 +57,8 @@ async def handle_query_memory(bot: Bot, event: GroupMessageEvent, args: Message 
         bot_role = state.session.role()
 
         # --- 用户画像查找逻辑 ---
-        # 1. 优先尝试用 ID 查找
         profile = state.session.profiles.get(target_id)
-
-        # 2. 如果没找到，尝试用 名字 查找
         if not profile:
-            logger.warning(f"ID [{target_id}] 未找到画像，尝试使用名字 [{target_name}] 查找...")
             profile = state.session.profiles.get(target_name)
 
         if profile:
@@ -73,7 +69,6 @@ async def handle_query_memory(bot: Bot, event: GroupMessageEvent, args: Message 
                 "interactions": len(profile.interactions),
                 "last_seen": profile.last_update_time.strftime("%Y-%m-%d %H:%M")
             }
-            logger.info(f"成功加载用户画像: {target_name} (交互次数: {len(profile.interactions)})")
         else:
             profile_data = {
                 "valence": 0.0,
@@ -82,30 +77,45 @@ async def handle_query_memory(bot: Bot, event: GroupMessageEvent, args: Message 
                 "interactions": 0,
                 "last_seen": "未知"
             }
-            logger.warning(f"彻底未找到用户画像: {target_name}")
 
-        # --- B. 读取 向量数据库 ---
+        # --- B. 读取 向量数据库 (双重过滤) ---
         try:
             search_queries = [
                 f"关于{target_name}的记忆",
                 f"我对{target_name}的看法",
-                f"{target_name}说过的",
-                f"{target_name}的性格",
-                f"Evaluation of {target_name}"
+                f"{target_name}做过的事",
+                f"{target_name}的性格特点"
             ]
 
-            # 构造过滤条件：如果已知 user_id，则精准过滤
-            search_filter = None
-            if target_id:
-                search_filter = {"user_id": target_id}
+            # [关键] 构造过滤条件
+            # 基础条件：只查记忆 (source="memory")，排除预设
+            where_conditions = [{"source": {"$eq": "memory"}}]
+
+            # 增强条件：如果已知 target_id，且不为空，则强制匹配 user_id
+            if target_id and target_id.strip():
+                where_conditions.append({"user_id": {"$eq": target_id}})
+
+            # 组合条件 (ChromaDB 的 $and 语法)
+            # 最终形式: {"$and": [{"source": {"$eq": "memory"}}, {"user_id": {"$eq": "12345"}}]}
+            search_filter = {"$and": where_conditions} if len(where_conditions) > 1 else where_conditions[0]
 
             if hasattr(state.session, 'long_term_memory'):
-                # 传入 where 参数进行过滤
                 vector_records = await run_sync(state.session.long_term_memory.retrieve)(
-                    search_queries, k=6, where=search_filter
+                    search_queries,
+                    k=5,
+                    where=search_filter
                 )
                 if vector_records:
-                    logger.debug(f"查询记忆: 成功检索到 {len(vector_records)} 条向量记录")
+                    unique_recs = []
+                    seen = set()
+                    for rec in vector_records:
+                        content = rec.get('content', '')
+                        if content and content not in seen:
+                            seen.add(content)
+                            unique_recs.append(content)
+                    vector_records = unique_recs
+
+                    logger.debug(f"查询记忆: 检索到 {len(vector_records)} 条记录 (Filter: {search_filter})")
         except Exception as e:
             logger.error(f"向量记忆检索失败: {e}")
 
@@ -115,15 +125,14 @@ async def handle_query_memory(bot: Bot, event: GroupMessageEvent, args: Message 
             session_db = await SessionModel.get_or_none(id=state.session.id)
 
             if session_db:
-                # 优先使用 user_id 查找
                 db_msgs = []
+                # 优先 ID 查
                 if target_id and target_id.strip():
                     db_msgs = await GlobalMessageModel.filter(
                         session=session_db,
                         user_id=target_id
                     ).order_by("-time").limit(10)
-
-                # 如果用 ID 没查到（可能是旧数据或未同步），回退用名字查
+                # 兜底 名字 查
                 if not db_msgs:
                     db_msgs = await GlobalMessageModel.filter(
                         session=session_db,
@@ -159,28 +168,30 @@ async def handle_query_memory(bot: Bot, event: GroupMessageEvent, args: Message 
   - 关注度(Arousal, 0无感~1兴奋): {profile_data['arousal']:.2f}
   - 支配度(Dominance, -1你畏惧他~1你掌控他): {profile_data['dominance']:.2f}
 - 交互深度: {profile_data['interactions']} 次
-- 长期记忆碎片(重要参考):
+- 长期记忆碎片(重要参考 - 这些是发生在他身上的真实事件):
 {vector_memory_str}
 - 他最近说过的话: {json.dumps(recent_user_msgs, ensure_ascii=False)}
 
-[要求]
-请模仿你的角色语气，以第一人称输出 JSON 格式（不要包含 Markdown 代码块标记）：
+[任务]
+请模仿你的角色语气，以第一人称输出一个 JSON 对象：
 {{
     "description": "结合'长期记忆碎片'和'最近说过的话'，评价这个用户。描述你们的过往经历（如果有）、关系（朋友、陌生人、死对头等），以及他对你的态度。100字以内。",
     "emotion": "3-5个关键词，概括你对他的感觉（例如：'信赖, 亲密, 有趣' 或 '冷漠, 警惕, 陌生'）"
 }}
 """
 
-    # 6. 调用 LLM
+    # 6. 调用 LLM (带重试)
     from .config import plugin_config
     max_retries = 2
 
     for attempt in range(max_retries + 1):
         try:
+            # 使用 JSON Mode
             response = await state.client.generate_response(
                 prompt=prompt,
                 model=plugin_config.nyaturingtest_chat_openai_model,
-                temperature=0.8 + (attempt * 0.2)
+                temperature=0.8 + (attempt * 0.2),
+                response_format={"type": "json_object"}
             )
 
             result = extract_and_parse_json(response)
@@ -199,12 +210,12 @@ async def handle_query_memory(bot: Bot, event: GroupMessageEvent, args: Message 
                 return
 
             else:
-                logger.warning(f"印象生成 JSON 解析失败 (尝试 {attempt + 1}): {response}")
+                logger.warning(f"印象生成 JSON 解析失败: {response}")
 
         except FinishedException:
             raise
         except Exception as e:
-            logger.error(f"LLM 请求异常 (尝试 {attempt + 1}): {e}")
+            logger.error(f"LLM 请求异常: {e}")
 
         if attempt < max_retries:
             await asyncio.sleep(1)

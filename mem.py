@@ -105,7 +105,7 @@ class Memory:
 """
         try:
             # 适当调高 temperature 增加灵活性，或者调低保证稳定
-            response = await self.__llm_client.generate_response(prompt, model="Qwen/Qwen3-8B", temperature=0.3)
+            response = await self.__llm_client.generate_response(prompt, model="Pro/Qwen/Qwen2.5-7B-Instruct", temperature=0.3)
 
             if response:
                 self.__compressed_message = response

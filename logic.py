@@ -15,20 +15,29 @@ from .client import LLMClient
 from .config import plugin_config
 from .image_manager import IMAGE_CACHE_DIR, image_manager
 from .mem import Message as MMessage
-# [修改] 导入 SELF_SENT_MSG_IDS
 from .state_manager import GroupState, SELF_SENT_MSG_IDS
 from .utils import get_http_client, smart_split_text
 
 _IMG_SEMAPHORE = asyncio.Semaphore(3)
 
 
-async def llm_response(client: LLMClient, message: str) -> str:
-    """封装 LLM 调用"""
+async def llm_response(client: LLMClient, message: str, json_mode: bool = False) -> str:
+    """
+    封装 LLM 调用
+    """
     try:
+        kwargs = {}
+        if json_mode:
+            kwargs["response_format"] = {"type": "json_object"}
+
+        # kwargs["extra_body"] = {"include_reasoning": False}
+
         result = await client.generate_response(
             prompt=message,
             model=plugin_config.nyaturingtest_chat_openai_model,
-            temperature=1.3
+            # Qwen 系列建议 Temperature: 0.7 ~ 0.8
+            temperature=0.7,
+            **kwargs
         )
         return result if result else ""
     except Exception as e:
@@ -36,8 +45,12 @@ async def llm_response(client: LLMClient, message: str) -> str:
         return "Error occurred while processing the message."
 
 
+
 async def message2BotMessage(bot_name: str, group_id: int, message: Message, bot: Bot) -> str:
-    """将 OneBot 消息转换为 Bot 可读文本"""
+    """
+    将 OneBot 消息转换为 Bot 可读文本
+    处理图片、表情包、@提及和回复引用
+    """
 
     async def process_segment(seg: MessageSegment) -> str:
         if seg.type == "text":
@@ -136,9 +149,13 @@ async def message2BotMessage(bot_name: str, group_id: int, message: Message, bot
 
 
 async def spawn_state(state: GroupState):
-    """后台思考循环"""
+    """
+    后台思考循环 (Producer-Consumer 模式)
+    负责从 Buffer 取消息 -> 调用 Session 处理 -> 发送回复
+    """
     while True:
         try:
+            # 1. 等待新消息信号 (debounce 2秒)
             try:
                 await asyncio.wait_for(state.new_message_signal.wait(), timeout=20.0)
             except asyncio.TimeoutError:
@@ -147,88 +164,89 @@ async def spawn_state(state: GroupState):
             state.new_message_signal.clear()
             await asyncio.sleep(2.0)
 
+            # 2. 从 Buffer 取出消息
             current_chunk = []
-
             async with state.data_lock:
                 if state.bot is None or state.event is None: continue
                 if len(state.messages_chunk) == 0: continue
                 current_chunk = state.messages_chunk.copy()
                 state.messages_chunk.clear()
 
-            # 检查是否全是 LLM 自己的回显
-            # 在 matchers.py 中，我们已经规定：
-            # 1. 自己的回显: user_id = bot_self_id
-            # 2. 功能Bot: user_id = "10000" (虚拟ID)
-            # 3. 用户: user_id = 真实QQ
             bot_self_id = str(state.bot.self_id)
             is_echo_only = all(str(msg.user_id) == bot_self_id for msg in current_chunk)
-
-            # 如果只有回显 -> Publish=False (只存记忆，不自言自语)
-            # 如果有功能Bot消息或用户消息 -> Publish=True (允许回复)
             should_publish = not is_echo_only
 
+            # 3. 加载 Session (加锁)
+            # [优化] 只在加载数据时加锁，后续 LLM 生成时不加锁，允许查询命令插队
             async with state.session_lock:
                 await state.session.load_session()
 
-                try:
-                    responses = await state.session.update(
-                        messages_chunk=current_chunk,
-                        llm=lambda x: llm_response(state.client, x),
-                        publish=should_publish  # [传入控制参数]
-                    )
+            # 4. 执行核心逻辑 (LLM 生成)
+            try:
+                # [修正] 将 jm 改为 json_mode，与 session.py 的调用保持一致
+                responses = await state.session.update(
+                    messages_chunk=current_chunk,
+                    llm_func=lambda msg, json_mode=False: llm_response(state.client, msg, json_mode=json_mode),
+                    publish=should_publish
+                )
 
-                    if responses:
-                        total = len(responses)
-                        for r_idx, response in enumerate(responses):
-                            raw_content = ""
-                            reply_id = None
-                            if isinstance(response, str):
-                                raw_content = response
-                            elif isinstance(response, dict):
-                                raw_content = response.get("content", "")
-                                reply_id = response.get("reply_to")
+                # 5. 发送回复
+                if responses:
+                    total = len(responses)
+                    for r_idx, response in enumerate(responses):
+                        raw_content = ""
+                        reply_id = None
+                        if isinstance(response, str):
+                            raw_content = response
+                        elif isinstance(response, dict):
+                            raw_content = response.get("content", "")
+                            reply_id = response.get("reply_to")
 
-                            if not raw_content: continue
+                        if not raw_content: continue
 
-                            msg_parts = smart_split_text(raw_content)
-                            for i, part in enumerate(msg_parts):
-                                part = part.strip()
-                                if part.endswith("。"):
-                                    part = part[:-1]
-                                elif part.endswith(".") and not part.endswith(".."):
-                                    part = part[:-1]
+                        # 智能分句发送
+                        msg_parts = smart_split_text(raw_content)
+                        for i, part in enumerate(msg_parts):
+                            part = part.strip()
+                            # 清理句末多余标点
+                            if part and part[-1] in ["。", ".", "，"]:
+                                part = part[:-1]
 
-                                msg_to_send = Message(part)
-                                if reply_id and r_idx == 0 and i == 0:
-                                    msg_to_send.insert(0, MessageSegment.reply(int(reply_id)))
+                            if not part: continue
 
-                                try:
-                                    result = await state.bot.send(message=msg_to_send, event=state.event)
+                            msg_to_send = Message(part)
+                            # 如果是回复某条特定消息，且是第一段，则带上 reply 引用
+                            if reply_id and r_idx == 0 and i == 0:
+                                msg_to_send.insert(0, MessageSegment.reply(int(reply_id)))
 
-                                    # 记录自己发送的消息ID，用于 matchers.py 识别回显
-                                    if isinstance(result, dict) and "message_id" in result:
-                                        msg_id = str(result["message_id"])
-                                        SELF_SENT_MSG_IDS.append(msg_id)
-                                        logger.debug(f"记录自身发送消息 ID: {msg_id}")
+                            try:
+                                result = await state.bot.send(message=msg_to_send, event=state.event)
 
-                                except ActionFailed as e:
-                                    if e.retcode == 1200 or "120" in str(e):
-                                        logger.warning(f"风控拦截 (1200), 冷却中...")
-                                        await asyncio.sleep(random.uniform(5.0, 10.0))
-                                    else:
-                                        logger.error(f"发送失败: {e}")
-                                except Exception as e:
-                                    logger.error(f"发送未知错误: {e}")
+                                if isinstance(result, dict) and "message_id" in result:
+                                    msg_id = str(result["message_id"])
+                                    SELF_SENT_MSG_IDS.append(msg_id)
+                                    logger.debug(f"记录自身发送消息 ID: {msg_id}")
 
-                                if i < len(msg_parts) - 1 or r_idx < total - 1:
-                                    delay = 1.0 + len(part) * 0.1
-                                    delay = min(delay, 5.0)
-                                    await asyncio.sleep(delay)
+                            except ActionFailed as e:
+                                if e.retcode == 1200 or "120" in str(e):
+                                    logger.warning(f"风控拦截 (1200), 冷却中...")
+                                    await asyncio.sleep(random.uniform(5.0, 10.0))
+                                else:
+                                    logger.error(f"发送失败: {e}")
+                            except Exception as e:
+                                logger.error(f"发送未知错误: {e}")
 
-                except Exception as e:
-                    logger.error(f"Processing cycle error: {e}")
-                    traceback.print_exc()
-                    continue
+                            # 模拟人类打字延迟
+                            if i < len(msg_parts) - 1 or r_idx < total - 1:
+                                delay = 1.0 + len(part) * 0.1
+                                delay = min(delay, 5.0)
+                                await asyncio.sleep(delay)
+
+            except Exception as e:
+                logger.error(f"Processing cycle error: {e}")
+                traceback.print_exc()
+                continue
+
         except asyncio.CancelledError:
             logger.info("后台任务被取消")
             break
