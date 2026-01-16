@@ -16,8 +16,7 @@ def get_feedback_prompt(
         last_summary: str
 ) -> str:
     """
-    反馈阶段 Prompt (2026 Optimized)
-    简化了 JSON 示例，依赖模型强大的指令遵循能力
+    反馈阶段 Prompt
     """
     return f"""
 # Role
@@ -64,7 +63,7 @@ def get_chat_prompt(
         chat_summary: str
 ) -> str:
     """
-    对话阶段 Prompt (2026 Optimized)
+    对话阶段 Prompt
     """
     return f"""
 # Role

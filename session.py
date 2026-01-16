@@ -51,7 +51,7 @@ class _ChattingState(Enum):
 
 class Session:
     """
-    群聊会话 - 拟人化串行版 (真实感优先)
+    群聊会话
     """
 
     def __init__(
@@ -197,7 +197,7 @@ class Session:
                         ))
                     await GlobalMessageModel.bulk_create(bulk_msgs)
 
-            # [新增] 记忆生命周期管理：1% 概率触发清理，或强制保存时触发
+            # 记忆生命周期管理：1% 概率触发清理，或强制保存时触发
             if force_index or random.random() < 0.01:
                 # 清理超过 90 天的旧记忆
                 await run_sync(self.long_term_memory.cleanup)(days_retention=90)
@@ -226,7 +226,7 @@ class Session:
             self._last_speak_time = session_db.last_speak_time
         self.__chatting_state = _ChattingState(session_db.chatting_state)
 
-        # [优化] 重启后给一点点初始意愿，防止Bot彻底装死
+        # 重启后给一点点初始意愿，防止Bot彻底装死
         self.willingness = 0.1
 
         self.profiles = {}
@@ -279,7 +279,7 @@ class Session:
         await self.set_role(preset.name, preset.role)
         self.__aliases = preset.aliases
 
-        # [修复] 在添加新预设前，删除旧的预设记忆，防止重复
+        # 在添加新预设前，删除旧的预设记忆，防止重复
         await run_sync(self.long_term_memory.delete_by_metadata)({"source": "preset"})
 
         to_add = (preset.knowledges + preset.relationships + preset.events + preset.bot_self)
@@ -364,7 +364,7 @@ class Session:
         )
         search_history = self.__search_result.mem_history if self.__search_result else []
 
-        # [修改] 格式化消息时包含 UserID，供 LLM 识别
+        # 格式化消息时包含 UserID，供 LLM 识别
         formatted_msgs = [f"[ID:{msg.user_id}] {msg.user_name}: '{self._escape_for_prompt(msg.content)}'" for msg in
                           messages_chunk]
 
@@ -426,15 +426,13 @@ class Session:
         # 5. 更新摘要
         self.chat_summary = str(response_dict.get("summary", self.chat_summary))
 
-        # 6. [优化] 记忆提取转为异步后台任务 (Fire-and-forget)
+        # 6. 记忆提取转为异步后台任务 (Fire-and-forget)
         analyze_result = response_dict.get("analyze_result", [])
         if isinstance(analyze_result, list) and analyze_result:
-            # --- [新增逻辑] 计算兜底 User ID ---
             unique_user_ids = {
                 str(msg.user_id) for msg in messages_chunk
                 if msg.user_id and str(msg.user_id).strip()
             }
-            # 如果当前对话片段只属于一个用户，那么所有提取出的记忆默认都归他
             fallback_uid = list(unique_user_ids)[0] if len(unique_user_ids) == 1 else ""
 
             task = asyncio.create_task(
@@ -586,9 +584,8 @@ class Session:
             queries.append(self.chat_summary)
         await self.__search_stage(queries)
 
-        # 5. [拟人化] 串行执行 (先思考/反馈，再决定是否说话)
-        # 这种模式延迟较高，但情绪反应最真实，不会出现"被骂了还笑嘻嘻"的情况
-        logger.debug("🐢 启用拟人化串行模式: Feedback -> Check -> Chat")
+        # 5. 串行执行 (先思考/反馈，再决定是否说话)
+        logger.debug("启用拟人化串行模式: Feedback -> Check -> Chat")
 
         # 5.1 反馈与思考 (LLM 更新情绪、提取记忆、最终决定意愿)
         # 这一步会更新 self.global_emotion 和 self.willingness

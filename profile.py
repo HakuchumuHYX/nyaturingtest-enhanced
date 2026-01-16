@@ -94,7 +94,7 @@ class PersonProfile:
         """
         随时间流逝衰减情感 (增量更新 - 衰减)
         """
-        # [修复] 统一使用带时区的时间
+        # 统一使用带时区的时间
         now = datetime.now().astimezone()
 
         if self.last_update_time.tzinfo is None:

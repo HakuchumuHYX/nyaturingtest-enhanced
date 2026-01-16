@@ -78,7 +78,6 @@ async def handle_query_memory(bot: Bot, event: GroupMessageEvent, args: Message 
                 "last_seen": "未知"
             }
 
-        # --- B. 读取 向量数据库 (双重过滤) ---
         try:
             search_queries = [
                 f"关于{target_name}的记忆",
@@ -87,7 +86,7 @@ async def handle_query_memory(bot: Bot, event: GroupMessageEvent, args: Message 
                 f"{target_name}的性格特点"
             ]
 
-            # [关键] 构造过滤条件
+            # 构造过滤条件
             # 基础条件：只查记忆 (source="memory")，排除预设
             where_conditions = [{"source": {"$eq": "memory"}}]
 
@@ -95,8 +94,7 @@ async def handle_query_memory(bot: Bot, event: GroupMessageEvent, args: Message 
             if target_id and target_id.strip():
                 where_conditions.append({"user_id": {"$eq": target_id}})
 
-            # 组合条件 (ChromaDB 的 $and 语法)
-            # 最终形式: {"$and": [{"source": {"$eq": "memory"}}, {"user_id": {"$eq": "12345"}}]}
+            # 组合条件
             search_filter = {"$and": where_conditions} if len(where_conditions) > 1 else where_conditions[0]
 
             if hasattr(state.session, 'long_term_memory'):
@@ -119,7 +117,6 @@ async def handle_query_memory(bot: Bot, event: GroupMessageEvent, args: Message 
         except Exception as e:
             logger.error(f"向量记忆检索失败: {e}")
 
-        # --- C. 读取 SQL 数据库 (最近发言) ---
         try:
             from .models import SessionModel
             session_db = await SessionModel.get_or_none(id=state.session.id)
@@ -180,7 +177,7 @@ async def handle_query_memory(bot: Bot, event: GroupMessageEvent, args: Message 
 }}
 """
 
-    # 6. 调用 LLM (带重试)
+    # 6. 调用 LLM
     from .config import plugin_config
     max_retries = 2
 

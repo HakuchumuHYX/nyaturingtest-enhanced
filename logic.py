@@ -45,7 +45,6 @@ async def llm_response(client: LLMClient, message: str, json_mode: bool = False)
         return "Error occurred while processing the message."
 
 
-
 async def message2BotMessage(bot_name: str, group_id: int, message: Message, bot: Bot) -> str:
     """
     将 OneBot 消息转换为 Bot 可读文本
@@ -177,13 +176,12 @@ async def spawn_state(state: GroupState):
             should_publish = not is_echo_only
 
             # 3. 加载 Session (加锁)
-            # [优化] 只在加载数据时加锁，后续 LLM 生成时不加锁，允许查询命令插队
+            # 只在加载数据时加锁，后续 LLM 生成时不加锁，允许查询命令插队
             async with state.session_lock:
                 await state.session.load_session()
 
             # 4. 执行核心逻辑 (LLM 生成)
             try:
-                # [修正] 将 jm 改为 json_mode，与 session.py 的调用保持一致
                 responses = await state.session.update(
                     messages_chunk=current_chunk,
                     llm_func=lambda msg, json_mode=False: llm_response(state.client, msg, json_mode=json_mode),

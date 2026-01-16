@@ -10,7 +10,7 @@ class LLMClient:
 
     async def generate_response(self, prompt: str, model: str, temperature: float = 0.7, **kwargs) -> str | None:
         """
-        生成回复，支持透传参数 (如 response_format)
+        生成回复，支持透传参数
         """
         try:
             system_content = (

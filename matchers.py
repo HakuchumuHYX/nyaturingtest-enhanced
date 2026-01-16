@@ -320,12 +320,10 @@ async def handle_auto_chat(bot: Bot, event: GroupMessageEvent):
     if not state:
         return
 
-    # 获取 Bot 名字前，先确保加载
     async with state.session_lock:
         await state.session.load_session()
         bot_name = state.session.name()
 
-    # 使用 logic 模块中的转换函数
     message_content = await message2BotMessage(
         bot_name=bot_name, group_id=group_id, message=event.original_message, bot=bot
     )
@@ -337,19 +335,13 @@ async def handle_auto_chat(bot: Bot, event: GroupMessageEvent):
     self_id = str(bot.self_id)
     nickname = ""
 
-    # === 自身消息身份判定优化 ===
-    # 只要消息发送者 ID 是 Bot 自己，就严格视为回显（Echo），不进行任何伪装
     if user_id == self_id:
         if msg_id in SELF_SENT_MSG_IDS:
             logger.debug(f"检测到自身回显 (Echo): {msg_id}")
         else:
             logger.debug(f"检测到非本机发送的自身消息 (可能是其他插件或端): {msg_id}")
-
-        # 保持 user_id 不变，这样 logic.py 会识别出这是 bot 自己的消息
-        # 从而只将其存入记忆，而不会触发回复
         pass
 
-    # === 普通用户消息处理 ===
     if not nickname:
         try:
             user_info = await bot.get_group_member_info(group_id=group_id, user_id=int(user_id))
@@ -369,5 +361,4 @@ async def handle_auto_chat(bot: Bot, event: GroupMessageEvent):
                 user_id=user_id
             )
         )
-        # 无论是什么消息，都触发信号，让 logic.py 去处理
         state.new_message_signal.set()

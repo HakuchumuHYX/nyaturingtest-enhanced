@@ -7,7 +7,6 @@ class SessionModel(Model):
     id = fields.CharField(pk=True, max_length=255)
     name = fields.CharField(max_length=255, default="terminus")
     role = fields.TextField(default="一个普通的AI助手")
-    # [新增] 存储别名，使用 JSON 列表存储
     aliases = fields.JSONField(default=list)
 
     valence = fields.FloatField(default=0.5)

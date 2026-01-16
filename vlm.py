@@ -21,7 +21,7 @@ class SiliconFlowVLM:
         self.client = AsyncOpenAI(
             api_key=api_key,
             base_url=endpoint,
-            # [新增] 显式配置 HTTP 客户端，增加连接池大小，防止多图片并发阻塞
+            # 显式配置 HTTP 客户端，增加连接池大小，防止多图片并发阻塞
             http_client=httpx.AsyncClient(
                 limits=httpx.Limits(max_connections=50, max_keepalive_connections=20),
                 timeout=timeout  # 初始化时也传入超时作为保底
