@@ -8,7 +8,7 @@ from datetime import datetime
 from nonebot import logger
 
 from .client import LLMClient
-
+from .config import plugin_config
 
 @dataclass
 class Message:
@@ -111,8 +111,11 @@ class Memory:
 请直接输出新的记忆摘要。
 """
         try:
-            response = await self.__llm_client.generate_response(prompt, model="Qwen/Qwen2.5-14B-Instruct",
-                                                                 temperature=0.3)
+            response = await self.__llm_client.generate_response(
+                prompt,
+                model=plugin_config.nyaturingtest_feedback_openai_model,
+                temperature=0.3
+            )
 
             if response:
                 self.__compressed_message = response

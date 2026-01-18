@@ -30,6 +30,7 @@ class LLMClient:
                 model=model,
                 messages=messages,
                 temperature=temperature,
+                timeout=60.0,  # 显式增加超时设置（单位：秒），防止大文本处理中断
                 **kwargs
             )
             return response.choices[0].message.content
