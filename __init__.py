@@ -5,7 +5,7 @@ from tortoise import Tortoise
 require("nonebot_plugin_localstore")
 import nonebot_plugin_localstore as store
 
-from .state_manager import cleanup_global_resources
+from .state_manager import cleanup_global_resources, init_enabled_groups
 from . import matchers
 from . import memory_query
 
@@ -23,6 +23,9 @@ async def init_db():
     )
     await Tortoise.generate_schemas()
     logger.info(f"数据库已连接: {db_path}")
+
+    # 初始化群组列表
+    await init_enabled_groups()
 
 
 @driver.on_shutdown

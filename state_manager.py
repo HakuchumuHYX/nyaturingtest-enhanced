@@ -12,6 +12,7 @@ from .config import plugin_config
 from .mem import Message as MMessage
 from .session import Session
 from .utils import get_http_client, close_http_client
+from .models import EnabledGroupModel
 
 SELF_SENT_MSG_IDS = deque(maxlen=50)
 
@@ -44,13 +45,37 @@ class GroupState:
 group_states: dict[int, GroupState] = {}
 # 后台任务集合
 _tasks: set[asyncio.Task] = set()
+# 运行时启用的群组集合 (内存缓存)
+runtime_enabled_groups: set[int] = set()
+
+
+async def init_enabled_groups():
+    # 1. 从数据库读取
+    db_groups = await EnabledGroupModel.all()
+    db_ids = {g.group_id for g in db_groups}
+
+    # 2. 读取配置文件 (用于迁移)
+    config_ids = set(plugin_config.nyaturingtest_enabled_groups)
+
+    # 3. 如果配置文件里有 DB 里没有的，自动迁移写入 DB
+    new_ids = config_ids - db_ids
+    if new_ids:
+        logger.info(f"检测到配置文件中的新群组，正在迁移至数据库: {new_ids}")
+        await EnabledGroupModel.bulk_create([
+            EnabledGroupModel(group_id=gid) for gid in new_ids
+        ])
+        db_ids.update(new_ids)
+
+    # 4. 更新到内存集合
+    runtime_enabled_groups.clear()
+    runtime_enabled_groups.update(db_ids)
+    logger.info(f"已加载 Autochat 启用群组: {runtime_enabled_groups}")
 
 
 def ensure_group_state(group_id: int):
     """确保群组状态已初始化，并启动后台任务"""
     if group_id not in group_states:
-        allowed_groups = plugin_config.nyaturingtest_enabled_groups
-        if group_id not in allowed_groups:
+        if group_id not in runtime_enabled_groups:
             return None
 
         # 初始化状态

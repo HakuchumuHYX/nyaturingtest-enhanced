@@ -13,7 +13,13 @@ from nonebot.permission import SUPERUSER
 from nonebot.matcher import Matcher
 
 from .config import plugin_config
-from .state_manager import ensure_group_state, SELF_SENT_MSG_IDS
+from .models import EnabledGroupModel
+from .state_manager import (
+    ensure_group_state,
+    SELF_SENT_MSG_IDS,
+    runtime_enabled_groups,
+    group_states
+)
 from .logic import message2BotMessage
 from .mem import Message as MMessage
 
@@ -92,7 +98,9 @@ set_presets_pm = on_command(
 list_groups_pm = on_command(
     rule=is_private_message, permission=SUPERUSER, cmd="list_groups", aliases={"群组列表"}, priority=0, block=True
 )
-
+manage_cmd = on_command(
+    rule=is_group_message, permission=SUPERUSER, cmd="autochat", priority=1, block=True
+)
 
 # ==================== 处理逻辑 ====================
 
@@ -362,3 +370,41 @@ async def handle_auto_chat(bot: Bot, event: GroupMessageEvent):
             )
         )
         state.new_message_signal.set()
+
+
+@manage_cmd.handle()
+async def handle_manage_autochat(event: GroupMessageEvent, args: Message = CommandArg()):
+    arg = args.extract_plain_text().strip().lower()
+    group_id = event.group_id
+
+    if arg == "enable":
+        if group_id in runtime_enabled_groups:
+            await manage_cmd.finish("本群 Autochat 已处于启用状态")
+
+        # 写入数据库
+        await EnabledGroupModel.create(group_id=group_id)
+        # 更新内存
+        runtime_enabled_groups.add(group_id)
+        # 立即初始化状态
+        ensure_group_state(group_id)
+
+        await manage_cmd.finish("Autochat 已在本群启用 (已保存至数据库)")
+
+    elif arg == "disable":
+        if group_id not in runtime_enabled_groups:
+            await manage_cmd.finish("本群 Autochat 未启用")
+
+        # 从数据库删除
+        await EnabledGroupModel.filter(group_id=group_id).delete()
+        # 更新内存
+        runtime_enabled_groups.discard(group_id)
+
+        # 清理运行时状态 (如果存在)
+        if group_id in group_states:
+            # 可以在这里做一些特定的清理工作，目前直接移除引用
+            del group_states[group_id]
+
+        await manage_cmd.finish("Autochat 已在本群禁用")
+
+    else:
+        await manage_cmd.finish("指令格式错误。请使用: autochat enable 或 autochat disable")
