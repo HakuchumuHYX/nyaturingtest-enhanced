@@ -47,74 +47,95 @@ async def llm_response(client: LLMClient, message: str, model: str, temperature:
 async def message2BotMessage(bot_name: str, group_id: int, message: Message, bot: Bot) -> str:
     """
     将 OneBot 消息转换为 Bot 可读文本
-    处理图片、表情包、@提及和回复引用
+    支持解析引用消息(Reply)中的图片内容
     """
 
+    # === 提取通用的图片解析逻辑 ===
+    async def resolve_image(url: str, file_unique: str, is_sticker: bool) -> str:
+        """内部函数：下载并分析图片，返回描述文本"""
+        if not url:
+            return "[无效图片]"
+
+        async with _IMG_SEMAPHORE:
+            try:
+                # 1. 尝试从内存缓存获取
+                if file_unique:
+                    cached_desc = image_manager.get_from_cache(file_unique)
+                    if cached_desc:
+                        if is_sticker:
+                            return f"\n[表情包] [情感:{cached_desc.emotion}] [内容:{cached_desc.description}]\n"
+                        else:
+                            return f"\n[图片] {cached_desc.description}\n"
+
+                # 2. 准备文件缓存路径
+                cache_path = IMAGE_CACHE_DIR.joinpath("raw")
+                cache_path.mkdir(parents=True, exist_ok=True)
+
+                # 尝试从 URL 或 file_unique 提取文件名
+                key = None
+                key_match = re.search(r"[?&]fileid=([a-zA-Z0-9_-]+)", url)
+                if key_match:
+                    key = key_match.group(1)
+                elif file_unique:
+                    key = file_unique
+
+                image_bytes = None
+
+                # 3. 尝试读取本地文件缓存
+                if key and cache_path.joinpath(key).exists():
+                    async with await anyio.open_file(cache_path.joinpath(key), "rb") as f:
+                        image_bytes = await f.read()
+                else:
+                    # 4. 下载图片
+                    client = get_http_client()
+                    for _ in range(2):  # 重试2次
+                        try:
+                            resp = await client.get(url, timeout=10.0)  # 稍微增加超时
+                            resp.raise_for_status()
+                            image_bytes = resp.content
+                            break
+                        except Exception:
+                            await asyncio.sleep(0.5)
+
+                    # 下载成功后写入缓存
+                    if image_bytes and key:
+                        try:
+                            async with await anyio.open_file(cache_path.joinpath(key), "wb") as f:
+                                await f.write(image_bytes)
+                        except Exception as e:
+                            logger.warning(f"写入图片缓存失败: {e}")
+
+                if not image_bytes:
+                    return "\n[图片下载失败]\n"
+
+                # 5. 调用 VLM 进行识别
+                image_base64 = base64.b64encode(image_bytes).decode("utf-8")
+                description = await image_manager.get_image_description(
+                    image_base64=image_base64, is_sticker=is_sticker, cache_key=file_unique
+                )
+
+                if description:
+                    if is_sticker:
+                        return f"\n[表情包] [情感:{description.emotion}] [内容:{description.description}]\n"
+                    else:
+                        return f"\n[图片] {description.description}\n"
+                return "\n[图片识别无结果]\n"
+
+            except Exception as e:
+                logger.error(f"Image resolve error: {e}")
+                return "\n[图片处理出错]\n"
+
+    # === 消息段处理逻辑 ===
     async def process_segment(seg: MessageSegment) -> str:
         if seg.type == "text":
             return f"{seg.data.get('text', '')}"
 
-        elif seg.type == "image" or seg.type == "emoji":
-            async with _IMG_SEMAPHORE:
-                try:
-                    url = seg.data.get("url", "")
-                    file_unique = seg.data.get("file_unique", "")
-
-                    if file_unique:
-                        cached_desc = image_manager.get_from_cache(file_unique)
-                        if cached_desc:
-                            is_sticker = seg.data.get("sub_type") == 1
-                            if is_sticker:
-                                return f"\n[表情包] [情感:{cached_desc.emotion}] [内容:{cached_desc.description}]\n"
-                            else:
-                                return f"\n[图片] {cached_desc.description}\n"
-
-                    cache_path = IMAGE_CACHE_DIR.joinpath("raw")
-                    cache_path.mkdir(parents=True, exist_ok=True)
-
-                    key = re.search(r"[?&]fileid=([a-zA-Z0-9_-]+)", url)
-                    key = key.group(1) if key else (file_unique if file_unique else None)
-
-                    image_bytes = None
-                    if key and cache_path.joinpath(key).exists():
-                        async with await anyio.open_file(cache_path.joinpath(key), "rb") as f:
-                            image_bytes = await f.read()
-                    else:
-                        client = get_http_client()
-                        try:
-                            for _ in range(2):
-                                try:
-                                    resp = await client.get(url, timeout=5.0)
-                                    resp.raise_for_status()
-                                    image_bytes = resp.content
-                                    break
-                                except Exception:
-                                    await asyncio.sleep(0.5)
-
-                            if image_bytes and key:
-                                async with await anyio.open_file(cache_path.joinpath(key), "wb") as f:
-                                    await f.write(image_bytes)
-                        except Exception as e:
-                            logger.warning(f"下载图片失败: {e}")
-                            return "\n[图片下载失败]\n"
-
-                    if not image_bytes: return "\n[图片为空]\n"
-
-                    is_sticker = seg.data.get("sub_type") == 1
-                    image_base64 = base64.b64encode(image_bytes).decode("utf-8")
-
-                    description = await image_manager.get_image_description(
-                        image_base64=image_base64, is_sticker=is_sticker, cache_key=file_unique
-                    )
-                    if description:
-                        if is_sticker:
-                            return f"\n[表情包] [情感:{description.emotion}] [内容:{description.description}]\n"
-                        else:
-                            return f"\n[图片] {description.description}\n"
-                    return "\n[图片识别无结果]\n"
-                except Exception as e:
-                    logger.error(f"Image process error: {e}")
-                    return "\n[图片处理出错]\n"
+        elif seg.type == "image":
+            url = seg.data.get("url", "")
+            file_unique = seg.data.get("file_unique", "")
+            is_sticker = seg.data.get("sub_type") == 1
+            # 调用通用逻辑
+            return await resolve_image(url, file_unique, is_sticker)
 
         elif seg.type == "at":
             id = seg.data.get("qq")
@@ -135,10 +156,48 @@ async def message2BotMessage(bot_name: str, group_id: int, message: Message, bot
                 try:
                     source_msg = await bot.get_msg(message_id=int(reply_id))
                     sender = source_msg.get("sender", {}).get("nickname", "未知")
-                    return f" [回复 {sender}] "
-                except:
+
+                    content_data = source_msg.get("message", [])
+                    source_text = ""
+
+                    # 统一转为列表处理
+                    if isinstance(content_data, str):
+                        # 如果是纯文本(这种情况较少，通常是列表)，直接当文本
+                        source_text = content_data
+                    elif isinstance(content_data, list):
+                        for s in content_data:
+                            msg_type = s.get("type")
+                            data = s.get("data", {})
+
+                            if msg_type == "text":
+                                source_text += data.get("text", "")
+
+                            elif msg_type == "image":
+                                # 对引用消息里的图片也进行分析
+                                img_url = data.get("url", "")
+                                img_file_unique = data.get("file_unique", "")
+                                # 引用里的图片通常不易判断是否为表情包，默认 False，或者尝试获取 sub_type
+                                is_sticker_ref = str(data.get("sub_type", "")) == "1"
+
+                                # Await 分析结果
+                                img_desc = await resolve_image(img_url, img_file_unique, is_sticker_ref)
+                                source_text += img_desc
+
+                            elif msg_type == "face":
+                                # 简单处理 QQ 表情
+                                source_text += "[表情]"
+
+                    # 截断过长文本 (图片描述通常比较长，这里稍微放宽一点限制，或者只截断纯文本部分)
+                    # 简单策略：如果总长度超过 200 字符，截断
+                    if len(source_text) > 200:
+                        source_text = source_text[:200] + "..."
+
+                    return f" [回复 {sender}: \"{source_text}\"] "
+                except Exception as e:
+                    logger.warning(f"获取回复内容失败: {e}")
                     return " [回复] "
             return ""
+
         return ""
 
     tasks = [process_segment(seg) for seg in message]

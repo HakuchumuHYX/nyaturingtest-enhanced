@@ -348,7 +348,8 @@ async def handle_auto_chat(bot: Bot, event: GroupMessageEvent):
             logger.debug(f"检测到自身回显 (Echo): {msg_id}")
         else:
             logger.debug(f"检测到非本机发送的自身消息 (可能是其他插件或端): {msg_id}")
-        pass
+
+        nickname = bot_name
 
     if not nickname:
         try:
