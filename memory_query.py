@@ -9,7 +9,7 @@ from nonebot.exception import FinishedException
 
 from .state_manager import ensure_group_state
 from .utils import extract_and_parse_json
-from .models import GlobalMessageModel
+from .models import GlobalMessageModel, SessionModel, UserProfileModel, InteractionLogModel
 
 # 定义命令
 query_memory = on_command("查询记忆", aliases={"memory", "印象"}, priority=5, block=True)
@@ -56,28 +56,42 @@ async def handle_query_memory(bot: Bot, event: GroupMessageEvent, args: Message 
         bot_name = state.session.name()
         bot_role = state.session.role()
 
-        # --- 用户画像查找逻辑 ---
+        # --- 用户画像与交互统计逻辑 ---
+        # 即使内存里没有加载 profile，也要去数据库查真实的交互次数
+        interaction_count = 0
+        try:
+            session_db = await SessionModel.get_or_none(id=state.session.id)
+            if session_db:
+                # 查找对应的用户记录
+                user_db = await UserProfileModel.filter(
+                    session=session_db,
+                    user_id=target_id
+                ).first()
+
+                if user_db:
+                    # 直接对关联表进行 Count 统计，获取真实的记忆深度
+                    interaction_count = await InteractionLogModel.filter(user=user_db).count()
+        except Exception as e:
+            logger.error(f"统计交互次数失败: {e}")
+
+        # 获取内存中的情绪数据
         profile = state.session.profiles.get(target_id)
-        if not profile:
-            profile = state.session.profiles.get(target_name)
 
-        if profile:
-            profile_data = {
-                "valence": profile.emotion.valence,
-                "arousal": profile.emotion.arousal,
-                "dominance": profile.emotion.dominance,
-                "interactions": len(profile.interactions),
-                "last_seen": profile.last_update_time.strftime("%Y-%m-%d %H:%M")
-            }
-        else:
-            profile_data = {
-                "valence": 0.0,
-                "arousal": 0.0,
-                "dominance": 0.0,
-                "interactions": 0,
-                "last_seen": "未知"
-            }
+        # 构造显示数据
+        valence = profile.emotion.valence if profile else 0.0
+        arousal = profile.emotion.arousal if profile else 0.0
+        dominance = profile.emotion.dominance if profile else 0.0
+        last_seen = profile.last_update_time.strftime("%Y-%m-%d %H:%M") if profile else "未知"
 
+        profile_data = {
+            "valence": valence,
+            "arousal": arousal,
+            "dominance": dominance,
+            "interactions": interaction_count,  # 使用数据库统计的真实数值
+            "last_seen": last_seen
+        }
+
+        # --- 向量记忆检索 (RAG) ---
         try:
             search_queries = [
                 f"关于{target_name}的记忆",
@@ -86,16 +100,19 @@ async def handle_query_memory(bot: Bot, event: GroupMessageEvent, args: Message 
                 f"{target_name}的性格特点"
             ]
 
-            # 构造过滤条件
-            # 基础条件：只查记忆 (source="memory")，排除预设
-            where_conditions = [{"source": {"$eq": "memory"}}]
-
-            # 增强条件：如果已知 target_id，且不为空，则强制匹配 user_id
+            # 构造过滤条件：匹配 target_id 或者 user_id 为空 (全局记忆/未标记记忆)
+            user_filter = []
             if target_id and target_id.strip():
-                where_conditions.append({"user_id": {"$eq": target_id}})
+                user_filter = [{"user_id": {"$eq": target_id}}, {"user_id": {"$eq": ""}}]
+            else:
+                user_filter = [{"user_id": {"$eq": ""}}]
 
-            # 组合条件
-            search_filter = {"$and": where_conditions} if len(where_conditions) > 1 else where_conditions[0]
+            search_filter = {
+                "$and": [
+                    {"source": {"$eq": "memory"}},
+                    {"$or": user_filter}
+                ]
+            }
 
             if hasattr(state.session, 'long_term_memory'):
                 vector_records = await run_sync(state.session.long_term_memory.retrieve)(
@@ -103,6 +120,7 @@ async def handle_query_memory(bot: Bot, event: GroupMessageEvent, args: Message 
                     k=5,
                     where=search_filter
                 )
+                # 简单去重
                 if vector_records:
                     unique_recs = []
                     seen = set()
@@ -113,13 +131,15 @@ async def handle_query_memory(bot: Bot, event: GroupMessageEvent, args: Message 
                             unique_recs.append(content)
                     vector_records = unique_recs
 
-                    logger.debug(f"查询记忆: 检索到 {len(vector_records)} 条记录 (Filter: {search_filter})")
+                    logger.debug(f"查询记忆: 检索到 {len(vector_records)} 条记录")
         except Exception as e:
             logger.error(f"向量记忆检索失败: {e}")
 
+        # --- 获取最近聊天记录 ---
         try:
-            from .models import SessionModel
-            session_db = await SessionModel.get_or_none(id=state.session.id)
+            # 确保 session_db 存在 (前面可能已获取)
+            if not session_db:
+                session_db = await SessionModel.get_or_none(id=state.session.id)
 
             if session_db:
                 db_msgs = []
@@ -144,7 +164,7 @@ async def handle_query_memory(bot: Bot, event: GroupMessageEvent, args: Message 
             logger.error(f"查询历史消息失败: {e}")
             recent_user_msgs = ["(查询历史失败)"]
 
-    # 4. 判断逻辑
+    # 4. 判断逻辑 (如果没有交互且没有记忆，直接返回)
     if profile_data['interactions'] == 0 and not vector_records:
         msg = "我对你还没有形成具体的印象呢，多和我聊聊天吧！" if target_id == sender_id else f"我的记忆中暂时没有关于 {target_name} 的印象。"
         await query_memory.finish(msg)
@@ -155,6 +175,7 @@ async def handle_query_memory(bot: Bot, event: GroupMessageEvent, args: Message 
 
     vector_memory_str = "\n".join([f"- {rec}" for rec in vector_records]) if vector_records else "(暂无深层记忆)"
 
+    # Prompt 增加甄别指令，防止张冠李戴
     prompt = f"""
 你现在的名字是"{bot_name}"，设定是"{bot_role}"。
 请根据以下数据，生成你对用户"{target_name}"的印象评价。
@@ -165,8 +186,10 @@ async def handle_query_memory(bot: Bot, event: GroupMessageEvent, args: Message 
   - 关注度(Arousal, 0无感~1兴奋): {profile_data['arousal']:.2f}
   - 支配度(Dominance, -1你畏惧他~1你掌控他): {profile_data['dominance']:.2f}
 - 交互深度: {profile_data['interactions']} 次
-- 长期记忆碎片(重要参考 - 这些是发生在他身上的真实事件):
+- 长期记忆碎片(重要参考):
 {vector_memory_str}
+**(注意: 记忆碎片可能包含群聊中其他人的信息。请仔细甄别，只提取主语是"{target_name}"或明显关于他的事件，忽略无关人员的记忆。)**
+
 - 他最近说过的话: {json.dumps(recent_user_msgs, ensure_ascii=False)}
 
 [任务]

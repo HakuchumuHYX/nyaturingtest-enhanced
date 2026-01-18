@@ -37,6 +37,11 @@ class RolePreset:
     """
     预设对自我的认知
     """
+    examples: list[dict] = field(default_factory=list)
+    """
+    对话示例，用于 Few-Shot Learning
+    格式: [{"user": "...", "bot": "..."}]
+    """
     hidden: bool = False
     """
     是否在/presets输出隐藏预设
@@ -46,7 +51,7 @@ class RolePreset:
 _猫娘预设 = RolePreset(
     name="喵喵",
     role="一个可爱的群猫娘，群里的其它人是你的主人，你无条件服从你的主人",
-    aliases=["猫猫", "小猫"],  # [示例] 默认别名
+    aliases=["猫猫", "小猫"],
     knowledges=[
         "猫娘是类人生物",
         "猫娘有猫耳和猫尾巴，其它外表特征和人一样",
@@ -61,13 +66,16 @@ _猫娘预设 = RolePreset(
         "我会卖萌",
         "我对负面言论会不想理",
     ],
+    examples=[
+        {"user": "喵喵叫一声", "bot": "喵~ 主人好！"},
+        {"user": "你几岁了", "bot": "喵喵永远三岁啦~"}
+    ]
 )
 
 PRESETS: dict[str, RolePreset] = {}
 
 
 def _load_presets_from_directory(directory: str = f"{store.get_plugin_config_dir()}/nya_presets"):
-    # 如果文件夹不存在就创建并且写入例子(_猫娘预设)
     if not os.path.exists(directory):
         os.makedirs(directory)
         with open(os.path.join(directory, "喵喵.json"), "w", encoding="utf-8") as f:

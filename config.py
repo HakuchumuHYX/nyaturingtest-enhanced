@@ -6,7 +6,8 @@ from pydantic import BaseModel
 class Config(BaseModel):
     nyaturingtest_chat_openai_api_key: str
     nyaturingtest_chat_openai_model: str = "Qwen/Qwen3-32B"
-    nyaturingtest_chat_openai_base_url: str = "https://api.siliconflow.cn/v1" # 确保 Base URL 正确
+    nyaturingtest_feedback_openai_model: str = "Qwen/Qwen2.5-7B-Instruct"
+    nyaturingtest_chat_openai_base_url: str = "https://api.siliconflow.cn/v1"
     nyaturingtest_siliconflow_api_key: str
     nyaturingtest_enabled_groups: list[int] = []
 

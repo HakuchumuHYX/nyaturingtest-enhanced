@@ -8,16 +8,18 @@ class LLMClient:
     def __init__(self, client: AsyncOpenAI):
         self.client = client
 
-    async def generate_response(self, prompt: str, model: str, temperature: float = 0.7, **kwargs) -> str | None:
+    async def generate_response(self, prompt: str, model: str, temperature: float = 0.7, system_prompt: str = None, **kwargs) -> str | None:
         """
-        生成回复，支持透传参数
+        生成回复，支持透传参数和自定义 System Prompt
         """
         try:
-            system_content = (
-                "You are a helpful assistant designed to output JSON directly. "
-                "You may use <think>...</think> tags for internal reasoning and planning. "
-                "However, the final output MUST be a valid JSON object outside the tags."
-            )
+            if not system_prompt:
+                system_content = (
+                    "You are an intelligent agent. "
+                    "Output the final response in JSON format."
+                )
+            else:
+                system_content = system_prompt
 
             messages = [
                 {"role": "system", "content": system_content},

@@ -21,9 +21,10 @@ from .utils import get_http_client, smart_split_text
 _IMG_SEMAPHORE = asyncio.Semaphore(3)
 
 
-async def llm_response(client: LLMClient, message: str, json_mode: bool = False) -> str:
+async def llm_response(client: LLMClient, message: str, model: str, temperature: float, json_mode: bool = False,
+                       system_prompt: str = None) -> str:
     """
-    封装 LLM 调用
+    封装 LLM 调用，支持指定模型和温度，以及 System Prompt
     """
     try:
         kwargs = {}
@@ -32,13 +33,14 @@ async def llm_response(client: LLMClient, message: str, json_mode: bool = False)
 
         result = await client.generate_response(
             prompt=message,
-            model=plugin_config.nyaturingtest_chat_openai_model,
-            temperature=0.7,
+            model=model,
+            temperature=temperature,
+            system_prompt=system_prompt,  # 传递 System Prompt
             **kwargs
         )
         return result if result else ""
     except Exception as e:
-        logger.error(f"LLM Error: {e}")
+        logger.error(f"LLM Error [{model}]: {e}")
         return "Error occurred while processing the message."
 
 
@@ -173,19 +175,45 @@ async def spawn_state(state: GroupState):
             should_publish = not is_echo_only
 
             # 3. 加载 Session (加锁)
-            # 只在加载数据时加锁，后续 LLM 生成时不加锁，允许查询命令插队
             async with state.session_lock:
                 await state.session.load_session()
 
-            # 4. 执行核心逻辑 (LLM 生成)
+            # 4. 组装 LLM 调用函数
+
+            # 定义一个强制的 System Prompt 用于 Roleplay，使用中文指令
+            rp_system_prompt = (
+                "你是一个沉浸式的角色扮演者。你必须时刻保持角色设定。"
+                "请使用中文进行思考和回答（除非人设要求使用其他语言）。"
+                "最终输出必须是合法的 JSON 格式。"
+            )
+
+            # Chat 函数
+            chat_func = lambda msg, json_mode=False: llm_response(
+                state.client, msg,
+                model=plugin_config.nyaturingtest_chat_openai_model,
+                temperature=0.65,
+                json_mode=json_mode,
+                system_prompt=rp_system_prompt
+            )
+
+            # Feedback 函数：温度极低，保证逻辑分析准确
+            feedback_func = lambda msg, json_mode=False: llm_response(
+                state.client, msg,
+                model=plugin_config.nyaturingtest_feedback_openai_model,
+                temperature=0.1,
+                json_mode=json_mode
+            )
+
+            # 5. 执行核心逻辑 (LLM 生成)
             try:
                 responses = await state.session.update(
                     messages_chunk=current_chunk,
-                    llm_func=lambda msg, json_mode=False: llm_response(state.client, msg, json_mode=json_mode),
+                    chat_llm_func=chat_func,  # 传入 Chat 函数
+                    feedback_llm_func=feedback_func,  # 传入 Feedback 函数
                     publish=should_publish
                 )
 
-                # 5. 发送回复
+                # 6. 发送回复 (保持不变)
                 if responses:
                     total = len(responses)
                     for r_idx, response in enumerate(responses):
@@ -195,7 +223,6 @@ async def spawn_state(state: GroupState):
                             raw_content = response
                         elif isinstance(response, dict):
                             raw_content = response.get("content", "")
-                            # 优先读取 'target_id' ，兼容 'reply_to'
                             reply_id = response.get("target_id") or response.get("reply_to")
 
                         if not raw_content: continue
@@ -204,14 +231,12 @@ async def spawn_state(state: GroupState):
                         msg_parts = smart_split_text(raw_content)
                         for i, part in enumerate(msg_parts):
                             part = part.strip()
-                            # 清理句末多余标点
                             if part and part[-1] in ["。", ".", "，"]:
                                 part = part[:-1]
 
                             if not part: continue
 
                             msg_to_send = Message(part)
-                            # 如果是回复某条特定消息，且是第一段，则带上 reply 引用
                             if reply_id and r_idx == 0 and i == 0:
                                 try:
                                     msg_to_send.insert(0, MessageSegment.reply(int(reply_id)))
@@ -236,7 +261,6 @@ async def spawn_state(state: GroupState):
                             except Exception as e:
                                 logger.error(f"发送未知错误: {e}")
 
-                            # 模拟人类打字延迟
                             if i < len(msg_parts) - 1 or r_idx < total - 1:
                                 delay = 1.0 + len(part) * 0.1
                                 delay = min(delay, 5.0)
