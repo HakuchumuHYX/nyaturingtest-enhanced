@@ -2,91 +2,120 @@
 
 ## 项目简介
 
-本项目基于 [nonebot-plugin-nyaturingtest](https://github.com/shadow3aaa/nonebot-plugin-nyaturingtest) 进行修改。
+本项目是基于 [nonebot-plugin-nyaturingtest](https://github.com/shadow3aaa/nonebot-plugin-nyaturingtest) 的改造版本。
 
-## 配置指南
+核心目标是将原项目从“重本地算力”转向“重云端API”，在保留核心拟人化交互体验的同时，极大地降低部署门槛和资源消耗。
 
-如果你想使用本插件，建议先从[原项目](https://github.com/shadow3aaa/nonebot-plugin-nyaturingtest)安装所需的依赖。  
-如果你是Windows系统，可能会出现运行报错，可以带着你的错误日志在[这里](https://gemini.google.com)或是与之类似的地方求助。  
-本插件的配置参数与原项目一致，详细说明请查阅[原项目文档](https://github.com/shadow3aaa/nonebot-plugin-nyaturingtest/blob/master/README.md)。
+## ✨ 核心特性
 
-## 功能变更
+### 1. 轻量化架构 (Lite Architecture)
 
-与原项目相比，本项目主要做出了以下重大更改：
+- **去本地化模型**：移除了原项目中庞大的 `HippoRAG` (图神经网络) 和本地 `BGE-M3` Embedding 模型。
+- **云端算力替代**：
+  - **Embedding**: 对接 SiliconFlow (硅基流动) 的 Embedding API，速度更快，效果更强。
+  - **VLM**: 图片理解模块对接 Qwen-VL (via SiliconFlow)，无需本地显存即可实现高精度识图。
+- **资源占用骤降**：运行时内存占用从 4GB+ 降低至 **200MB 左右**，启动速度提升至秒级。
 
-1. **架构重构（Lite化）**：
-   - **移除重型依赖**：移除了本地运行的 `HippoRAG` (图神经网络) 和 `BGE-M3` 模型，重构为 **ChromaDB** + **SiliconFlow Embedding API**。
-   - **性能飞跃**：插件启动速度从 10秒+ 提升至 **秒级**；运行时内存占用从 4GB+ 暴降至 **200MB 左右**。
-   - **实时记忆**：长期记忆不再需要退出时构建索引，而是随对话实时写入向量库，意外断电也不会丢失数据。
+### 2. 增强的交互逻辑
 
-2. **交互逻辑增强**：
-   - **强制响应机制**：新增了对 `@Bot` 和回复消息的检测逻辑。当被用户点名时，Bot 会强制打破“潜水”或“贤者时间”状态进行回应，彻底解决了“叫不答应”的问题。
-   - **意愿算法调优**：优化了拟人化状态机（潜水/冒泡/活跃）的转换逻辑，大幅降低了无关话题下的插嘴频率，但在被召唤时响应更积极。
+- **自主意识循环**：采用 `Producer-Consumer` 模型的后台思考循环 (`spawn_state`)，Bot 会根据群聊上下文自主决定是否发言，而非传统的“一问一答”。
+- **强制响应机制**：解决了“叫不答应”的问题。当检测到 `@Bot` 或 `回复Bot消息` 时，会自动打破“潜水”状态，强制触发响应逻辑。
+- **拟人化状态机**：维护 `潜水` / `冒泡` / `活跃` 三种状态，根据群聊热度动态调整插话频率。
 
-3. **稳定性与性能优化**：
-   - **并发控制**：图片处理引入了信号量锁（Semaphore）和 GIF 流式读取机制，防止因接收大量图片或大尺寸动图导致内存溢出 (OOM) 或 API 频率限制 (429)。
-   - **网络增强**：API 请求配置为强制直连（`trust_env=False`），有效解决了国内环境下因系统代理格式问题导致的请求失败。
+### 3. 稳定可靠的数据持久化
 
-4. **数据持久化**：
-   - 长期记忆使用 ChromaDB (SQLite) 存储，会话状态使用 Tortoise-ORM (SQLite) 管理，替代了不稳定的 JSON 文件读写，数据更安全。
+- **数据库迁移**：从不稳定的 JSON 文件读写全面迁移至 **SQLite + Tortoise-ORM**。
+- **实时记忆**：
+  - **长期记忆**: 使用 **ChromaDB** 存储向量化记忆，支持实时写入，意外断电不丢数据。
+  - **短时记忆**: 采用滑动窗口 + LLM 实时摘要 (`Summary`) 机制，自动压缩历史对话。
 
-## 项目架构与模块说明
+### 4. 高并发与抗风控
 
-本项目采用了模块化设计，各文件职责如下：
+- **并发控制**：引入 `asyncio.Semaphore` 限制图片处理并发数，防止瞬间大量图片导致内存溢出。
+- **网络优化**：API 请求强制直连 (`trust_env=False`)，并在底层配置了 `httpx` 连接池，解决 Windows 下系统代理导致的连接问题。
+- **风控规避**：内置随机延迟发送和智能分句逻辑，降低被腾讯风控拦截的概率。
 
-### 1. 核心入口与调度
-- **`__init__.py`**: 插件的入口文件。
-    - 负责生命周期管理（启动时连接数据库，关闭时保存数据）。
-    - 注册 NoneBot 的 Matchers。
-- **`state_manager.py` (状态大管家)**:
-    - 管理全局的 `GroupState`（群组状态）。
-    - 负责资源的初始化（`ensure_group_state`）和统一清理（`cleanup_global_resources`）。
-    - **关键作用**: 解决了 Session 和 Bot 实例的循环引用问题。
-- **`matchers.py` (指令接收)**:
-    - 定义所有的 `on_command` (如 `/reset`, `/role`) 和 `on_message`。
-    - 负责接收 OneBot 事件，并将其通过 `logic` 层传递给后台。
+## 🛠️ 配置指南
 
-### 2. 业务逻辑层
-- **`logic.py` (业务大脑)**:
-    - **`spawn_state`**: 后台无限循环任务，负责定时从 Session 获取回复并发送。包含抗风控的随机延迟逻辑。
-    - **`message2BotMessage`**: 将复杂的 QQ 消息（图片、表情包、@、回复）转译为 LLM 能读懂的纯文本格式。
-    - **并发控制**: 对图片下载和识别加入了信号量锁，防止瞬间高并发。
-- **`session.py` (会话核心)**:
-    - 维护单个群聊的完整上下文（Session 类）。
-    - **核心调度**: 串联感知 (`feedback`)、记忆检索 (`search`) 和表达 (`chat`) 三个阶段。
-    - **状态机**: 维护 潜水/冒泡/活跃 三种状态，并包含针对被 @ 的强制状态修正逻辑。
+在使用前，请确保你的 `.env` 文件中包含以下配置项：
 
-### 3. 记忆与数据层
-- **`vector_mem.py` (长期记忆)**:
-    - 封装 `ChromaDB` 和 `SiliconFlowEmbeddingFunction`。
-    - 实现了基于 MD5 的内容去重（Upsert）和 API 调用的容错处理。
-- **`mem.py` (短时记忆)**:
-    - 管理最近的聊天记录窗口（滑动窗口机制）。
-    - 负责调用小模型对过往历史进行压缩摘要。
-- **`profile.py` & `impression.py` (用户画像)**:
-    - 维护 Bot 对每个群友的 VAD 情感模型（愉悦度、唤醒度、支配度）。
-    - 包含情感随时间衰减的数学逻辑。
-- **`models.py`**: 定义 `Tortoise-ORM` 的数据库表结构（SQLite），确保持久化存储。
+```dotenv
+# --- LLM 对话配置 ---
+nyaturingtest_chat_openai_api_key=
+nyaturingtest_chat_openai_model=
+nyaturingtest_chat_openai_base_url=
 
-### 4. 基础设施与工具
-- **`client.py`**: 封装 OpenAI 格式的 API 调用，支持超时重试。
-- **`vlm.py` & `image_manager.py`**: 
-    - 处理图片理解。`image_manager` 负责缓存图片描述（避免重复消耗 Token），`vlm.py` 负责调用硅基流动的视觉大模型。
-    - 优化了 GIF 处理逻辑，改为流式读取，防止内存溢出 (OOM)。
-- **`prompts.py`**: 集中管理所有复杂的 System Prompt，包含 JSON 格式约束和 Few-Shot 示例。
-- **`utils.py`**: 提供全局 HTTP 客户端、智能断句、JSON 提取等通用工具函数。
-- **`config.py`**: 管理从 `.env` 读取的配置项。
+# --- 记忆与反馈配置 ---
+# 用于记忆压缩和自我反馈的小模型
+nyaturingtest_feedback_openai_model=
 
-## 注意事项
+# --- 硅基流动服务配置 ---
+# 用于 Embedding 和 VLM (视觉理解)
+nyaturingtest_siliconflow_api_key=sk-xxxxxx
 
-~~由于该插件的运作逻辑，导致token消耗会**非常非常大**（在一个一天发2k条消息的群聊中使用，一天总共约消耗30Mtoken），使用请注意。~~  
-~~也许在之后会优化一下token使用。~~  
-更改了feedback逻辑，以轻微降低智能的代价大幅降低了token使用。  
-~~更改了长期记忆索引的逻辑，大幅降低了token使用。~~  
-~~目前的token用量大约在先前的20%左右，即处理大概2k条消息总共消耗6-7Mtoken。~~  
-更改了长期记忆的逻辑，极大程度地降低了token使用。现在token的使用主要在对话阶段以及反馈阶段，记忆阶段几乎不消耗。  
-作为参考，目前处理2k条消息，大概消耗在1Mtoken左右。  
-建议：.env文件中配置的对话用大模型用优质一点的（作为参考，我用的是DeepSeek-V3.2），会更加智能。  
+# --- 启用范围 ---
+# 填写允许 Bot 运行的群组 QQ 号列表
+nyaturingtest_enabled_groups=[123456789, 987654321]
+```
+
+### 指令、架构与说明
+
+---
+
+## 🎮 指令列表
+
+所有指令仅支持 **SUPERUSER** 使用。
+
+### 群聊指令
+
+| 指令                        | 别名     | 说明                                        |
+| :-------------------------- | :------- | :------------------------------------------ |
+| `/help`                     | 帮助     | 显示帮助信息                                |
+| `/status`                   | 状态     | 查看当前群组的 Bot 状态（记忆数、情感值等） |
+| `/role`                     | 当前角色 | 查看当前加载的角色设定                      |
+| `/set_role <角色名> <设定>` | 设置角色 | 动态修改 Bot 的人设（支持实时生效）         |
+| `/presets`                  | preset   | 查看所有可用的预设文件                      |
+| `/set_preset <文件名>`      | 加载预设 | 从文件加载角色预设                          |
+| `/calm`                     | 冷静     | 强制降低 Bot 的活跃度（进入贤者时间）       |
+| `/reset`                    | 重置     | 清空当前群组的短期记忆和会话状态            |
+
+### 私聊指令
+
+私聊指令通常需要指定群号，格式为：`指令 <群号> [参数]`。
+例如：`status 123456789`
+
+## 📂 项目架构
+
+为了方便二次开发，简要说明各模块职责：
+
+### 1. 核心调度层
+
+- **`matchers.py`**: 消息接收入口。处理 OneBot 事件，过滤群组，将消息推送到后台缓冲区。
+- **`state_manager.py`**: 全局状态容器。管理所有群组的 `GroupState`，负责资源（数据库、HTTP客户端）的生命周期管理，解决循环引用问题。
+- **`logic.py`**: 业务大脑。包含 `spawn_state` 无限循环，负责从队列取消息 -> 组装 Prompt -> 调用 LLM -> 发送消息。
+
+### 2. 记忆系统
+
+- **`mem.py`**: 短时记忆管理。实现了一个带有“压缩缓冲区”的滑动窗口，当积压消息达到阈值时，自动调用小模型生成摘要。
+- **`vector_mem.py`**: 长期记忆管理。封装 ChromaDB 操作，负责文本的向量化（Embedding）和相似度检索。
+
+### 3. 感知与表达
+
+- **`vlm.py`**: 视觉中心。封装 OpenAI 格式的 Vision API，支持 GIF 流式读取和图片描述缓存。
+- **`client.py`**: LLM 客户端。封装了带有重试机制（Retrying）的 `AsyncOpenAI` 调用。
+- **`emotion.py` / `profile.py`**: 情感模型。维护基于 VAD（愉悦-唤醒-支配）理论的群友印象系统。
+
+## ⚠️ 注意事项
+
+1. **Token 消耗**：
+   - 虽然通过“记忆摘要”和“长期记忆检索”优化了 Prompt 长度，但由于 Bot 需要不断读取群聊上下文进行“自我思考”（Feedback 阶段），Token 消耗依然可观。
+   - **建议**：在 `.env` 中将 `feedback` 模型设置为廉价模型，将 `chat` 模型设置为高性能模型。
+
+2. **数据库文件**：
+   - 运行时会在插件数据目录生成 `nyabot.sqlite`。请定期备份此文件以防数据丢失。
+   - 长期记忆向量库由 ChromaDB 管理，通常位于本地文件夹。
 
 ## Special Thanks
-[G指导](https://gemini.google.com)：帮我完成了代码的修改以及这篇readme的撰写。
+
+- **原作者**: [shadow3aaa](https://github.com/shadow3aaa/) 提供的前沿架构思路。
+- [**G指导**](https://gemini.google.com/app): 协助完成了代码的重构、Bug 修复以及文档编写。

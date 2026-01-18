@@ -50,7 +50,7 @@ class LLMClient:
             except (APIConnectionError, APITimeoutError, httpx.ConnectError, httpx.ReadTimeout) as e:
                 logger.warning(f"[LLM] 网络请求失败 (尝试 {attempt + 1}/{max_retries}): {type(e).__name__} - {e}")
                 if attempt < max_retries - 1:
-                    await asyncio.sleep(base_delay * (attempt + 1))  
+                    await asyncio.sleep(base_delay * (attempt + 1))
                 else:
                     logger.error(f"[LLM] 最终请求失败: {e}")
                     return None
