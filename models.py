@@ -61,6 +61,7 @@ class GlobalMessageModel(Model):
     class Meta:
         table = "nyabot_global_messages"
 
+
 class EnabledGroupModel(Model):
     """存储启用的群组ID"""
     group_id = fields.BigIntField(pk=True)

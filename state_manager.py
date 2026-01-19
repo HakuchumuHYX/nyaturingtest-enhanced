@@ -26,12 +26,24 @@ class GroupState:
             http_client=get_http_client()
         )
     )
+
     messages_chunk: list[MMessage] = field(default_factory=list)
+
     client: LLMClient = field(
         default_factory=lambda: LLMClient(
             client=AsyncOpenAI(
                 api_key=plugin_config.nyaturingtest_chat_openai_api_key,
                 base_url=plugin_config.nyaturingtest_chat_openai_base_url,
+                http_client=get_http_client()
+            )
+        )
+    )
+
+    feedback_client: LLMClient = field(
+        default_factory=lambda: LLMClient(
+            client=AsyncOpenAI(
+                api_key=plugin_config.nyaturingtest_siliconflow_api_key,
+                base_url="https://api.siliconflow.cn/v1",
                 http_client=get_http_client()
             )
         )

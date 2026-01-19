@@ -22,12 +22,12 @@ _IMG_SEMAPHORE = asyncio.Semaphore(3)
 
 
 async def llm_response(client: LLMClient, message: str, model: str, temperature: float, json_mode: bool = False,
-                       system_prompt: str = None) -> str:
+                       system_prompt: str = None, **kwargs) -> str:  # <--- 添加 **kwargs
     """
-    封装 LLM 调用，支持指定模型和温度，以及 System Prompt
+    封装 LLM 调用，支持高级参数透传
     """
     try:
-        kwargs = {}
+        # 如果是 JSON 模式，合并到 kwargs
         if json_mode:
             kwargs["response_format"] = {"type": "json_object"}
 
@@ -35,13 +35,13 @@ async def llm_response(client: LLMClient, message: str, model: str, temperature:
             prompt=message,
             model=model,
             temperature=temperature,
-            system_prompt=system_prompt,  # 传递 System Prompt
+            system_prompt=system_prompt,
             **kwargs
         )
         return result if result else ""
     except Exception as e:
         logger.error(f"LLM Error [{model}]: {e}")
-        return "Error occurred while processing the message."
+        return "Error occurred."
 
 
 async def message2BotMessage(bot_name: str, group_id: int, message: Message, bot: Bot) -> str:
@@ -246,18 +246,45 @@ async def spawn_state(state: GroupState):
                 "最终输出必须是合法的 JSON 格式。"
             )
 
+            gemini_extra_body = {
+                "google": {
+                    "model_safety_settings": {
+                        # 必须全关，否则 RP 中稍微激动一点就会被 Google 掐断
+                        "enabled": False
+                    },
+                    "thinking_config": {
+                        # Gemini 3 Flash 特性：开启轻量思考，提升 RP 逻辑感
+                        "include_thoughts": False,  # 只返回结果，不返回思考过程文本
+                        "thinking_level": "low"  # 档位：minimal/low/medium/high
+                    }
+                }
+            }
+
             # Chat 函数
             chat_func = lambda msg, json_mode=False: llm_response(
                 state.client, msg,
-                model=plugin_config.nyaturingtest_chat_openai_model,
-                temperature=0.65,
+                model=plugin_config.nyaturingtest_chat_openai_model,  # 确保 config 里填的是 "gemini-3-flash-preview"
+
+                # Gemini 3 推荐保持 1.0，不要降温
+                temperature=1.05,
+
+                # OpenAI SDK 标准参数
+                top_p=0.95,
+
+                # 透传 Gemini 独有参数
+                extra_body={
+                    "top_k": 64,  # 锁住发散边界
+                    **gemini_extra_body
+                },
+
                 json_mode=json_mode,
                 system_prompt=rp_system_prompt
             )
 
             # Feedback 函数：温度极低，保证逻辑分析准确
             feedback_func = lambda msg, json_mode=False: llm_response(
-                state.client, msg,
+                state.feedback_client,
+                msg,
                 model=plugin_config.nyaturingtest_feedback_openai_model,
                 temperature=0.1,
                 json_mode=json_mode

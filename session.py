@@ -74,7 +74,7 @@ class Session:
             llm_client=LLMClient(
                 client=AsyncOpenAI(
                     api_key=plugin_config.nyaturingtest_siliconflow_api_key,
-                    base_url=plugin_config.nyaturingtest_chat_openai_base_url,
+                    base_url="https://api.siliconflow.cn/v1",
                     http_client=self._client_instance
                 )
             )

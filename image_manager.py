@@ -15,7 +15,7 @@ from PIL import Image, ImageSequence
 from nonebot.utils import run_sync
 
 from .config import plugin_config
-from .vlm import SiliconFlowVLM
+from .vlm import VLM
 
 IMAGE_CACHE_DIR = Path(f"{store.get_plugin_cache_dir()}/image_cache")
 
@@ -56,13 +56,13 @@ class ImageManager:
 
     def __init__(self):
         if not self._initialized:
-            self._vlm = SiliconFlowVLM(
-                api_key=plugin_config.nyaturingtest_siliconflow_api_key,
-                model="zai-org/GLM-4.6V",
+            self._vlm = VLM(
+                api_key=plugin_config.nyaturingtest_chat_openai_api_key,
+                endpoint=plugin_config.nyaturingtest_chat_openai_base_url,
+                model=plugin_config.nyaturingtest_chat_openai_model,
             )
             IMAGE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
             self._initialized = True
-            # 简单的内存缓存，存储 id -> ImageWithDescription
             self._mem_cache: dict[str, ImageWithDescription] = {}
 
     def get_from_cache(self, key: str) -> ImageWithDescription | None:
@@ -162,6 +162,15 @@ class ImageManager:
             prompt=prompt,
             image_base64=target_image_base64,
             image_format=target_format,
+            # 这里传入 extra_body，vlm.py 修改后会透传给 API
+            extra_body={
+                "top_k": 64,  # Gemini 识图也需要这个来保证稳定性
+                "google": {
+                    "model_safety_settings": {
+                        "enabled": False  # 关掉识图的安全过滤，防止把用户的普通表情包误杀
+                    }
+                }
+            }
         )
 
         if not response:
