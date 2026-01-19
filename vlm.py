@@ -1,7 +1,7 @@
 from openai import AsyncOpenAI
 from nonebot import logger
 import asyncio
-import httpx  # [新增] 用于配置连接池
+import httpx 
 
 
 class VLM:
