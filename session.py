@@ -292,7 +292,7 @@ class Session:
 {recent_str}
 """
 
-    async def __search_stage(self, queries: list[str], active_user_names: list[str], on_usage=None):
+    async def __search_stage(self, queries: list[str], active_user_names: list[str]):
         """
         优化检索阶段
         """
@@ -322,8 +322,7 @@ class Session:
             raw_results = await run_sync(self.long_term_memory.retrieve)(
                 queries,
                 k=20,
-                where=where_filter,
-                on_usage=on_usage
+                where=where_filter
             )
 
             if raw_results:
@@ -603,8 +602,7 @@ class Session:
     async def update(self, messages_chunk: list[Message],
                      chat_llm_func: Callable[[str, bool], Awaitable[str]],
                      feedback_llm_func: Callable[[str, bool], Awaitable[str]],
-                     publish: bool = True,
-                     on_rerank_usage=None) -> list[dict] | None:
+                     publish: bool = True) -> list[dict] | None:
         
         # 1. 更新短时记忆 (Buffer)
         # 这里的 update 不再触发后台压缩，而是单纯的 Rolling Window 更新
@@ -652,7 +650,7 @@ class Session:
         queries = [msg.content for msg in messages_chunk[-2:]]
         active_users = [msg.user_name for msg in messages_chunk if msg.user_name]
 
-        await self.__search_stage(queries, active_user_names=active_users, on_usage=on_rerank_usage)
+        await self.__search_stage(queries, active_user_names=active_users)
 
         logger.debug("启用拟人化串行模式: Feedback -> Check -> Chat")
 
