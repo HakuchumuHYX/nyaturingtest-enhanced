@@ -1,5 +1,6 @@
 # nyaturingtest/client.py
 import asyncio
+from typing import Callable, Any
 import httpx
 from openai import AsyncOpenAI, APIConnectionError, APITimeoutError
 from nonebot import logger
@@ -10,6 +11,7 @@ class LLMClient:
         self.client = client
 
     async def generate_response(self, prompt: str, model: str, temperature: float = 0.7, system_prompt: str | None = None,
+                                on_usage: Callable[[dict], None] | None = None,
                                 **kwargs) -> str | None:
         """
         生成回复，支持透传参数和自定义 System Prompt，包含重试机制
@@ -45,6 +47,13 @@ class LLMClient:
                     timeout=request_timeout,
                     **kwargs
                 )
+                
+                if on_usage and response.usage:
+                    try:
+                        on_usage(response.usage.model_dump())
+                    except Exception as ex:
+                        logger.warning(f"Usage callback failed: {ex}")
+
                 return response.choices[0].message.content
 
             except (APIConnectionError, APITimeoutError, httpx.ConnectError, httpx.ReadTimeout) as e:

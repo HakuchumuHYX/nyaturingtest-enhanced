@@ -103,9 +103,14 @@ async def handle_query_memory(bot: Bot, event: GroupMessageEvent, args: Message 
             }
 
             if hasattr(state.session, 'long_term_memory'):
+                # 动态计算提取条数
+                # 基础5条，每增加20次交互加1条，上限15条
+                dynamic_k = min(max(5, interaction_count // 20), 15)
+                
+                # 移除 on_usage 参数
                 vector_records = await run_sync(state.session.long_term_memory.retrieve)(
                     search_queries,
-                    k=5,
+                    k=dynamic_k,
                     where=search_filter
                 )
                 # 简单去重
@@ -119,7 +124,7 @@ async def handle_query_memory(bot: Bot, event: GroupMessageEvent, args: Message 
                             unique_recs.append(content)
                     vector_records = unique_recs
 
-                    logger.debug(f"查询记忆: 检索到 {len(vector_records)} 条记录")
+                    logger.debug(f"查询记忆: 目标k={dynamic_k}, 实际检索到 {len(vector_records)} 条记录")
         except Exception as e:
             logger.error(f"向量记忆检索失败: {e}")
 

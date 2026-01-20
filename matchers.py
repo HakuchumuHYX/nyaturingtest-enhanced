@@ -6,7 +6,8 @@ from nonebot.adapters.onebot.v11 import (
     GroupMessageEvent,
     PrivateMessageEvent,
     Message,
-    Event
+    Event,
+    MessageSegment
 )
 from nonebot.params import CommandArg
 from nonebot.permission import SUPERUSER
@@ -23,6 +24,7 @@ from .state_manager import (
 )
 from .logic import message2BotMessage
 from .mem import Message as MMessage
+from .repository import SessionRepository
 
 
 # ==================== 辅助规则 ====================
@@ -101,6 +103,9 @@ list_groups_pm = on_command(
 )
 manage_cmd = on_command(
     rule=is_group_message, permission=SUPERUSER, cmd="autochat", priority=1, block=True
+)
+token_stats = on_command(
+    rule=is_group_message, permission=SUPERUSER, cmd="token统计", aliases={"autochat token统计"}, priority=1, block=True
 )
 
 # ==================== 处理逻辑 ====================
@@ -408,3 +413,59 @@ async def handle_manage_autochat(event: GroupMessageEvent, args: Message = Comma
 
     else:
         await manage_cmd.finish("指令格式错误。请使用: autochat enable 或 autochat disable")
+
+
+@token_stats.handle()
+async def handle_token_stats(bot: Bot, event: GroupMessageEvent):
+    group_id = event.group_id
+    stats = await SessionRepository.get_token_stats(group_id)
+
+    # 辅助函数：格式化单个统计项
+    def format_stat_list(stat_list):
+        if not stat_list:
+            return "无数据"
+        lines = []
+        total_all = 0
+        for item in stat_list:
+            lines.append(f"[{item['model']}]")
+            lines.append(f"  Prompt: {item['prompt']}")
+            lines.append(f"  Completion: {item['completion']}")
+            lines.append(f"  Total: {item['total']}")
+            total_all += item['total']
+        lines.append(f"------------\n总计: {total_all}")
+        return "\n".join(lines)
+
+    # 构造三个节点的内容
+    content_1d = f"=== 24小时消耗统计 ===\n\n【本群消耗】\n{format_stat_list(stats['1d_local'])}\n\n【全局所有群消耗】\n{format_stat_list(stats['1d_global'])}"
+    content_7d = f"=== 7天消耗统计 ===\n\n【本群消耗】\n{format_stat_list(stats['7d_local'])}\n\n【全局所有群消耗】\n{format_stat_list(stats['7d_global'])}"
+    content_all = f"=== 历史总消耗统计 ===\n\n【全局总计】\n{format_stat_list(stats['all_global'])}"
+
+    # 构造合并转发节点
+    nodes = [
+        MessageSegment.node_custom(
+            user_id=int(bot.self_id),
+            nickname="Token统计姬",
+            content=content_1d
+        ),
+        MessageSegment.node_custom(
+            user_id=int(bot.self_id),
+            nickname="Token统计姬",
+            content=content_7d
+        ),
+        MessageSegment.node_custom(
+            user_id=int(bot.self_id),
+            nickname="Token统计姬",
+            content=content_all
+        )
+    ]
+
+    try:
+        await bot.call_api(
+            "send_group_forward_msg",
+            group_id=group_id,
+            messages=nodes
+        )
+    except Exception as e:
+        logger.error(f"发送合并转发消息失败: {e}")
+        # 降级：直接发文本
+        await token_stats.finish(f"{content_1d}\n\n{content_7d}\n\n{content_all}")

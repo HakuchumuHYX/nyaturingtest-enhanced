@@ -292,7 +292,7 @@ class Session:
 {recent_str}
 """
 
-    async def __search_stage(self, queries: list[str], active_user_names: list[str]):
+    async def __search_stage(self, queries: list[str], active_user_names: list[str], on_usage=None):
         """
         优化检索阶段
         """
@@ -322,7 +322,8 @@ class Session:
             raw_results = await run_sync(self.long_term_memory.retrieve)(
                 queries,
                 k=20,
-                where=where_filter
+                where=where_filter,
+                on_usage=on_usage
             )
 
             if raw_results:
@@ -602,7 +603,8 @@ class Session:
     async def update(self, messages_chunk: list[Message],
                      chat_llm_func: Callable[[str, bool], Awaitable[str]],
                      feedback_llm_func: Callable[[str, bool], Awaitable[str]],
-                     publish: bool = True) -> list[dict] | None:
+                     publish: bool = True,
+                     on_rerank_usage=None) -> list[dict] | None:
         
         # 1. 更新短时记忆 (Buffer)
         # 这里的 update 不再触发后台压缩，而是单纯的 Rolling Window 更新
@@ -616,7 +618,7 @@ class Session:
         seconds_passed = (now - self._last_activity_time).total_seconds()
 
         # 加速非活跃期的意愿衰减
-        decay_rate = 0.05 if seconds_passed < 300 else 0.08
+        decay_rate = 0.03 if seconds_passed < 300 else 0.06
         decay = (seconds_passed / 60.0) * decay_rate
         self.willingness = max(0.0, self.willingness - decay)
         self._last_activity_time = now
@@ -628,11 +630,11 @@ class Session:
         else:
             # 降低自然增长幅度，避免看别人聊天自己越来越兴奋
             # 只有当目前意愿值较低时，才允许缓慢增长，防止无上限的自我激励
-            if self.willingness < 0.6:
-                self.willingness = min(1.0, self.willingness + 0.02 * len(messages_chunk))
+            if self.willingness < 0.7:
+                self.willingness = min(1.0, self.willingness + 0.03 * len(messages_chunk))
 
         # 3. 节流判断 (Gatekeeper)
-        if self.willingness < 0.4 and not is_relevant:
+        if self.willingness < 0.35 and not is_relevant:
             logger.debug(f"意愿值过低 ({self.willingness:.2f}) 且无强关联，跳过响应")
             return None
 
@@ -650,7 +652,7 @@ class Session:
         queries = [msg.content for msg in messages_chunk[-2:]]
         active_users = [msg.user_name for msg in messages_chunk if msg.user_name]
 
-        await self.__search_stage(queries, active_user_names=active_users)
+        await self.__search_stage(queries, active_user_names=active_users, on_usage=on_rerank_usage)
 
         logger.debug("启用拟人化串行模式: Feedback -> Check -> Chat")
 
@@ -658,7 +660,7 @@ class Session:
         recalled_history = await self.__feedback_stage(messages_chunk, feedback_llm_func, is_relevant=is_relevant)
 
         # 再次检查意愿 (Feedback 可能会调整意愿)
-        if self.willingness < 0.5 and not is_relevant:  # 这里同步提高阈值到 0.5
+        if self.willingness < 0.4 and not is_relevant:  # 这里同步提高阈值到 0.4
             return None
 
         # 6. Chat 阶段 (使用 chat_llm_func)

@@ -68,3 +68,17 @@ class EnabledGroupModel(Model):
 
     class Meta:
         table = "nyabot_enabled_groups"
+
+
+class TokenUsageModel(Model):
+    """记录 Token 消耗"""
+    id = fields.IntField(pk=True)
+    session_id = fields.CharField(max_length=255)  # 群号
+    model_name = fields.CharField(max_length=255)  # 模型名称
+    prompt_tokens = fields.IntField()
+    completion_tokens = fields.IntField()
+    timestamp = fields.DatetimeField(auto_now_add=True)  # 自动记录时间
+
+    class Meta:
+        table = "nyabot_token_usage"
+        indexes = (("session_id", "timestamp"),)  # 联合索引加速查询

@@ -1,8 +1,9 @@
 # nyaturingtest/repository.py
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
+from tortoise.functions import Sum
 from nonebot import logger
-from .models import SessionModel, UserProfileModel, GlobalMessageModel, InteractionLogModel
+from .models import SessionModel, UserProfileModel, GlobalMessageModel, InteractionLogModel, TokenUsageModel
 from .mem import Message
 from .utils import sanitize_text
 
@@ -241,3 +242,80 @@ class SessionRepository:
         except Exception as e:
             logger.error(f"[Repo] 获取用户历史消息失败: {e}")
             return []
+
+    @staticmethod
+    async def log_token_usage(session_id: str, model_name: str, prompt_tokens: int, completion_tokens: int):
+        """记录 Token 消耗"""
+        try:
+            await TokenUsageModel.create(
+                session_id=session_id,
+                model_name=model_name,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens
+            )
+        except Exception as e:
+            logger.error(f"[Repo] 记录 Token 消耗失败: {e}")
+
+    @staticmethod
+    async def get_token_stats(group_id: str | int) -> dict:
+        """
+        获取统计数据
+        返回格式:
+        {
+            "1d_local": [{"model": "...", "total": 123}, ...],
+            "1d_global": [...],
+            "7d_local": [...],
+            "7d_global": [...],
+            "all_global": [...]
+        }
+        """
+        result = {
+            "1d_local": [],
+            "1d_global": [],
+            "7d_local": [],
+            "7d_global": [],
+            "all_global": []
+        }
+        group_id_str = str(group_id)
+        now = datetime.now()
+        one_day_ago = now - timedelta(days=1)
+        seven_days_ago = now - timedelta(days=7)
+
+        async def _query(filter_kwargs):
+            # 按模型分组统计
+            stats = await TokenUsageModel.filter(**filter_kwargs) \
+                .annotate(
+                    total_prompt=Sum("prompt_tokens"),
+                    total_completion=Sum("completion_tokens")
+                ) \
+                .group_by("model_name") \
+                .values("model_name", "total_prompt", "total_completion")
+            
+            return [
+                {
+                    "model": s["model_name"], 
+                    "prompt": s["total_prompt"] or 0,
+                    "completion": s["total_completion"] or 0,
+                    "total": (s["total_prompt"] or 0) + (s["total_completion"] or 0)
+                } 
+                for s in stats
+            ]
+
+        try:
+            # 1. 一天内本群
+            result["1d_local"] = await _query({"session_id": group_id_str, "timestamp__gte": one_day_ago})
+            # 2. 一天内全局
+            result["1d_global"] = await _query({"timestamp__gte": one_day_ago})
+            
+            # 3. 七天内本群
+            result["7d_local"] = await _query({"session_id": group_id_str, "timestamp__gte": seven_days_ago})
+            # 4. 七天内全局
+            result["7d_global"] = await _query({"timestamp__gte": seven_days_ago})
+
+            # 5. 所有时间所有消耗
+            result["all_global"] = await _query({})
+            
+        except Exception as e:
+            logger.error(f"[Repo] 查询 Token 统计失败: {e}")
+
+        return result

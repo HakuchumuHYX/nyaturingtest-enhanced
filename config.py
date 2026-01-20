@@ -9,6 +9,8 @@ class Config(BaseModel):
     nyaturingtest_feedback_openai_model: str = "Qwen/Qwen2.5-7B-Instruct"
     nyaturingtest_chat_openai_base_url: str = "https://api.siliconflow.cn/v1"
     nyaturingtest_siliconflow_api_key: str
+    nyaturingtest_rerank_model: str = "BAAI/bge-reranker-v2-m3"
+    nyaturingtest_rerank_threshold: float = 0.05
     nyaturingtest_enabled_groups: list[int] = []
 
 

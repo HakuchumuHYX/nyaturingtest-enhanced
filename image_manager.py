@@ -9,6 +9,7 @@ import math
 from pathlib import Path
 import re
 
+from typing import Callable
 import anyio
 from nonebot import logger
 import nonebot_plugin_localstore as store
@@ -97,7 +98,8 @@ class ImageManager:
                 pass
         return None
 
-    async def resolve_image_from_url(self, url: str, file_unique: str, is_sticker: bool, context_text: str = "") -> str:
+    async def resolve_image_from_url(self, url: str, file_unique: str, is_sticker: bool, context_text: str = "",
+                                     on_usage: Callable[[dict], None] | None = None) -> str:
         """
         高层接口：下载并分析图片，返回格式化的描述文本
         """
@@ -164,7 +166,7 @@ class ImageManager:
                 image_base64 = base64.b64encode(image_bytes).decode("utf-8")
                 description = await self.get_image_description(
                     image_base64=image_base64, is_sticker=is_sticker, cache_key=file_unique,
-                    context_text=context_text
+                    context_text=context_text, on_usage=on_usage
                 )
 
                 if description:
@@ -180,7 +182,8 @@ class ImageManager:
 
     async def get_image_description(self, image_base64: str, is_sticker: bool,
                                     cache_key: str | None = None,
-                                    context_text: str | None = None) -> ImageWithDescription | None:
+                                    context_text: str | None = None,
+                                    on_usage: Callable[[dict], None] | None = None) -> ImageWithDescription | None:
         # 1. 缓存检查
         if cache_key and cache_key in self._mem_cache:
             return self._mem_cache[cache_key]
@@ -269,6 +272,7 @@ class ImageManager:
             prompt=prompt,
             image_base64=target_image_base64,
             image_format=target_format,
+            on_usage=on_usage,
             extra_body={
                 "top_k": 64,
                 "google": {

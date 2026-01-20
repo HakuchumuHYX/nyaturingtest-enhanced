@@ -13,10 +13,11 @@ from .image_manager import image_manager
 from .mem import Message as MMessage
 from .state_manager import GroupState, SELF_SENT_MSG_IDS
 from .utils import smart_split_text
+from .repository import SessionRepository
 
 
 async def llm_response(client: LLMClient, message: str, model: str, temperature: float, json_mode: bool = False,
-                       system_prompt: str | None = None, **kwargs) -> str:  # <--- 添加 **kwargs
+                       system_prompt: str | None = None, on_usage=None, **kwargs) -> str:  # <--- 添加 **kwargs
     """
     封装 LLM 调用，支持高级参数透传
     """
@@ -30,6 +31,7 @@ async def llm_response(client: LLMClient, message: str, model: str, temperature:
             model=model,
             temperature=temperature,
             system_prompt=system_prompt,
+            on_usage=on_usage,
             **kwargs
         )
         return result if result else ""
@@ -53,6 +55,21 @@ async def message2BotMessage(bot_name: str, group_id: int, message: Message, bot
         full_context_text = full_context_text[:200]
 
     # === 消息段处理逻辑 ===
+
+    # 定义 VLM 使用记录器
+    def make_vlm_recorder(model_name: str):
+        def _recorder(usage: dict):
+            # 异步执行入库
+            asyncio.create_task(
+                SessionRepository.log_token_usage(
+                    session_id=str(group_id),
+                    model_name=model_name,
+                    prompt_tokens=usage.get("prompt_tokens", 0),
+                    completion_tokens=usage.get("completion_tokens", 0)
+                )
+            )
+        return _recorder
+
     async def process_segment(seg: MessageSegment) -> str:
         if seg.type == "text":
             return f"{seg.data.get('text', '')}"
@@ -61,8 +78,18 @@ async def message2BotMessage(bot_name: str, group_id: int, message: Message, bot
             url = seg.data.get("url", "")
             file_unique = seg.data.get("file_unique", "")
             is_sticker = seg.data.get("sub_type") == 1
+            
+            # 使用逻辑层定义的 chat model 作为 VLM model 的近似记录（通常 VLM 和 Chat 用的是同一个 Key，或者 image_manager 内部用的就是 chat model）
+            # image_manager 内部初始化时用的是 plugin_config.nyaturingtest_chat_openai_model
+            # 所以这里记录为同一个模型名是准确的
+            vlm_recorder = make_vlm_recorder(plugin_config.nyaturingtest_chat_openai_model)
+
             # 调用通用逻辑，传入提取到的上下文
-            return await image_manager.resolve_image_from_url(url, file_unique, is_sticker, context_text=full_context_text)
+            return await image_manager.resolve_image_from_url(
+                url, file_unique, is_sticker, 
+                context_text=full_context_text,
+                on_usage=vlm_recorder
+            )
 
         elif seg.type == "at":
             id = seg.data.get("qq")
@@ -106,8 +133,13 @@ async def message2BotMessage(bot_name: str, group_id: int, message: Message, bot
                                 # 引用里的图片通常不易判断是否为表情包，默认 False，或者尝试获取 sub_type
                                 is_sticker_ref = str(data.get("sub_type", "")) == "1"
 
+                                vlm_recorder = make_vlm_recorder(plugin_config.nyaturingtest_chat_openai_model)
+
                                 # Await 分析结果
-                                img_desc = await image_manager.resolve_image_from_url(img_url, img_file_unique, is_sticker_ref)
+                                img_desc = await image_manager.resolve_image_from_url(
+                                    img_url, img_file_unique, is_sticker_ref, 
+                                    on_usage=vlm_recorder
+                                )
                                 source_text += img_desc
 
                             elif msg_type == "face":
@@ -195,6 +227,23 @@ async def spawn_state(state: GroupState):
 
             # 4. 组装 LLM 调用函数
 
+            # --- 定义统计回调 ---
+            # 使用闭包捕获 session.id
+            current_session_id = str(state.session.id)
+            
+            def make_usage_recorder(model_name_record: str):
+                def _recorder(usage: dict):
+                    # 异步执行入库，不阻塞 LLM 返回
+                    asyncio.create_task(
+                        SessionRepository.log_token_usage(
+                            session_id=current_session_id,
+                            model_name=model_name_record,
+                            prompt_tokens=usage.get("prompt_tokens", 0),
+                            completion_tokens=usage.get("completion_tokens", 0)
+                        )
+                    )
+                return _recorder
+
             # 定义一个强制的 System Prompt 用于 Roleplay，使用中文指令
             rp_system_prompt = (
                 "你是一个沉浸式的角色扮演者。你必须时刻保持角色设定。"
@@ -234,7 +283,8 @@ async def spawn_state(state: GroupState):
                 },
 
                 json_mode=json_mode,
-                system_prompt=rp_system_prompt
+                system_prompt=rp_system_prompt,
+                on_usage=make_usage_recorder(plugin_config.nyaturingtest_chat_openai_model)
             )
 
             # Feedback 函数：温度极低，保证逻辑分析准确
@@ -243,7 +293,8 @@ async def spawn_state(state: GroupState):
                 msg,
                 model=plugin_config.nyaturingtest_feedback_openai_model,
                 temperature=0.1,
-                json_mode=json_mode
+                json_mode=json_mode,
+                on_usage=make_usage_recorder(plugin_config.nyaturingtest_feedback_openai_model)
             )
 
             # 5. 执行核心逻辑 (LLM 生成)

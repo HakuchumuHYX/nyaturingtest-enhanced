@@ -1,3 +1,4 @@
+from typing import Callable
 from openai import AsyncOpenAI
 from nonebot import logger
 import asyncio
@@ -36,6 +37,7 @@ class VLM:
             prompt: str,
             image_base64: str,
             image_format: str,
+            on_usage: Callable[[dict], None] | None = None,
             **kwargs,  # 添加 **kwargs 接收额外参数
     ) -> str | None:
         """
@@ -61,6 +63,13 @@ class VLM:
                     timeout=self.timeout,
                     **kwargs  # 透传参数 (如 extra_body)
                 )
+                
+                if on_usage and response.usage:
+                    try:
+                        on_usage(response.usage.model_dump())
+                    except Exception as ex:
+                        logger.warning(f"VLM Usage callback failed: {ex}")
+
                 content = response.choices[0].message.content
                 if content:
                     return content
