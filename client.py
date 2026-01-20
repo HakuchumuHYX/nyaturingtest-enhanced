@@ -9,7 +9,7 @@ class LLMClient:
     def __init__(self, client: AsyncOpenAI):
         self.client = client
 
-    async def generate_response(self, prompt: str, model: str, temperature: float = 0.7, system_prompt: str = None,
+    async def generate_response(self, prompt: str, model: str, temperature: float = 0.7, system_prompt: str | None = None,
                                 **kwargs) -> str | None:
         """
         生成回复，支持透传参数和自定义 System Prompt，包含重试机制

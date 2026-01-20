@@ -1,4 +1,5 @@
 # nyaturingtest/image_manager.py
+import asyncio
 import base64
 from dataclasses import asdict, dataclass
 import hashlib
@@ -17,8 +18,10 @@ from nonebot.utils import run_sync
 
 from .config import plugin_config
 from .vlm import VLM
+from .utils import get_http_client
 
 IMAGE_CACHE_DIR = Path(f"{store.get_plugin_cache_dir()}/image_cache")
+_IMG_SEMAPHORE = asyncio.Semaphore(3)
 
 
 @dataclass
@@ -94,8 +97,90 @@ class ImageManager:
                 pass
         return None
 
+    async def resolve_image_from_url(self, url: str, file_unique: str, is_sticker: bool, context_text: str = "") -> str:
+        """
+        高层接口：下载并分析图片，返回格式化的描述文本
+        """
+        if not url:
+            return "[无效图片]"
+
+        async with _IMG_SEMAPHORE:
+            try:
+                # 1. 尝试从内存缓存获取
+                if file_unique:
+                    cached_desc = self.get_from_cache(file_unique)
+                    if cached_desc:
+                        if is_sticker:
+                            return f"\n[表情包] [情感:{cached_desc.emotion}] [内容:{cached_desc.description}]\n"
+                        else:
+                            return f"\n[图片] {cached_desc.description}\n"
+
+                # 2. 准备文件缓存路径
+                cache_path = IMAGE_CACHE_DIR.joinpath("raw")
+                cache_path.mkdir(parents=True, exist_ok=True)
+
+                # 尝试从 URL 或 file_unique 提取文件名
+                key = None
+                key_match = re.search(r"[?&]fileid=([a-zA-Z0-9_-]+)", url)
+                if key_match:
+                    key = key_match.group(1)
+                elif file_unique:
+                    key = file_unique
+
+                image_bytes = None
+
+                # 3. 尝试读取本地文件缓存
+                if key and cache_path.joinpath(key).exists():
+                    try:
+                        async with await anyio.open_file(cache_path.joinpath(key), "rb") as f:
+                            image_bytes = await f.read()
+                    except Exception as e:
+                        logger.warning(f"读取图片缓存失败: {e}")
+
+                if not image_bytes:
+                    # 4. 下载图片
+                    client = get_http_client()
+                    for _ in range(2):  # 重试2次
+                        try:
+                            resp = await client.get(url, timeout=10.0)  # 稍微增加超时
+                            resp.raise_for_status()
+                            image_bytes = resp.content
+                            break
+                        except Exception:
+                            await asyncio.sleep(0.5)
+
+                    # 下载成功后写入缓存
+                    if image_bytes and key:
+                        try:
+                            async with await anyio.open_file(cache_path.joinpath(key), "wb") as f:
+                                await f.write(image_bytes)
+                        except Exception as e:
+                            logger.warning(f"写入图片缓存失败: {e}")
+
+                if not image_bytes:
+                    return "\n[图片下载失败]\n"
+
+                # 5. 调用 VLM 进行识别
+                image_base64 = base64.b64encode(image_bytes).decode("utf-8")
+                description = await self.get_image_description(
+                    image_base64=image_base64, is_sticker=is_sticker, cache_key=file_unique,
+                    context_text=context_text
+                )
+
+                if description:
+                    if is_sticker:
+                        return f"\n[表情包] [情感:{description.emotion}] [内容:{description.description}]\n"
+                    else:
+                        return f"\n[图片] {description.description}\n"
+                return "\n[图片识别无结果]\n"
+
+            except Exception as e:
+                logger.error(f"Image resolve error: {e}")
+                return "\n[图片处理出错]\n"
+
     async def get_image_description(self, image_base64: str, is_sticker: bool,
-                                    cache_key: str | None = None) -> ImageWithDescription | None:
+                                    cache_key: str | None = None,
+                                    context_text: str | None = None) -> ImageWithDescription | None:
         # 1. 缓存检查
         if cache_key and cache_key in self._mem_cache:
             return self._mem_cache[cache_key]
@@ -130,8 +215,13 @@ class ImageManager:
         target_format = raw_format
 
         code_mark = "```"
-        base_prompt = f"""请分析这张图片。
-1. 用中文详细描述图片内容（'description'），如果是表情包请把上面的文字也识别出来，最多100字。
+        
+        # 构建基础 Prompt
+        base_prompt = "请分析这张图片。\n"
+        if context_text:
+            base_prompt += f"【背景信息】这张图片是在对话中发送的，相关文本内容是：“{context_text}”。请结合此背景理解图片的含义。\n"
+            
+        base_prompt += f"""1. 用中文详细描述图片内容（'description'），如果是表情包请把上面的文字也识别出来，最多100字。
 2. 分析图片表达的情感（'emotion'），格式为'情感, 类型, 含义'，例如"开心, 表情包, 嘲讽"。
 请直接输出纯 JSON 格式，不要包含其他内容：
 {code_mark}json

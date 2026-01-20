@@ -1,7 +1,7 @@
 from openai import AsyncOpenAI
 from nonebot import logger
 import asyncio
-import httpx 
+import httpx
 
 
 class VLM:

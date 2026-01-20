@@ -55,8 +55,8 @@ class GroupState:
 
 # 全局状态字典
 group_states: dict[int, GroupState] = {}
-# 后台任务集合
-_tasks: set[asyncio.Task] = set()
+# 后台任务字典 group_id -> Task
+_group_tasks: dict[int, asyncio.Task] = {}
 # 运行时启用的群组集合 (内存缓存)
 runtime_enabled_groups: set[int] = set()
 
@@ -86,11 +86,12 @@ async def init_enabled_groups():
 
 def ensure_group_state(group_id: int):
     """确保群组状态已初始化，并启动后台任务"""
-    if group_id not in group_states:
-        if group_id not in runtime_enabled_groups:
-            return None
+    if group_id not in runtime_enabled_groups:
+        return None
 
-        # 初始化状态
+    # 1. 状态初始化
+    if group_id not in group_states:
+        logger.info(f"初始化群 {group_id} 的 GroupState...")
         new_state = GroupState(
             session=Session(
                 id=f"{group_id}",
@@ -99,17 +100,50 @@ def ensure_group_state(group_id: int):
             )
         )
         group_states[group_id] = new_state
+    
+    # 2. 任务守护 (如果任务挂了或者没启动，重启它)
+    if group_id not in _group_tasks or _group_tasks[group_id].done():
+        if group_id in _group_tasks:
+            # 清理旧的已完成任务记录
+            try:
+                # 获取异常以防万一
+                exc = _group_tasks[group_id].exception()
+                if exc:
+                    logger.error(f"群 {group_id} 的后台任务曾异常退出: {exc}")
+            except Exception:
+                pass
+            del _group_tasks[group_id]
 
-        # 延迟导入以避免循环引用
         from .logic import spawn_state
-
-        # 启动后台任务
-        task = asyncio.create_task(spawn_state(state=new_state))
-        _tasks.add(task)
-        task.add_done_callback(_tasks.discard)
-        logger.info(f"群 {group_id} 状态已初始化，后台任务已启动")
+        
+        # 启动新任务
+        logger.info(f"启动群 {group_id} 的 spawn_state 后台任务...")
+        task = asyncio.create_task(spawn_state(state=group_states[group_id]))
+        _group_tasks[group_id] = task
 
     return group_states[group_id]
+
+
+async def remove_group_state(group_id: int):
+    """安全移除群组状态并取消后台任务"""
+    # 1. 取消任务
+    if group_id in _group_tasks:
+        task = _group_tasks[group_id]
+        if not task.done():
+            logger.info(f"正在取消群 {group_id} 的后台任务...")
+            task.cancel()
+            try:
+                await asyncio.wait_for(task, timeout=5.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+            except Exception as e:
+                logger.error(f"取消任务时发生错误: {e}")
+        del _group_tasks[group_id]
+
+    # 2. 移除状态
+    if group_id in group_states:
+        logger.info(f"移除群 {group_id} 的 GroupState...")
+        del group_states[group_id]
 
 
 async def cleanup_global_resources():
@@ -132,11 +166,16 @@ async def cleanup_global_resources():
             logger.error(f"关机保存错误: {e}")
 
     # 2. 取消后台任务
-    for task in _tasks:
+    for gid in list(_group_tasks.keys()):
+        task = _group_tasks.pop(gid)
         if not task.done():
             task.cancel()
-    if _tasks:
-        await asyncio.gather(*_tasks, return_exceptions=True)
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.error(f"清理任务 {gid} 异常: {e}")
 
     # 3. 关闭 HTTP 客户端
     await close_http_client()

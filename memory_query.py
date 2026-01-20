@@ -9,7 +9,9 @@ from nonebot.exception import FinishedException
 
 from .state_manager import ensure_group_state
 from .utils import extract_and_parse_json
-from .models import GlobalMessageModel, SessionModel, UserProfileModel, InteractionLogModel
+from .repository import SessionRepository
+from .logic import llm_response
+from .config import plugin_config
 
 # 定义命令
 query_memory = on_command("查询记忆", aliases={"memory", "印象"}, priority=5, block=True)
@@ -57,22 +59,8 @@ async def handle_query_memory(bot: Bot, event: GroupMessageEvent, args: Message 
         bot_role = state.session.role()
 
         # --- 用户画像与交互统计逻辑 ---
-        # 即使内存里没有加载 profile，也要去数据库查真实的交互次数
-        interaction_count = 0
-        try:
-            session_db = await SessionModel.get_or_none(id=state.session.id)
-            if session_db:
-                # 查找对应的用户记录
-                user_db = await UserProfileModel.filter(
-                    session=session_db,
-                    user_id=target_id
-                ).first()
-
-                if user_db:
-                    # 直接对关联表进行 Count 统计，获取真实的记忆深度
-                    interaction_count = await InteractionLogModel.filter(user=user_db).count()
-        except Exception as e:
-            logger.error(f"统计交互次数失败: {e}")
+        # 使用 Repository 获取真实的交互次数
+        interaction_count = await SessionRepository.get_interaction_count(state.session.id, target_id)
 
         # 获取内存中的情绪数据
         profile = state.session.profiles.get(target_id)
@@ -87,7 +75,7 @@ async def handle_query_memory(bot: Bot, event: GroupMessageEvent, args: Message 
             "valence": valence,
             "arousal": arousal,
             "dominance": dominance,
-            "interactions": interaction_count,  # 使用数据库统计的真实数值
+            "interactions": interaction_count,
             "last_seen": last_seen
         }
 
@@ -136,33 +124,14 @@ async def handle_query_memory(bot: Bot, event: GroupMessageEvent, args: Message 
             logger.error(f"向量记忆检索失败: {e}")
 
         # --- 获取最近聊天记录 ---
-        try:
-            # 确保 session_db 存在 (前面可能已获取)
-            if not session_db:
-                session_db = await SessionModel.get_or_none(id=state.session.id)
-
-            if session_db:
-                db_msgs = []
-                # 优先 ID 查
-                if target_id and target_id.strip():
-                    db_msgs = await GlobalMessageModel.filter(
-                        session=session_db,
-                        user_id=target_id
-                    ).order_by("-time").limit(10)
-                # 兜底 名字 查
-                if not db_msgs:
-                    db_msgs = await GlobalMessageModel.filter(
-                        session=session_db,
-                        user_name=target_name
-                    ).order_by("-time").limit(10)
-
-                recent_user_msgs = [m.content for m in reversed(db_msgs)]
-
-            if not recent_user_msgs:
-                recent_user_msgs = ["(暂无最近发言记录)"]
-        except Exception as e:
-            logger.error(f"查询历史消息失败: {e}")
-            recent_user_msgs = ["(查询历史失败)"]
+        recent_user_msgs = await SessionRepository.get_recent_messages_by_user(
+            state.session.id, 
+            user_id=target_id, 
+            user_name=target_name, 
+            limit=10
+        )
+        if not recent_user_msgs:
+            recent_user_msgs = ["(暂无最近发言记录)"]
 
     # 4. 判断逻辑 (如果没有交互且没有记忆，直接返回)
     if profile_data['interactions'] == 0 and not vector_records:
@@ -201,17 +170,17 @@ async def handle_query_memory(bot: Bot, event: GroupMessageEvent, args: Message 
 """
 
     # 6. 调用 LLM
-    from .config import plugin_config
     max_retries = 2
 
     for attempt in range(max_retries + 1):
         try:
-            # 使用 JSON Mode
-            response = await state.client.generate_response(
-                prompt=prompt,
+            # 使用统一的 llm_response 封装
+            response = await llm_response(
+                state.client,
+                prompt,
                 model=plugin_config.nyaturingtest_chat_openai_model,
                 temperature=0.8 + (attempt * 0.2),
-                response_format={"type": "json_object"}
+                json_mode=True
             )
 
             result = extract_and_parse_json(response)

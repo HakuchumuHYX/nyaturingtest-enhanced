@@ -33,6 +33,21 @@ async def close_http_client():
         logger.info("全局 HTTP 客户端已关闭")
 
 
+def sanitize_text(text: str) -> str:
+    """清洗文本，移除无法编码的字符"""
+    if not text: return ""
+    try:
+        return text.encode('utf-8', 'ignore').decode('utf-8')
+    except:
+        return ""
+
+
+def escape_for_prompt(text: str) -> str:
+    """转义文本以安全放入 JSON 或 Prompt"""
+    if not text: return ""
+    return text.replace('"', '\\"').replace('\n', ' ')
+
+
 def smart_split_text(text: str, max_chars: int = 40) -> list[str]:
     """
     严格断句逻辑：

@@ -13,15 +13,19 @@ def get_feedback_prompt(
         emotion: dict,
         related_profiles_json: str,
         search_result: list,
-        last_summary: str
+        last_summary: str,
+        is_relevant: bool = False
 ) -> str:
     """
     反馈阶段 Prompt - 观察者模式
     """
+    relevance_hint = "【重要提示】检测到新消息中直接提到了你的名字或相关别名，请重点关注，这极可能是在和你对话。" if is_relevant else ""
+
     return f"""
 # System Role
 你是一个极具洞察力的对话观察者。你正在暗中观察群聊中的角色 "{bot_name}"。
 你的任务是分析局势，更新角色的心理状态，而不是直接回复消息。
+{relevance_hint}
 
 # Character Profile (被观察者设定)
 {role}
@@ -53,6 +57,7 @@ JSON 需包含以下字段：
 3. "new_emotion" (Object): 更新后的 VAD 情绪对象。
 4. "emotion_tends" (Array): 对应每条新消息的情绪影响值（正数表示开心，负数表示生气）。
 5. "summary" (String): 当前话题的一句话简短摘要。
+6. "need_history" (Boolean): 是否需要翻阅更久远的历史记录来理解上下文？(当发现对话缺乏前因后果，或者似乎在引用之前的事件时，设为 true)
 """
 
 
@@ -67,7 +72,8 @@ def get_chat_prompt(
         related_profiles_json: str,
         search_result: list,
         chat_summary: str,
-        examples_text: str = ""
+        examples_text: str = "",
+        recalled_history: str = ""
 ) -> str:
     """
     对话阶段 Prompt - 深度角色扮演 (全中文优化版)
@@ -99,12 +105,19 @@ def get_chat_prompt(
 # Context Information
 <status>
 - 当前话题: {chat_summary}
-- 当前情绪: V:{emotion['valence']:.2f} (愉悦度), A:{emotion['arousal']:.2f} (兴奋度)
+- 当前情绪 (VAD模型): 
+  - V (愉悦度): {emotion['valence']:.2f} (负数不开心，正数开心)
+  - A (兴奋度): {emotion['arousal']:.2f} (低分平静，高分激动)
+  - D (支配度): {emotion['dominance']:.2f} (低分顺从/自卑，高分强势/自信)
 </status>
 
 <memory_rag>
 {json.dumps(search_result, ensure_ascii=False)}
 </memory_rag>
+
+<historical_recall>
+{recalled_history}
+</historical_recall>
 
 <recent_log>
 {recent_msgs}

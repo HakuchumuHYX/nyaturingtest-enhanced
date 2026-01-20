@@ -16,6 +16,7 @@ from .config import plugin_config
 from .models import EnabledGroupModel
 from .state_manager import (
     ensure_group_state,
+    remove_group_state,
     SELF_SENT_MSG_IDS,
     runtime_enabled_groups,
     group_states
@@ -312,7 +313,7 @@ async def do_status(matcher: type[Matcher], group_id: int):
 
 @list_groups_pm.handle()
 async def handle_list_groups_pm():
-    allowed_groups = plugin_config.nyaturingtest_enabled_groups
+    allowed_groups = runtime_enabled_groups
     if not allowed_groups:
         await list_groups_pm.finish("没有启用的群组")
     msg = "启用的群组:\n"
@@ -400,10 +401,8 @@ async def handle_manage_autochat(event: GroupMessageEvent, args: Message = Comma
         # 更新内存
         runtime_enabled_groups.discard(group_id)
 
-        # 清理运行时状态 (如果存在)
-        if group_id in group_states:
-            # 可以在这里做一些特定的清理工作，目前直接移除引用
-            del group_states[group_id]
+        # 安全清理运行时状态和后台任务
+        await remove_group_state(group_id)
 
         await manage_cmd.finish("Autochat 已在本群禁用")
 

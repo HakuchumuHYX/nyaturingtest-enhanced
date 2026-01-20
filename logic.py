@@ -1,28 +1,22 @@
 # nyaturingtest/logic.py
 import asyncio
-import base64
 import random
-import re
 import traceback
-from datetime import datetime
 
-import anyio
 from nonebot import logger
 from nonebot.adapters.onebot.v11 import Bot, Message, MessageSegment
 from nonebot.adapters.onebot.v11.exception import ActionFailed
 
 from .client import LLMClient
 from .config import plugin_config
-from .image_manager import IMAGE_CACHE_DIR, image_manager
+from .image_manager import image_manager
 from .mem import Message as MMessage
 from .state_manager import GroupState, SELF_SENT_MSG_IDS
-from .utils import get_http_client, smart_split_text
-
-_IMG_SEMAPHORE = asyncio.Semaphore(3)
+from .utils import smart_split_text
 
 
 async def llm_response(client: LLMClient, message: str, model: str, temperature: float, json_mode: bool = False,
-                       system_prompt: str = None, **kwargs) -> str:  # <--- 添加 **kwargs
+                       system_prompt: str | None = None, **kwargs) -> str:  # <--- 添加 **kwargs
     """
     封装 LLM 调用，支持高级参数透传
     """
@@ -50,80 +44,13 @@ async def message2BotMessage(bot_name: str, group_id: int, message: Message, bot
     支持解析引用消息(Reply)中的图片内容
     """
 
-    # === 提取通用的图片解析逻辑 ===
-    async def resolve_image(url: str, file_unique: str, is_sticker: bool) -> str:
-        """内部函数：下载并分析图片，返回描述文本"""
-        if not url:
-            return "[无效图片]"
-
-        async with _IMG_SEMAPHORE:
-            try:
-                # 1. 尝试从内存缓存获取
-                if file_unique:
-                    cached_desc = image_manager.get_from_cache(file_unique)
-                    if cached_desc:
-                        if is_sticker:
-                            return f"\n[表情包] [情感:{cached_desc.emotion}] [内容:{cached_desc.description}]\n"
-                        else:
-                            return f"\n[图片] {cached_desc.description}\n"
-
-                # 2. 准备文件缓存路径
-                cache_path = IMAGE_CACHE_DIR.joinpath("raw")
-                cache_path.mkdir(parents=True, exist_ok=True)
-
-                # 尝试从 URL 或 file_unique 提取文件名
-                key = None
-                key_match = re.search(r"[?&]fileid=([a-zA-Z0-9_-]+)", url)
-                if key_match:
-                    key = key_match.group(1)
-                elif file_unique:
-                    key = file_unique
-
-                image_bytes = None
-
-                # 3. 尝试读取本地文件缓存
-                if key and cache_path.joinpath(key).exists():
-                    async with await anyio.open_file(cache_path.joinpath(key), "rb") as f:
-                        image_bytes = await f.read()
-                else:
-                    # 4. 下载图片
-                    client = get_http_client()
-                    for _ in range(2):  # 重试2次
-                        try:
-                            resp = await client.get(url, timeout=10.0)  # 稍微增加超时
-                            resp.raise_for_status()
-                            image_bytes = resp.content
-                            break
-                        except Exception:
-                            await asyncio.sleep(0.5)
-
-                    # 下载成功后写入缓存
-                    if image_bytes and key:
-                        try:
-                            async with await anyio.open_file(cache_path.joinpath(key), "wb") as f:
-                                await f.write(image_bytes)
-                        except Exception as e:
-                            logger.warning(f"写入图片缓存失败: {e}")
-
-                if not image_bytes:
-                    return "\n[图片下载失败]\n"
-
-                # 5. 调用 VLM 进行识别
-                image_base64 = base64.b64encode(image_bytes).decode("utf-8")
-                description = await image_manager.get_image_description(
-                    image_base64=image_base64, is_sticker=is_sticker, cache_key=file_unique
-                )
-
-                if description:
-                    if is_sticker:
-                        return f"\n[表情包] [情感:{description.emotion}] [内容:{description.description}]\n"
-                    else:
-                        return f"\n[图片] {description.description}\n"
-                return "\n[图片识别无结果]\n"
-
-            except Exception as e:
-                logger.error(f"Image resolve error: {e}")
-                return "\n[图片处理出错]\n"
+    # === 0. 预提取当前消息中的纯文本上下文 ===
+    full_context_text = ""
+    for seg in message:
+        if seg.type == "text":
+            full_context_text += seg.data.get("text", "")
+    if len(full_context_text) > 200:
+        full_context_text = full_context_text[:200]
 
     # === 消息段处理逻辑 ===
     async def process_segment(seg: MessageSegment) -> str:
@@ -134,8 +61,8 @@ async def message2BotMessage(bot_name: str, group_id: int, message: Message, bot
             url = seg.data.get("url", "")
             file_unique = seg.data.get("file_unique", "")
             is_sticker = seg.data.get("sub_type") == 1
-            # 调用通用逻辑
-            return await resolve_image(url, file_unique, is_sticker)
+            # 调用通用逻辑，传入提取到的上下文
+            return await image_manager.resolve_image_from_url(url, file_unique, is_sticker, context_text=full_context_text)
 
         elif seg.type == "at":
             id = seg.data.get("qq")
@@ -180,7 +107,7 @@ async def message2BotMessage(bot_name: str, group_id: int, message: Message, bot
                                 is_sticker_ref = str(data.get("sub_type", "")) == "1"
 
                                 # Await 分析结果
-                                img_desc = await resolve_image(img_url, img_file_unique, is_sticker_ref)
+                                img_desc = await image_manager.resolve_image_from_url(img_url, img_file_unique, is_sticker_ref)
                                 source_text += img_desc
 
                             elif msg_type == "face":
@@ -210,28 +137,57 @@ async def spawn_state(state: GroupState):
     后台思考循环 (Producer-Consumer 模式)
     负责从 Buffer 取消息 -> 调用 Session 处理 -> 发送回复
     """
+    logger.info(f"GroupState 后台任务启动: {id(state)}")
     while True:
         try:
             # 1. 等待新消息信号 (debounce 2秒)
             try:
+                # 等待信号触发
                 await asyncio.wait_for(state.new_message_signal.wait(), timeout=20.0)
             except asyncio.TimeoutError:
+                # 超时意味着长期无消息，检查任务是否被取消
                 continue
 
-            state.new_message_signal.clear()
+            # 防抖逻辑：
+            # 信号触发后，等待 2 秒让更多消息进入 buffer
+            # 注意：在这 2 秒内如果有新消息，它们会被 append 到 chunk 中
+            # 但不会再次触发 wait (因为我们还没回到 loop 顶部)
             await asyncio.sleep(2.0)
+            
+            # 清除信号，准备下一轮等待
+            # 注意：要在取数据之前还是之后 clear？
+            # 如果在 sleep 之后 clear，那么 sleep 期间进来的消息所触发的 set 会被 clear 掉
+            # 但消息本身已经在 buffer 里了，会被接下来的代码取走
+            # 所以这里 clear 是安全的，表示“直到此刻的消息我都处理了”
+            state.new_message_signal.clear()
 
             # 2. 从 Buffer 取出消息
             current_chunk = []
             async with state.data_lock:
-                if state.bot is None or state.event is None: continue
-                if len(state.messages_chunk) == 0: continue
+                if state.bot is None or state.event is None: 
+                    # 只有当状态未完全初始化时才会发生
+                    continue
+                
+                if len(state.messages_chunk) == 0: 
+                    # 这是一个防御性检查，理论上信号触发了就该有消息
+                    # 但可能被其他协程取走了（虽然目前只有一个消费者）
+                    continue
+                
                 current_chunk = state.messages_chunk.copy()
                 state.messages_chunk.clear()
 
             bot_self_id = str(state.bot.self_id)
+            # 过滤掉只有 Bot 自己发的消息的 chunk (通常是回显)
+            # 除非这些回显被某些逻辑标记为需要处理（目前没有）
             is_echo_only = all(str(msg.user_id) == bot_self_id for msg in current_chunk)
-            should_publish = not is_echo_only
+            
+            # 如果全是回显，跳过（不处理，也不发布）
+            if is_echo_only:
+                logger.debug("跳过仅包含自身回显的消息块")
+                continue
+            
+            # 既然已经过滤了回显，剩下的都是应该发布的消息
+            should_publish = True
 
             # 3. 加载 Session (加锁)
             async with state.session_lock:
@@ -317,7 +273,8 @@ async def spawn_state(state: GroupState):
                         msg_parts = smart_split_text(raw_content)
                         for i, part in enumerate(msg_parts):
                             part = part.strip()
-                            if part and part[-1] in ["。", ".", "，"]:
+                            # 删除句末标点，保留逗号等句中标点，但保留问号以维持句意
+                            if part and part[-1] in ["。", ".", "！", "!"]:
                                 part = part[:-1]
 
                             if not part: continue
@@ -339,7 +296,7 @@ async def spawn_state(state: GroupState):
                                     logger.debug(f"记录自身发送消息 ID: {msg_id}")
 
                             except ActionFailed as e:
-                                if e.retcode == 1200 or "120" in str(e):
+                                if getattr(e, "retcode", 0) == 1200 or "120" in str(e):
                                     logger.warning(f"风控拦截 (1200), 冷却中...")
                                     await asyncio.sleep(random.uniform(5.0, 10.0))
                                 else:
@@ -358,8 +315,9 @@ async def spawn_state(state: GroupState):
                 continue
 
         except asyncio.CancelledError:
-            logger.info("后台任务被取消")
+            logger.info(f"后台任务被取消: {id(state)}")
             break
         except Exception as e:
             logger.error(f"Spawn loop fatal error: {e}")
+            traceback.print_exc()
             await asyncio.sleep(5.0)

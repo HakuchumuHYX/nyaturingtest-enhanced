@@ -55,7 +55,7 @@ class GlobalMessageModel(Model):
     user_name = fields.CharField(max_length=255)
     user_id = fields.CharField(max_length=255, default="")
     content = fields.TextField()
-    time = fields.DatetimeField()
+    time = fields.DatetimeField(index=True)
     msg_id = fields.CharField(max_length=255, default="")
 
     class Meta:
