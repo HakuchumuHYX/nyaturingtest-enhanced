@@ -89,9 +89,23 @@ class Memory:
     async def update(self, message_chunk: list[Message], after_compress: Callable[[], None] | None = None):
         """
         仅更新上下文窗口，不再触发后台压缩任务
+        增加基于 message_id 的去重逻辑
         """
-        # 1. 更新上下文窗口 (Rolling Window)
-        self.__messages.extend(message_chunk)
+        existing_ids = {msg.id for msg in self.__messages if msg.id}
+        
+        to_add = []
+        for m in message_chunk:
+            # 如果消息有ID且已存在，则跳过
+            if m.id and str(m.id) in existing_ids:
+                continue
+            to_add.append(m)
+            # 把新加的ID也放入集合，防止本次chunk内部重复（虽然不太可能）
+            if m.id:
+                existing_ids.add(str(m.id))
+
+        if to_add:
+            # 1. 更新上下文窗口 (Rolling Window)
+            self.__messages.extend(to_add)
         
         # 为了兼容性，保留 after_compress 参数但暂不使用
         if after_compress:

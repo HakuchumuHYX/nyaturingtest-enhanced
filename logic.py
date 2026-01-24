@@ -213,9 +213,13 @@ async def spawn_state(state: GroupState):
             # 除非这些回显被某些逻辑标记为需要处理（目前没有）
             is_echo_only = all(str(msg.user_id) == bot_self_id for msg in current_chunk)
             
-            # 如果全是回显，跳过（不处理，也不发布）
+            # 如果全是回显，跳过生成回复，但需要更新记忆 (记录上下文)
+            # 因为可能是其他进程发送的消息，或者是本进程的消息的回显(会被Session层去重)
             if is_echo_only:
-                logger.debug("跳过仅包含自身回显的消息块")
+                async with state.session_lock:
+                    await state.session.load_session()
+                    # 仅更新记忆，不触发 LLM
+                    await state.session.update_without_trigger(current_chunk)
                 continue
             
             # 既然已经过滤了回显，剩下的都是应该发布的消息
@@ -345,6 +349,17 @@ async def spawn_state(state: GroupState):
                                     msg_id = str(result["message_id"])
                                     SELF_SENT_MSG_IDS.append(msg_id)
                                     logger.debug(f"记录自身发送消息 ID: {msg_id}")
+                                    
+                                    # 主动写入记忆，确保"知道自己上一句说了什么"
+                                    # 注意：这里需要 msg_to_send 的纯文本内容
+                                    # 简单提取文本部分
+                                    sent_content = msg_to_send.extract_plain_text()
+                                    if not sent_content and len(msg_to_send) > 0:
+                                        # 如果是图片或其他，尝试简单转义
+                                        sent_content = str(msg_to_send)
+                                    
+                                    async with state.session_lock:
+                                        await state.session.append_self_message(sent_content, msg_id)
 
                             except ActionFailed as e:
                                 if getattr(e, "retcode", 0) == 1200 or "120" in str(e):

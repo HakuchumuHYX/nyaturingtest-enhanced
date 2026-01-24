@@ -373,12 +373,25 @@ class Session:
         formatted_msgs = [f"[ID:{msg.user_id}] {msg.user_name}: '{escape_for_prompt(msg.content)}'" for msg in
                           messages_chunk]
 
+        # 过滤掉本次的新消息，避免 Prompt 上下文重复
+        all_messages = self.global_memory.access().messages
+        history_msgs = [m for m in all_messages if m not in messages_chunk]
+        # 格式化一下 history_msgs，使其更易读 (不再直接 dump repr)
+        # 格式化为：[ID:xxx] Name: Content
+        # 但 get_feedback_prompt 原本接收 list，可能需要的是 raw object list 或者 dict list？
+        # 原 Prompt 定义接收 list，然后直接放入 f-string。如果是 Object list，会显示 repr。
+        # 为了 LLM 友好，我们这里转换成易读的文本列表
+        history_msgs_formatted = [
+            f"[{m.time.strftime('%H:%M')}] {m.user_name}: {escape_for_prompt(m.content)}" 
+            for m in history_msgs
+        ]
+
         # 2. 调用 LLM (使用传入的 feedback_llm_func)
         prompt = get_feedback_prompt(
             self.__name, self.__role, self.willingness,
             self.__chatting_state.value,
             self.global_memory.access().compressed_history,
-            self.global_memory.access().messages,
+            history_msgs_formatted, # 传入格式化后的历史
             formatted_msgs,
             asdict(self.global_emotion),
             related_profiles_json, search_history, self.chat_summary,
@@ -555,10 +568,18 @@ class Session:
         # 格式化回溯的历史记录
         recalled_str = "\n".join(recalled_history) if recalled_history else "无"
 
+        # 过滤掉本次的新消息，避免 Prompt 上下文重复
+        all_messages = self.global_memory.access().messages
+        history_msgs = [m for m in all_messages if m not in messages_chunk]
+        history_msgs_formatted = [
+            f"[{m.time.strftime('%H:%M')}] {m.user_name}: {escape_for_prompt(m.content)}" 
+            for m in history_msgs
+        ]
+
         prompt = get_chat_prompt(
             self.__name, self.__role, self.__chatting_state.value,
             self.global_memory.access().compressed_history,
-            self.global_memory.access().messages,
+            history_msgs_formatted, # 传入格式化后的历史
             formatted_msgs,
             asdict(self.global_emotion),
             "{}",
@@ -599,6 +620,33 @@ class Session:
         return []
 
     # 提高插话阈值，防止连击
+    async def append_self_message(self, content: str, msg_id: str):
+        """
+        主动记录 Bot 自己的发言 (防止等待回显导致记忆延迟)
+        """
+        logger.debug(f"[Session {self.id}] 主动写入自身记忆: {content[:20]}... (ID: {msg_id})")
+        msg = Message(
+            time=datetime.now(),
+            user_name=self.__name,
+            content=content,
+            id=msg_id,
+            user_id=self.id # Bot 自己的 ID 通常就是 group_id 或者 bot_id，这里用 self.id 只是标记
+        )
+        # 这里的 user_id 可能需要更准确，但这主要影响 Memory.related_users
+        # 暂时用 self.id 或空字符串
+        
+        await self.global_memory.update([msg])
+        asyncio.create_task(self.save_session())
+
+    async def update_without_trigger(self, messages_chunk: list[Message]):
+        """
+        仅更新记忆，不触发 LLM 回复 (用于处理回显)
+        """
+        if not messages_chunk: return
+        logger.debug(f"[Session {self.id}] 处理回显消息 (Count: {len(messages_chunk)})")
+        await self.global_memory.update(messages_chunk)
+        asyncio.create_task(self.save_session())
+
     async def update(self, messages_chunk: list[Message],
                      chat_llm_func: Callable[[str, bool], Awaitable[str]],
                      feedback_llm_func: Callable[[str, bool], Awaitable[str]],
@@ -642,7 +690,10 @@ class Session:
 
         time_since_speak = (now - last_speak).total_seconds()
 
-        if time_since_speak < 10.0 and not is_relevant:
+        if time_since_speak < 0:
+            logger.warning(f"[Session {self.id}] 检测到最后发言时间在未来 ({time_since_speak:.1f}s)，忽略冷却限制")
+            # 此时视为没有冷却，允许通行
+        elif time_since_speak < 10.0 and not is_relevant:
             logger.debug(f"处于发言冷却期 ({time_since_speak:.1f}s)，跳过响应")
             return None
 
