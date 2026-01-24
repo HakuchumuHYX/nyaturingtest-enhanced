@@ -22,7 +22,7 @@ from .impression import Impression
 from .mem import Memory, Message
 from .presets import PRESETS
 from .profile import PersonProfile
-from .utils import extract_and_parse_json, check_relevance, sanitize_text, escape_for_prompt
+from .utils import extract_and_parse_json, check_relevance, sanitize_text, escape_for_prompt, get_time_description
 from .prompts import get_feedback_prompt, get_chat_prompt
 from .repository import SessionRepository
 
@@ -387,6 +387,7 @@ class Session:
         ]
 
         # 2. 调用 LLM (使用传入的 feedback_llm_func)
+        time_str = get_time_description(datetime.now())
         prompt = get_feedback_prompt(
             self.__name, self.__role, self.willingness,
             self.__chatting_state.value,
@@ -395,7 +396,8 @@ class Session:
             formatted_msgs,
             asdict(self.global_emotion),
             related_profiles_json, search_history, self.chat_summary,
-            is_relevant=is_relevant
+            is_relevant=is_relevant,
+            time_info=time_str
         )
 
         response_dict = {}
@@ -576,6 +578,7 @@ class Session:
             for m in history_msgs
         ]
 
+        time_str = get_time_description(datetime.now())
         prompt = get_chat_prompt(
             self.__name, self.__role, self.__chatting_state.value,
             self.global_memory.access().compressed_history,
@@ -585,7 +588,8 @@ class Session:
             "{}",
             search_history, self.chat_summary,
             examples_text="",  # examples 已经包含在 self.__role 里了
-            recalled_history=recalled_str
+            recalled_history=recalled_str,
+            time_info=time_str
         )
 
         last_error = None

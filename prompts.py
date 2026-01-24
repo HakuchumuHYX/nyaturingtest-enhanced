@@ -14,7 +14,8 @@ def get_feedback_prompt(
         related_profiles_json: str,
         search_result: list,
         last_summary: str,
-        is_relevant: bool = False
+        is_relevant: bool = False,
+        time_info: str = ""
 ) -> str:
     """
     反馈阶段 Prompt - 观察者模式
@@ -26,6 +27,8 @@ def get_feedback_prompt(
 你是一个极具洞察力的对话观察者。你正在暗中观察群聊中的角色 "{bot_name}"。
 你的任务是分析局势，更新角色的心理状态，而不是直接回复消息。
 {relevance_hint}
+
+当前时间信息: {time_info}
 
 # Character Profile (被观察者设定)
 {role}
@@ -47,7 +50,7 @@ def get_feedback_prompt(
 请先在 <think> 标签中分析：
 1. 谁在说话？这和我有关吗？
 2. 我的情绪应该如何变化？
-3. 我现在想插话吗？
+3. 我现在想插话吗？(考虑当前时间：如果是深夜/休息时间，除非被点名或有重要话题，否则应降低发言意愿。如果是工作时间，可能在忙。)
 
 # Output Requirements (JSON Only)
 JSON 需包含以下字段：
@@ -73,7 +76,8 @@ def get_chat_prompt(
         search_result: list,
         chat_summary: str,
         examples_text: str = "",
-        recalled_history: str = ""
+        recalled_history: str = "",
+        time_info: str = ""
 ) -> str:
     """
     对话阶段 Prompt - 深度角色扮演 (全中文优化版)
@@ -111,6 +115,10 @@ def get_chat_prompt(
   - D (支配度): {emotion['dominance']:.2f} (低分顺从/自卑，高分强势/自信)
 </status>
 
+<current_time>
+{time_info}
+</current_time>
+
 <memory_rag>
 {json.dumps(search_result, ensure_ascii=False)}
 </memory_rag>
@@ -129,13 +137,15 @@ def get_chat_prompt(
 
 # Instruction
 请根据 <profile> 和 <memory_rag> 回复 <new_messages>。
+**特别注意**: 参考 <current_time>，让你的行为符合当前时间（如深夜正在休息刷手机，周末在放松，工作日在忙等）。不要总是说“在看文献”。
 
 <think_protocol>
 在生成 JSON 之前，你必须先在 <think> 标签中进行内心独白：
 1. **意图识别**: 对方到底想说什么？是在问我吗？
-2. **知识检索**: 我真的知道这个信息吗？如果记忆里没有，不要瞎编。
-3. **情绪反应**: 这句话让我（{bot_name}）感觉如何？
-4. **安全检查**: 我是不是又要说“哈哈”了？赶紧删掉。我是不是太客气了？改得随意点。我是不是又要用emoji了？赶紧去掉。
+2. **时间感知**: 现在是{time_info}。我应该在做什么？(如深夜可能在床上，周末可能在玩)。我的回复状态应该如何？
+3. **知识检索**: 我真的知道这个信息吗？如果记忆里没有，不要瞎编。
+4. **情绪反应**: 这句话让我（{bot_name}）感觉如何？
+5. **安全检查**: 我是不是又要说“哈哈”了？赶紧删掉。我是不是太客气了？改得随意点。我是不是又要用emoji了？赶紧去掉。
 </think_protocol>
 
 # Output Format

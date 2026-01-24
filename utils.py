@@ -2,6 +2,9 @@
 import json
 import re
 import ssl
+from datetime import datetime
+
+import chinese_calendar as chinesecalendar
 import httpx
 from nonebot import logger
 from .mem import Message
@@ -163,3 +166,55 @@ def check_relevance(bot_name: str, aliases: list[str], messages: list[Message]) 
 
 
     return False
+
+
+def get_time_description(dt: datetime) -> str:
+    """
+    生成详细的时间描述，包含节假日判断
+    """
+    # 星期映射
+    weekday_map = {0: "周一", 1: "周二", 2: "周三", 3: "周四", 4: "周五", 5: "周六", 6: "周日"}
+    weekday_str = weekday_map[dt.weekday()]
+
+    # 格式化基础时间
+    time_str = dt.strftime("%Y年%m月%d日 %H:%M")
+
+    # 判断时段
+    hour = dt.hour
+    period = ""
+    if 0 <= hour < 6:
+        period = "深夜"
+    elif 6 <= hour < 9:
+        period = "清晨"
+    elif 9 <= hour < 12:
+        period = "上午"
+    elif 12 <= hour < 14:
+        period = "中午"
+    elif 14 <= hour < 18:
+        period = "下午"
+    elif 18 <= hour < 23:
+        period = "晚上"
+    else:
+        period = "深夜"
+
+    # 判断节假日
+    try:
+        # chinesecalendar.is_holiday: True if holiday (including weekends)
+        # chinesecalendar.get_holiday_detail: (bool, name)
+        is_rest = chinesecalendar.is_holiday(dt.date())
+        on_holiday, holiday_name = chinesecalendar.get_holiday_detail(dt.date())
+
+        status_str = "工作日"
+        if is_rest:
+            if holiday_name:
+                status_str = f"节假日({holiday_name})"
+            else:
+                status_str = "周末休息" if dt.weekday() >= 5 else "休息日"
+        else:
+            status_str = "工作日"
+
+    except Exception as e:
+        logger.warning(f"节假日判断失败: {e}")
+        status_str = "周末" if dt.weekday() >= 5 else "工作日"
+
+    return f"{time_str} {weekday_str} [{period}] [{status_str}]"
