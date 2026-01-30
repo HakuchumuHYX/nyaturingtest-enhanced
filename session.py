@@ -22,7 +22,7 @@ from .impression import Impression
 from .mem import Memory, Message
 from .presets import PRESETS
 from .profile import PersonProfile
-from .utils import extract_and_parse_json, check_relevance, sanitize_text, escape_for_prompt, get_time_description
+from .utils import extract_and_parse_json, check_relevance, sanitize_text, escape_for_prompt, get_time_description, should_store_memory
 from .prompts import get_feedback_prompt, get_chat_prompt
 from .repository import SessionRepository
 
@@ -292,11 +292,11 @@ class Session:
 {recent_str}
 """
 
-    async def __search_stage(self, queries: list[str], active_user_names: list[str]):
+    async def __search_stage(self, queries: list[str], active_user_names: list[str], use_rerank: bool = True):
         """
         优化检索阶段
         """
-        logger.debug("检索阶段开始")
+        logger.debug(f"检索阶段开始 (Use Rerank: {use_rerank})")
 
         if self.chat_summary:
             queries.append(self.chat_summary)
@@ -322,7 +322,8 @@ class Session:
             raw_results = await run_sync(self.long_term_memory.retrieve)(
                 queries,
                 k=20,
-                where=where_filter
+                where=where_filter,
+                use_rerank=use_rerank
             )
 
             if raw_results:
@@ -516,11 +517,13 @@ class Session:
     async def __save_long_term_memory(self, analyze_result: list, default_user_id: str = ""):
         """
         后台任务：保存长期记忆到向量数据库
+        优化：增加质量过滤和去重
         """
         try:
-            texts = []
-            metadatas = []
             today = int(datetime.now().strftime("%Y%m%d"))
+            saved_count = 0
+            skipped_quality = 0
+            skipped_dedup = 0
 
             for item in analyze_result:
                 content = ""
@@ -529,34 +532,39 @@ class Session:
                 # 情况 1: LLM 还是返回了字符串 (Prompt 没生效或模型太笨)
                 if isinstance(item, str) and item.strip():
                     content = item.strip()
-                    # 只有在 default_user_id 非常明确（比如私聊或只有一人说话）时才使用
-                    # 否则宁可留空，让内容里的主语起作用
                     uid = default_user_id if default_user_id else ""
 
                 # 情况 2: LLM 返回了我们要求的标准字典
                 elif isinstance(item, dict):
                     content = item.get("content", "").strip()
                     uid = str(item.get("related_user_id", ""))
-
-                    # 只有当 LLM 真的没填 ID，且 default_user_id 存在时才兜底
                     if not uid and default_user_id:
                         uid = default_user_id
 
-                # 确保保存的内容本身足够长，减少误判
-                if content and len(content) > 2:
-                    texts.append(content)
-                    metadatas.append({
-                        "source": "memory",
-                        "type": "event",
-                        "date": today,
-                        "user_id": uid  # 这里的 uid 现在更准确了
-                    })
+                # 质量过滤：使用 should_store_memory 函数
+                if not should_store_memory(content):
+                    skipped_quality += 1
+                    logger.debug(f"[Memory] 跳过低质量记忆: {content[:30]}...")
+                    continue
 
-            if texts:
-                await run_sync(self.long_term_memory.add_texts)(texts, metadatas=metadatas)
-                # 记录日志方便调试，看看到底存了谁的记忆
+                metadata = {
+                    "source": "memory",
+                    "type": "event",
+                    "date": today,
+                    "user_id": uid
+                }
+
+                # 去重添加
+                added = await run_sync(self.long_term_memory.add_memory_with_dedup)(content, metadata)
+                if added:
+                    saved_count += 1
+                else:
+                    skipped_dedup += 1
+
+            if saved_count > 0 or skipped_quality > 0 or skipped_dedup > 0:
                 logger.info(
-                    f"[Memory] Saved {len(texts)} entries. First meta: {metadatas[0] if metadatas else 'None'}")
+                    f"[Memory] 存储结果: 成功 {saved_count}, 质量过滤 {skipped_quality}, 去重跳过 {skipped_dedup}"
+                )
         except Exception as e:
             logger.error(f"[Async] 保存记忆失败: {e}")
 
@@ -705,7 +713,11 @@ class Session:
         queries = [msg.content for msg in messages_chunk[-2:]]
         active_users = [msg.user_name for msg in messages_chunk if msg.user_name]
 
-        await self.__search_stage(queries, active_user_names=active_users)
+        # 优化策略：仅当意愿值较高 (>0.6) 或强关联 (被点名) 时才启用重排序
+        # 低意愿状态下使用纯向量检索，极其省钱且足够应付普通场景
+        use_rerank_strategy = self.willingness > 0.6 or is_relevant
+
+        await self.__search_stage(queries, active_user_names=active_users, use_rerank=use_rerank_strategy)
 
         logger.debug("启用拟人化串行模式: Feedback -> Check -> Chat")
 

@@ -168,6 +168,83 @@ def check_relevance(bot_name: str, aliases: list[str], messages: list[Message]) 
     return False
 
 
+def should_store_memory(content: str) -> bool:
+    """
+    判断记忆是否值得存储
+    过滤低质量内容，避免存储无意义的语气词
+    """
+    if not content:
+        return False
+    
+    content = content.strip()
+    
+    # 太短不存（少于10字符）
+    if len(content) < 10:
+        return False
+    
+    # 纯语气词/无意义内容不存
+    noise_words = {
+        "好的", "好", "嗯", "嗯嗯", "哦", "哦哦", 
+        "ok", "OK", "Ok", "收到", "了解", "明白",
+        "哈哈", "哈哈哈", "233", "666", "厉害",
+        "是的", "对", "对的", "是啊", "好吧",
+        "行", "可以", "没问题", "好呀", "好哒",
+        "谢谢", "感谢", "辛苦了", "拜拜", "再见",
+        "早", "晚安", "午安", "早安", "晚上好",
+    }
+    
+    if content.lower() in noise_words:
+        return False
+    
+    return True
+
+
+def calculate_dynamic_k(interaction_count: int, memory_count: int, days_since_first: int) -> int:
+    """
+    综合计算检索条数，上限根据记忆量自动调整
+    
+    Args:
+        interaction_count: 交互次数
+        memory_count: 记忆总量
+        days_since_first: 距离首次交互的天数
+    
+    Returns:
+        检索条数 k
+    """
+    # 1. 根据记忆量决定上限
+    if memory_count <= 10:
+        max_limit = memory_count  # 记忆少，全取
+    elif memory_count <= 30:
+        max_limit = 20
+    elif memory_count <= 50:
+        max_limit = 30
+    else:
+        max_limit = 40  # 记忆非常丰富，取 Top 40
+    
+    # 2. 计算综合分数
+    base = 5
+    
+    # 交互贡献：每 50 次 +1，最多 +6
+    interaction_bonus = min(interaction_count // 50, 6)
+    
+    # 记忆贡献：每 10 条 +1，最多 +8
+    memory_bonus = min(memory_count // 10, 8)
+    
+    # 时间贡献
+    if days_since_first > 90:
+        time_bonus = 4
+    elif days_since_first > 30:
+        time_bonus = 3
+    elif days_since_first > 7:
+        time_bonus = 2
+    else:
+        time_bonus = 0
+    
+    # 3. 求和并限制范围
+    k = base + interaction_bonus + memory_bonus + time_bonus
+    return max(5, min(k, max_limit))
+
+
 def get_time_description(dt: datetime) -> str:
     """
     生成详细的时间描述，包含节假日判断

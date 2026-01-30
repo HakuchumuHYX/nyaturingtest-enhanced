@@ -257,6 +257,27 @@ class SessionRepository:
             logger.error(f"[Repo] 记录 Token 消耗失败: {e}")
 
     @staticmethod
+    async def get_first_interaction_time(session_id: str, user_id: str) -> datetime | None:
+        """获取用户首次交互时间"""
+        try:
+            session_db = await SessionModel.get_or_none(id=session_id)
+            if not session_db:
+                return None
+            
+            user_db = await UserProfileModel.get_or_none(
+                session=session_db,
+                user_id=str(user_id)
+            )
+            if not user_db:
+                return None
+            
+            first_log = await InteractionLogModel.filter(user=user_db).order_by("timestamp").first()
+            return first_log.timestamp if first_log else None
+        except Exception as e:
+            logger.error(f"[Repo] 获取首次交互时间失败: {e}")
+            return None
+
+    @staticmethod
     async def get_token_stats(group_id: str | int) -> dict:
         """
         获取统计数据

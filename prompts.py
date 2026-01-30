@@ -22,6 +22,9 @@ def get_feedback_prompt(
     """
     relevance_hint = "【重要提示】检测到新消息中直接提到了你的名字或相关别名，请重点关注，这极可能是在和你对话。" if is_relevant else ""
 
+    # 将最近消息列表转换为字符串
+    recent_msgs_str = "\n".join(recent_msgs) if isinstance(recent_msgs, list) else str(recent_msgs)
+
     return f"""
 # System Role
 你是一个极具洞察力的对话观察者。你正在暗中观察群聊中的角色 "{bot_name}"。
@@ -42,6 +45,8 @@ def get_feedback_prompt(
 - 历史话题摘要: {history_summary}
 - 脑海中的记忆片段:
 {json.dumps(search_result, ensure_ascii=False, indent=2)}
+- 近期对话上下文:
+{recent_msgs_str}
 - **【新收到的消息】**:
 {new_msgs_formatted}
 
@@ -49,8 +54,9 @@ def get_feedback_prompt(
 阅读【新收到的消息】，结合上下文，输出一个 JSON 对象来更新状态。
 请先在 <think> 标签中分析：
 1. 谁在说话？这和我有关吗？
-2. 我的情绪应该如何变化？
-3. 我现在想插话吗？(考虑当前时间：如果是深夜/休息时间，除非被点名或有重要话题，否则应降低发言意愿。如果是工作时间，可能在忙。)
+2. **对话连续性**：这是否是对上一句的追问？或者是话题的延续？上下文是什么？
+3. 我的情绪应该如何变化？
+4. 我现在想插话吗？(考虑当前时间：如果是深夜/休息时间，除非被点名或有重要话题，否则应降低发言意愿。如果是工作时间，可能在忙。)
 
 # Output Requirements (JSON Only)
 JSON 需包含以下字段：

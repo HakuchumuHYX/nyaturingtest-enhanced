@@ -2,6 +2,7 @@
 import os
 import asyncio
 import uuid
+import math
 import httpx
 from datetime import datetime, timedelta
 from typing import List, Dict, Any
@@ -9,7 +10,6 @@ import chromadb
 from chromadb.api.types import Documents, EmbeddingFunction, Embeddings
 from nonebot import logger
 from .config import plugin_config
-from .repository import SessionRepository
 
 
 class SiliconFlowReranker:
@@ -116,14 +116,17 @@ class VectorMemory:
     def retrieve(self, queries: List[str], k: int = 5, where: dict | None = None, use_rerank: bool = True) -> List[Dict[str, Any]]:
         """
         检索逻辑：
-        1. 如果启用 Rerank，先扩大召回 (k * 4)，然后 Rerank 取 Top K
+        1. 如果启用 Rerank，先扩大召回 (k * 2, max 50)，然后 Rerank 取 Top K
         2. 如果未启用，直接召回 Top K
         """
         if not queries: return []
         unique_queries = list(set([q for q in queries if q.strip()]))
         
-        # 决定初筛数量
-        initial_k = k * 4 if (use_rerank and self.reranker) else k
+        # 决定初筛数量 (优化：降低倍率至2倍，且设置硬性上限50，防止Token爆炸)
+        if use_rerank and self.reranker:
+            initial_k = min(k * 2, 50) 
+        else:
+            initial_k = k
         
         try:
             results = self.collection.query(query_texts=unique_queries, n_results=initial_k, where=where)
@@ -228,3 +231,130 @@ class VectorMemory:
             self.collection = self.client.get_or_create_collection(name="nyabot_memory", embedding_function=self.emb_fn)
         except Exception as e:
             logger.error(f"Clear failed: {e}")
+
+    def count_by_user(self, user_id: str) -> int:
+        """统计某用户的记忆数量"""
+        try:
+            if not user_id or not user_id.strip():
+                return 0
+            
+            results = self.collection.get(
+                where={"user_id": {"$eq": user_id}},
+                include=[]  # 不需要实际内容，只需要 ID
+            )
+            return len(results.get("ids", []))
+        except Exception as e:
+            logger.warning(f"统计记忆数量失败: {e}")
+            return 0
+
+    def add_memory_with_dedup(self, content: str, metadata: dict, threshold: float = 0.9) -> bool:
+        """
+        带去重的记忆添加
+        
+        Args:
+            content: 记忆内容
+            metadata: 元数据
+            threshold: 相似度阈值，超过此值视为重复
+            
+        Returns:
+            是否成功添加（False 表示重复跳过）
+        """
+        if not content or not content.strip():
+            return False
+        
+        content = content.strip()
+        
+        try:
+            # 检索最相似的已有记忆
+            existing = self.collection.query(
+                query_texts=[content],
+                n_results=1,
+                where={"source": {"$eq": "memory"}}
+            )
+            
+            if existing.get('distances') and existing['distances'][0]:
+                # ChromaDB 使用 cosine 距离，值越小越相似
+                # 距离范围 [0, 2]，转换为相似度 [1, -1]
+                distance = existing['distances'][0][0]
+                similarity = 1 - distance
+                
+                if similarity > threshold:
+                    logger.debug(f"[Memory] 跳过重复记忆 (相似度 {similarity:.2f}): {content[:30]}...")
+                    return False
+            
+            # 不重复，正常添加
+            self.add_texts([content], metadatas=[metadata])
+            return True
+            
+        except Exception as e:
+            logger.error(f"去重添加记忆失败: {e}")
+            # 出错时降级为直接添加
+            self.add_texts([content], metadatas=[metadata])
+            return True
+
+    def retrieve_with_decay(
+        self, 
+        queries: List[str], 
+        k: int = 5, 
+        where: dict | None = None, 
+        use_rerank: bool = True,
+        decay_rate: float = 0.02
+    ) -> List[Dict[str, Any]]:
+        """
+        带时间衰减的检索
+        
+        Args:
+            queries: 查询语句列表
+            k: 返回结果数量
+            where: 过滤条件
+            use_rerank: 是否使用 Rerank
+            decay_rate: 时间衰减率（默认 0.02，约 35 天半衰期）
+            
+        Returns:
+            检索结果列表，按综合分数排序
+        """
+        # 1. 调用原有检索方法
+        raw_results = self.retrieve(queries, k=k * 2, where=where, use_rerank=use_rerank)
+        
+        if not raw_results:
+            return []
+        
+        # 2. 应用时间衰减
+        today = int(datetime.now().strftime("%Y%m%d"))
+        
+        for item in raw_results:
+            meta = item.get("metadata", {})
+            date = meta.get("date", 0)
+            
+            # 计算天数差
+            if date and isinstance(date, int) and date > 0:
+                # 简化计算：假设每个月 30 天
+                year_diff = (today // 10000) - (date // 10000)
+                month_diff = ((today % 10000) // 100) - ((date % 10000) // 100)
+                day_diff = (today % 100) - (date % 100)
+                days_ago = year_diff * 365 + month_diff * 30 + day_diff
+                days_ago = max(0, days_ago)
+            else:
+                # 没有日期的记忆，视为较久以前
+                days_ago = 60
+            
+            # 指数衰减
+            decay_factor = math.exp(-decay_rate * days_ago)
+            
+            # 获取原始分数
+            original_score = meta.get("rerank_score", 0.5)  # 如果没有 rerank 分数，默认 0.5
+            
+            # 计算调整后的分数
+            adjusted_score = original_score * decay_factor
+            meta["adjusted_score"] = adjusted_score
+            meta["days_ago"] = days_ago
+        
+        # 3. 重新排序
+        sorted_results = sorted(
+            raw_results, 
+            key=lambda x: x.get("metadata", {}).get("adjusted_score", 0), 
+            reverse=True
+        )
+        
+        # 4. 截取前 k 个
+        return sorted_results[:k]

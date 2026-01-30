@@ -1,6 +1,7 @@
 # nyaturingtest/memory_query.py
 import json
 import asyncio
+from datetime import datetime
 from nonebot import on_command, logger
 from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, Message
 from nonebot.params import CommandArg
@@ -8,7 +9,7 @@ from nonebot.utils import run_sync
 from nonebot.exception import FinishedException
 
 from .state_manager import ensure_group_state
-from .utils import extract_and_parse_json
+from .utils import extract_and_parse_json, calculate_dynamic_k, should_store_memory
 from .repository import SessionRepository
 from .logic import llm_response
 from .config import plugin_config
@@ -103,28 +104,49 @@ async def handle_query_memory(bot: Bot, event: GroupMessageEvent, args: Message 
             }
 
             if hasattr(state.session, 'long_term_memory'):
-                # 动态计算提取条数
-                # 基础5条，每增加20次交互加1条，上限15条
-                dynamic_k = min(max(5, interaction_count // 20), 15)
+                # 获取用户记忆数量
+                memory_count = await run_sync(state.session.long_term_memory.count_by_user)(target_id)
                 
-                # 移除 on_usage 参数
-                vector_records = await run_sync(state.session.long_term_memory.retrieve)(
+                # 获取首次交互时间，计算天数
+                first_interaction_time = await SessionRepository.get_first_interaction_time(
+                    state.session.id, target_id
+                )
+                if first_interaction_time:
+                    # 统一为 naive datetime，避免时区问题
+                    if first_interaction_time.tzinfo is not None:
+                        first_interaction_time = first_interaction_time.replace(tzinfo=None)
+                    days_since_first = (datetime.now() - first_interaction_time).days
+                else:
+                    days_since_first = 0
+                
+                # 使用综合评分计算动态 k 值
+                dynamic_k = calculate_dynamic_k(interaction_count, memory_count, days_since_first)
+                
+                # 使用时间衰减检索（近期记忆权重更高）
+                vector_records = await run_sync(state.session.long_term_memory.retrieve_with_decay)(
                     search_queries,
                     k=dynamic_k,
-                    where=search_filter
+                    where=search_filter,
+                    use_rerank=True,
+                    decay_rate=0.02  # 衰减率：约35天后权重减半
                 )
-                # 简单去重
+                
+                # 后过滤：去重 + 质量过滤
                 if vector_records:
                     unique_recs = []
                     seen = set()
                     for rec in vector_records:
                         content = rec.get('content', '')
-                        if content and content not in seen:
+                        # 质量过滤：排除低质量内容
+                        if content and content not in seen and should_store_memory(content):
                             seen.add(content)
                             unique_recs.append(content)
                     vector_records = unique_recs
 
-                    logger.debug(f"查询记忆: 目标k={dynamic_k}, 实际检索到 {len(vector_records)} 条记录")
+                    logger.debug(
+                        f"查询记忆: 交互={interaction_count}, 记忆量={memory_count}, "
+                        f"天数={days_since_first}, 目标k={dynamic_k}, 实际={len(vector_records)}条"
+                    )
         except Exception as e:
             logger.error(f"向量记忆检索失败: {e}")
 
