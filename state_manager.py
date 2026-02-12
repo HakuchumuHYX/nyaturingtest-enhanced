@@ -8,11 +8,54 @@ from openai import AsyncOpenAI
 from tortoise import Tortoise
 
 from .client import LLMClient
-from .config import plugin_config
+from .config import (
+    plugin_config,
+    get_effective_chat_api_key,
+    get_effective_chat_base_url,
+)
 from .mem import Message as MMessage
 from .session import Session
 from .utils import get_http_client, close_http_client
 from .models import EnabledGroupModel
+
+
+def _build_chat_llm_client() -> LLMClient:
+    provider = (getattr(plugin_config, "nyaturingtest_chat_provider", None) or "openai_compatible").strip().lower()
+
+    openai_client = None
+    if provider == "openai_compatible":
+        openai_client = AsyncOpenAI(
+            api_key=get_effective_chat_api_key(plugin_config),
+            base_url=get_effective_chat_base_url(plugin_config),
+            http_client=get_http_client(),
+        )
+
+    google_key = (getattr(plugin_config, "nyaturingtest_chat_google_api_key", None) or "").strip()
+    if not google_key:
+        # allow reuse existing key if user puts google key into legacy field
+        google_key = get_effective_chat_api_key(plugin_config)
+
+    google_base_url = (
+        getattr(plugin_config, "nyaturingtest_chat_google_base_url", None)
+        or "https://generativelanguage.googleapis.com/v1beta"
+    )
+
+    return LLMClient(
+        provider=provider,
+        openai_client=openai_client,
+        google_api_key=google_key,
+        google_base_url=google_base_url,
+    )
+
+
+def _build_feedback_llm_client() -> LLMClient:
+    # feedback remains SiliconFlow (unchanged), OpenAI-compatible
+    openai_client = AsyncOpenAI(
+        api_key=plugin_config.nyaturingtest_siliconflow_api_key,
+        base_url="https://api.siliconflow.cn/v1",
+        http_client=get_http_client(),
+    )
+    return LLMClient(provider="openai_compatible", openai_client=openai_client)
 
 SELF_SENT_MSG_IDS = deque(maxlen=50)
 
@@ -29,25 +72,9 @@ class GroupState:
 
     messages_chunk: list[MMessage] = field(default_factory=list)
 
-    client: LLMClient = field(
-        default_factory=lambda: LLMClient(
-            client=AsyncOpenAI(
-                api_key=plugin_config.nyaturingtest_chat_openai_api_key,
-                base_url=plugin_config.nyaturingtest_chat_openai_base_url,
-                http_client=get_http_client()
-            )
-        )
-    )
+    client: LLMClient = field(default_factory=_build_chat_llm_client)
 
-    feedback_client: LLMClient = field(
-        default_factory=lambda: LLMClient(
-            client=AsyncOpenAI(
-                api_key=plugin_config.nyaturingtest_siliconflow_api_key,
-                base_url="https://api.siliconflow.cn/v1",
-                http_client=get_http_client()
-            )
-        )
-    )
+    feedback_client: LLMClient = field(default_factory=_build_feedback_llm_client)
     data_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     session_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     new_message_signal: asyncio.Event = field(default_factory=asyncio.Event)

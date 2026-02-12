@@ -17,7 +17,12 @@ import numpy as np
 from PIL import Image, ImageSequence, ImageDraw, ImageFont
 from nonebot.utils import run_sync
 
-from .config import plugin_config
+from .config import (
+    plugin_config,
+    get_effective_chat_api_key,
+    get_effective_chat_base_url,
+    get_effective_chat_model,
+)
 from .vlm import VLM
 from .utils import get_http_client
 
@@ -61,12 +66,38 @@ class ImageManager:
 
     def __init__(self):
         if not self._initialized:
-            # 使用 Chat 配置，统一走 Gemini 3 Flash
-            # 如果chat model并非多模态，这里要修改
+            # VLM config is independent. If VLM openai_* is empty, fallback to Chat settings.
+            vlm_openai_key = (getattr(plugin_config, "nyaturingtest_vlm_openai_api_key", "") or "").strip()
+            if not vlm_openai_key:
+                vlm_openai_key = get_effective_chat_api_key(plugin_config)
+
+            vlm_openai_base_url = (getattr(plugin_config, "nyaturingtest_vlm_openai_base_url", "") or "").strip()
+            if not vlm_openai_base_url:
+                vlm_openai_base_url = get_effective_chat_base_url(plugin_config)
+
+            vlm_model = (getattr(plugin_config, "nyaturingtest_vlm_model", "") or "").strip()
+            if not vlm_model:
+                vlm_model = get_effective_chat_model(plugin_config)
+
+            vlm_provider = (getattr(plugin_config, "nyaturingtest_vlm_provider", None) or "openai_compatible").strip().lower()
+
+            vlm_google_key = (getattr(plugin_config, "nyaturingtest_vlm_google_api_key", "") or "").strip()
+            if not vlm_google_key:
+                # allow reusing legacy key if user puts google key into openai field
+                vlm_google_key = vlm_openai_key
+
+            vlm_google_base_url = (
+                getattr(plugin_config, "nyaturingtest_vlm_google_base_url", None)
+                or "https://generativelanguage.googleapis.com/v1beta"
+            )
+
             self._vlm = VLM(
-                api_key=plugin_config.nyaturingtest_chat_openai_api_key,
-                endpoint=plugin_config.nyaturingtest_chat_openai_base_url,
-                model=plugin_config.nyaturingtest_chat_openai_model,
+                api_key=vlm_openai_key,
+                endpoint=vlm_openai_base_url,
+                model=vlm_model,
+                provider=vlm_provider,
+                google_api_key=vlm_google_key,
+                google_base_url=vlm_google_base_url,
             )
             IMAGE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
             self._initialized = True

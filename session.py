@@ -69,12 +69,14 @@ class Session:
             )
 
         # 保存基础 LLM Client，供 Memory 和其他组件使用
+        # NOTE: this client is for internal memory/analysis components, keep SiliconFlow OpenAI-compatible here.
         self._base_llm_client = LLMClient(
-            client=AsyncOpenAI(
+            provider="openai_compatible",
+            openai_client=AsyncOpenAI(
                 api_key=plugin_config.nyaturingtest_siliconflow_api_key,
                 base_url="https://api.siliconflow.cn/v1",
-                http_client=self._client_instance
-            )
+                http_client=self._client_instance,
+            ),
         )
 
         self.global_memory: Memory = Memory(

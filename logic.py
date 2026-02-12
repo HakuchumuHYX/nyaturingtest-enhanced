@@ -8,7 +8,7 @@ from nonebot.adapters.onebot.v11 import Bot, Message, MessageSegment
 from nonebot.adapters.onebot.v11.exception import ActionFailed
 
 from .client import LLMClient
-from .config import plugin_config
+from .config import plugin_config, get_effective_chat_model
 from .image_manager import image_manager
 from .mem import Message as MMessage
 from .state_manager import GroupState, SELF_SENT_MSG_IDS
@@ -78,11 +78,15 @@ async def message2BotMessage(bot_name: str, group_id: int, message: Message, bot
             url = seg.data.get("url", "")
             file_unique = seg.data.get("file_unique", "")
             is_sticker = seg.data.get("sub_type") == 1
+
+            # VLM disabled: skip recognition to avoid token cost / errors
+            if not getattr(plugin_config, "nyaturingtest_vlm_enabled", True):
+                return "\n[表情包]\n" if is_sticker else "\n[图片]\n"
             
             # 使用逻辑层定义的 chat model 作为 VLM model 的近似记录（通常 VLM 和 Chat 用的是同一个 Key，或者 image_manager 内部用的就是 chat model）
             # image_manager 内部初始化时用的是 plugin_config.nyaturingtest_chat_openai_model
             # 所以这里记录为同一个模型名是准确的
-            vlm_recorder = make_vlm_recorder(plugin_config.nyaturingtest_chat_openai_model)
+            vlm_recorder = make_vlm_recorder(get_effective_chat_model(plugin_config))
 
             # 调用通用逻辑，传入提取到的上下文
             return await image_manager.resolve_image_from_url(
@@ -133,14 +137,18 @@ async def message2BotMessage(bot_name: str, group_id: int, message: Message, bot
                                 # 引用里的图片通常不易判断是否为表情包，默认 False，或者尝试获取 sub_type
                                 is_sticker_ref = str(data.get("sub_type", "")) == "1"
 
-                                vlm_recorder = make_vlm_recorder(plugin_config.nyaturingtest_chat_openai_model)
+                                # VLM disabled: skip recognition
+                                if not getattr(plugin_config, "nyaturingtest_vlm_enabled", True):
+                                    source_text += "\n[表情包]\n" if is_sticker_ref else "\n[图片]\n"
+                                else:
+                                    vlm_recorder = make_vlm_recorder(get_effective_chat_model(plugin_config))
 
-                                # Await 分析结果
-                                img_desc = await image_manager.resolve_image_from_url(
-                                    img_url, img_file_unique, is_sticker_ref, 
-                                    on_usage=vlm_recorder
-                                )
-                                source_text += img_desc
+                                    # Await 分析结果
+                                    img_desc = await image_manager.resolve_image_from_url(
+                                        img_url, img_file_unique, is_sticker_ref, 
+                                        on_usage=vlm_recorder
+                                    )
+                                    source_text += img_desc
 
                             elif msg_type == "face":
                                 # 简单处理 QQ 表情
@@ -272,7 +280,7 @@ async def spawn_state(state: GroupState):
             # Chat 函数
             chat_func = lambda msg, json_mode=False: llm_response(
                 state.client, msg,
-                model=plugin_config.nyaturingtest_chat_openai_model,  # 确保 config 里填的是 "gemini-3-flash-preview"
+                model=get_effective_chat_model(plugin_config),  # e.g. "gemini-3-flash-preview"
 
                 # Gemini 3 推荐保持 1.0，不要降温
                 temperature=1.05,
@@ -288,7 +296,7 @@ async def spawn_state(state: GroupState):
 
                 json_mode=json_mode,
                 system_prompt=rp_system_prompt,
-                on_usage=make_usage_recorder(plugin_config.nyaturingtest_chat_openai_model)
+                on_usage=make_usage_recorder(get_effective_chat_model(plugin_config))
             )
 
             # Feedback 函数：温度极低，保证逻辑分析准确

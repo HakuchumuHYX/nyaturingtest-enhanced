@@ -12,7 +12,7 @@ from .state_manager import ensure_group_state
 from .utils import extract_and_parse_json, calculate_dynamic_k, should_store_memory
 from .repository import SessionRepository
 from .logic import llm_response
-from .config import plugin_config
+from .config import plugin_config, get_effective_chat_model
 
 # 定义命令
 query_memory = on_command("查询记忆", aliases={"memory", "印象"}, priority=5, block=True)
@@ -205,7 +205,7 @@ async def handle_query_memory(bot: Bot, event: GroupMessageEvent, args: Message 
             response = await llm_response(
                 state.client,
                 prompt,
-                model=plugin_config.nyaturingtest_chat_openai_model,
+                model=get_effective_chat_model(plugin_config),
                 temperature=0.8 + (attempt * 0.2),
                 json_mode=True
             )
