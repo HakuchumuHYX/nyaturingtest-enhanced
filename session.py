@@ -73,7 +73,7 @@ class Session:
         self._base_llm_client = LLMClient(
             provider="openai_compatible",
             openai_client=AsyncOpenAI(
-                api_key=plugin_config.nyaturingtest_siliconflow_api_key,
+                api_key=plugin_config.get("siliconflow_api_key", ""),
                 base_url="https://api.siliconflow.cn/v1",
                 http_client=self._client_instance,
             ),
@@ -84,7 +84,7 @@ class Session:
         )
 
         self.long_term_memory: VectorMemory = VectorMemory(
-            api_key=plugin_config.nyaturingtest_siliconflow_api_key,
+            api_key=plugin_config.get("siliconflow_api_key", ""),
             persist_directory=f"{store.get_plugin_data_dir()}/vector_index_{id}",
         )
 

@@ -205,7 +205,7 @@ async def handle_query_memory(bot: Bot, event: GroupMessageEvent, args: Message 
             response = await llm_response(
                 state.client,
                 prompt,
-                model=get_effective_chat_model(plugin_config),
+                model=get_effective_chat_model(),
                 temperature=0.8 + (attempt * 0.2),
                 json_mode=True
             )

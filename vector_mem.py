@@ -83,10 +83,10 @@ class VectorMemory:
         
         # 初始化 Reranker
         self.reranker = None
-        if plugin_config.nyaturingtest_rerank_model:
+        if plugin_config.get("rerank", {}).get("model"):
             self.reranker = SiliconFlowReranker(
                 api_key=api_key, 
-                model=plugin_config.nyaturingtest_rerank_model
+                model=plugin_config.get("rerank", {}).get("model", "")
             )
 
         self.client = chromadb.PersistentClient(path=self.persist_directory)
@@ -174,7 +174,7 @@ class VectorMemory:
             )
             
             final_results = []
-            threshold = plugin_config.nyaturingtest_rerank_threshold
+            threshold = plugin_config.get("rerank", {}).get("threshold", 0.05)
             
             for res in rerank_results:
                 idx = res.get("index")

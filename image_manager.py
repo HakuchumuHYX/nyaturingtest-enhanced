@@ -67,27 +67,27 @@ class ImageManager:
     def __init__(self):
         if not self._initialized:
             # VLM config is independent. If VLM openai_* is empty, fallback to Chat settings.
-            vlm_openai_key = (getattr(plugin_config, "nyaturingtest_vlm_openai_api_key", "") or "").strip()
+            vlm_openai_key = plugin_config.get("vlm", {}).get("openai_api_key", "").strip()
             if not vlm_openai_key:
-                vlm_openai_key = get_effective_chat_api_key(plugin_config)
+                vlm_openai_key = get_effective_chat_api_key()
 
-            vlm_openai_base_url = (getattr(plugin_config, "nyaturingtest_vlm_openai_base_url", "") or "").strip()
+            vlm_openai_base_url = plugin_config.get("vlm", {}).get("openai_base_url", "").strip()
             if not vlm_openai_base_url:
-                vlm_openai_base_url = get_effective_chat_base_url(plugin_config)
+                vlm_openai_base_url = get_effective_chat_base_url()
 
-            vlm_model = (getattr(plugin_config, "nyaturingtest_vlm_model", "") or "").strip()
+            vlm_model = plugin_config.get("vlm", {}).get("model", "").strip()
             if not vlm_model:
-                vlm_model = get_effective_chat_model(plugin_config)
+                vlm_model = get_effective_chat_model()
 
-            vlm_provider = (getattr(plugin_config, "nyaturingtest_vlm_provider", None) or "openai_compatible").strip().lower()
+            vlm_provider = plugin_config.get("vlm", {}).get("provider", "openai_compatible").strip().lower()
 
-            vlm_google_key = (getattr(plugin_config, "nyaturingtest_vlm_google_api_key", "") or "").strip()
+            vlm_google_key = plugin_config.get("vlm", {}).get("google_api_key", "").strip()
             if not vlm_google_key:
                 # allow reusing legacy key if user puts google key into openai field
                 vlm_google_key = vlm_openai_key
 
             vlm_google_base_url = (
-                getattr(plugin_config, "nyaturingtest_vlm_google_base_url", None)
+                plugin_config.get("vlm", {}).get("google_base_url") or "https://generativelanguage.googleapis.com/v1beta"
                 or "https://generativelanguage.googleapis.com/v1beta"
             )
 

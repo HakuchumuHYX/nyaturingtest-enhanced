@@ -278,17 +278,22 @@ class SessionRepository:
             return None
 
     @staticmethod
-    async def get_token_stats(group_id: str | int) -> dict:
+    async def get_token_stats(group_id: str | int, model_names: list[str] | None = None) -> dict:
         """
         获取统计数据
-        返回格式:
-        {
-            "1d_local": [{"model": "...", "total": 123}, ...],
-            "1d_global": [...],
-            "7d_local": [...],
-            "7d_global": [...],
-            "all_global": [...]
-        }
+        
+        Args:
+            group_id: 群组 ID
+            model_names: 要统计的模型列表，为 None 则统计所有模型
+        
+        Returns:
+            {
+                "1d_local": [{"model": "...", "total": 123}, ...],
+                "1d_global": [...],
+                "7d_local": [...],
+                "7d_global": [...],
+                "all_global": [...]
+            }
         """
         result = {
             "1d_local": [],
@@ -303,6 +308,10 @@ class SessionRepository:
         seven_days_ago = now - timedelta(days=7)
 
         async def _query(filter_kwargs):
+            # 如果指定了模型列表，添加过滤条件
+            if model_names:
+                filter_kwargs["model_name__in"] = model_names
+            
             # 按模型分组统计
             stats = await TokenUsageModel.filter(**filter_kwargs) \
                 .annotate(

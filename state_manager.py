@@ -20,23 +20,23 @@ from .models import EnabledGroupModel
 
 
 def _build_chat_llm_client() -> LLMClient:
-    provider = (getattr(plugin_config, "nyaturingtest_chat_provider", None) or "openai_compatible").strip().lower()
+    provider = plugin_config.get("chat", {}).get("provider", "openai_compatible").strip().lower()
 
     openai_client = None
     if provider == "openai_compatible":
         openai_client = AsyncOpenAI(
-            api_key=get_effective_chat_api_key(plugin_config),
-            base_url=get_effective_chat_base_url(plugin_config),
+            api_key=get_effective_chat_api_key(),
+            base_url=get_effective_chat_base_url(),
             http_client=get_http_client(),
         )
 
-    google_key = (getattr(plugin_config, "nyaturingtest_chat_google_api_key", None) or "").strip()
+    google_key = plugin_config.get("chat", {}).get("google_api_key", "").strip()
     if not google_key:
         # allow reuse existing key if user puts google key into legacy field
-        google_key = get_effective_chat_api_key(plugin_config)
+        google_key = get_effective_chat_api_key()
 
     google_base_url = (
-        getattr(plugin_config, "nyaturingtest_chat_google_base_url", None)
+        plugin_config.get("chat", {}).get("google_base_url") or "https://generativelanguage.googleapis.com/v1beta"
         or "https://generativelanguage.googleapis.com/v1beta"
     )
 
@@ -49,13 +49,34 @@ def _build_chat_llm_client() -> LLMClient:
 
 
 def _build_feedback_llm_client() -> LLMClient:
-    # feedback remains SiliconFlow (unchanged), OpenAI-compatible
-    openai_client = AsyncOpenAI(
-        api_key=plugin_config.nyaturingtest_siliconflow_api_key,
-        base_url="https://api.siliconflow.cn/v1",
-        http_client=get_http_client(),
+    provider = plugin_config.get("feedback", {}).get("provider", "openai_compatible").strip().lower()
+
+    openai_client = None
+    if provider == "openai_compatible":
+        from .config import get_effective_feedback_api_key, get_effective_feedback_base_url
+        openai_client = AsyncOpenAI(
+            api_key=get_effective_feedback_api_key(),
+            base_url=get_effective_feedback_base_url(),
+            http_client=get_http_client(),
+        )
+
+    google_key = plugin_config.get("feedback", {}).get("google_api_key", "").strip()
+    if not google_key:
+        # allow reuse existing key if user puts google key into generic field
+        from .config import get_effective_feedback_api_key
+        google_key = get_effective_feedback_api_key()
+
+    google_base_url = (
+        plugin_config.get("feedback", {}).get("google_base_url") or "https://generativelanguage.googleapis.com/v1beta"
+        or "https://generativelanguage.googleapis.com/v1beta"
     )
-    return LLMClient(provider="openai_compatible", openai_client=openai_client)
+
+    return LLMClient(
+        provider=provider,
+        openai_client=openai_client,
+        google_api_key=google_key,
+        google_base_url=google_base_url,
+    )
 
 SELF_SENT_MSG_IDS = deque(maxlen=50)
 
@@ -65,7 +86,7 @@ class GroupState:
     bot: Bot | None = None
     session: Session = field(
         default_factory=lambda: Session(
-            siliconflow_api_key=plugin_config.nyaturingtest_siliconflow_api_key,
+            siliconflow_api_key=plugin_config.get("siliconflow_api_key", ""),
             http_client=get_http_client()
         )
     )
@@ -94,7 +115,7 @@ async def init_enabled_groups():
     db_ids = {g.group_id for g in db_groups}
 
     # 2. 读取配置文件 (用于迁移)
-    config_ids = set(plugin_config.nyaturingtest_enabled_groups)
+    config_ids = set(plugin_config.get("enabled_groups", []))
 
     # 3. 如果配置文件里有 DB 里没有的，自动迁移写入 DB
     new_ids = config_ids - db_ids
@@ -122,7 +143,7 @@ def ensure_group_state(group_id: int):
         new_state = GroupState(
             session=Session(
                 id=f"{group_id}",
-                siliconflow_api_key=plugin_config.nyaturingtest_siliconflow_api_key,
+                siliconflow_api_key=plugin_config.get("siliconflow_api_key", ""),
                 http_client=get_http_client()
             )
         )

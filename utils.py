@@ -295,3 +295,180 @@ def get_time_description(dt: datetime) -> str:
         status_str = "周末" if dt.weekday() >= 5 else "工作日"
 
     return f"{time_str} {weekday_str} [{period}] [{status_str}]"
+
+
+async def render_token_stats_card(
+    *,
+    stats: dict,
+    watermark: str | None = None,
+    width: int = 750
+) -> bytes:
+    """渲染 Token 统计卡片
+    
+    Args:
+        stats: 统计数据字典（包含 1d_local, 1d_global, 7d_local, 7d_global, all_global）
+        watermark: 右下角水印文字（可选）
+        width: 图片宽度
+    
+    Returns:
+        PNG bytes
+    """
+    from io import BytesIO
+    import sys
+    sys.path.insert(0, str(__file__).replace("nyaturingtest\\utils.py", ""))
+    from utils.draw.plot import Canvas, VSplit, HSplit, TextBox, TextStyle, FillBg, RoundRectBg, Spacer
+    
+    # 配色方案
+    canvas_bg = (240, 245, 250, 255)  # 浅灰蓝
+    card_bg = (255, 255, 255, 255)    # 白色
+    card_border = (200, 215, 230, 255)
+    
+    section_bg = (248, 251, 255, 255)  # 超浅蓝
+    text_main = (30, 40, 50, 255)
+    text_sub = (90, 105, 120, 255)
+    text_muted = (140, 155, 170, 255)
+    
+    # 模型颜色映射（根据模型名称）
+    model_colors = {
+        "chat": (100, 150, 255, 255),     # 蓝色
+        "vlm": (150, 100, 255, 255),      # 紫色  
+        "feedback": (255, 150, 100, 255), # 橙色
+    }
+    
+    # 文本样式（使用绝对路径）
+    import os
+    font_dir = os.path.join(os.path.dirname(__file__), "..", "..", "data", "nyaturingtest")
+    
+    title_style = TextStyle(font=os.path.join(font_dir, "SourceHanSansCN-Heavy.ttf"), size=36, color=text_main)
+    section_title_style = TextStyle(font=os.path.join(font_dir, "SourceHanSansCN-Bold.ttf"), size=24, color=text_main)
+    label_style = TextStyle(font=os.path.join(font_dir, "SourceHanSansCN-Regular.ttf"), size=18, color=text_sub)
+    value_style = TextStyle(font=os.path.join(font_dir, "SourceHanSansCN-Bold.ttf"), size=20, color=text_main)
+    model_style = TextStyle(font=os.path.join(font_dir, "SourceHanSansCN-Bold.ttf"), size=18, color=text_main)
+    watermark_style = TextStyle(font=os.path.join(font_dir, "SourceHanSansCN-Regular.ttf"), size=14, color=text_muted)
+    
+    outer_margin = 24
+    card_padding = 22
+    content_w = width - outer_margin * 2 - card_padding * 2
+    
+    items = []
+    
+    # 标题
+    items.append(TextBox("Token 使用统计", style=title_style).set_w(content_w).set_padding(0))
+    items.append(Spacer(1, 16))
+    
+    # 辅助函数：格式化单个时间段的统计
+    def render_period(title: str, local_stats: list, global_stats: list):
+        period_items = []
+        
+        # 标题
+        period_items.append(
+            TextBox(title, style=section_title_style).set_w(content_w).set_padding((0, 8))
+        )
+        
+        # 本群消耗
+        if local_stats:
+            period_items.append(TextBox("【本群消耗】", style=label_style).set_w(content_w).set_padding((0, 4)))
+            for item in local_stats:
+                model_rows = []
+                model_rows.append(
+                    TextBox(f"模型: {item['model']}", style=model_style).set_w(content_w).set_padding((8, 2))
+                )
+                model_rows.append(
+                    TextBox(
+                        f"  Prompt: {item['prompt']:,}  |  Completion: {item['completion']:,}  |  Total: {item['total']:,}",
+                        style=value_style
+                    ).set_w(content_w).set_padding((16, 2))
+                )
+                period_items.extend(model_rows)
+        else:
+            period_items.append(TextBox("【本群消耗】无数据", style=label_style).set_w(content_w).set_padding((0, 4)))
+        
+        period_items.append(Spacer(1, 8))
+        
+        # 全局消耗
+        if global_stats:
+            period_items.append(TextBox("【全局所有群消耗】", style=label_style).set_w(content_w).set_padding((0, 4)))
+            for item in global_stats:
+                model_rows = []
+                model_rows.append(
+                    TextBox(f"模型: {item['model']}", style=model_style).set_w(content_w).set_padding((8, 2))
+                )
+                model_rows.append(
+                    TextBox(
+                        f"  Prompt: {item['prompt']:,}  |  Completion: {item['completion']:,}  |  Total: {item['total']:,}",
+                        style=value_style
+                    ).set_w(content_w).set_padding((16, 2))
+                )
+                period_items.extend(model_rows)
+        else:
+            period_items.append(TextBox("【全局所有群消耗】无数据", style=label_style).set_w(content_w).set_padding((0, 4)))
+        
+        # 打包成一个圆角区域
+        section = VSplit(items=period_items, sep=4, item_size_mode="fixed") \
+            .set_w(content_w) \
+            .set_padding(16) \
+            .set_bg(RoundRectBg(fill=section_bg, radius=16))
+        
+        return section
+    
+    # 24小时统计
+    items.append(render_period("24小时统计", stats.get("1d_local", []), stats.get("1d_global", [])))
+    items.append(Spacer(1, 12))
+    
+    # 7天统计
+    items.append(render_period("7天统计", stats.get("7d_local", []), stats.get("7d_global", [])))
+    items.append(Spacer(1, 12))
+    
+    # 总计统计
+    all_stats = stats.get("all_global", [])
+    if all_stats:
+        total_items = []
+        total_items.append(
+            TextBox("历史总消耗", style=section_title_style).set_w(content_w).set_padding((0, 8))
+        )
+        for item in all_stats:
+            model_rows = []
+            model_rows.append(
+                TextBox(f"模型: {item['model']}", style=model_style).set_w(content_w).set_padding((8, 2))
+            )
+            model_rows.append(
+                TextBox(
+                    f"  Prompt: {item['prompt']:,}  |  Completion: {item['completion']:,}  |  Total: {item['total']:,}",
+                    style=value_style
+                ).set_w(content_w).set_padding((16, 2))
+            )
+            total_items.extend(model_rows)
+        
+        total_section = VSplit(items=total_items, sep=4, item_size_mode="fixed") \
+            .set_w(content_w) \
+            .set_padding(16) \
+            .set_bg(RoundRectBg(fill=section_bg, radius=16))
+        
+        items.append(total_section)
+    
+    # 水印
+    items.append(Spacer(1, 12))
+    if watermark is None:
+        watermark = "Generated by HakuBot"
+    if watermark:
+        items.append(
+            TextBox(watermark, style=watermark_style).set_w(content_w).set_content_align("r").set_padding(0)
+        )
+    
+    # 卡片容器
+    card = VSplit(items=items, sep=4, item_size_mode="fixed") \
+        .set_w(width - outer_margin * 2) \
+        .set_padding(card_padding) \
+        .set_margin(outer_margin) \
+        .set_bg(RoundRectBg(fill=card_bg, radius=26, stroke=card_border, stroke_width=2))
+    
+    # 画布
+    canvas = Canvas(w=width, h=None, bg=FillBg(canvas_bg))
+    canvas.set_items([card]).set_content_align("c")
+    
+    img = await canvas.get_img()
+    
+    buf = BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
