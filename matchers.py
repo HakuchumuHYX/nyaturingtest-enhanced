@@ -20,7 +20,8 @@ from .state_manager import (
     remove_group_state,
     SELF_SENT_MSG_IDS,
     runtime_enabled_groups,
-    group_states
+    group_states,
+    is_shutting_down
 )
 from .logic import message2BotMessage
 from .mem import Message as MMessage
@@ -75,6 +76,13 @@ calm_down = on_command(
 )
 calm_down_pm = on_command(
     rule=is_private_message, permission=SUPERUSER, cmd="calm", aliases={"冷静"}, priority=0, block=True
+)
+
+reset_emotion = on_command(
+    rule=is_group_message, permission=SUPERUSER, cmd="reset_emotion", aliases={"重置情绪"}, priority=0, block=True
+)
+reset_emotion_pm = on_command(
+    rule=is_private_message, permission=SUPERUSER, cmd="reset_emotion", aliases={"重置情绪"}, priority=0, block=True
 )
 
 reset = on_command(
@@ -173,11 +181,12 @@ async def handle_help():
 可用命令:
 1. set_role <角色名> <角色设定> - 设置角色
 2. role - 获取当前角色
-3. calm - 冷静
-4. reset - 重置会话
-5. status - 获取状态
-6. presets - 获取可用预设
-7. help - 显示本帮助信息
+3. calm - 冷静（重置全部状态）
+4. reset_emotion - 重置情绪（仅重置VAD）
+5. reset - 重置会话
+6. status - 获取状态
+7. presets - 获取可用预设
+8. help - 显示本帮助信息
 """
     await help_cmd.finish(help_message)
 
@@ -189,11 +198,12 @@ async def handle_help_pm():
 1. set_role <群号> <角色名> <角色设定>
 2. role <群号>
 3. calm <群号>
-4. reset <群号>
-5. status <群号>
-6. presets <群号>
-7. list_groups
-8. help
+4. reset_emotion <群号>
+5. reset <群号>
+6. status <群号>
+7. presets <群号>
+8. list_groups
+9. help
 """
     await help_pm.finish(help_message)
 
@@ -270,6 +280,29 @@ async def do_calm_down(matcher: type[Matcher], group_id: int):
     await matcher.finish("已老实")
 
 
+@reset_emotion.handle()
+async def handle_reset_emotion(event: GroupMessageEvent):
+    await do_reset_emotion(reset_emotion, event.group_id)
+
+
+@reset_emotion_pm.handle()
+async def handle_reset_emotion_pm(args: Message = CommandArg()):
+    arg = args.extract_plain_text().strip()
+    if arg == "":
+        await reset_emotion_pm.finish("请提供<qq群号>")
+    await do_reset_emotion(reset_emotion_pm, int(arg))
+
+
+async def do_reset_emotion(matcher: type[Matcher], group_id: int):
+    state = ensure_group_state(group_id)
+    if not state:
+        return
+    async with state.session_lock:
+        await state.session.load_session()
+        await state.session.reset_emotion()
+    await matcher.finish("情绪已初始化 (VAD -> 0, 0, 0)")
+
+
 @reset.handle()
 async def handle_reset(event: GroupMessageEvent):
     await do_reset(reset, event.group_id)
@@ -338,6 +371,10 @@ async def handle_auto_chat(bot: Bot, event: GroupMessageEvent):
         await state.session.load_session()
         bot_name = state.session.name()
 
+    # Shutdown 检查：避免在关机时进入耗时的 VLM 处理
+    if is_shutting_down():
+        return
+
     message_content = await message2BotMessage(
         bot_name=bot_name, group_id=group_id, message=event.original_message, bot=bot
     )
@@ -358,6 +395,8 @@ async def handle_auto_chat(bot: Bot, event: GroupMessageEvent):
         nickname = bot_name
 
     if not nickname:
+        if is_shutting_down():
+            return
         try:
             user_info = await bot.get_group_member_info(group_id=group_id, user_id=int(user_id))
             nickname = user_info.get("card") or user_info.get("nickname") or str(user_id)

@@ -107,6 +107,13 @@ group_states: dict[int, GroupState] = {}
 _group_tasks: dict[int, asyncio.Task] = {}
 # 运行时启用的群组集合 (内存缓存)
 runtime_enabled_groups: set[int] = set()
+# Shutdown 标志：设置后所有新的消息处理都会提前退出
+_shutting_down = False
+
+
+def is_shutting_down() -> bool:
+    """检查是否正在关机"""
+    return _shutting_down
 
 
 async def init_enabled_groups():
@@ -196,7 +203,9 @@ async def remove_group_state(group_id: int):
 
 async def cleanup_global_resources():
     """统一的资源清理逻辑 (关机时调用)"""
-    logger.info("正在执行资源清理...")
+    global _shutting_down
+    _shutting_down = True
+    logger.info("正在执行资源清理（已设置 shutdown 标志）...")
 
     # 1. 强制保存会话 (需要数据库连接)
     save_tasks = []
@@ -225,7 +234,15 @@ async def cleanup_global_resources():
             except Exception as e:
                 logger.error(f"清理任务 {gid} 异常: {e}")
 
-    # 3. 关闭 HTTP 客户端
+    # 3. 关闭 VLM 的私有 HTTP 客户端（强制中断正在进行的 VLM 请求）
+    try:
+        from .image_manager import image_manager
+        await image_manager._vlm.close()
+        logger.info("VLM HTTP 客户端已关闭")
+    except Exception as e:
+        logger.warning(f"关闭 VLM 客户端失败: {e}")
+
+    # 4. 关闭全局 HTTP 客户端
     await close_http_client()
 
     # 4. 最后关闭数据库

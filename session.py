@@ -122,6 +122,7 @@ class Session:
         self.__name = "terminus"
         self.__aliases = []
         self.__role = "一个男性人类"
+        self.__examples_str = ""
         await self.global_memory.clear()
         self.long_term_memory.clear()
         self.profiles = {}
@@ -132,7 +133,10 @@ class Session:
         self._active_count = 0
         self._last_activity_time = datetime.now()
         self._last_speak_time = datetime.min
+        # 清理数据库中的所有关联数据
+        await SessionRepository.delete_session_data(self.id)
         await self.save_session()
+        logger.info(f"[Session {self.id}] 已完全重置（含数据库清理）")
 
     async def calm_down(self):
         self.global_emotion = EmotionState()
@@ -142,6 +146,31 @@ class Session:
         self._active_count = 0
         self._last_activity_time = datetime.now()
         await self.save_session()
+
+    async def reset_emotion(self):
+        """仅重置情绪状态（VAD），不影响意愿值、聊天状态、记忆等"""
+        self.global_emotion = EmotionState()
+        # 同时重置所有用户画像的情绪
+        for profile in self.profiles.values():
+            profile.emotion = EmotionState()
+        logger.info(f"[Session {self.id}] 情绪已初始化 (VAD -> 0, 0, 0)")
+        await self.save_session()
+
+    def _create_safe_task(self, coro):
+        """创建带异常捕获的后台任务"""
+        task = asyncio.create_task(coro)
+        task.add_done_callback(self._on_task_done)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
+
+    @staticmethod
+    def _on_task_done(task: asyncio.Task):
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc:
+            logger.error(f"[Session] 后台任务异常: {exc}")
 
     async def save_session(self, force_index: bool = False):
         try:
@@ -420,9 +449,13 @@ class Session:
 
         # 3. 更新情绪
         new_emo = response_dict.get("new_emotion", {})
-        self.global_emotion.valence = new_emo.get("valence", self.global_emotion.valence)
-        self.global_emotion.arousal = new_emo.get("arousal", self.global_emotion.arousal)
-        self.global_emotion.dominance = new_emo.get("dominance", self.global_emotion.dominance)
+        if not new_emo:
+            logger.warning(f"[Session {self.id}] Feedback 未返回 new_emotion，跳过情绪更新。response_dict keys: {list(response_dict.keys())}")
+        else:
+            logger.debug(f"[Session {self.id}] Feedback 返回 emotion: V={new_emo.get('valence')}, A={new_emo.get('arousal')}, D={new_emo.get('dominance')}")
+            self.global_emotion.valence = new_emo.get("valence", self.global_emotion.valence)
+            self.global_emotion.arousal = new_emo.get("arousal", self.global_emotion.arousal)
+            self.global_emotion.dominance = new_emo.get("dominance", self.global_emotion.dominance)
 
         # 4. 更新用户印象
         emo_tends = response_dict.get("emotion_tends", [])
@@ -450,7 +483,7 @@ class Session:
 
                     # 2. 异步写入数据库
                     # 启动一个后台任务去存库，不阻塞主流程
-                    asyncio.create_task(self._save_interaction_log(uid, delta))
+                    self._create_safe_task(self._save_interaction_log(uid, delta))
 
         for p in self.profiles.values():
             p.update_emotion_tends()
@@ -589,15 +622,17 @@ class Session:
         ]
 
         time_str = get_time_description(datetime.now())
+        # 分离 role 和 examples：role 中可能包含 [对话样本] 后缀，需要去除避免重复
+        chat_role = self.__role.split("[对话样本]")[0].strip() if "[对话样本]" in self.__role else self.__role
         prompt = get_chat_prompt(
-            self.__name, self.__role, self.__chatting_state.value,
+            self.__name, chat_role, self.__chatting_state.value,
             self.global_memory.access().compressed_history,
             history_msgs_formatted, # 传入格式化后的历史
             formatted_msgs,
             asdict(self.global_emotion),
             "{}",
             search_history, self.chat_summary,
-            examples_text="",  # examples 已经包含在 self.__role 里了
+            examples_text=self.__examples_str,
             recalled_history=recalled_str,
             time_info=time_str
         )
@@ -650,7 +685,7 @@ class Session:
         # 暂时用 self.id 或空字符串
         
         await self.global_memory.update([msg])
-        asyncio.create_task(self.save_session())
+        self._create_safe_task(self.save_session())
 
     async def update_without_trigger(self, messages_chunk: list[Message]):
         """
@@ -659,7 +694,7 @@ class Session:
         if not messages_chunk: return
         logger.debug(f"[Session {self.id}] 处理回显消息 (Count: {len(messages_chunk)})")
         await self.global_memory.update(messages_chunk)
-        asyncio.create_task(self.save_session())
+        self._create_safe_task(self.save_session())
 
     async def update(self, messages_chunk: list[Message],
                      chat_llm_func: Callable[[str, bool], Awaitable[str]],
@@ -669,7 +704,7 @@ class Session:
         # 1. 更新短时记忆 (Buffer)
         # 这里的 update 不再触发后台压缩，而是单纯的 Rolling Window 更新
         await self.global_memory.update(messages_chunk)
-        asyncio.create_task(self.save_session())
+        self._create_safe_task(self.save_session())
 
         if not publish: return None
 

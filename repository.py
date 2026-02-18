@@ -17,6 +17,33 @@ class SessionRepository:
         return await SessionModel.filter(id=session_id).first()
 
     @staticmethod
+    async def delete_session_data(session_id: str):
+        """删除会话的所有关联数据（消息、用户画像、交互日志），不删除会话本身"""
+        try:
+            session_db = await SessionModel.get_or_none(id=session_id)
+            if not session_db:
+                return
+
+            # 1. 删除交互日志（必须先删，因为依赖 UserProfile 外键）
+            users = await UserProfileModel.filter(session=session_db).all()
+            for user in users:
+                deleted_count = await InteractionLogModel.filter(user=user).delete()
+                if deleted_count:
+                    logger.debug(f"[Repo] 删除用户 {user.user_id} 的 {deleted_count} 条交互日志")
+
+            # 2. 删除用户画像
+            profile_count = await UserProfileModel.filter(session=session_db).delete()
+            logger.debug(f"[Repo] 删除 {profile_count} 个用户画像")
+
+            # 3. 删除聊天消息
+            msg_count = await GlobalMessageModel.filter(session=session_db).delete()
+            logger.debug(f"[Repo] 删除 {msg_count} 条聊天消息")
+
+            logger.info(f"[Repo] 会话 {session_id} 数据已完全清除")
+        except Exception as e:
+            logger.error(f"[Repo] 删除会话数据失败: {e}")
+
+    @staticmethod
     async def save_session_state(session_id: str, data: dict):
         """保存会话的基础状态"""
         try:
@@ -26,9 +53,9 @@ class SessionRepository:
                     "name": sanitize_text(data.get("name", "")),
                     "role": sanitize_text(data.get("role", "")),
                     "aliases": data.get("aliases", []),
-                    "valence": data.get("valence", 0.5),
-                    "arousal": data.get("arousal", 0.5),
-                    "dominance": data.get("dominance", 0.5),
+                    "valence": data.get("valence", 0.0),
+                    "arousal": data.get("arousal", 0.0),
+                    "dominance": data.get("dominance", 0.0),
                     "chat_summary": sanitize_text(data.get("chat_summary", "")),
                     "last_speak_time": data.get("last_speak_time"),
                     "chatting_state": data.get("chatting_state", 0)

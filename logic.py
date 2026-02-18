@@ -11,7 +11,7 @@ from .client import LLMClient
 from .config import plugin_config, get_effective_chat_model, get_effective_feedback_model
 from .image_manager import image_manager
 from .mem import Message as MMessage
-from .state_manager import GroupState, SELF_SENT_MSG_IDS
+from .state_manager import GroupState, SELF_SENT_MSG_IDS, is_shutting_down
 from .utils import smart_split_text
 from .repository import SessionRepository
 
@@ -81,6 +81,10 @@ async def message2BotMessage(bot_name: str, group_id: int, message: Message, bot
 
             # VLM disabled: skip recognition to avoid token cost / errors
             if not plugin_config.get("vlm", {}).get("enabled", True):
+                return "\n[表情包]\n" if is_sticker else "\n[图片]\n"
+
+            # Shutdown 检查：避免在关机时进入耗时的 VLM 请求
+            if is_shutting_down():
                 return "\n[表情包]\n" if is_sticker else "\n[图片]\n"
             
             # 使用逻辑层定义的 chat model 作为 VLM model 的近似记录（通常 VLM 和 Chat 用的是同一个 Key，或者 image_manager 内部用的就是 chat model）
@@ -233,6 +237,11 @@ async def spawn_state(state: GroupState):
             # 既然已经过滤了回显，剩下的都是应该发布的消息
             should_publish = True
 
+            # Shutdown 检查：避免在关机时进入耗时的 LLM 调用
+            if is_shutting_down():
+                logger.debug("Shutdown 检测，跳过 LLM 处理")
+                continue
+
             # 3. 加载 Session (加锁)
             async with state.session_lock:
                 await state.session.load_session()
@@ -256,9 +265,13 @@ async def spawn_state(state: GroupState):
                     )
                 return _recorder
 
+            # 读取当前人设角色，注入到 System Prompt 中
+            current_role = state.session.role()
+
             # 定义一个强制的 System Prompt 用于 Roleplay，使用中文指令
             rp_system_prompt = (
-                "你是一个沉浸式的角色扮演者。你必须时刻保持角色设定。"
+                f"你是一个沉浸式的角色扮演者。你正在扮演的角色是：{current_role}。"
+                "你必须时刻保持角色设定，严格遵循角色的性格描述，不得偏离。"
                 "请使用中文进行思考和回答（除非人设要求使用其他语言）。"
                 "最终输出必须是合法的 JSON 格式。"
             )
@@ -299,6 +312,14 @@ async def spawn_state(state: GroupState):
                 on_usage=make_usage_recorder(get_effective_chat_model())
             )
 
+            # 定义 Feedback 专用的 System Prompt
+            feedback_system_prompt = (
+                "你是一个精确的对话情感分析器。"
+                "你的任务是观察群聊消息，分析角色的情绪变化，并以 JSON 格式输出分析结果。"
+                "你的输出必须包含 new_emotion 对象（含 valence、arousal、dominance 三个浮点数字段）。"
+                "最终输出必须是合法的 JSON 格式，不要输出任何其他内容。"
+            )
+
             # Feedback 函数：温度极低，保证逻辑分析准确
             feedback_func = lambda msg, json_mode=False: llm_response(
                 state.feedback_client,
@@ -306,7 +327,8 @@ async def spawn_state(state: GroupState):
                 model=get_effective_feedback_model(),
                 temperature=0.1,
                 json_mode=json_mode,
-                on_usage=make_usage_recorder(get_effective_feedback_model())
+                on_usage=make_usage_recorder(get_effective_feedback_model()),
+                system_prompt=feedback_system_prompt
             )
 
             # 5. 执行核心逻辑 (LLM 生成)

@@ -9,9 +9,9 @@ class SessionModel(Model):
     role = fields.TextField(default="一个普通的AI助手")
     aliases = fields.JSONField(default=list)
 
-    valence = fields.FloatField(default=0.5)
-    arousal = fields.FloatField(default=0.5)
-    dominance = fields.FloatField(default=0.5)
+    valence = fields.FloatField(default=0.0)
+    arousal = fields.FloatField(default=0.0)
+    dominance = fields.FloatField(default=0.0)
 
     chat_summary = fields.TextField(default="")
     last_speak_time = fields.DatetimeField(null=True)

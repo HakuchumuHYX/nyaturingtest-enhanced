@@ -20,7 +20,7 @@ class VLM:
         api_key: str,
         model: str,
         endpoint: str,
-        timeout: int = 30,
+        timeout: int = 60,
         max_retries: int = 1,
         retry_delay: float = 1.0,
         *,
@@ -37,18 +37,26 @@ class VLM:
         self.proxy = proxy
 
         # openai-compatible client
+        self._http_client = httpx.AsyncClient(
+            limits=httpx.Limits(max_connections=50, max_keepalive_connections=20),
+            timeout=timeout,
+        )
         self.client = AsyncOpenAI(
             api_key=api_key,
             base_url=endpoint,
-            http_client=httpx.AsyncClient(
-                limits=httpx.Limits(max_connections=50, max_keepalive_connections=20),
-                timeout=timeout,
-            ),
+            http_client=self._http_client,
         )
 
         # google official config
         self.google_api_key = (google_api_key or "").strip() or None
         self.google_base_url = (google_base_url or "https://generativelanguage.googleapis.com/v1beta").rstrip("/")
+
+    async def close(self):
+        """关闭内部 HTTP 客户端，中断所有正在进行的请求"""
+        try:
+            await self._http_client.aclose()
+        except Exception:
+            pass
 
     @staticmethod
     def _parse_gemini_text_and_usage(data: dict) -> tuple[str, dict]:
@@ -152,6 +160,15 @@ class VLM:
                         **kwargs,
                     )
                 else:
+                    # openai_compatible 模式下，过滤掉 Gemini 专属的 extra_body 字段，避免代理端报错
+                    filtered_kwargs = dict(kwargs)
+                    if "extra_body" in filtered_kwargs and isinstance(filtered_kwargs["extra_body"], dict):
+                        filtered_kwargs["extra_body"] = {
+                            k: v for k, v in filtered_kwargs["extra_body"].items()
+                            if k != "google"
+                        }
+                        if not filtered_kwargs["extra_body"]:
+                            del filtered_kwargs["extra_body"]
                     response = await self.client.chat.completions.create(
                         model=self.model,
                         messages=[
@@ -167,7 +184,7 @@ class VLM:
                             }
                         ],
                         timeout=self.timeout,
-                        **kwargs,
+                        **filtered_kwargs,
                     )
 
                     if on_usage and response.usage:

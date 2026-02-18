@@ -134,6 +134,6 @@ def decay_arousal(elapsed_hours: float, arousal: float, target: float = 0.3, dec
     return arousal * decay + target * (1 - decay)
 
 
-def decay_dominance(elapsed_hours: float, dominance: float, target: float = 0.5, decay_rate: float = 0.03) -> float:
+def decay_dominance(elapsed_hours: float, dominance: float, target: float = 0.0, decay_rate: float = 0.03) -> float:
     decay = math.exp(-decay_rate * elapsed_hours)
     return dominance * decay + target * (1 - decay)
