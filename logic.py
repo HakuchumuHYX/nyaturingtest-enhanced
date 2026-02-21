@@ -86,11 +86,11 @@ async def message2BotMessage(bot_name: str, group_id: int, message: Message, bot
             # Shutdown 检查：避免在关机时进入耗时的 VLM 请求
             if is_shutting_down():
                 return "\n[表情包]\n" if is_sticker else "\n[图片]\n"
-            
-            # 使用逻辑层定义的 chat model 作为 VLM model 的近似记录（通常 VLM 和 Chat 用的是同一个 Key，或者 image_manager 内部用的就是 chat model）
-            # image_manager 内部初始化时用的是 plugin_config.nyaturingtest_chat_openai_model
-            # 所以这里记录为同一个模型名是准确的
-            vlm_recorder = make_vlm_recorder(get_effective_chat_model())
+
+            # 获取 VLM 的真实模型名称以准确记录 token 消耗
+            # 兼容老配置，如果 vlm 未指定模型，则退而求其次使用 chat model
+            vlm_model_name = plugin_config.get("vlm", {}).get("model") or get_effective_chat_model()
+            vlm_recorder = make_vlm_recorder(vlm_model_name)
 
             # 调用通用逻辑，传入提取到的上下文
             return await image_manager.resolve_image_from_url(
@@ -142,10 +142,11 @@ async def message2BotMessage(bot_name: str, group_id: int, message: Message, bot
                                 is_sticker_ref = str(data.get("sub_type", "")) == "1"
 
                                 # VLM disabled: skip recognition
-                                if not getattr(plugin_config, "nyaturingtest_vlm_enabled", True):
+                                if not plugin_config.get("vlm", {}).get("enabled", True):
                                     source_text += "\n[表情包]\n" if is_sticker_ref else "\n[图片]\n"
                                 else:
-                                    vlm_recorder = make_vlm_recorder(get_effective_chat_model())
+                                    vlm_model_name_ref = plugin_config.get("vlm", {}).get("model") or get_effective_chat_model()
+                                    vlm_recorder = make_vlm_recorder(vlm_model_name_ref)
 
                                     # Await 分析结果
                                     img_desc = await image_manager.resolve_image_from_url(

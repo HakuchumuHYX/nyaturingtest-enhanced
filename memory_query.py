@@ -199,6 +199,18 @@ async def handle_query_memory(bot: Bot, event: GroupMessageEvent, args: Message 
     # 6. 调用 LLM
     max_retries = 2
 
+    def make_usage_recorder(model_name_record: str):
+        def _recorder(usage: dict):
+            asyncio.create_task(
+                SessionRepository.log_token_usage(
+                    session_id=str(state.session.id),
+                    model_name=model_name_record,
+                    prompt_tokens=usage.get("prompt_tokens", 0),
+                    completion_tokens=usage.get("completion_tokens", 0)
+                )
+            )
+        return _recorder
+
     for attempt in range(max_retries + 1):
         try:
             # 使用统一的 llm_response 封装
@@ -207,7 +219,8 @@ async def handle_query_memory(bot: Bot, event: GroupMessageEvent, args: Message 
                 prompt,
                 model=get_effective_chat_model(),
                 temperature=0.8 + (attempt * 0.2),
-                json_mode=True
+                json_mode=True,
+                on_usage=make_usage_recorder(get_effective_chat_model())
             )
 
             result = extract_and_parse_json(response)
