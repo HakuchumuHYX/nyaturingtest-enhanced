@@ -5,9 +5,10 @@ from tortoise import Tortoise
 require("nonebot_plugin_localstore")
 import nonebot_plugin_localstore as store
 
-from .state_manager import cleanup_global_resources, init_enabled_groups
-from . import matchers
-from . import memory_query
+from .core.state_manager import cleanup_global_resources, init_enabled_groups
+from .handlers import commands
+from .handlers import memory
+from .database.backup import setup_backup_job
 
 driver = get_driver()
 
@@ -19,13 +20,16 @@ async def init_db():
 
     await Tortoise.init(
         db_url=f'sqlite://{db_path}',
-        modules={'models': [f'{__package__}.models']}
+        modules={'models': [f'{__package__}.models.database']}
     )
     await Tortoise.generate_schemas()
     logger.info(f"数据库已连接: {db_path}")
 
     # 初始化群组列表
     await init_enabled_groups()
+
+    # 注册定时备份任务
+    setup_backup_job()
 
 
 @driver.on_shutdown

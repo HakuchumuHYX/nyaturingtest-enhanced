@@ -14,17 +14,17 @@ import nonebot_plugin_localstore as store
 from nonebot.utils import run_sync
 from openai import AsyncOpenAI
 
-from .client import LLMClient
-from .config import plugin_config
-from .emotion import EmotionState
-from .vector_mem import VectorMemory
-from .impression import Impression
-from .mem import Memory, Message
-from .presets import PRESETS
-from .profile import PersonProfile
-from .utils import extract_and_parse_json, check_relevance, sanitize_text, escape_for_prompt, get_time_description, should_store_memory
-from .prompts import get_feedback_prompt, get_chat_prompt
-from .repository import SessionRepository
+from ..llm.client import LLMClient
+from ..config import plugin_config
+from ..models.emotion import EmotionState
+from ..memory.vector import VectorMemory
+from ..models.impression import Impression
+from ..memory.short_term import Memory, Message
+from ..prompts.presets import PRESETS
+from ..models.profile import PersonProfile
+from ..utils import extract_and_parse_json, check_relevance, sanitize_text, escape_for_prompt, get_time_description, should_store_memory
+from ..prompts.templates import get_feedback_prompt, get_chat_prompt
+from ..database.repository import SessionRepository
 
 
 @dataclass

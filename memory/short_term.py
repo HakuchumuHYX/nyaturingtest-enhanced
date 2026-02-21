@@ -6,8 +6,8 @@ from datetime import datetime
 
 from nonebot import logger
 
-from .client import LLMClient
-from .config import plugin_config
+from ..llm.client import LLMClient
+from ..config import plugin_config
 
 
 @dataclass

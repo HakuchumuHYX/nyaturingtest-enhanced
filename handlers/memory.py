@@ -8,11 +8,11 @@ from nonebot.params import CommandArg
 from nonebot.utils import run_sync
 from nonebot.exception import FinishedException
 
-from .state_manager import ensure_group_state
-from .utils import extract_and_parse_json, calculate_dynamic_k, should_store_memory
-from .repository import SessionRepository
-from .logic import llm_response
-from .config import plugin_config, get_effective_chat_model
+from ..core.state_manager import ensure_group_state
+from ..utils import extract_and_parse_json, calculate_dynamic_k, should_store_memory
+from ..database.repository import SessionRepository
+from ..core.logic import llm_response
+from ..config import plugin_config, get_effective_chat_model
 
 # 定义命令
 query_memory = on_command("查询记忆", aliases={"memory", "印象"}, priority=5, block=True)

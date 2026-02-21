@@ -7,16 +7,16 @@ from nonebot.adapters.onebot.v11 import Bot, Event
 from openai import AsyncOpenAI
 from tortoise import Tortoise
 
-from .client import LLMClient
-from .config import (
+from ..llm.client import LLMClient
+from ..config import (
     plugin_config,
     get_effective_chat_api_key,
     get_effective_chat_base_url,
 )
-from .mem import Message as MMessage
+from ..memory.short_term import Message as MMessage
 from .session import Session
-from .utils import get_http_client, close_http_client
-from .models import EnabledGroupModel
+from ..utils import get_http_client, close_http_client
+from ..models.database import EnabledGroupModel
 
 
 def _build_chat_llm_client() -> LLMClient:
@@ -53,7 +53,7 @@ def _build_feedback_llm_client() -> LLMClient:
 
     openai_client = None
     if provider == "openai_compatible":
-        from .config import get_effective_feedback_api_key, get_effective_feedback_base_url
+        from ..config import get_effective_feedback_api_key, get_effective_feedback_base_url
         openai_client = AsyncOpenAI(
             api_key=get_effective_feedback_api_key(),
             base_url=get_effective_feedback_base_url(),
@@ -63,7 +63,7 @@ def _build_feedback_llm_client() -> LLMClient:
     google_key = plugin_config.get("feedback", {}).get("google_api_key", "").strip()
     if not google_key:
         # allow reuse existing key if user puts google key into generic field
-        from .config import get_effective_feedback_api_key
+        from ..config import get_effective_feedback_api_key
         google_key = get_effective_feedback_api_key()
 
     google_base_url = (
@@ -236,7 +236,7 @@ async def cleanup_global_resources():
 
     # 3. 关闭 VLM 的私有 HTTP 客户端（强制中断正在进行的 VLM 请求）
     try:
-        from .image_manager import image_manager
+        from ..memory.image import image_manager
         await image_manager._vlm.close()
         logger.info("VLM HTTP 客户端已关闭")
     except Exception as e:

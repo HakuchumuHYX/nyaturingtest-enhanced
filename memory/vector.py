@@ -9,7 +9,7 @@ from typing import List, Dict, Any
 import chromadb
 from chromadb.api.types import Documents, EmbeddingFunction, Embeddings
 from nonebot import logger
-from .config import plugin_config
+from ..config import plugin_config
 
 
 class SiliconFlowReranker:

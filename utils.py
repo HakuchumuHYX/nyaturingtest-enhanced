@@ -7,7 +7,7 @@ from datetime import datetime
 import chinese_calendar as chinesecalendar
 import httpx
 from nonebot import logger
-from .mem import Message
+from .memory.short_term import Message
 
 # 全局客户端变量
 _GLOBAL_HTTP_CLIENT: httpx.AsyncClient | None = None
@@ -471,4 +471,3 @@ async def render_token_stats_card(
     buf = BytesIO()
     img.save(buf, format="PNG")
     return buf.getvalue()
-

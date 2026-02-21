@@ -17,14 +17,14 @@ import numpy as np
 from PIL import Image, ImageSequence, ImageDraw, ImageFont
 from nonebot.utils import run_sync
 
-from .config import (
+from ..config import (
     plugin_config,
     get_effective_chat_api_key,
     get_effective_chat_base_url,
     get_effective_chat_model,
 )
-from .vlm import VLM
-from .utils import get_http_client
+from ..llm.vlm import VLM
+from ..utils import get_http_client
 
 IMAGE_CACHE_DIR = Path(f"{store.get_plugin_cache_dir()}/image_cache")
 _IMG_SEMAPHORE = asyncio.Semaphore(3)

@@ -13,9 +13,9 @@ from nonebot.params import CommandArg
 from nonebot.permission import SUPERUSER
 from nonebot.matcher import Matcher
 
-from .config import plugin_config
-from .models import EnabledGroupModel
-from .state_manager import (
+from ..config import plugin_config
+from ..models.database import EnabledGroupModel
+from ..core.state_manager import (
     ensure_group_state,
     remove_group_state,
     SELF_SENT_MSG_IDS,
@@ -23,9 +23,10 @@ from .state_manager import (
     group_states,
     is_shutting_down
 )
-from .logic import message2BotMessage
-from .mem import Message as MMessage
-from .repository import SessionRepository
+from ..core.logic import message2BotMessage
+from ..memory.short_term import Message as MMessage
+from ..database.repository import SessionRepository
+from ..database.backup import backup_task
 
 
 # ==================== 辅助规则 ====================
@@ -108,6 +109,12 @@ set_presets_pm = on_command(
 
 list_groups_pm = on_command(
     rule=is_private_message, permission=SUPERUSER, cmd="list_groups", aliases={"群组列表"}, priority=0, block=True
+)
+manual_backup_cmd = on_command(
+    rule=is_group_message, permission=SUPERUSER, cmd="backup_data", aliases={"备份数据"}, priority=0, block=True
+)
+manual_backup_pm = on_command(
+    rule=is_private_message, permission=SUPERUSER, cmd="backup_data", aliases={"备份数据"}, priority=0, block=True
 )
 manage_cmd = on_command(
     rule=is_group_message, permission=SUPERUSER, cmd="autochat", priority=1, block=True
@@ -203,7 +210,8 @@ async def handle_help_pm():
 6. status <群号>
 7. presets <群号>
 8. list_groups
-9. help
+9. backup_data
+10. help
 """
     await help_pm.finish(help_message)
 
@@ -360,6 +368,20 @@ async def handle_list_groups_pm():
     await list_groups_pm.finish(msg)
 
 
+@manual_backup_cmd.handle()
+async def handle_manual_backup():
+    await manual_backup_cmd.send("开始手动备份 NyaTuringTest 数据，请稍候...")
+    await backup_task()
+    await manual_backup_cmd.finish("备份完成！")
+
+
+@manual_backup_pm.handle()
+async def handle_manual_backup_pm():
+    await manual_backup_pm.send("开始手动备份 NyaTuringTest 数据，请稍候...")
+    await backup_task()
+    await manual_backup_pm.finish("备份完成！")
+
+
 @auto_chat.handle()
 async def handle_auto_chat(bot: Bot, event: GroupMessageEvent):
     group_id = event.group_id
@@ -456,8 +478,8 @@ async def handle_manage_autochat(event: GroupMessageEvent, args: Message = Comma
 
 @token_stats.handle()
 async def handle_token_stats(bot: Bot, event: GroupMessageEvent):
-    from .config import plugin_config, get_effective_chat_model, get_effective_feedback_model
-    from .utils import render_token_stats_card
+    from ..config import plugin_config, get_effective_chat_model, get_effective_feedback_model
+    from ..utils import render_token_stats_card
     from nonebot.adapters.onebot.v11 import MessageSegment
     from nonebot.exception import FinishedException
     
@@ -497,5 +519,3 @@ async def handle_token_stats(bot: Bot, event: GroupMessageEvent):
         text_msg += f"24h本群: {stats.get('1d_local', [])}\n"
         text_msg += f"24h全局: {stats.get('1d_global', [])}\n"
         await token_stats.finish(text_msg)
-
-

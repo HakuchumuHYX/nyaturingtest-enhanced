@@ -7,13 +7,13 @@ from nonebot import logger
 from nonebot.adapters.onebot.v11 import Bot, Message, MessageSegment
 from nonebot.adapters.onebot.v11.exception import ActionFailed
 
-from .client import LLMClient
-from .config import plugin_config, get_effective_chat_model, get_effective_feedback_model
-from .image_manager import image_manager
-from .mem import Message as MMessage
+from ..llm.client import LLMClient
+from ..config import plugin_config, get_effective_chat_model, get_effective_feedback_model
+from ..memory.image import image_manager
+from ..memory.short_term import Message as MMessage
 from .state_manager import GroupState, SELF_SENT_MSG_IDS, is_shutting_down
-from .utils import smart_split_text
-from .repository import SessionRepository
+from ..utils import smart_split_text
+from ..database.repository import SessionRepository
 
 
 async def llm_response(client: LLMClient, message: str, model: str, temperature: float, json_mode: bool = False,
