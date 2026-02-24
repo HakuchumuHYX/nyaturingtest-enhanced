@@ -11,11 +11,18 @@ import re
 
 from typing import Callable
 import anyio
-from nonebot import logger
+from nonebot import logger, require
 import nonebot_plugin_localstore as store
 import numpy as np
 from PIL import Image, ImageSequence, ImageDraw, ImageFont
 from nonebot.utils import run_sync
+import time
+
+try:
+    require("nonebot_plugin_apscheduler")
+    from nonebot_plugin_apscheduler import scheduler
+except Exception:
+    scheduler = None
 
 from ..config import (
     plugin_config,
@@ -465,3 +472,56 @@ def _calculate_image_hash(image: bytes) -> str:
 
 
 image_manager = ImageManager()
+
+
+@run_sync
+def _clean_old_image_caches_sync():
+    """同步清理超过48小时的图片缓存文件"""
+    try:
+        now = time.time()
+        retention_seconds = 48 * 3600
+        count = 0
+
+        # 清理生成的 json 文件
+        if IMAGE_CACHE_DIR.exists():
+            for file_path in IMAGE_CACHE_DIR.glob("*.json"):
+                if file_path.is_file() and (now - file_path.stat().st_mtime > retention_seconds):
+                    try:
+                        file_path.unlink()
+                        count += 1
+                    except Exception as e:
+                        logger.warning(f"删除过期图片缓存JSON失败 {file_path}: {e}")
+
+        # 清理 raw 目录下下载的原始图片
+        raw_dir = IMAGE_CACHE_DIR.joinpath("raw")
+        if raw_dir.exists():
+            for file_path in raw_dir.iterdir():
+                if file_path.is_file() and (now - file_path.stat().st_mtime > retention_seconds):
+                    try:
+                        file_path.unlink()
+                        count += 1
+                    except Exception as e:
+                        logger.warning(f"删除过期原图缓存失败 {file_path}: {e}")
+
+        if count > 0:
+            logger.info(f"成功清理 {count} 个超过48小时的旧图片缓存文件。")
+    except Exception as e:
+        logger.error(f"清理图片缓存任务执行异常: {e}")
+
+
+async def cleanup_image_cache_task():
+    """异步包装器，用于被 APScheduler 调用"""
+    logger.info("触发图片缓存自动清理任务...")
+    await _clean_old_image_caches_sync()
+
+
+if scheduler:
+    # 每天凌晨 03:00 执行
+    scheduler.add_job(
+        cleanup_image_cache_task,
+        "cron",
+        hour=3,
+        minute=0,
+        id="nyabot_image_cache_cleanup",
+        replace_existing=True,
+    )
