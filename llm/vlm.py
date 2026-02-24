@@ -176,8 +176,8 @@ class VLM:
                                 "role": "user",
                                 "content": [
                                     {
-                                        "type": "image_url",
-                                        "image_url": {"url": f"data:image/{image_format};base64,{image_base64}"},
+                                "type": "image_url",
+                                "image_url": {"url": f"data:image/{image_format};base64,{image_base64}", "detail": "low"},
                                     },
                                     {"type": "text", "text": f"{prompt}"},
                                 ],

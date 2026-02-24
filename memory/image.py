@@ -293,16 +293,23 @@ class ImageManager:
                 # 如果处理失败，降级为第一帧
                 target_format = "jpeg"
 
-        # === 4. 格式最终清洗 ===
-        # 确保所有发出去的图片都是静态通用格式，防止 MIME Type 报错
-        if target_format not in ["jpeg", "png", "webp"]:
-            try:
-                buffer = io.BytesIO()
-                image.convert("RGB").save(buffer, format="JPEG", quality=85)
-                target_image_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
-                target_format = "jpeg"
-            except Exception as e:
-                logger.error(f"图片格式强制转换失败: {e}")
+        # === 4. 格式最终清洗 + 静态图压缩 ===
+        try:
+            img = Image.open(io.BytesIO(base64.b64decode(target_image_base64)))
+            max_side = 512
+            w, h = img.size
+            if max(w, h) > max_side:
+                ratio = max_side / max(w, h)
+                img = img.resize((int(w * ratio), int(h * ratio)), Image.Resampling.LANCZOS)
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            buffer = io.BytesIO()
+            img.save(buffer, format="JPEG", quality=85)
+            target_image_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+            target_format = "jpeg"
+        except Exception as e:
+            logger.error(f"图片压缩/格式转换失败: {e}")
+            if target_format not in ["jpeg", "png", "webp"]:
                 return None
 
         # 5. 发送请求 (带 Gemini 优化参数)
@@ -373,10 +380,8 @@ def _process_gif_to_grid(gif_base64: str) -> tuple[str, int] | None:
             target_count = 4
         elif total_frames <= 6:
             target_count = 6
-        elif total_frames <= 9:
-            target_count = 9
         else:
-            target_count = 16
+            target_count = 9
 
         # 计算采样索引 (均匀分布)
         # step = (total - 1) / (target - 1)
@@ -408,8 +413,8 @@ def _process_gif_to_grid(gif_base64: str) -> tuple[str, int] | None:
         rows = math.ceil(real_count / cols)  # 行数
 
         # 调整单帧大小 (兼顾清晰度和总Token)
-        # 单帧高度 320px 足够看清表情包文字
-        target_h = 320
+        # 单帧高度 256px，平衡文字可读性与 token 消耗
+        target_h = 256
         w, h = selected_frames[0].size
         if h == 0: return None
         target_w = int((target_h / h) * w)
