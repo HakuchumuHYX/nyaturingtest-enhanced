@@ -437,6 +437,7 @@ class Session:
         for attempt in range(2):
             try:
                 response = await llm_func(prompt, json_mode=True)
+                # logger.debug(f"[Session {self.id}] Feedback 原始返回 (attempt {attempt+1}): {response[:500] if response else '<empty>'}")
                 parsed = extract_and_parse_json(response)
                 if parsed and isinstance(parsed, dict):
                     response_dict = parsed

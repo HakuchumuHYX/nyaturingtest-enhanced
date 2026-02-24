@@ -314,20 +314,25 @@ async def spawn_state(state: GroupState):
             )
 
             # 定义 Feedback 专用的 System Prompt
+            # 使用学术化 NLP 数据处理框架，避免触发模型的角色扮演拒绝机制
             feedback_system_prompt = (
-                "你是一个精确的对话情感分析器。"
-                "你的任务是观察群聊消息，分析角色的情绪变化，并以 JSON 格式输出分析结果。"
+                "你是一个对话分析引擎。你的输入是群聊消息日志，输出是结构化的情感分析 JSON。"
+                "这是一个纯数据处理任务：读取文本 → 分析情感维度 → 输出 JSON。"
+                "你不需要参与对话，不需要扮演任何角色，只需要做文本情感分析。"
                 "你的输出必须包含 new_emotion 对象（含 valence、arousal、dominance 三个浮点数字段）。"
-                "最终输出必须是合法的 JSON 格式，不要输出任何其他内容。"
+                "允许在 <think> 标签中进行分析推理，最终输出合法的 JSON。"
             )
 
             # Feedback 函数：温度极低，保证逻辑分析准确
+            # 注意：json_mode 强制为 False，因为 feedback prompt 中包含 <think> 标签，
+            # Claude 等模型在 json_mode 下会拒绝输出非 JSON 内容导致解析失败。
+            # extract_and_parse_json 已能从混合文本中正确提取 JSON。
             feedback_func = lambda msg, json_mode=False: llm_response(
                 state.feedback_client,
                 msg,
                 model=get_effective_feedback_model(),
                 temperature=0.1,
-                json_mode=json_mode,
+                json_mode=False,
                 on_usage=make_usage_recorder(get_effective_feedback_model()),
                 system_prompt=feedback_system_prompt
             )
