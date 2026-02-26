@@ -1,9 +1,7 @@
 # __init__.py
-from nonebot import get_driver, logger, require
+from nonebot import get_driver, logger
 from tortoise import Tortoise
-
-require("nonebot_plugin_localstore")
-import nonebot_plugin_localstore as store
+from pathlib import Path
 
 from .core.state_manager import cleanup_global_resources, init_enabled_groups
 from .handlers import commands
@@ -12,15 +10,22 @@ from .database.backup import setup_backup_job
 
 driver = get_driver()
 
+# 使用项目根目录下的 data 目录
+PLUGIN_DATA_DIR = Path(__file__).parent.parent.parent / "data" / "nyaturingtest"
+
 
 @driver.on_startup
 async def init_db():
     import os
-    db_path = os.path.join(store.get_plugin_data_dir(), "nyabot.sqlite")
+    PLUGIN_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    db_path = PLUGIN_DATA_DIR / "nyabot.sqlite"
 
     await Tortoise.init(
         db_url=f'sqlite://{db_path}',
-        modules={'models': [f'{__package__}.models.database']}
+        modules={'models': [f'{__package__}.models.database']},
+        use_tz=False,
+        _create_db=True,
+        _enable_global_fallback=True
     )
     await Tortoise.generate_schemas()
     logger.info(f"数据库已连接: {db_path}")

@@ -77,48 +77,54 @@ def smart_split_text(text: str, max_chars: int = 40) -> list[str]:
 
 def extract_and_parse_json(text: str) -> dict | list | None:
     """
-    提取并解析 JSON，自动去除 Markdown 代码块和思考过程标签
+    提取并解析 JSON，自动去除 Markdown 代码块和思考过程标签。
+    使用 json_repair 作为最终兜底，处理中文引号、尾逗号、缺失引号等各种 LLM 输出畸形。
     """
     if not text:
         return None
 
-    # 1. 强力去除 <think>...</think> 标签及其内容 (支持跨行)
-    # flag=re.DOTALL 让 . 可以匹配换行符
+    # 1. 去除 <think>...</think>
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
 
     # 2. 去除 Markdown 代码块包裹
-    # 匹配 ```json ... ``` 或 ``` ... ```，捕获中间的内容
     match = re.search(r"```(?:json)?\s*(.*?)\s*```", text, flags=re.DOTALL)
     if match:
         text = match.group(1)
     else:
-        # 如果没匹配到成对的 ```，尝试单边清理
         text = re.sub(r"```json\s*", "", text)
         text = re.sub(r"```\s*", "", text)
 
-    # 3. 寻找最外层的 { } 或 [ ]
+    # 3. 提取最外层 { } 或 [ ]
+    json_str = None
+    start_idx = text.find("{")
+    list_start_idx = text.find("[")
+
+    if start_idx != -1 and (list_start_idx == -1 or start_idx < list_start_idx):
+        end_idx = text.rfind("}")
+        if end_idx != -1:
+            json_str = text[start_idx: end_idx + 1]
+    elif list_start_idx != -1:
+        end_idx = text.rfind("]")
+        if end_idx != -1:
+            json_str = text[list_start_idx: end_idx + 1]
+
+    if not json_str:
+        return None
+
+    # 4. 尝试标准解析
     try:
-        start_idx = text.find("{")
-        list_start_idx = text.find("[")
+        return json.loads(json_str)
+    except json.JSONDecodeError:
+        pass
 
-        # 判断是对象还是列表
-        if start_idx != -1 and (list_start_idx == -1 or start_idx < list_start_idx):
-            # 提取对象
-            end_idx = text.rfind("}")
-            if end_idx != -1:
-                json_str = text[start_idx: end_idx + 1]
-                return json.loads(json_str)
-        elif list_start_idx != -1:
-            # 提取列表
-            end_idx = text.rfind("]")
-            if end_idx != -1:
-                json_str = text[list_start_idx: end_idx + 1]
-                return json.loads(json_str)
-
-    except json.JSONDecodeError as e:
-        logger.warning(f"JSON 解析失败: {e}\n原文: {text}")
+    # 5. 兜底：使用 json_repair 修复各种畸形 JSON（中文引号、尾逗号、缺失引号等）
+    try:
+        from json_repair import repair_json
+        repaired = repair_json(json_str, return_objects=True)
+        if isinstance(repaired, (dict, list)):
+            return repaired
     except Exception as e:
-        logger.error(f"JSON 提取未知错误: {e}")
+        logger.warning(f"json_repair 也失败了: {e}\n原文: {json_str}")
 
     return None
 

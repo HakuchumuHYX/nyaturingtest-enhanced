@@ -442,6 +442,9 @@ async def handle_auto_chat(bot: Bot, event: GroupMessageEvent):
 
 @manage_cmd.handle()
 async def handle_manage_autochat(event: GroupMessageEvent, args: Message = CommandArg()):
+    from tortoise import Tortoise
+    from tortoise.transactions import in_transaction
+
     arg = args.extract_plain_text().strip().lower()
     group_id = event.group_id
 
@@ -449,8 +452,9 @@ async def handle_manage_autochat(event: GroupMessageEvent, args: Message = Comma
         if group_id in runtime_enabled_groups:
             await manage_cmd.finish("本群 Autochat 已处于启用状态")
 
-        # 写入数据库
-        await EnabledGroupModel.create(group_id=group_id)
+        # 写入数据库 (使用事务确保连接上下文)
+        async with in_transaction():
+            await EnabledGroupModel.create(group_id=group_id)
         # 更新内存
         runtime_enabled_groups.add(group_id)
         # 立即初始化状态
@@ -462,8 +466,9 @@ async def handle_manage_autochat(event: GroupMessageEvent, args: Message = Comma
         if group_id not in runtime_enabled_groups:
             await manage_cmd.finish("本群 Autochat 未启用")
 
-        # 从数据库删除
-        await EnabledGroupModel.filter(group_id=group_id).delete()
+        # 从数据库删除 (使用事务确保连接上下文)
+        async with in_transaction():
+            await EnabledGroupModel.filter(group_id=group_id).delete()
         # 更新内存
         runtime_enabled_groups.discard(group_id)
 
