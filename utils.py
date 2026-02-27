@@ -321,7 +321,12 @@ async def render_token_stats_card(
     """
     from io import BytesIO
     import sys
-    sys.path.insert(0, str(__file__).replace("nyaturingtest\\utils.py", ""))
+    import os
+    
+    plugins_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if plugins_dir not in sys.path:
+        sys.path.insert(0, plugins_dir)
+        
     from utils.draw.plot import Canvas, VSplit, HSplit, TextBox, TextStyle, FillBg, RoundRectBg, Spacer
     
     # 配色方案
