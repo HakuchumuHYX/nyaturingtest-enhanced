@@ -12,10 +12,104 @@ from ..core.state_manager import ensure_group_state
 from ..utils import extract_and_parse_json, calculate_dynamic_k, should_store_memory
 from ..database.repository import SessionRepository
 from ..core.logic import llm_response
-from ..config import plugin_config, get_effective_chat_model
+from ..config import get_effective_chat_model, get_effective_feedback_model
 
 # 定义命令
 query_memory = on_command("查询记忆", aliases={"memory", "印象"}, priority=5, block=True)
+
+
+def _make_usage_recorder(session_id: str, model_name_record: str):
+    def _recorder(usage: dict):
+        asyncio.create_task(
+            SessionRepository.log_token_usage(
+                session_id=session_id,
+                model_name=model_name_record,
+                prompt_tokens=usage.get("prompt_tokens", 0),
+                completion_tokens=usage.get("completion_tokens", 0)
+            )
+        )
+    return _recorder
+
+
+def _clamp_vad_value(value, lower: float, upper: float, default: float = 0.0) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+
+    if number != number:
+        return default
+
+    return max(lower, min(upper, number))
+
+
+def _normalize_vad_result(result: dict | None) -> dict | None:
+    if not isinstance(result, dict):
+        return None
+
+    return {
+        "valence": _clamp_vad_value(result.get("valence"), -1.0, 1.0),
+        "arousal": _clamp_vad_value(result.get("arousal"), 0.0, 1.0),
+        "dominance": _clamp_vad_value(result.get("dominance"), -1.0, 1.0)
+    }
+
+
+async def _summarize_long_term_vad(
+        state,
+        bot_name: str,
+        bot_role: str,
+        target_name: str,
+        target_id: str,
+        vector_records: list[str]
+) -> dict | None:
+    if not vector_records:
+        return None
+
+    prompt = f"""
+你是一个长期关系记忆分析器。
+你的任务是只根据长期记忆碎片，评估角色"{bot_name}"对用户"{target_name}"的稳定长期印象 VAD。
+
+[角色信息]
+- 名字: {bot_name}
+- 设定: {bot_role}
+
+[目标用户]
+- 用户名: {target_name}
+- 用户ID: {target_id}
+
+[长期记忆碎片]
+{json.dumps(vector_records, ensure_ascii=False)}
+
+[分析要求]
+1. 只能依据上面的长期记忆碎片做判断，不要参考当前群聊、最近消息或短期状态。
+2. 你要评估的是长期印象，不是此刻情绪。
+3. 如果记忆碎片里混入其他人的信息，只保留明显指向"{target_name}"或用户ID为"{target_id}"的内容。
+4. 如果信息不足，输出接近中性的值。
+5. 必须输出合法 JSON，不要输出任何额外文本。
+
+[输出格式]
+{{
+  "valence": float,
+  "arousal": float,
+  "dominance": float
+}}
+
+[取值定义]
+- valence: [-1.0, 1.0]，长期好感或反感
+- arousal: [0.0, 1.0]，长期关注度或情绪唤起强度
+- dominance: [-1.0, 1.0]，长期关系中的主动/被动与掌控感
+"""
+
+    response = await llm_response(
+        state.feedback_client,
+        prompt,
+        model=get_effective_feedback_model(),
+        temperature=0.1,
+        json_mode=True,
+        on_usage=_make_usage_recorder(str(state.session.id), get_effective_feedback_model())
+    )
+
+    return _normalize_vad_result(extract_and_parse_json(response))
 
 
 @query_memory.handle()
@@ -53,6 +147,7 @@ async def handle_query_memory(bot: Bot, event: GroupMessageEvent, args: Message 
     bot_role = "AI助手"
     recent_user_msgs = []
     vector_records = []
+    long_term_vad = None
 
     async with state.session_lock:
         await state.session.load_session()
@@ -160,6 +255,24 @@ async def handle_query_memory(bot: Bot, event: GroupMessageEvent, args: Message 
         if not recent_user_msgs:
             recent_user_msgs = ["(暂无最近发言记录)"]
 
+    if vector_records:
+        try:
+            long_term_vad = await _summarize_long_term_vad(
+                state=state,
+                bot_name=bot_name,
+                bot_role=bot_role,
+                target_name=target_name,
+                target_id=target_id,
+                vector_records=vector_records
+            )
+        except Exception as e:
+            logger.error(f"长期记忆 VAD 汇总失败: {e}")
+
+    if long_term_vad:
+        profile_data["valence"] = long_term_vad["valence"]
+        profile_data["arousal"] = long_term_vad["arousal"]
+        profile_data["dominance"] = long_term_vad["dominance"]
+
     # 4. 判断逻辑 (如果没有交互且没有记忆，直接返回)
     if profile_data['interactions'] == 0 and not vector_records:
         msg = "我对你还没有形成具体的印象呢，多和我聊聊天吧！" if target_id == sender_id else f"我的记忆中暂时没有关于 {target_name} 的印象。"
@@ -199,18 +312,6 @@ async def handle_query_memory(bot: Bot, event: GroupMessageEvent, args: Message 
     # 6. 调用 LLM
     max_retries = 2
 
-    def make_usage_recorder(model_name_record: str):
-        def _recorder(usage: dict):
-            asyncio.create_task(
-                SessionRepository.log_token_usage(
-                    session_id=str(state.session.id),
-                    model_name=model_name_record,
-                    prompt_tokens=usage.get("prompt_tokens", 0),
-                    completion_tokens=usage.get("completion_tokens", 0)
-                )
-            )
-        return _recorder
-
     for attempt in range(max_retries + 1):
         try:
             # 使用统一的 llm_response 封装
@@ -220,7 +321,7 @@ async def handle_query_memory(bot: Bot, event: GroupMessageEvent, args: Message 
                 model=get_effective_chat_model(),
                 temperature=0.8 + (attempt * 0.2),
                 json_mode=True,
-                on_usage=make_usage_recorder(get_effective_chat_model())
+                on_usage=_make_usage_recorder(str(state.session.id), get_effective_chat_model())
             )
 
             result = extract_and_parse_json(response)
