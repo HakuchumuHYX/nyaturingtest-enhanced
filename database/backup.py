@@ -1,5 +1,7 @@
 import os
 import shutil
+import sqlite3
+from tempfile import TemporaryDirectory
 import zipfile
 import asyncio
 from datetime import datetime
@@ -7,12 +9,15 @@ from pathlib import Path
 from nonebot import logger, require
 import nonebot_plugin_localstore as store
 
+from .backup_lock import BACKUP_IO_LOCK
+
 # 确保调度器插件已加载
 require("nonebot_plugin_apscheduler")
 from nonebot_plugin_apscheduler import scheduler
 
 # 保留最近多少天的备份
 MAX_BACKUP_DAYS = 7
+SQLITE_FILENAME = "nyabot.sqlite"
 
 
 def get_backup_dirs() -> tuple[Path, Path]:
@@ -21,6 +26,36 @@ def get_backup_dirs() -> tuple[Path, Path]:
     # 设置备份的存放目录（放在数据目录上一级，避免无限循环打包）
     backup_dir = data_dir.parent / "nyaturingtest_backups"
     return data_dir, backup_dir
+
+
+def _copy_sqlite_snapshot(source: Path, target: Path):
+    if not source.exists():
+        return
+    with sqlite3.connect(str(source)) as src_conn:
+        with sqlite3.connect(str(target)) as dst_conn:
+            src_conn.backup(dst_conn)
+
+
+def _copy_data_to_staging(data_dir: Path, staging_dir: Path):
+    sqlite_path = data_dir / SQLITE_FILENAME
+    for root, dirs, files in os.walk(data_dir):
+        root_path = Path(root)
+        rel_root = root_path.relative_to(data_dir)
+        target_root = staging_dir / rel_root
+        target_root.mkdir(parents=True, exist_ok=True)
+
+        for dirname in list(dirs):
+            if dirname == "__pycache__":
+                dirs.remove(dirname)
+
+        for file in files:
+            file_path = root_path / file
+            if file_path == sqlite_path or file_path.name in {f"{SQLITE_FILENAME}-wal", f"{SQLITE_FILENAME}-shm"}:
+                continue
+            target_path = target_root / file
+            shutil.copy2(file_path, target_path)
+
+    _copy_sqlite_snapshot(sqlite_path, staging_dir / SQLITE_FILENAME)
 
 
 def _backup_data_sync():
@@ -42,14 +77,18 @@ def _backup_data_sync():
     logger.info(f"开始备份 NyaTuringTest 数据到: {backup_filepath}")
 
     try:
-        # 使用 zipfile 遍历并压缩数据目录下的所有文件
-        with zipfile.ZipFile(backup_filepath, "w", zipfile.ZIP_DEFLATED) as zipf:
-            for root, _, files in os.walk(data_dir):
-                for file in files:
-                    file_path = Path(root) / file
-                    # 将绝对路径转换为相对于 data_dir 的相对路径，这样压缩包内的层级才是干净的
-                    arcname = file_path.relative_to(data_dir)
-                    zipf.write(file_path, arcname)
+        with BACKUP_IO_LOCK:
+            with TemporaryDirectory(prefix="nyaturingtest_backup_") as tmp:
+                staging_dir = Path(tmp) / "data"
+                staging_dir.mkdir(parents=True, exist_ok=True)
+                _copy_data_to_staging(data_dir, staging_dir)
+
+                with zipfile.ZipFile(backup_filepath, "w", zipfile.ZIP_DEFLATED) as zipf:
+                    for root, _, files in os.walk(staging_dir):
+                        for file in files:
+                            file_path = Path(root) / file
+                            arcname = file_path.relative_to(staging_dir)
+                            zipf.write(file_path, arcname)
 
         logger.info(f"备份完成: {backup_filepath}")
 

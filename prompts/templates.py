@@ -2,6 +2,21 @@
 import json
 
 
+def _canonical_json(data) -> str:
+    return json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def build_deepseek_v4_rp_marker(rp_style: str = "off") -> str:
+    if (rp_style or "off").strip().lower() != "deepseek_v4_roleplay":
+        return ""
+    return (
+        "\n\n<deepseek_v4_roleplay_instruct>\n"
+        "请进入角色沉浸模式。内部分析时优先检查角色设定、当前情境、关系和语气一致性；"
+        "最终只输出上方要求的 JSON，不输出分析过程。\n"
+        "</deepseek_v4_roleplay_instruct>"
+    )
+
+
 def get_feedback_prompt(
         bot_name: str,
         role: str,
@@ -24,14 +39,14 @@ def get_feedback_prompt(
 
     # 将最近消息列表转换为字符串
     recent_msgs_str = "\n".join(recent_msgs) if isinstance(recent_msgs, list) else str(recent_msgs)
+    memory_json = _canonical_json(search_result)
+    new_msgs_json = _canonical_json(new_msgs_formatted)
 
     return f"""
 # System Role
 你是一个极具洞察力的对话观察者。你正在暗中观察群聊中的角色 "{bot_name}"。
 你的任务是分析局势，更新角色的心理状态，而不是直接回复消息。
 {relevance_hint}
-
-当前时间信息: {time_info}
 
 # Character Profile (被观察者设定)
 {role}
@@ -43,16 +58,19 @@ def get_feedback_prompt(
 
 # Context
 - 历史话题摘要: {history_summary}
+- 相关用户画像:
+{related_profiles_json}
 - 脑海中的记忆片段:
-{json.dumps(search_result, ensure_ascii=False, indent=2)}
+{memory_json}
 - 近期对话上下文:
 {recent_msgs_str}
 - **【新收到的消息】**:
-{new_msgs_formatted}
+{new_msgs_json}
+- 当前时间信息: {time_info}
 
 # Task
 阅读【新收到的消息】，结合上下文，输出一个 JSON 对象来更新状态。
-请先在 <think> 标签中分析：
+请在内部完成分析，但最终输出只包含一个合法 JSON 对象，不要输出 Markdown、解释、思考过程或额外文本。分析时重点考虑：
 1. 谁在说话？这和我有关吗？
 2. **对话连续性**：这是否是对上一句的追问？或者是话题的延续？上下文是什么？
 3. 我的情绪应该如何变化？（注意：情绪变化应该是渐进的，单次变化幅度建议在 +/-0.3 以内）
@@ -92,7 +110,8 @@ def get_chat_prompt(
         chat_summary: str,
         examples_text: str = "",
         recalled_history: str = "",
-        time_info: str = ""
+        time_info: str = "",
+        rp_style: str = "off",
 ) -> str:
     """
     对话阶段 Prompt - 深度角色扮演 (全中文优化版)
@@ -100,6 +119,11 @@ def get_chat_prompt(
     valence_guide = "心情很好，语气可以轻快一些" if emotion['valence'] > 0.3 else "心情一般" if emotion['valence'] > -0.3 else "心情不太好，回复可以简短冷淡一些，但不要带攻击性"
     arousal_guide = "比较激动，可以多说几句" if emotion['arousal'] > 0.5 else "比较平静，正常回复"
     dominance_guide = "比较自信" if emotion['dominance'] > 0.3 else "比较随和" if emotion['dominance'] > -0.3 else "有点没底气，语气可以谦虚一些"
+    memory_json = _canonical_json(search_result)
+    recent_msgs_json = _canonical_json(recent_msgs)
+    new_msgs_json = _canonical_json(new_msgs_formatted)
+
+    rp_marker = build_deepseek_v4_rp_marker(rp_style)
 
     return f"""
 # Character Definition
@@ -130,12 +154,12 @@ def get_chat_prompt(
   - D (支配度): {emotion['dominance']:.2f} → {dominance_guide}
 </status>
 
-<current_time>
-{time_info}
-</current_time>
+<related_profiles>
+{related_profiles_json}
+</related_profiles>
 
 <memory_rag>
-{json.dumps(search_result, ensure_ascii=False)}
+{memory_json}
 </memory_rag>
 
 <historical_recall>
@@ -143,26 +167,27 @@ def get_chat_prompt(
 </historical_recall>
 
 <recent_log>
-{recent_msgs}
+{recent_msgs_json}
 </recent_log>
 
 <new_messages>
-{new_msgs_formatted}
+{new_msgs_json}
 </new_messages>
+
+<current_time>
+{time_info}
+</current_time>
 
 # Instruction
 请根据 <profile> 和 <memory_rag> 回复 <new_messages>。
 参考 <current_time> 和 <status> 中的情绪引导，让你的回复风格与当前状态一致。
-
-<think_protocol>
-在生成 JSON 之前，你必须先在 <think> 标签中进行内心独白：
+请在内部完成分析，但最终输出只包含一个合法 JSON 对象，不要输出 Markdown、解释、思考过程或额外文本。内部分析重点：
 1. **意图识别**: 对方到底想说什么？是在问我吗？
 2. **时间感知**: 现在是{time_info}。我应该在做什么？(如深夜可能在床上，周末可能在玩)。
 3. **知识检索**: 我真的知道这个信息吗？如果记忆里没有，不要编。
 4. **情绪反应**: 根据 <status> 中的情绪引导，我现在的语气应该是怎样的？
 5. **人设检查**: 我的回复是否符合 <profile>？是否包含质问、抱怨、讽刺？如果有，必须重写为温和版本。
 6. **长度检查**: 群聊中真人通常只说一两句话。我的回复是不是太长了？能不能精简一下？
-</think_protocol>
 
 # Output Format
 输出 **仅包含** 一个 JSON 对象。不要输出 Markdown 代码块标记（```json）。
@@ -172,7 +197,7 @@ def get_chat_prompt(
         "content": "最终生成的回复内容",
         "target_id": "要回复的消息ID（如果不是专门回复某人，留空）"
     }}
-  ],
-  "thought": "简短总结你的思考过程"
+  ]
 }}
+{rp_marker}
 """

@@ -29,6 +29,17 @@ class PersonProfile:
     """
     上次更新情感的时间
     """
+    _dirty: bool = field(default=True, init=False, repr=False, compare=False)
+
+    @property
+    def is_dirty(self) -> bool:
+        return self._dirty
+
+    def mark_dirty(self):
+        self._dirty = True
+
+    def mark_clean(self):
+        self._dirty = False
 
     def push_interaction(self, impression: Impression):
         """
@@ -66,6 +77,7 @@ class PersonProfile:
 
         # 将新的印象加入队列
         self.interactions.appendleft(impression)
+        self.mark_dirty()
 
     def merge_old_interactions(self):
         """
@@ -112,9 +124,13 @@ class PersonProfile:
             return
 
         # 对当前情感状态应用时间衰减
+        old_state = (self.emotion.valence, self.emotion.arousal, self.emotion.dominance)
         self.emotion.valence = decay_valence(elapsed_hours, self.emotion.valence)
         self.emotion.arousal = decay_arousal(elapsed_hours, self.emotion.arousal)
         self.emotion.dominance = decay_dominance(elapsed_hours, self.emotion.dominance)
+        new_state = (self.emotion.valence, self.emotion.arousal, self.emotion.dominance)
+        if new_state != old_state:
+            self.mark_dirty()
 
 
 def decay_valence(

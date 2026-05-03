@@ -1,6 +1,7 @@
 # nyaturingtest/image_manager.py
 import asyncio
 import base64
+from collections import OrderedDict
 from dataclasses import asdict, dataclass
 import hashlib
 import io
@@ -13,8 +14,7 @@ from typing import Callable
 import anyio
 from nonebot import logger, require
 import nonebot_plugin_localstore as store
-import numpy as np
-from PIL import Image, ImageSequence, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont
 from nonebot.utils import run_sync
 import time
 
@@ -26,12 +26,21 @@ except Exception:
 
 from ..config import (
     plugin_config,
-    get_effective_chat_api_key,
-    get_effective_chat_base_url,
-    get_effective_chat_model,
+    get_effective_vlm_api_key,
+    get_effective_vlm_base_url,
+    get_effective_vlm_model,
 )
 from ..llm.vlm import VLM
+from ..core.metrics import metrics
 from ..utils import get_http_client
+from .image_policy import (
+    MAX_IMAGE_BYTES,
+    MAX_IMAGE_PIXELS,
+    MEM_CACHE_MAX_ITEMS,
+    MEM_CACHE_TTL_SECONDS,
+    SAFE_IMAGE_CONTENT_TYPES,
+    sanitize_image_cache_key,
+)
 
 IMAGE_CACHE_DIR = Path(f"{store.get_plugin_cache_dir()}/image_cache")
 _IMG_SEMAPHORE = asyncio.Semaphore(3)
@@ -73,49 +82,37 @@ class ImageManager:
 
     def __init__(self):
         if not self._initialized:
-            # VLM config is independent. If VLM openai_* is empty, fallback to Chat settings.
-            vlm_openai_key = plugin_config.get("vlm", {}).get("openai_api_key", "").strip()
-            if not vlm_openai_key:
-                vlm_openai_key = get_effective_chat_api_key()
-
-            vlm_openai_base_url = plugin_config.get("vlm", {}).get("openai_base_url", "").strip()
-            if not vlm_openai_base_url:
-                vlm_openai_base_url = get_effective_chat_base_url()
-
-            vlm_model = plugin_config.get("vlm", {}).get("model", "").strip()
-            if not vlm_model:
-                vlm_model = get_effective_chat_model()
-
             vlm_provider = plugin_config.get("vlm", {}).get("provider", "openai_compatible").strip().lower()
 
-            vlm_google_key = plugin_config.get("vlm", {}).get("google_api_key", "").strip()
-            if not vlm_google_key:
-                # allow reusing legacy key if user puts google key into openai field
-                vlm_google_key = vlm_openai_key
-
-            vlm_google_base_url = (
-                plugin_config.get("vlm", {}).get("google_base_url") or "https://generativelanguage.googleapis.com/v1beta"
-                or "https://generativelanguage.googleapis.com/v1beta"
-            )
-
             self._vlm = VLM(
-                api_key=vlm_openai_key,
-                endpoint=vlm_openai_base_url,
-                model=vlm_model,
+                api_key=get_effective_vlm_api_key(),
+                endpoint=get_effective_vlm_base_url(),
+                model=get_effective_vlm_model(),
                 provider=vlm_provider,
-                google_api_key=vlm_google_key,
-                google_base_url=vlm_google_base_url,
+                timeout=int(plugin_config.get("vlm", {}).get("timeout") or 60),
             )
             IMAGE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
             self._initialized = True
-            self._mem_cache: dict[str, ImageWithDescription] = {}
+            self._mem_cache: OrderedDict[str, tuple[float, ImageWithDescription]] = OrderedDict()
 
     def get_from_cache(self, key: str) -> ImageWithDescription | None:
-        return self._mem_cache.get(key)
+        safe_key = sanitize_image_cache_key(key)
+        if not safe_key or safe_key not in self._mem_cache:
+            return None
+        created_at, data = self._mem_cache[safe_key]
+        if time.time() - created_at > MEM_CACHE_TTL_SECONDS:
+            self._mem_cache.pop(safe_key, None)
+            return None
+        self._mem_cache.move_to_end(safe_key)
+        return data
 
     def save_to_cache(self, key: str, data: ImageWithDescription):
-        if key and data:
-            self._mem_cache[key] = data
+        safe_key = sanitize_image_cache_key(key)
+        if safe_key and data:
+            self._mem_cache[safe_key] = (time.time(), data)
+            self._mem_cache.move_to_end(safe_key)
+            while len(self._mem_cache) > MEM_CACHE_MAX_ITEMS:
+                self._mem_cache.popitem(last=False)
 
     def _extract_json(self, response: str) -> dict | None:
         try:
@@ -163,9 +160,9 @@ class ImageManager:
                 key = None
                 key_match = re.search(r"[?&]fileid=([a-zA-Z0-9_-]+)", url)
                 if key_match:
-                    key = key_match.group(1)
+                    key = sanitize_image_cache_key(key_match.group(1))
                 elif file_unique:
-                    key = file_unique
+                    key = sanitize_image_cache_key(file_unique)
 
                 image_bytes = None
 
@@ -184,6 +181,13 @@ class ImageManager:
                         try:
                             resp = await client.get(url, timeout=10.0)  # 稍微增加超时
                             resp.raise_for_status()
+                            content_type = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
+                            if content_type and content_type not in SAFE_IMAGE_CONTENT_TYPES:
+                                logger.warning(f"拒绝非图片响应: {content_type}")
+                                return "\n[图片类型不支持]\n"
+                            if len(resp.content) > MAX_IMAGE_BYTES:
+                                logger.warning(f"拒绝过大图片: {len(resp.content)} bytes")
+                                return "\n[图片过大]\n"
                             image_bytes = resp.content
                             break
                         except Exception:
@@ -223,10 +227,14 @@ class ImageManager:
                                     context_text: str | None = None,
                                     on_usage: Callable[[dict], None] | None = None) -> ImageWithDescription | None:
         # 1. 缓存检查
-        if cache_key and cache_key in self._mem_cache:
-            return self._mem_cache[cache_key]
+        cached = self.get_from_cache(cache_key or "")
+        if cached:
+            return cached
 
         image_bytes = base64.b64decode(image_base64)
+        if len(image_bytes) > MAX_IMAGE_BYTES:
+            logger.warning(f"拒绝过大图片: {len(image_bytes)} bytes")
+            return None
         image_hash = await _calculate_image_hash(image_bytes)
 
         cache = IMAGE_CACHE_DIR.joinpath(f"{image_hash}.json")
@@ -239,7 +247,7 @@ class ImageManager:
                         async with await anyio.open_file(cache, "w", encoding="utf-8") as f:
                             await f.write(image_with_desc.to_json())
                     if cache_key:
-                        self._mem_cache[cache_key] = image_with_desc
+                        self.save_to_cache(cache_key, image_with_desc)
                     return image_with_desc
             except ValueError:
                 cache.unlink(missing_ok=True)
@@ -247,6 +255,9 @@ class ImageManager:
         # 2. 图片加载与初步格式判断
         try:
             image = Image.open(io.BytesIO(image_bytes))
+            if image.width * image.height > MAX_IMAGE_PIXELS:
+                logger.warning(f"拒绝像素过大的图片: {image.width}x{image.height}")
+                return None
             raw_format = (image.format or "JPEG").lower()
         except Exception:
             logger.error("无法识别的图片格式")
@@ -277,21 +288,25 @@ class ImageManager:
         # === 3. 核心逻辑：GIF 专门处理 ===
         # 判定条件：是动图 且 帧数 > 1 (避免单帧 GIF 误判)
         if getattr(image, "is_animated", False) and image.n_frames > 1:
-            # 调用专门的九宫格处理函数
-            grid_info = await _process_gif_to_grid(image_base64)
-            if grid_info:
-                grid_b64, frame_count = grid_info
-                # 更新 Prompt，告诉 LLM 这是一张拼图
-                prompt = (
-                             f"这是一张包含 {frame_count} 个关键帧的动图分解拼图。"
-                             "图片左上角标有数字序号（1, 2, 3...），代表时间顺序。"
-                             "请结合这些关键帧，分析这个动图发生了什么动作或情节。"
-                         ) + base_prompt
-                target_image_base64 = grid_b64
+            if image.n_frames > 80:
+                logger.warning(f"GIF 帧数过多，降级首帧处理: {image.n_frames}")
                 target_format = "jpeg"
             else:
-                # 如果处理失败，降级为第一帧
-                target_format = "jpeg"
+                # 调用专门的九宫格处理函数
+                grid_info = await _process_gif_to_grid(image_base64)
+                if grid_info:
+                    grid_b64, frame_count = grid_info
+                    # 更新 Prompt，告诉 LLM 这是一张拼图
+                    prompt = (
+                                 f"这是一张包含 {frame_count} 个关键帧的动图分解拼图。"
+                                 "图片左上角标有数字序号（1, 2, 3...），代表时间顺序。"
+                                 "请结合这些关键帧，分析这个动图发生了什么动作或情节。"
+                             ) + base_prompt
+                    target_image_base64 = grid_b64
+                    target_format = "jpeg"
+                else:
+                    # 如果处理失败，降级为第一帧
+                    target_format = "jpeg"
 
         # === 4. 格式最终清洗 + 静态图压缩 ===
         try:
@@ -312,24 +327,19 @@ class ImageManager:
             if target_format not in ["jpeg", "png", "webp"]:
                 return None
 
-        # 5. 发送请求 (带 Gemini 优化参数)
+        # 5. 发送请求
         response = await self._vlm.request(
             prompt=prompt,
             image_base64=target_image_base64,
             image_format=target_format,
             on_usage=on_usage,
-            extra_body={
-                "top_k": 64,
-                "google": {
-                    "model_safety_settings": {
-                        "enabled": False
-                    }
-                }
-            }
+            response_format={"type": "json_object"},
         )
 
         if not response:
+            metrics.vlm_failure += 1
             return None
+        metrics.vlm_success += 1
 
         data = self._extract_json(response)
         if not data:
@@ -349,7 +359,7 @@ class ImageManager:
             await f.write(result.to_json())
 
         if cache_key:
-            self._mem_cache[cache_key] = result
+            self.save_to_cache(cache_key, result)
 
         return result
 
@@ -362,10 +372,16 @@ def _process_gif_to_grid(gif_base64: str) -> tuple[str, int] | None:
     """
     try:
         gif_data = base64.b64decode(gif_base64)
+        if len(gif_data) > MAX_IMAGE_BYTES:
+            logger.warning(f"拒绝过大 GIF: {len(gif_data)} bytes")
+            return None
         gif = Image.open(io.BytesIO(gif_data))
 
         total_frames = gif.n_frames
         if total_frames <= 1:
+            return None
+        if total_frames > 80:
+            logger.warning(f"拒绝帧数过多 GIF: {total_frames}")
             return None
 
         # --- 策略：根据帧数决定抽多少帧 ---
@@ -426,6 +442,9 @@ def _process_gif_to_grid(gif_base64: str) -> tuple[str, int] | None:
         # 创建大画布
         grid_w = cols * target_w
         grid_h = rows * target_h
+        if grid_w * grid_h > MAX_IMAGE_PIXELS:
+            logger.warning(f"拒绝输出尺寸过大 GIF 拼图: {grid_w}x{grid_h}")
+            return None
         combined_image = Image.new("RGB", (grid_w, grid_h), (255, 255, 255))
 
         # 尝试加载字体 (如果失败则不画或者画简单的)

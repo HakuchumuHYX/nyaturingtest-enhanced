@@ -158,8 +158,8 @@ def check_relevance(bot_name: str, aliases: list[str], messages: list[Message]) 
     if aliases:
         triggers.extend(aliases)
 
-    # 过滤掉空字符串，防止误触
-    triggers = [t for t in triggers if t and t.strip()]
+    # 过滤掉空字符串和过短别名，防止普通单字误触发。
+    triggers = [t.strip() for t in triggers if t and len(t.strip()) >= 2]
 
     for msg in messages:
         # 统一转为小写，实现忽略大小写匹配
@@ -390,6 +390,13 @@ async def render_token_stats_card(
                         style=value_style
                     ).set_w(content_w).set_padding((16, 2))
                 )
+                if item.get("reasoning") or item.get("cache_hit") or item.get("cache_miss"):
+                    model_rows.append(
+                        TextBox(
+                            f"  Reasoning: {item.get('reasoning', 0):,}  |  Cache hit: {item.get('cache_hit', 0):,}  |  Cache miss: {item.get('cache_miss', 0):,}  |  Hit ratio: {item.get('cache_hit_ratio', 0.0):.1%}",
+                            style=label_style
+                        ).set_w(content_w).set_padding((16, 2))
+                    )
                 period_items.extend(model_rows)
         else:
             period_items.append(TextBox("【本群消耗】无数据", style=label_style).set_w(content_w).set_padding((0, 4)))
@@ -410,6 +417,13 @@ async def render_token_stats_card(
                         style=value_style
                     ).set_w(content_w).set_padding((16, 2))
                 )
+                if item.get("reasoning") or item.get("cache_hit") or item.get("cache_miss"):
+                    model_rows.append(
+                        TextBox(
+                            f"  Reasoning: {item.get('reasoning', 0):,}  |  Cache hit: {item.get('cache_hit', 0):,}  |  Cache miss: {item.get('cache_miss', 0):,}  |  Hit ratio: {item.get('cache_hit_ratio', 0.0):.1%}",
+                            style=label_style
+                        ).set_w(content_w).set_padding((16, 2))
+                    )
                 period_items.extend(model_rows)
         else:
             period_items.append(TextBox("【全局所有群消耗】无数据", style=label_style).set_w(content_w).set_padding((0, 4)))
@@ -448,6 +462,13 @@ async def render_token_stats_card(
                     style=value_style
                 ).set_w(content_w).set_padding((16, 2))
             )
+            if item.get("reasoning") or item.get("cache_hit") or item.get("cache_miss"):
+                model_rows.append(
+                    TextBox(
+                        f"  Reasoning: {item.get('reasoning', 0):,}  |  Cache hit: {item.get('cache_hit', 0):,}  |  Cache miss: {item.get('cache_miss', 0):,}  |  Hit ratio: {item.get('cache_hit_ratio', 0.0):.1%}",
+                        style=label_style
+                    ).set_w(content_w).set_padding((16, 2))
+                )
             total_items.extend(model_rows)
         
         total_section = VSplit(items=total_items, sep=4, item_size_mode="fixed") \

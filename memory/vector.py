@@ -1,6 +1,5 @@
 # nyaturingtest/vector_mem.py
 import os
-import asyncio
 import uuid
 import math
 import httpx
@@ -9,14 +8,18 @@ from typing import List, Dict, Any
 import chromadb
 from chromadb.api.types import Documents, EmbeddingFunction, Embeddings
 from nonebot import logger
-from ..config import plugin_config
+from openai import OpenAI
+from ..config import plugin_config, get_memory_endpoint_settings
+from ..database.backup_lock import BACKUP_IO_LOCK
 
 
 class SiliconFlowReranker:
-    def __init__(self, api_key: str, model: str):
+    def __init__(self, api_key: str, model: str, api_url: str | None = None, timeout: float | None = None):
+        settings = get_memory_endpoint_settings()
         self.api_key = api_key
         self.model = model
-        self.api_url = "https://api.siliconflow.cn/v1/rerank"
+        self.api_url = api_url or str(settings["rerank_base_url"])
+        self._client = httpx.Client(timeout=timeout or float(settings["rerank_timeout"]), trust_env=False)
 
     def rerank(self, query: str, documents: List[str], top_n: int = 5) -> List[Dict[str, Any]]:
         """
@@ -39,54 +42,86 @@ class SiliconFlowReranker:
         }
         
         try:
-            with httpx.Client(timeout=10.0, trust_env=False) as client:
-                response = client.post(self.api_url, headers=headers, json=payload)
-                response.raise_for_status()
-                data = response.json()
+            response = self._client.post(self.api_url, headers=headers, json=payload)
+            response.raise_for_status()
+            data = response.json()
 
-                # 兼容不同厂商的返回格式，通常 SiliconFlow (BGE) 返回 results 列表
-                return data.get("results", [])
+            # 兼容不同厂商的返回格式，通常 SiliconFlow (BGE) 返回 results 列表
+            return data.get("results", [])
         except Exception as e:
             logger.error(f"Rerank API Error: {e}")
             return []
 
+    def close(self):
+        self._client.close()
+
 
 class SiliconFlowEmbeddingFunction(EmbeddingFunction):
-    def __init__(self, api_key: str, session_id: str, model: str = "BAAI/bge-m3"):
+    def __init__(
+        self,
+        api_key: str,
+        session_id: str,
+        model: str | None = None,
+        base_url: str | None = None,
+        timeout: float | None = None,
+    ):
+        settings = get_memory_endpoint_settings()
         self.api_key = api_key
         self.session_id = session_id
-        self.model = model
-        self.api_url = "https://api.siliconflow.cn/v1/embeddings"
+        self.model = model or str(settings["model"])
+        self._client = OpenAI(
+            api_key=api_key,
+            base_url=base_url or str(settings["base_url"]),
+            timeout=timeout or float(settings["timeout"]),
+            max_retries=1,
+        )
 
     def __call__(self, input: Documents) -> Embeddings:
         if not input: return []
-        headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
         cleaned_input = [text.replace("\n", " ") for text in input]
-        payload = {"model": self.model, "input": cleaned_input, "encoding_format": "float"}
         try:
-            with httpx.Client(timeout=30.0, trust_env=False) as client:
-                response = client.post(self.api_url, headers=headers, json=payload)
-                response.raise_for_status()
-                data = response.json()
-                
-                return [item["embedding"] for item in data["data"]]
+            response = self._client.embeddings.create(
+                model=self.model,
+                input=cleaned_input,
+                encoding_format="float",
+            )
+            return [item.embedding for item in response.data]
         except Exception as e:
             logger.error(f"Embedding API Error: {e}")
             raise e
 
+    def close(self):
+        self._client.close()
+
 
 class VectorMemory:
+    """
+    Synchronous vector store wrapper.
+
+    Call ChromaDB, embedding, and rerank operations from async code through
+    nonebot.utils.run_sync or another thread-pool adapter.
+    """
+
     def __init__(self, api_key: str, persist_directory: str, session_id: str = "global"):
         self.persist_directory = persist_directory
         os.makedirs(self.persist_directory, exist_ok=True)
-        self.emb_fn = SiliconFlowEmbeddingFunction(api_key=api_key, session_id=session_id)
+        memory_settings = get_memory_endpoint_settings()
+        self.emb_fn = SiliconFlowEmbeddingFunction(
+            api_key=api_key,
+            session_id=session_id,
+            model=str(memory_settings["model"]),
+            base_url=str(memory_settings["base_url"]),
+            timeout=float(memory_settings["timeout"]),
+        )
         
         # 初始化 Reranker
         self.reranker = None
         if plugin_config.get("rerank", {}).get("model"):
             self.reranker = SiliconFlowReranker(
                 api_key=api_key, 
-                model=plugin_config.get("rerank", {}).get("model", "")
+                model=plugin_config.get("rerank", {}).get("model", ""),
+                api_url=str(memory_settings["rerank_base_url"]),
+                timeout=float(memory_settings["rerank_timeout"]),
             )
 
         self.client = chromadb.PersistentClient(path=self.persist_directory)
@@ -105,11 +140,12 @@ class VectorMemory:
         # 使用 UUID 防止重复覆盖
         ids = [str(uuid.uuid4()) for _ in valid_data]
         try:
-            self.collection.add(
-                documents=[d[0] for d in valid_data],
-                metadatas=[d[1] for d in valid_data],
-                ids=ids
-            )
+            with BACKUP_IO_LOCK:
+                self.collection.add(
+                    documents=[d[0] for d in valid_data],
+                    metadatas=[d[1] for d in valid_data],
+                    ids=ids
+                )
         except Exception as e:
             logger.error(f"Vector add failed: {e}")
 
@@ -202,7 +238,8 @@ class VectorMemory:
     def delete_by_metadata(self, where: dict):
         """删除指定条件的记忆"""
         try:
-            self.collection.delete(where=where)
+            with BACKUP_IO_LOCK:
+                self.collection.delete(where=where)
             logger.info(f"Deleted vectors where {where}")
         except Exception as e:
             logger.error(f"Vector delete failed: {e}")
@@ -220,17 +257,30 @@ class VectorMemory:
                     {"date": {"$lt": cutoff_date}}  # 现在是整数比较整数，ChromaDB 支持
                 ]
             }
-            self.collection.delete(where=where_filter)
+            with BACKUP_IO_LOCK:
+                self.collection.delete(where=where_filter)
             logger.info(f"Cleaned up memories before {cutoff_date}")
         except Exception as e:
             logger.error(f"Cleanup failed: {e}")
 
     def clear(self):
         try:
-            self.client.delete_collection("nyabot_memory")
-            self.collection = self.client.get_or_create_collection(name="nyabot_memory", embedding_function=self.emb_fn)
+            with BACKUP_IO_LOCK:
+                self.client.delete_collection("nyabot_memory")
+                self.collection = self.client.get_or_create_collection(name="nyabot_memory", embedding_function=self.emb_fn)
         except Exception as e:
             logger.error(f"Clear failed: {e}")
+
+    def close(self):
+        try:
+            self.emb_fn.close()
+        except Exception as e:
+            logger.warning(f"Close embedding client failed: {e}")
+        if self.reranker:
+            try:
+                self.reranker.close()
+            except Exception as e:
+                logger.warning(f"Close reranker client failed: {e}")
 
     def count_by_user(self, user_id: str) -> int:
         """统计某用户的记忆数量"""
@@ -259,38 +309,67 @@ class VectorMemory:
         Returns:
             是否成功添加（False 表示重复跳过）
         """
-        if not content or not content.strip():
-            return False
-        
-        content = content.strip()
-        
+        result = self.add_memories_with_dedup([(content, metadata)], threshold=threshold)
+        return result["added"] > 0
+
+    def add_memories_with_dedup(self, memories: list[tuple[str, dict]], threshold: float = 0.9) -> dict[str, int]:
+        """
+        批量去重并添加长期记忆。
+
+        对同一批候选记忆只做一次 Chroma query 和一次 add，避免逐条 embedding/query/add。
+        """
+        result = {"added": 0, "skipped_empty": 0, "skipped_dedup": 0}
+        valid: list[tuple[str, dict]] = []
+        for content, metadata in memories:
+            normalized = (content or "").strip()
+            if not normalized:
+                result["skipped_empty"] += 1
+                continue
+            valid.append((normalized, metadata or {}))
+
+        if not valid:
+            return result
+
         try:
-            # 检索最相似的已有记忆
             existing = self.collection.query(
-                query_texts=[content],
+                query_texts=[content for content, _ in valid],
                 n_results=1,
                 where={"source": {"$eq": "memory"}}
             )
-            
-            if existing.get('distances') and existing['distances'][0]:
-                # ChromaDB 使用 cosine 距离，值越小越相似
-                # 距离范围 [0, 2]，转换为相似度 [1, -1]
-                distance = existing['distances'][0][0]
+
+            to_add: list[tuple[str, dict]] = []
+            distances = existing.get("distances") or []
+            for idx, (content, metadata) in enumerate(valid):
+                row = distances[idx] if idx < len(distances) else []
+                distance = row[0] if row else None
+                if distance is None:
+                    to_add.append((content, metadata))
+                    continue
+
                 similarity = 1 - distance
-                
                 if similarity > threshold:
                     logger.debug(f"[Memory] 跳过重复记忆 (相似度 {similarity:.2f}): {content[:30]}...")
-                    return False
-            
-            # 不重复，正常添加
-            self.add_texts([content], metadatas=[metadata])
-            return True
-            
+                    result["skipped_dedup"] += 1
+                else:
+                    to_add.append((content, metadata))
+
+            if to_add:
+                self.add_texts(
+                    [content for content, _ in to_add],
+                    metadatas=[metadata for _, metadata in to_add],
+                )
+                result["added"] = len(to_add)
+            return result
+
         except Exception as e:
-            logger.error(f"去重添加记忆失败: {e}")
-            # 出错时降级为直接添加
-            self.add_texts([content], metadatas=[metadata])
-            return True
+            logger.error(f"批量去重添加记忆失败: {e}")
+            self.add_texts(
+                [content for content, _ in valid],
+                metadatas=[metadata for _, metadata in valid],
+            )
+            result["added"] = len(valid)
+            result["skipped_dedup"] = 0
+            return result
 
     def retrieve_with_decay(
         self, 
@@ -320,7 +399,7 @@ class VectorMemory:
             return []
         
         # 2. 应用时间衰减
-        today = int(datetime.now().strftime("%Y%m%d"))
+        today_dt = datetime.now()
         
         for item in raw_results:
             meta = item.get("metadata", {})
@@ -328,12 +407,11 @@ class VectorMemory:
             
             # 计算天数差
             if date and isinstance(date, int) and date > 0:
-                # 简化计算：假设每个月 30 天
-                year_diff = (today // 10000) - (date // 10000)
-                month_diff = ((today % 10000) // 100) - ((date % 10000) // 100)
-                day_diff = (today % 100) - (date % 100)
-                days_ago = year_diff * 365 + month_diff * 30 + day_diff
-                days_ago = max(0, days_ago)
+                try:
+                    memory_dt = datetime.strptime(str(date), "%Y%m%d")
+                    days_ago = max(0, (today_dt - memory_dt).days)
+                except ValueError:
+                    days_ago = 60
             else:
                 # 没有日期的记忆，视为较久以前
                 days_ago = 60

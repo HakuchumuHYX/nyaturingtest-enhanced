@@ -13,7 +13,7 @@
 - **去本地化模型**：移除了原项目中庞大的 `HippoRAG` (图神经网络) 和本地 `BGE-M3` Embedding 模型。
 - **云端算力替代**：
   - **Embedding**: 对接 SiliconFlow (硅基流动) 的 Embedding API，速度更快，效果更强。
-  - **VLM**: 图片理解模块支持 OpenAI Compatible 和 Google AI Studio 双通道，无需本地显存即可实现高精度识图。
+  - **VLM**: 图片理解模块保留 OpenAI-compatible 视觉模型路线，无需本地显存即可实现高精度识图。
   - **Rerank (重排序)**: 引入 Reranker 模型优化 RAG 检索链路，大幅提升长期记忆召回的准确性。
 - **资源占用骤降**：运行时内存占用从 4GB+ 降低至 **200MB 左右**，启动速度提升至秒级。
 
@@ -22,7 +22,7 @@
 - **自主意识循环**：采用 `Producer-Consumer` 模型的后台思考循环 (`spawn_state`)，Bot 会根据群聊上下文自主决定是否发言，而非传统的"一问一答"。
 - **强制响应机制**：解决了"叫不答应"的问题。当检测到 `@Bot` 或 `回复Bot消息` 时，会自动打破"潜水"状态，强制触发响应逻辑。
 - **拟人化状态机**：维护 `潜水` / `冒泡` / `活跃` 三种状态，根据群聊热度动态调整插话频率。
-- **多模态感知**: 能够通过 VLM 模型"看见"群聊图片，并将图片内容转化为文本纳入对话上下文，实现真正的"看图说话"。
+- **多模态感知**: 当 `vlm.enabled=true` 时，能够通过 VLM 模型"看见"群聊图片，并将图片内容转化为文本纳入对话上下文，实现真正的"看图说话"。
 - **情绪护栏**：基于 VAD 情绪模型动态调整回复风格，并设有护栏机制确保 Bot 在负面情绪下也不会产生攻击性语言。
 
 ### 3. 稳定可靠的数据持久化
@@ -51,34 +51,41 @@
 
 ## 🛠️ 配置指南
 
-本插件使用 `config.json` 进行配置（位于插件目录下）。首次运行时需要手动创建。
+本插件使用 `config.json` 进行配置（位于插件目录下）。该文件是 gitignored 的本地私有配置，可以放真实 API Key；提交配置模板时使用 `config.example.json`。
 
 ```jsonc
 {
   "chat": {
-    "provider": "openai_compatible", // 或 "google_ai_studio"
-    "api_key": "sk-your-api-key", // OpenAI Compatible API Key
-    "base_url": "https://your-api-endpoint/v1/",
-    "model": "gemini-3-flash", // 对话模型
-    "google_api_key": "", // Google AI Studio API Key (可选)
-    "google_base_url": "https://generativelanguage.googleapis.com/v1beta",
+    "provider": "deepseek_official",
+    "api_key": "sk-your-deepseek-key",
+    "base_url": "https://api.deepseek.com",
+    "model": "deepseek-v4-flash",
+    "thinking": {
+      "enabled": true,
+      "reasoning_effort": "high",
+      "rp_style": "off"
+    },
+    "max_tokens": 4096,
+    "timeout": 180
   },
   "vlm": {
     "enabled": true, // 是否启用图片理解
-    "provider": "openai_compatible", // 或 "google_ai_studio"
-    "model": "gemini-3-flash",
-    "openai_api_key": "sk-your-api-key",
-    "openai_base_url": "https://your-api-endpoint/v1/",
-    "google_api_key": "",
-    "google_base_url": "https://generativelanguage.googleapis.com/v1beta",
+    "provider": "openai_compatible",
+    "api_key": "sk-your-vlm-key",
+    "base_url": "https://api.siliconflow.cn/v1",
+    "model": "zai-org/GLM-4.6V",
+    "timeout": 60
   },
   "feedback": {
-    "provider": "openai_compatible", // 反馈/分析模型
-    "api_key": "sk-your-api-key",
-    "base_url": "https://your-api-endpoint/v1/",
-    "model": "gemini-3-flash",
-    "google_api_key": "",
-    "google_base_url": "https://generativelanguage.googleapis.com/v1beta",
+    "provider": "deepseek_official",
+    "api_key": "sk-your-deepseek-key",
+    "base_url": "https://api.deepseek.com",
+    "model": "deepseek-v4-flash",
+    "thinking": {
+      "enabled": false
+    },
+    "max_tokens": 2048,
+    "timeout": 60
   },
   "siliconflow_api_key": "sk-your-siliconflow-key", // 硅基流动 API Key (Embedding + Rerank)
   "rerank": {
@@ -92,13 +99,13 @@
 }
 ```
 
-> **注意**: `chat`、`vlm`、`feedback` 三个模块可以分别配置不同的 API 端点和模型，以实现成本优化（如：对话用高质量模型，反馈用低成本模型）。
+> **注意**: Chat 与 Feedback 默认使用 DeepSeek 官方 API；Embedding/Rerank 继续使用 SiliconFlow；VLM 使用 OpenAI-compatible 视觉模型。
 
 ---
 
 ## 🎮 指令列表
 
-所有指令仅支持 **SUPERUSER** 使用。大部分指令同时支持群聊和私聊（私聊需附加群号）。
+除 `/查询记忆` 外，管理类指令仅支持 **SUPERUSER** 使用。大部分管理指令同时支持群聊和私聊（私聊需附加群号）；`/查询记忆` 是群聊内公开指令，所有群员可用。
 
 ### 群聊指令
 
@@ -113,8 +120,8 @@
 | `/set_preset <文件名>`       | set_presets   | 从文件加载角色预设                                                 |
 | `/calm`                      | 冷静          | 重置情绪、意愿值和活跃状态（保留记忆和人设）                       |
 | `/reset_emotion`             | 重置情绪      | 仅重置 VAD 情绪值（保留意愿值、记忆等）                            |
-| `/reset`                     | 重置          | **完全重置**：清空人设、记忆、情绪，并删除数据库中的消息和画像记录 |
-| `/token统计`                 | -             | 查看本群及全局的 Token 消耗统计（24h/7d/总计）                     |
+| `/reset confirm`             | 重置          | **完全重置**：先自动备份，再清空人设、记忆、情绪，并删除数据库中的消息和画像记录 |
+| `/token统计`                 | -             | 查看本群及全局全部模型的 Token、reasoning token、DeepSeek cache hit/miss 统计 |
 | `/查询记忆 <@某人/空>`       | memory / 印象 | 查看 AI 对特定群友的长期记忆与印象                                 |
 | `/backup_data`               | 备份数据      | **手动触发数据备份**：立即打包所有插件数据到备份文件夹             |
 
@@ -129,7 +136,7 @@
 | `set_preset <群号> <文件名>`      | 加载指定群的预设     |
 | `calm <群号>`                     | 冷静指定群           |
 | `reset_emotion <群号>`            | 重置指定群情绪       |
-| `reset <群号>`                    | 完全重置指定群       |
+| `reset <群号> confirm`            | 先备份再完全重置指定群 |
 | `list_groups` / 群组列表          | 查看所有已启用的群组 |
 | `backup_data` / 备份数据          | 手动触发全量数据备份 |
 
@@ -170,11 +177,11 @@
 ### 4. 大模型通信层 (`llm/`)
 
 - **`client.py`**: 基于 AsyncOpenAI 封装的高可用大模型通信基类。
-- **`vlm.py`**: 提供支持 Google AI Studio / OAI 兼容接口的多模态看图服务模块。
+- **`vlm.py`**: 提供 OpenAI-compatible 多模态看图服务模块。
 
 ### 5. 记忆与心智 (`memory/`)
 
-- **`short_term.py`**: 滑动窗口记忆。基于消息队列进行即时会话缓存，超容时调用小模型生成摘要。
+- **`short_term.py`**: 滑动窗口记忆。基于消息队列进行即时会话缓存；摘要由 Feedback 阶段统一维护。
 - **`vector.py`**: ChromaDB 持久化向量检索。结合 Embedding 与 Rerank 双重引擎。
 - **`image.py`**: 专门处理图片下载、GIF解析以及并发的看图缓存管理。
 
@@ -199,12 +206,12 @@
 
 1. **Token 消耗**：
    - Bot 需要不断读取群聊上下文进行"自我思考"（Feedback 阶段），Token 消耗可观。
-   - **建议**：使用 `/token统计` 指令定期监控消耗，并为 Feedback 阶段配置成本较低的模型。
+   - **建议**：使用 `/token统计` 指令定期监控消耗、reasoning token 和 DeepSeek cache hit ratio。
 
 2. **数据库文件**：
    - 运行时会在插件数据目录生成 `nyabot.sqlite`，请定期备份。
    - 长期记忆向量库由 ChromaDB 管理，数据位于插件数据目录下。
-   - 使用 `/reset` 会**永久删除**该群的所有数据库记录，操作不可逆。
+   - 使用 `/reset confirm` 会先触发备份，再删除该群的所有数据库记录；删除仍不可逆，请确认备份可用。
 
 3. **预设文件**：
    - 角色预设 JSON 文件存放在 `config/nyaturingtest/nya_presets/` 目录下。
@@ -213,4 +220,3 @@
 ## Special Thanks
 
 - **原作者**: [shadow3aaa](https://github.com/shadow3aaa/) 提供的前沿架构思路。
-- [**G指导**](https://gemini.google.com/app): 协助完成了代码的重构、Bug 修复以及文档编写。

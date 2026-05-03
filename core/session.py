@@ -15,8 +15,8 @@ from nonebot.utils import run_sync
 from openai import AsyncOpenAI
 
 from ..llm.client import LLMClient
-from ..config import plugin_config
-from ..models.emotion import EmotionState
+from ..config import get_chat_thinking_settings, get_runtime_settings
+from ..models.emotion import EmotionState, clamp_vad_value
 from ..memory.vector import VectorMemory
 from ..models.impression import Impression
 from ..memory.short_term import Memory, Message
@@ -24,7 +24,17 @@ from ..prompts.presets import PRESETS
 from ..models.profile import PersonProfile
 from ..utils import extract_and_parse_json, check_relevance, sanitize_text, escape_for_prompt, get_time_description, should_store_memory
 from ..prompts.templates import get_feedback_prompt, get_chat_prompt
-from ..database.repository import SessionRepository
+from ..database.message_repository import MessageRepository
+from ..database.profile_repository import ProfileRepository
+from ..database.session_repository import SessionStateRepository
+from .orchestrator import ConversationOrchestrator
+
+
+def _limit_role_text(text: str, max_chars: int) -> str:
+    text = text or ""
+    if max_chars > 0 and len(text) > max_chars:
+        return text[:max_chars].rstrip() + "\n[内容过长，已截断]"
+    return text
 
 
 @dataclass
@@ -60,31 +70,32 @@ class Session:
             http_client: httpx.AsyncClient | None = None
     ):
         self.id = id
+        self._siliconflow_api_key = siliconflow_api_key
         if http_client:
             self._client_instance = http_client
+            self._owns_http_client = False
         else:
             self._client_instance = httpx.AsyncClient(
                 limits=httpx.Limits(max_keepalive_connections=5, max_connections=10),
                 timeout=60.0
             )
+            self._owns_http_client = True
 
         # 保存基础 LLM Client，供 Memory 和其他组件使用
         # NOTE: this client is for internal memory/analysis components, keep SiliconFlow OpenAI-compatible here.
         self._base_llm_client = LLMClient(
             provider="openai_compatible",
             openai_client=AsyncOpenAI(
-                api_key=plugin_config.get("siliconflow_api_key", ""),
+                api_key=self._siliconflow_api_key,
                 base_url="https://api.siliconflow.cn/v1",
                 http_client=self._client_instance,
             ),
         )
 
-        self.global_memory: Memory = Memory(
-            llm_client=self._base_llm_client
-        )
+        self.global_memory: Memory = Memory()
 
         self.long_term_memory: VectorMemory = VectorMemory(
-            api_key=plugin_config.get("siliconflow_api_key", ""),
+            api_key=self._siliconflow_api_key,
             persist_directory=f"{store.get_plugin_data_dir()}/vector_index_{id}",
         )
 
@@ -104,11 +115,12 @@ class Session:
         self._last_activity_time = datetime.now()
         self._last_speak_time = datetime.min
         self._active_count = 0
+        self._passive_observe_skips = 0
         self._loaded = False
         self._background_tasks = set()
 
     async def set_role(self, name: str, role: str):
-        self.__role = role
+        self.__role = _limit_role_text(role, get_runtime_settings()["role_max_chars"])
         self.__name = name
         await self.save_session()
 
@@ -117,6 +129,9 @@ class Session:
 
     def name(self) -> str:
         return self.__name
+
+    def aliases(self) -> list[str]:
+        return list(self.__aliases)
 
     async def reset(self):
         self.__name = "terminus"
@@ -134,7 +149,7 @@ class Session:
         self._last_activity_time = datetime.now()
         self._last_speak_time = datetime.min
         # 清理数据库中的所有关联数据
-        await SessionRepository.delete_session_data(self.id)
+        await SessionStateRepository.delete_session_data(self.id)
         await self.save_session()
         logger.info(f"[Session {self.id}] 已完全重置（含数据库清理）")
 
@@ -153,6 +168,7 @@ class Session:
         # 同时重置所有用户画像的情绪
         for profile in self.profiles.values():
             profile.emotion = EmotionState()
+            profile.mark_dirty()
         logger.info(f"[Session {self.id}] 情绪已初始化 (VAD -> 0, 0, 0)")
         await self.save_session()
 
@@ -175,7 +191,7 @@ class Session:
     async def save_session(self, force_index: bool = False):
         try:
             # 1. 保存基础状态
-            await SessionRepository.save_session_state(
+            await SessionStateRepository.save_session_state(
                 self.id,
                 {
                     "name": self.__name,
@@ -190,13 +206,21 @@ class Session:
                 }
             )
 
-            # 2. 更新画像
-            await SessionRepository.update_user_profiles(self.id, self.profiles)
+            # 2. 更新变化过的画像，避免高频保存重复写全量 profiles。
+            dirty_profiles = {
+                user_id: profile
+                for user_id, profile in self.profiles.items()
+                if profile.is_dirty
+            }
+            if dirty_profiles:
+                await ProfileRepository.update_user_profiles(self.id, dirty_profiles)
+                for profile in dirty_profiles.values():
+                    profile.mark_clean()
 
             # 3. 同步消息
             recent_msgs = self.global_memory.access().messages
             if recent_msgs:
-                await SessionRepository.sync_messages(self.id, recent_msgs)
+                await MessageRepository.sync_messages(self.id, recent_msgs)
 
             if force_index or random.random() < 0.01:
                 await run_sync(self.long_term_memory.cleanup)(days_retention=90)
@@ -209,7 +233,7 @@ class Session:
         if self._loaded: return
 
         # 使用 Repository 加载完整数据
-        data = await SessionRepository.load_full_session_data(self.id)
+        data = await SessionStateRepository.load_full_session_data(self.id)
         
         if not data:
             logger.info(f"[Session {self.id}] 初始化新会话")
@@ -219,7 +243,7 @@ class Session:
         session_db = data["session"]
         
         self.__name = session_db.name
-        self.__role = session_db.role
+        self.__role = _limit_role_text(session_db.role, get_runtime_settings()["role_max_chars"])
         self.__aliases = session_db.aliases if session_db.aliases else []
         self.chat_summary = session_db.chat_summary
         self.global_emotion.valence = session_db.valence
@@ -256,12 +280,12 @@ class Session:
                     delta=log_data["delta"]
                 )
                 profile.interactions.append(imp)
+            profile.mark_clean()
             self.profiles[user_id] = profile
 
         # 恢复短时记忆
         # 注意：这里将数据库中的 chat_summary 同步给 Memory，确保摘要不丢失
         self.global_memory = Memory(
-            llm_client=self._base_llm_client,
             compressed_message=self.chat_summary,
             messages=data["messages"]
         )
@@ -289,14 +313,17 @@ class Session:
                 b = ex.get("bot", "")
                 if u and b:
                     ex_lines.append(f"User: {u}\n{preset.name}: {b}")
-            self.__examples_str = "\n".join(ex_lines)
+            self.__examples_str = _limit_role_text("\n".join(ex_lines), get_runtime_settings()["examples_max_chars"])
         else:
             self.__examples_str = ""
 
         if self.__examples_str:
-            self.__role = f"{base_role}\n\n[对话样本]\n{self.__examples_str}"
+            self.__role = _limit_role_text(
+                f"{base_role}\n\n[对话样本]\n{self.__examples_str}",
+                get_runtime_settings()["role_max_chars"],
+            )
         else:
-            self.__role = base_role
+            self.__role = _limit_role_text(base_role, get_runtime_settings()["role_max_chars"])
 
         await run_sync(self.long_term_memory.delete_by_metadata)({"source": "preset"})
 
@@ -323,7 +350,7 @@ class Session:
 {recent_str}
 """
 
-    async def __search_stage(self, queries: list[str], active_user_names: list[str], use_rerank: bool = True):
+    async def search_stage(self, queries: list[str], active_user_names: list[str], use_rerank: bool = True):
         """
         优化检索阶段
         """
@@ -350,7 +377,7 @@ class Session:
                 ]
             }
 
-            raw_results = await run_sync(self.long_term_memory.retrieve)(
+            raw_results = await run_sync(self.long_term_memory.retrieve_with_decay)(
                 queries,
                 k=20,
                 where=where_filter,
@@ -381,7 +408,7 @@ class Session:
 
         self.__search_result = _SearchResult(mem_history=long_term_memory)
 
-    async def __feedback_stage(self, messages_chunk: list[Message], llm_func: Callable,
+    async def feedback_stage(self, messages_chunk: list[Message], llm_func: Callable,
                                is_relevant: bool = False) -> list[str]:
         """
         反馈阶段：分析情绪、提取记忆、更新摘要
@@ -398,7 +425,7 @@ class Session:
 
         related_profiles_json = json.dumps(
             [{"user_name": p.user_id, "emotion_tends_to_user": asdict(p.emotion)} for p in related_profiles],
-            ensure_ascii=False, indent=2
+            ensure_ascii=False, sort_keys=True, separators=(",", ":")
         )
         search_history = self.__search_result.mem_history if self.__search_result else []
 
@@ -406,7 +433,8 @@ class Session:
                           messages_chunk]
 
         # 过滤掉本次的新消息，避免 Prompt 上下文重复
-        all_messages = self.global_memory.access().messages
+        context_record = self.global_memory.access_context(limit=get_runtime_settings()["short_context_limit"])
+        all_messages = context_record.messages
         history_msgs = [m for m in all_messages if m not in messages_chunk]
         # 格式化一下 history_msgs，使其更易读 (不再直接 dump repr)
         # 格式化为：[ID:xxx] Name: Content
@@ -423,7 +451,7 @@ class Session:
         prompt = get_feedback_prompt(
             self.__name, self.__role, self.willingness,
             self.__chatting_state.value,
-            self.global_memory.access().compressed_history,
+            context_record.compressed_history,
             history_msgs_formatted, # 传入格式化后的历史
             formatted_msgs,
             asdict(self.global_emotion),
@@ -454,9 +482,9 @@ class Session:
             logger.warning(f"[Session {self.id}] Feedback 未返回 new_emotion，跳过情绪更新。response_dict keys: {list(response_dict.keys())}")
         else:
             logger.debug(f"[Session {self.id}] Feedback 返回 emotion: V={new_emo.get('valence')}, A={new_emo.get('arousal')}, D={new_emo.get('dominance')}")
-            self.global_emotion.valence = new_emo.get("valence", self.global_emotion.valence)
-            self.global_emotion.arousal = new_emo.get("arousal", self.global_emotion.arousal)
-            self.global_emotion.dominance = new_emo.get("dominance", self.global_emotion.dominance)
+            self.global_emotion.valence = clamp_vad_value(new_emo.get("valence"), -1.0, 1.0, self.global_emotion.valence)
+            self.global_emotion.arousal = clamp_vad_value(new_emo.get("arousal"), 0.0, 1.0, self.global_emotion.arousal)
+            self.global_emotion.dominance = clamp_vad_value(new_emo.get("dominance"), -1.0, 1.0, self.global_emotion.dominance)
 
         # 4. 更新用户印象
         emo_tends = response_dict.get("emotion_tends", [])
@@ -505,7 +533,7 @@ class Session:
             fallback_uid = list(unique_user_ids)[0] if len(unique_user_ids) == 1 else ""
 
             task = asyncio.create_task(
-                self.__save_long_term_memory(analyze_result, default_user_id=fallback_uid)
+                self.save_long_term_memory(analyze_result, default_user_id=fallback_uid)
             )
             self._background_tasks.add(task)
             task.add_done_callback(self._background_tasks.discard)
@@ -518,7 +546,11 @@ class Session:
             if current_msgs:
                 earliest_time = current_msgs[0].time
                 # 使用 Repository 查库
-                recalled_msgs = await SessionRepository.get_history_before(self.id, earliest_time, limit=20)
+                recalled_msgs = await MessageRepository.get_history_before(
+                    self.id,
+                    earliest_time,
+                    limit=get_runtime_settings()["history_recall_limit"],
+                )
 
                 if recalled_msgs:
                     formatted_history = []
@@ -550,16 +582,15 @@ class Session:
         logger.debug(f"<< 反馈结束: 意愿 {self.willingness:.2f}, 状态 {self.__chatting_state}")
         return recalled_history
 
-    async def __save_long_term_memory(self, analyze_result: list, default_user_id: str = ""):
+    async def save_long_term_memory(self, analyze_result: list, default_user_id: str = ""):
         """
         后台任务：保存长期记忆到向量数据库
         优化：增加质量过滤和去重
         """
         try:
             today = int(datetime.now().strftime("%Y%m%d"))
-            saved_count = 0
             skipped_quality = 0
-            skipped_dedup = 0
+            pending_memories: list[tuple[str, dict]] = []
 
             for item in analyze_result:
                 content = ""
@@ -590,13 +621,14 @@ class Session:
                     "user_id": uid
                 }
 
-                # 去重添加
-                added = await run_sync(self.long_term_memory.add_memory_with_dedup)(content, metadata)
-                if added:
-                    saved_count += 1
-                else:
-                    skipped_dedup += 1
+                pending_memories.append((content, metadata))
 
+            store_result = {"added": 0, "skipped_dedup": 0}
+            if pending_memories:
+                store_result = await run_sync(self.long_term_memory.add_memories_with_dedup)(pending_memories)
+
+            saved_count = store_result.get("added", 0)
+            skipped_dedup = store_result.get("skipped_dedup", 0)
             if saved_count > 0 or skipped_quality > 0 or skipped_dedup > 0:
                 logger.info(
                     f"[Memory] 存储结果: 成功 {saved_count}, 质量过滤 {skipped_quality}, 去重跳过 {skipped_dedup}"
@@ -604,7 +636,7 @@ class Session:
         except Exception as e:
             logger.error(f"[Async] 保存记忆失败: {e}")
 
-    async def __chat_stage(self, messages_chunk: list[Message], llm_func: Callable,
+    async def chat_stage(self, messages_chunk: list[Message], llm_func: Callable,
                            recalled_history: list[str]) -> list[dict]:
         logger.debug(">> 对话阶段 (Chat) 开始")
         search_history = self.__search_result.mem_history if self.__search_result else []
@@ -615,7 +647,8 @@ class Session:
         recalled_str = "\n".join(recalled_history) if recalled_history else "无"
 
         # 过滤掉本次的新消息，避免 Prompt 上下文重复
-        all_messages = self.global_memory.access().messages
+        context_record = self.global_memory.access_context(limit=get_runtime_settings()["short_context_limit"])
+        all_messages = context_record.messages
         history_msgs = [m for m in all_messages if m not in messages_chunk]
         history_msgs_formatted = [
             f"[{m.time.strftime('%H:%M')}] {m.user_name}: {escape_for_prompt(m.content)}" 
@@ -625,17 +658,24 @@ class Session:
         time_str = get_time_description(datetime.now())
         # 分离 role 和 examples：role 中可能包含 [对话样本] 后缀，需要去除避免重复
         chat_role = self.__role.split("[对话样本]")[0].strip() if "[对话样本]" in self.__role else self.__role
+        reaction_users = list({msg.user_id if msg.user_id else msg.user_name for msg in messages_chunk})
+        related_profiles = [self.profiles.get(uid, PersonProfile(user_id=uid)) for uid in reaction_users]
+        related_profiles_json = json.dumps(
+            [{"user_name": p.user_id, "emotion_tends_to_user": asdict(p.emotion)} for p in related_profiles],
+            ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
         prompt = get_chat_prompt(
             self.__name, chat_role, self.__chatting_state.value,
-            self.global_memory.access().compressed_history,
+            context_record.compressed_history,
             history_msgs_formatted, # 传入格式化后的历史
             formatted_msgs,
             asdict(self.global_emotion),
-            "{}",
+            related_profiles_json,
             search_history, self.chat_summary,
             examples_text=self.__examples_str,
             recalled_history=recalled_str,
-            time_info=time_str
+            time_info=time_str,
+            rp_style=get_chat_thinking_settings().get("rp_style", "off"),
         )
 
         last_error = None
@@ -670,7 +710,7 @@ class Session:
         return []
 
     # 提高插话阈值，防止连击
-    async def append_self_message(self, content: str, msg_id: str):
+    async def append_self_message(self, content: str, msg_id: str, bot_user_id: str):
         """
         主动记录 Bot 自己的发言 (防止等待回显导致记忆延迟)
         """
@@ -680,10 +720,8 @@ class Session:
             user_name=self.__name,
             content=content,
             id=msg_id,
-            user_id=self.id # Bot 自己的 ID 通常就是 group_id 或者 bot_id，这里用 self.id 只是标记
+            user_id=bot_user_id
         )
-        # 这里的 user_id 可能需要更准确，但这主要影响 Memory.related_users
-        # 暂时用 self.id 或空字符串
         
         await self.global_memory.update([msg])
         self._create_safe_task(self.save_session())
@@ -697,82 +735,40 @@ class Session:
         await self.global_memory.update(messages_chunk)
         self._create_safe_task(self.save_session())
 
+    async def drain_background_tasks(self, timeout: float = 10.0):
+        pending = [task for task in self._background_tasks if not task.done()]
+        if not pending:
+            return
+        try:
+            await asyncio.wait_for(asyncio.gather(*pending, return_exceptions=True), timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.warning(f"[Session {self.id}] 等待后台任务超时，取消 {len(pending)} 个任务")
+            for task in pending:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    async def close(self):
+        try:
+            self.long_term_memory.close()
+        except Exception as e:
+            logger.warning(f"[Session {self.id}] 关闭向量记忆失败: {e}")
+        if getattr(self, "_client_instance", None) and getattr(self, "_owns_http_client", False):
+            try:
+                await self._client_instance.aclose()
+            except Exception as e:
+                logger.warning(f"[Session {self.id}] 关闭 HTTP 客户端失败: {e}")
+
     async def update(self, messages_chunk: list[Message],
                      chat_llm_func: Callable[[str, bool], Awaitable[str]],
                      feedback_llm_func: Callable[[str, bool], Awaitable[str]],
                      publish: bool = True) -> list[dict] | None:
-        
-        # 1. 更新短时记忆 (Buffer)
-        # 这里的 update 不再触发后台压缩，而是单纯的 Rolling Window 更新
-        await self.global_memory.update(messages_chunk)
-        self._create_safe_task(self.save_session())
-
-        if not publish: return None
-
-        # 2. 意愿值计算
-        now = datetime.now()
-        seconds_passed = (now - self._last_activity_time).total_seconds()
-
-        # 加速非活跃期的意愿衰减
-        decay_rate = 0.03 if seconds_passed < 300 else 0.06
-        decay = (seconds_passed / 60.0) * decay_rate
-        self.willingness = max(0.0, self.willingness - decay)
-        self._last_activity_time = now
-
-        is_relevant = check_relevance(self.__name, self.__aliases, messages_chunk)
-        if is_relevant:
-            self.willingness = max(self.willingness, 0.95)
-            logger.info("检测到强关联，意愿值提升")
-        else:
-            # 降低自然增长幅度，避免看别人聊天自己越来越兴奋
-            # 只有当目前意愿值较低时，才允许缓慢增长，防止无上限的自我激励
-            if self.willingness < 0.7:
-                self.willingness = min(1.0, self.willingness + 0.03 * len(messages_chunk))
-
-        # 3. 节流判断 (Gatekeeper)
-        if self.willingness < 0.35 and not is_relevant:
-            logger.debug(f"意愿值过低 ({self.willingness:.2f}) 且无强关联，跳过响应")
-            return None
-
-        last_speak = self._last_speak_time
-        if last_speak.tzinfo is not None:
-            last_speak = last_speak.astimezone(None).replace(tzinfo=None)
-
-        time_since_speak = (now - last_speak).total_seconds()
-
-        if time_since_speak < 0:
-            logger.warning(f"[Session {self.id}] 检测到最后发言时间在未来 ({time_since_speak:.1f}s)，忽略冷却限制")
-            # 此时视为没有冷却，允许通行
-        elif time_since_speak < 10.0 and not is_relevant:
-            logger.debug(f"处于发言冷却期 ({time_since_speak:.1f}s)，跳过响应")
-            return None
-
-        # 4. 检索阶段
-        queries = [msg.content for msg in messages_chunk[-2:]]
-        active_users = [msg.user_name for msg in messages_chunk if msg.user_name]
-
-        # 优化策略：仅当意愿值较高 (>0.6) 或强关联 (被点名) 时才启用重排序
-        # 低意愿状态下使用纯向量检索，极其省钱且足够应付普通场景
-        use_rerank_strategy = self.willingness > 0.6 or is_relevant
-
-        await self.__search_stage(queries, active_user_names=active_users, use_rerank=use_rerank_strategy)
-
-        logger.debug("启用拟人化串行模式: Feedback -> Check -> Chat")
-
-        # 5. Feedback 阶段 (使用 feedback_llm_func)
-        recalled_history = await self.__feedback_stage(messages_chunk, feedback_llm_func, is_relevant=is_relevant)
-
-        # 再次检查意愿 (Feedback 可能会调整意愿)
-        if self.willingness < 0.4 and not is_relevant:  # 这里同步提高阈值到 0.4
-            return None
-
-        # 6. Chat 阶段 (使用 chat_llm_func)
-        reply_messages = await self.__chat_stage(messages_chunk, chat_llm_func, recalled_history=recalled_history)
-
-        if reply_messages:
-            self._last_speak_time = datetime.now()
-
-        return reply_messages
+        return await ConversationOrchestrator(self).process_chunk(
+            messages_chunk,
+            chat_llm_func,
+            feedback_llm_func,
+            publish=publish,
+        )
 
     async def _save_interaction_log(self, user_id: str, delta: dict):
-        await SessionRepository.log_interaction(self.id, user_id, delta)
+        await ProfileRepository.log_interaction(self.id, user_id, delta)

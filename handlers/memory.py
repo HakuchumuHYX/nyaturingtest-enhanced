@@ -3,29 +3,48 @@ import json
 import asyncio
 from datetime import datetime
 from nonebot import on_command, logger
-from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, Message
+from nonebot.adapters.onebot.v11 import Bot, Event, GroupMessageEvent, Message
 from nonebot.params import CommandArg
 from nonebot.utils import run_sync
 from nonebot.exception import FinishedException
 
 from ..core.state_manager import ensure_group_state
 from ..utils import extract_and_parse_json, calculate_dynamic_k, should_store_memory
-from ..database.repository import SessionRepository
+from ..database.message_repository import MessageRepository
+from ..database.profile_repository import ProfileRepository
+from ..database.token_repository import TokenUsageRepository
 from ..core.logic import llm_response
-from ..config import get_effective_chat_model, get_effective_feedback_model
+from ..config import (
+    get_effective_chat_model,
+    get_effective_feedback_model,
+    get_chat_thinking_settings,
+    get_chat_max_tokens,
+    get_chat_timeout,
+    get_feedback_max_tokens,
+    get_feedback_timeout,
+)
+
+async def is_group_message(event: Event) -> bool:
+    return isinstance(event, GroupMessageEvent)
+
 
 # 定义命令
-query_memory = on_command("查询记忆", aliases={"memory", "印象"}, priority=5, block=True)
+query_memory = on_command("查询记忆", aliases={"memory", "印象"}, rule=is_group_message, priority=5, block=True)
 
 
 def _make_usage_recorder(session_id: str, model_name_record: str):
     def _recorder(usage: dict):
         asyncio.create_task(
-            SessionRepository.log_token_usage(
+            TokenUsageRepository.log_token_usage(
                 session_id=session_id,
                 model_name=model_name_record,
                 prompt_tokens=usage.get("prompt_tokens", 0),
-                completion_tokens=usage.get("completion_tokens", 0)
+                completion_tokens=usage.get("completion_tokens", 0),
+                prompt_cache_hit_tokens=usage.get("prompt_cache_hit_tokens", 0),
+                prompt_cache_miss_tokens=usage.get("prompt_cache_miss_tokens", 0),
+                reasoning_tokens=usage.get("reasoning_tokens", 0),
+                finish_reason=usage.get("finish_reason", ""),
+                provider=usage.get("provider", ""),
             )
         )
     return _recorder
@@ -106,6 +125,9 @@ async def _summarize_long_term_vad(
         model=get_effective_feedback_model(),
         temperature=0.1,
         json_mode=True,
+        extra_body={"thinking": {"type": "disabled"}},
+        max_tokens=get_feedback_max_tokens(),
+        timeout=get_feedback_timeout(),
         on_usage=_make_usage_recorder(str(state.session.id), get_effective_feedback_model())
     )
 
@@ -141,6 +163,8 @@ async def handle_query_memory(bot: Bot, event: GroupMessageEvent, args: Message 
         await query_memory.finish("本群尚未启用 AI 功能。")
         return
 
+    await query_memory.send("正在回溯记忆深处...")
+
     # 3. 收集数据 (加锁读取)
     profile_data = None
     bot_name = "Bot"
@@ -156,7 +180,7 @@ async def handle_query_memory(bot: Bot, event: GroupMessageEvent, args: Message 
 
         # --- 用户画像与交互统计逻辑 ---
         # 使用 Repository 获取真实的交互次数
-        interaction_count = await SessionRepository.get_interaction_count(state.session.id, target_id)
+        interaction_count = await ProfileRepository.get_interaction_count(state.session.id, target_id)
 
         # 获取内存中的情绪数据
         profile = state.session.profiles.get(target_id)
@@ -203,7 +227,7 @@ async def handle_query_memory(bot: Bot, event: GroupMessageEvent, args: Message 
                 memory_count = await run_sync(state.session.long_term_memory.count_by_user)(target_id)
                 
                 # 获取首次交互时间，计算天数
-                first_interaction_time = await SessionRepository.get_first_interaction_time(
+                first_interaction_time = await ProfileRepository.get_first_interaction_time(
                     state.session.id, target_id
                 )
                 if first_interaction_time:
@@ -246,7 +270,7 @@ async def handle_query_memory(bot: Bot, event: GroupMessageEvent, args: Message 
             logger.error(f"向量记忆检索失败: {e}")
 
         # --- 获取最近聊天记录 ---
-        recent_user_msgs = await SessionRepository.get_recent_messages_by_user(
+        recent_user_msgs = await MessageRepository.get_recent_messages_by_user(
             state.session.id, 
             user_id=target_id, 
             user_name=target_name, 
@@ -280,8 +304,6 @@ async def handle_query_memory(bot: Bot, event: GroupMessageEvent, args: Message 
         return
 
     # 5. 构建 Prompt
-    await query_memory.send("正在回溯记忆深处...")
-
     vector_memory_str = "\n".join([f"- {rec}" for rec in vector_records]) if vector_records else "(暂无深层记忆)"
 
     # Prompt 增加甄别指令，防止张冠李戴
@@ -311,6 +333,12 @@ async def handle_query_memory(bot: Bot, event: GroupMessageEvent, args: Message 
 
     # 6. 调用 LLM
     max_retries = 2
+    query_memory_chat_thinking = get_chat_thinking_settings()
+    query_memory_chat_extra_body = {
+        "thinking": {
+            "type": "enabled" if query_memory_chat_thinking.get("enabled") else "disabled"
+        }
+    }
 
     for attempt in range(max_retries + 1):
         try:
@@ -319,8 +347,12 @@ async def handle_query_memory(bot: Bot, event: GroupMessageEvent, args: Message 
                 state.client,
                 prompt,
                 model=get_effective_chat_model(),
-                temperature=0.8 + (attempt * 0.2),
+                temperature=None if query_memory_chat_thinking.get("enabled") else 0.8 + (attempt * 0.2),
                 json_mode=True,
+                extra_body=query_memory_chat_extra_body,
+                reasoning_effort=query_memory_chat_thinking.get("reasoning_effort", "high") if query_memory_chat_thinking.get("enabled") else None,
+                max_tokens=min(get_chat_max_tokens(), 2048),
+                timeout=get_chat_timeout(),
                 on_usage=_make_usage_recorder(str(state.session.id), get_effective_chat_model())
             )
 

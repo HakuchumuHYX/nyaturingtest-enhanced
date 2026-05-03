@@ -1,6 +1,16 @@
 from dataclasses import dataclass
 
 
+def clamp_vad_value(value, lower: float, upper: float, default: float = 0.0) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    if number != number:
+        return default
+    return max(lower, min(upper, number))
+
+
 @dataclass
 class EmotionState:
     """
@@ -25,3 +35,9 @@ class EmotionState:
     """
     支配度(dominance): 表示情感的控制程度，范围为[-1.0, 1.0]。
     """
+
+    def clamp(self) -> "EmotionState":
+        self.valence = clamp_vad_value(self.valence, -1.0, 1.0)
+        self.arousal = clamp_vad_value(self.arousal, 0.0, 1.0)
+        self.dominance = clamp_vad_value(self.dominance, -1.0, 1.0)
+        return self

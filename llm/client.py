@@ -1,126 +1,267 @@
 # nyaturingtest/client.py
 import asyncio
-from typing import Callable, Any, Optional, List, Tuple
+from dataclasses import dataclass, field
+import time
+from typing import Callable, Any, Optional
 
 import httpx
 from openai import AsyncOpenAI, APIConnectionError, APITimeoutError
 from nonebot import logger
 
 
+@dataclass
+class LLMResponse:
+    content: str
+    reasoning_content: str = ""
+    finish_reason: str = ""
+    model: str = ""
+    provider: str = "deepseek_official"
+    usage: dict[str, int | str] = field(default_factory=dict)
+
+
+@dataclass
+class ProviderStatus:
+    last_error_type: str = ""
+    last_error_message: str = ""
+    last_error_time: float = 0.0
+    circuit_until: float = 0.0
+
+    @property
+    def circuit_remaining_seconds(self) -> int:
+        return max(0, int(self.circuit_until - time.time()))
+
+
 class LLMClient:
     """
-    Chat LLM client with pluggable provider.
-
-    provider:
-      - openai_compatible: use OpenAI SDK + /chat/completions compatible endpoint
-      - google_ai_studio: use Gemini Developer API official endpoint (generateContent)
+    Chat LLM client for DeepSeek official and OpenAI-compatible endpoints.
     """
 
     def __init__(
         self,
         *,
-        provider: str = "openai_compatible",
+        provider: str = "deepseek_official",
         openai_client: Optional[AsyncOpenAI] = None,
-        google_api_key: Optional[str] = None,
-        google_base_url: str = "https://generativelanguage.googleapis.com/v1beta",
         timeout: float = 60.0,
         proxy: Optional[str] = None,
     ):
-        self.provider = (provider or "openai_compatible").strip().lower()
+        self.provider = self._normalize_provider(provider)
         self.openai_client = openai_client
-        self.google_api_key = (google_api_key or "").strip() or None
-        self.google_base_url = (google_base_url or "https://generativelanguage.googleapis.com/v1beta").rstrip("/")
         self.timeout = timeout
         self.proxy = proxy
+        self.provider_status = ProviderStatus()
+
+    @staticmethod
+    def _normalize_provider(provider: str | None) -> str:
+        value = (provider or "deepseek_official").strip().lower()
+        if value == "openai_compatible":
+            return value
+        if value == "deepseek_official":
+            return value
+        raise ValueError(f"Unsupported LLM provider: {value}")
 
     def _openai_client_required(self) -> AsyncOpenAI:
         if not self.openai_client:
-            raise RuntimeError("openai_client is required when provider=openai_compatible")
+            raise RuntimeError("openai_client is required for LLMClient")
         return self.openai_client
 
     @staticmethod
-    def _build_gemini_payload(prompt: str, system_prompt: str | None) -> dict:
-        system_text = (system_prompt or "").strip()
-        payload: dict = {
-            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-        }
-        if system_text:
-            payload["systemInstruction"] = {"parts": [{"text": system_text}]}
-        return payload
+    def _is_thinking_enabled(extra_body: dict[str, Any] | None) -> bool:
+        thinking = (extra_body or {}).get("thinking")
+        if isinstance(thinking, dict):
+            return str(thinking.get("type", "")).lower() == "enabled"
+        return False
 
     @staticmethod
-    def _parse_gemini_text_and_usage(data: dict) -> tuple[str, dict]:
-        candidates = data.get("candidates") or []
-        text_parts: List[str] = []
-        if candidates:
-            c0 = candidates[0] or {}
-            content = (c0.get("content") or {})
-            parts = content.get("parts") or []
-            for p in parts:
-                if isinstance(p, dict) and p.get("text"):
-                    text_parts.append(str(p.get("text")))
-        text = "\n".join(text_parts).strip()
+    def _usage_to_dict(usage: Any, finish_reason: str) -> dict[str, int | str]:
+        if not usage:
+            data: dict[str, Any] = {}
+        elif hasattr(usage, "model_dump"):
+            data = usage.model_dump()
+        elif isinstance(usage, dict):
+            data = usage
+        else:
+            data = {
+                "prompt_tokens": getattr(usage, "prompt_tokens", 0) or 0,
+                "completion_tokens": getattr(usage, "completion_tokens", 0) or 0,
+                "total_tokens": getattr(usage, "total_tokens", 0) or 0,
+            }
 
-        usage = data.get("usageMetadata") or {}
-        usage_out = {
-            "prompt_tokens": int(usage.get("promptTokenCount") or 0),
-            "completion_tokens": int(usage.get("candidatesTokenCount") or 0),
-            "total_tokens": int(usage.get("totalTokenCount") or 0),
+        completion_details = data.get("completion_tokens_details") or {}
+        if hasattr(completion_details, "model_dump"):
+            completion_details = completion_details.model_dump()
+
+        prompt_tokens = int(data.get("prompt_tokens") or 0)
+        completion_tokens = int(data.get("completion_tokens") or 0)
+        hit_tokens = int(data.get("prompt_cache_hit_tokens") or 0)
+        miss_tokens = int(data.get("prompt_cache_miss_tokens") or 0)
+        reasoning_tokens = int(data.get("reasoning_tokens") or 0)
+        if isinstance(completion_details, dict):
+            reasoning_tokens = int(completion_details.get("reasoning_tokens") or reasoning_tokens)
+
+        return {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": int(data.get("total_tokens") or prompt_tokens + completion_tokens),
+            "prompt_cache_hit_tokens": hit_tokens,
+            "prompt_cache_miss_tokens": miss_tokens,
+            "reasoning_tokens": reasoning_tokens,
+            "finish_reason": finish_reason or "",
         }
-        return text, usage_out
 
-    async def _generate_response_google(
+    @staticmethod
+    def _status_code(exc: Exception) -> int:
+        response = getattr(exc, "response", None)
+        return int(getattr(response, "status_code", 0) or getattr(exc, "status_code", 0) or 0)
+
+    @staticmethod
+    def _error_text(exc: Exception) -> str:
+        response = getattr(exc, "response", None)
+        return str(getattr(response, "text", "") or exc)
+
+    def _classify_exception(self, exc: Exception) -> str:
+        status_code = self._status_code(exc)
+        text = self._error_text(exc).lower()
+        if status_code == 429:
+            return "rate_limit"
+        if "content_filter" in text:
+            return "content_filter"
+        if "insufficient_system_resource" in text:
+            return "insufficient_system_resource"
+        if status_code >= 500:
+            return "server_error"
+        return "api_error"
+
+    def _error_response(self, model: str, error_type: str, message: str = "") -> LLMResponse:
+        self.provider_status.last_error_type = error_type
+        self.provider_status.last_error_message = message[:300]
+        self.provider_status.last_error_time = time.time()
+        return LLMResponse(
+            content="",
+            model=model,
+            provider=self.provider,
+            usage={
+                "provider": self.provider,
+                "error_type": error_type,
+                "error_message": message[:300],
+            },
+        )
+
+    async def generate(
         self,
-        *,
         prompt: str,
         model: str,
-        temperature: float,
-        system_prompt: str | None,
-        on_usage: Callable[[dict], None] | None,
+        temperature: float | None = None,
+        system_prompt: str | None = None,
+        on_usage: Callable[[dict], None] | None = None,
         **kwargs,
-    ) -> str | None:
-        api_key = (self.google_api_key or "").strip()
-        if not api_key:
-            raise RuntimeError("google_api_key is required when provider=google_ai_studio")
+    ) -> LLMResponse:
+        """
+        Generate a structured response. DeepSeek thinking mode is configured via
+        extra_body={"thinking": {"type": "enabled"|"disabled"}, ...}.
+        """
+        system_content = system_prompt or "You are an intelligent agent. Output only valid JSON."
+        max_retries = 3
+        base_delay = 2
 
-        payload = self._build_gemini_payload(prompt, system_prompt)
-        payload["generationConfig"] = {
-            "temperature": float(temperature),
-            # keep a high ceiling; upstream will clamp as needed
-            "maxOutputTokens": int(kwargs.pop("max_tokens", 4096) or 4096),
-        }
+        for attempt in range(max_retries):
+            if self.provider_status.circuit_until > time.time():
+                return LLMResponse(
+                    content="",
+                    model=model,
+                    provider=self.provider,
+                    usage={
+                        "provider": self.provider,
+                        "error_type": "circuit_open",
+                        "error_message": "provider circuit breaker is open",
+                    },
+                )
 
-        # ignore OpenAI-specific kwargs
-        kwargs.pop("response_format", None)
-        kwargs.pop("extra_body", None)
-        kwargs.pop("top_p", None)
-        kwargs.pop("frequency_penalty", None)
-        kwargs.pop("presence_penalty", None)
+            request_kwargs = dict(kwargs)
+            request_timeout = request_kwargs.pop("timeout", self.timeout)
+            extra_body = request_kwargs.get("extra_body")
+            if isinstance(extra_body, dict):
+                extra_body = dict(extra_body)
+                request_kwargs["extra_body"] = extra_body
+            thinking_enabled = self.provider == "deepseek_official" and self._is_thinking_enabled(extra_body)
 
-        async with httpx.AsyncClient(
-            base_url=self.google_base_url,
-            proxy=self.proxy,
-            timeout=float(kwargs.pop("timeout", self.timeout) or self.timeout),
-        ) as client:
-            resp = await client.post(
-                f"/models/{model}:generateContent",
-                params={"key": api_key},
-                json=payload,
-            )
+            if isinstance(extra_body, dict) and "reasoning_effort" in extra_body:
+                request_kwargs["reasoning_effort"] = extra_body.pop("reasoning_effort")
 
-        if resp.status_code != 200:
-            raise Exception(f"API Error {resp.status_code}: {resp.text}")
+            if temperature is not None and not thinking_enabled:
+                request_kwargs["temperature"] = temperature
+            if thinking_enabled:
+                request_kwargs.pop("temperature", None)
+                request_kwargs.pop("top_p", None)
+                request_kwargs.pop("presence_penalty", None)
+                request_kwargs.pop("frequency_penalty", None)
+            request_kwargs = {key: value for key, value in request_kwargs.items() if value is not None}
 
-        data = resp.json()
-        text, usage = self._parse_gemini_text_and_usage(data)
-
-        if on_usage:
             try:
-                on_usage(usage)
-            except Exception as ex:
-                logger.warning(f"Usage callback failed: {ex}")
+                client = self._openai_client_required()
+                response = await client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": system_content},
+                        {"role": "user", "content": prompt},
+                    ],
+                    timeout=request_timeout,
+                    **request_kwargs,
+                )
 
-        return text
+                choice = response.choices[0]
+                message = choice.message
+                finish_reason = getattr(choice, "finish_reason", "") or ""
+                content = getattr(message, "content", "") or ""
+                reasoning_content = getattr(message, "reasoning_content", "") or ""
+                usage = self._usage_to_dict(getattr(response, "usage", None), finish_reason)
+                usage["provider"] = self.provider
+
+                result = LLMResponse(
+                    content=content,
+                    reasoning_content=reasoning_content,
+                    finish_reason=finish_reason,
+                    model=getattr(response, "model", "") or model,
+                    provider=self.provider,
+                    usage=usage,
+                )
+
+                if on_usage:
+                    try:
+                        on_usage(usage)
+                    except Exception as ex:
+                        logger.warning(f"Usage callback failed: {ex}")
+
+                if finish_reason == "length":
+                    return self._error_response(model, "length", "finish_reason=length")
+                if not content.strip() and attempt < max_retries - 1:
+                    self.provider_status.last_error_type = "empty_content"
+                    self.provider_status.last_error_message = "empty content from provider"
+                    self.provider_status.last_error_time = time.time()
+                    await asyncio.sleep(0.2)
+                    continue
+
+                return result
+
+            except (APIConnectionError, APITimeoutError, httpx.ConnectError, httpx.ReadTimeout) as e:
+                logger.warning(f"[LLM] 网络请求失败 (尝试 {attempt + 1}/{max_retries}): {type(e).__name__} - {e}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(base_delay * (attempt + 1))
+                else:
+                    logger.error(f"[LLM] 最终请求失败: {e}")
+                    return self._error_response(model, "network_error", str(e))
+
+            except Exception as e:
+                error_type = self._classify_exception(e)
+                logger.error(f"[LLM] API 调用失败 [{error_type}]: {e}")
+                if error_type == "rate_limit":
+                    self.provider_status.circuit_until = time.time() + 30
+                    return self._error_response(model, error_type, str(e))
+                if error_type in {"insufficient_system_resource", "server_error"} and attempt < max_retries - 1:
+                    await asyncio.sleep(base_delay * (attempt + 1))
+                    continue
+                return self._error_response(model, error_type, str(e))
+
+        return self._error_response(model, "retry_exhausted", "max retries exhausted")
 
     async def generate_response(
         self,
@@ -132,63 +273,14 @@ class LLMClient:
         **kwargs,
     ) -> str | None:
         """
-        生成回复，支持透传参数和自定义 System Prompt，包含重试机制
+        Backward-compatible string API. New call sites should use generate().
         """
-        if not system_prompt:
-            system_content = "You are an intelligent agent. Output the final response in JSON format."
-        else:
-            system_content = system_prompt
-
-        # 重试配置
-        max_retries = 3
-        base_delay = 2
-
-        for attempt in range(max_retries):
-            try:
-                request_timeout = kwargs.pop("timeout", self.timeout)
-
-                if self.provider == "google_ai_studio":
-                    return await self._generate_response_google(
-                        prompt=prompt,
-                        model=model,
-                        temperature=temperature,
-                        system_prompt=system_content,
-                        on_usage=on_usage,
-                        timeout=request_timeout,
-                        **kwargs,
-                    )
-
-                # openai-compatible path (legacy)
-                client = self._openai_client_required()
-                response = await client.chat.completions.create(
-                    model=model,
-                    messages=[
-                        {"role": "system", "content": system_content},
-                        {"role": "user", "content": prompt},
-                    ],
-                    temperature=temperature,
-                    timeout=request_timeout,
-                    **kwargs,
-                )
-
-                if on_usage and response.usage:
-                    try:
-                        on_usage(response.usage.model_dump())
-                    except Exception as ex:
-                        logger.warning(f"Usage callback failed: {ex}")
-
-                return response.choices[0].message.content
-
-            except (APIConnectionError, APITimeoutError, httpx.ConnectError, httpx.ReadTimeout) as e:
-                logger.warning(f"[LLM] 网络请求失败 (尝试 {attempt + 1}/{max_retries}): {type(e).__name__} - {e}")
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(base_delay * (attempt + 1))
-                else:
-                    logger.error(f"[LLM] 最终请求失败: {e}")
-                    return None
-
-            except Exception as e:
-                logger.error(f"[LLM] API 调用发生不可重试错误: {e}")
-                return None
-
-        return None
+        response = await self.generate(
+            prompt=prompt,
+            model=model,
+            temperature=temperature,
+            system_prompt=system_prompt,
+            on_usage=on_usage,
+            **kwargs,
+        )
+        return response.content

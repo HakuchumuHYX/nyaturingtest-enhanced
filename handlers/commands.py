@@ -13,8 +13,13 @@ from nonebot.params import CommandArg
 from nonebot.permission import SUPERUSER
 from nonebot.matcher import Matcher
 
-from ..config import plugin_config
-from ..models.database import EnabledGroupModel
+from ..config import (
+    plugin_config,
+    get_chat_thinking_settings,
+    get_feedback_thinking_settings,
+    get_runtime_settings,
+    get_token_stats_model_names,
+)
 from ..core.state_manager import (
     ensure_group_state,
     remove_group_state,
@@ -24,9 +29,13 @@ from ..core.state_manager import (
     is_shutting_down
 )
 from ..core.logic import message2BotMessage
+from ..core.metrics import metrics
+from ..core.structured_log import log_event
 from ..memory.short_term import Message as MMessage
-from ..database.repository import SessionRepository
+from ..database.enabled_group_repository import EnabledGroupRepository
+from ..database.token_repository import TokenUsageRepository
 from ..database.backup import backup_task
+from .command_meta import render_group_help, render_private_help
 
 
 # ==================== 辅助规则 ====================
@@ -38,6 +47,24 @@ async def is_group_message(event: Event) -> bool:
 
 async def is_private_message(event: Event) -> bool:
     return isinstance(event, PrivateMessageEvent)
+
+
+def _is_priority_message(message: Message, bot_self_id: str, bot_name: str, rendered_text: str) -> bool:
+    for seg in message:
+        if seg.type == "at" and str(seg.data.get("qq", "")) == bot_self_id:
+            return True
+        if seg.type == "reply":
+            return True
+    return f"@{bot_name}" in rendered_text or bot_self_id in rendered_text
+
+
+async def _parse_group_id_or_finish(matcher: type[Matcher], raw: str) -> int:
+    raw_group_id = raw.strip()
+    try:
+        return int(raw_group_id)
+    except ValueError:
+        await matcher.finish("群号必须是数字")
+        raise
 
 
 # ==================== 命令定义 ====================
@@ -136,14 +163,14 @@ async def handle_get_presets_pm(args: Message = CommandArg()):
     arg = args.extract_plain_text().strip()
     if arg == "":
         await get_presets_pm.finish("请提供<qq群号>")
-    group_id = int(arg)
+    group_id = await _parse_group_id_or_finish(get_presets_pm, arg)
     await do_get_presets(get_presets_pm, group_id)
 
 
 async def do_get_presets(matcher: type[Matcher], group_id: int):
     state = ensure_group_state(group_id)
     if not state:
-        return
+        await matcher.finish("本群 Autochat 未启用，请先使用 autochat enable")
     async with state.session_lock:
         await state.session.load_session()
         presets = state.session.presets()
@@ -167,13 +194,14 @@ async def handle_set_presets_pm(args: Message = CommandArg()):
     preset_args = args.extract_plain_text().strip().split(" ", 1)
     if len(preset_args) != 2:
         await set_presets_pm.finish("请提供<qq群号> <预设文件名>")
-    await do_set_presets(set_presets_pm, int(preset_args[0]), preset_args[1])
+    group_id = await _parse_group_id_or_finish(set_presets_pm, preset_args[0])
+    await do_set_presets(set_presets_pm, group_id, preset_args[1])
 
 
 async def do_set_presets(matcher: type[Matcher], group_id: int, file: str):
     state = ensure_group_state(group_id)
     if not state:
-        return
+        await matcher.finish("本群 Autochat 未启用，请先使用 autochat enable")
     async with state.session_lock:
         await state.session.load_session()
         if await state.session.load_preset(filename=file):
@@ -184,41 +212,17 @@ async def do_set_presets(matcher: type[Matcher], group_id: int, file: str):
 
 @help_cmd.handle()
 async def handle_help():
-    help_message = """
-可用命令:
-1. set_role <角色名> <角色设定> - 设置角色
-2. role - 获取当前角色
-3. calm - 冷静（重置全部状态）
-4. reset_emotion - 重置情绪（仅重置VAD）
-5. reset - 重置会话
-6. status - 获取状态
-7. presets - 获取可用预设
-8. help - 显示本帮助信息
-"""
-    await help_cmd.finish(help_message)
+    await help_cmd.finish(render_group_help())
 
 
 @help_pm.handle()
 async def handle_help_pm():
-    help_message = """
-可用命令(私聊需加群号):
-1. set_role <群号> <角色名> <角色设定>
-2. role <群号>
-3. calm <群号>
-4. reset_emotion <群号>
-5. reset <群号>
-6. status <群号>
-7. presets <群号>
-8. list_groups
-9. backup_data
-10. help
-"""
-    await help_pm.finish(help_message)
+    await help_pm.finish(render_private_help())
 
 
 @set_role.handle()
 async def handle_set_role(event: GroupMessageEvent, args: Message = CommandArg()):
-    role_args = args.extract_plain_text().strip().split(" ")
+    role_args = args.extract_plain_text().strip().split(" ", 1)
     if len(role_args) != 2:
         await set_role.finish("请提供<角色名> <角色设定>")
     await do_set_role(set_role, event.group_id, role_args[0], role_args[1])
@@ -226,16 +230,17 @@ async def handle_set_role(event: GroupMessageEvent, args: Message = CommandArg()
 
 @set_role_pm.handle()
 async def handle_set_role_pm(args: Message = CommandArg()):
-    role_args = args.extract_plain_text().strip().split(" ")
+    role_args = args.extract_plain_text().strip().split(" ", 2)
     if len(role_args) != 3:
         await set_role_pm.finish("请提供<群号> <角色名> <角色设定>")
-    await do_set_role(set_role_pm, int(role_args[0]), role_args[1], role_args[2])
+    group_id = await _parse_group_id_or_finish(set_role_pm, role_args[0])
+    await do_set_role(set_role_pm, group_id, role_args[1], role_args[2])
 
 
 async def do_set_role(matcher: type[Matcher], group_id: int, name: str, role: str):
     state = ensure_group_state(group_id)
     if not state:
-        return
+        await matcher.finish("本群 Autochat 未启用，请先使用 autochat enable")
     async with state.session_lock:
         await state.session.load_session()
         await state.session.set_role(name=name, role=role)
@@ -252,13 +257,14 @@ async def handle_get_role_pm(args: Message = CommandArg()):
     arg = args.extract_plain_text().strip()
     if arg == "":
         await get_role_pm.finish("请提供<群号>")
-    await do_get_role(get_role_pm, int(arg))
+    group_id = await _parse_group_id_or_finish(get_role_pm, arg)
+    await do_get_role(get_role_pm, group_id)
 
 
 async def do_get_role(matcher: type[Matcher], group_id: int):
     state = ensure_group_state(group_id)
     if not state:
-        return
+        await matcher.finish("本群 Autochat 未启用，请先使用 autochat enable")
     async with state.session_lock:
         await state.session.load_session()
         role = state.session.role()
@@ -275,13 +281,14 @@ async def handle_calm_down_pm(args: Message = CommandArg()):
     arg = args.extract_plain_text().strip()
     if arg == "":
         await calm_down_pm.finish("请提供<群号>")
-    await do_calm_down(calm_down_pm, int(arg))
+    group_id = await _parse_group_id_or_finish(calm_down_pm, arg)
+    await do_calm_down(calm_down_pm, group_id)
 
 
 async def do_calm_down(matcher: type[Matcher], group_id: int):
     state = ensure_group_state(group_id)
     if not state:
-        return
+        await matcher.finish("本群 Autochat 未启用，请先使用 autochat enable")
     async with state.session_lock:
         await state.session.load_session()
         await state.session.calm_down()
@@ -298,13 +305,14 @@ async def handle_reset_emotion_pm(args: Message = CommandArg()):
     arg = args.extract_plain_text().strip()
     if arg == "":
         await reset_emotion_pm.finish("请提供<qq群号>")
-    await do_reset_emotion(reset_emotion_pm, int(arg))
+    group_id = await _parse_group_id_or_finish(reset_emotion_pm, arg)
+    await do_reset_emotion(reset_emotion_pm, group_id)
 
 
 async def do_reset_emotion(matcher: type[Matcher], group_id: int):
     state = ensure_group_state(group_id)
     if not state:
-        return
+        await matcher.finish("本群 Autochat 未启用，请先使用 autochat enable")
     async with state.session_lock:
         await state.session.load_session()
         await state.session.reset_emotion()
@@ -312,22 +320,28 @@ async def do_reset_emotion(matcher: type[Matcher], group_id: int):
 
 
 @reset.handle()
-async def handle_reset(event: GroupMessageEvent):
+async def handle_reset(event: GroupMessageEvent, args: Message = CommandArg()):
+    arg = args.extract_plain_text().strip().lower()
+    if arg != "confirm":
+        await reset.finish("危险操作：将清空本群会话、记忆和画像。确认执行请发送：reset confirm")
     await do_reset(reset, event.group_id)
 
 
 @reset_pm.handle()
 async def handle_reset_pm(args: Message = CommandArg()):
-    arg = args.extract_plain_text().strip()
-    if arg == "":
-        await reset_pm.finish("请提供<群号>")
-    await do_reset(reset_pm, int(arg))
+    parts = args.extract_plain_text().strip().split(" ", 1)
+    if len(parts) != 2 or parts[1].lower() != "confirm":
+        await reset_pm.finish("危险操作：请提供<群号> confirm")
+    group_id = await _parse_group_id_or_finish(reset_pm, parts[0])
+    await do_reset(reset_pm, group_id)
 
 
 async def do_reset(matcher: type[Matcher], group_id: int):
     state = ensure_group_state(group_id)
     if not state:
-        return
+        await matcher.finish("本群 Autochat 未启用，请先使用 autochat enable")
+    await matcher.send("即将重置，会先执行一次数据备份...")
+    await backup_task()
     async with state.session_lock:
         await state.session.load_session()
         await state.session.reset()
@@ -344,16 +358,35 @@ async def handle_status_pm(args: Message = CommandArg()):
     arg = args.extract_plain_text().strip()
     if arg == "":
         await get_status_pm.finish("请提供<群号>")
-    await do_status(get_status_pm, int(arg))
+    group_id = await _parse_group_id_or_finish(get_status_pm, arg)
+    await do_status(get_status_pm, group_id)
 
 
 async def do_status(matcher: type[Matcher], group_id: int):
     state = ensure_group_state(group_id)
     if not state:
-        return
+        await matcher.finish("本群 Autochat 未启用，请先使用 autochat enable")
     async with state.session_lock:
         await state.session.load_session()
         status_msg = state.session.status()
+    chat_thinking = get_chat_thinking_settings()
+    feedback_thinking = get_feedback_thinking_settings()
+    chat_provider_status = getattr(state.client, "provider_status", None)
+    feedback_provider_status = getattr(state.feedback_client, "provider_status", None)
+    provider_lines = [
+        "",
+        "Provider:",
+        f"- Chat thinking: {'on' if chat_thinking.get('enabled') else 'off'} {chat_thinking.get('reasoning_effort', '')}".strip(),
+        f"- Feedback thinking: {'on' if feedback_thinking.get('enabled') else 'off'}",
+        f"- Queue length: {len(state.messages_chunk)}",
+        f"- Metrics: llm={metrics.llm_success}/{metrics.llm_failure}, vlm={metrics.vlm_success}/{metrics.vlm_failure}, db_write_failure={metrics.db_write_failure}",
+    ]
+    for name, provider_status in (("Chat", chat_provider_status), ("Feedback", feedback_provider_status)):
+        if provider_status and provider_status.last_error_type:
+            provider_lines.append(
+                f"- {name} last_error={provider_status.last_error_type} circuit_remaining={provider_status.circuit_remaining_seconds}s"
+            )
+    status_msg += "\n".join(provider_lines)
     await matcher.finish(status_msg)
 
 
@@ -398,7 +431,11 @@ async def handle_auto_chat(bot: Bot, event: GroupMessageEvent):
         return
 
     message_content = await message2BotMessage(
-        bot_name=bot_name, group_id=group_id, message=event.original_message, bot=bot
+        bot_name=bot_name,
+        group_id=group_id,
+        message=event.original_message,
+        bot=bot,
+        resolve_images=plugin_config.get("vlm", {}).get("enabled", True),
     )
     if not message_content:
         return
@@ -426,6 +463,15 @@ async def handle_auto_chat(bot: Bot, event: GroupMessageEvent):
             nickname = str(user_id)
 
     async with state.data_lock:
+        max_size = get_runtime_settings()["queue_max_size"]
+        if len(state.messages_chunk) >= max_size:
+            is_priority = _is_priority_message(event.original_message, str(bot.self_id), bot_name, message_content)
+            if is_priority:
+                state.messages_chunk.pop(0)
+            else:
+                logger.warning(f"群 {group_id} 消息队列已满，丢弃低优先级消息")
+                log_event("queue_drop", group_id=group_id, decision="drop_low_priority", queue_len=len(state.messages_chunk))
+                return
         state.event = event
         state.bot = bot
         state.messages_chunk.append(
@@ -442,9 +488,6 @@ async def handle_auto_chat(bot: Bot, event: GroupMessageEvent):
 
 @manage_cmd.handle()
 async def handle_manage_autochat(event: GroupMessageEvent, args: Message = CommandArg()):
-    from tortoise import Tortoise
-    from tortoise.transactions import in_transaction
-
     arg = args.extract_plain_text().strip().lower()
     group_id = event.group_id
 
@@ -452,9 +495,7 @@ async def handle_manage_autochat(event: GroupMessageEvent, args: Message = Comma
         if group_id in runtime_enabled_groups:
             await manage_cmd.finish("本群 Autochat 已处于启用状态")
 
-        # 写入数据库 (使用事务确保连接上下文)
-        async with in_transaction():
-            await EnabledGroupModel.create(group_id=group_id)
+        await EnabledGroupRepository.enable_group(group_id)
         # 更新内存
         runtime_enabled_groups.add(group_id)
         # 立即初始化状态
@@ -466,9 +507,7 @@ async def handle_manage_autochat(event: GroupMessageEvent, args: Message = Comma
         if group_id not in runtime_enabled_groups:
             await manage_cmd.finish("本群 Autochat 未启用")
 
-        # 从数据库删除 (使用事务确保连接上下文)
-        async with in_transaction():
-            await EnabledGroupModel.filter(group_id=group_id).delete()
+        await EnabledGroupRepository.disable_group(group_id)
         # 更新内存
         runtime_enabled_groups.discard(group_id)
 
@@ -483,24 +522,14 @@ async def handle_manage_autochat(event: GroupMessageEvent, args: Message = Comma
 
 @token_stats.handle()
 async def handle_token_stats(bot: Bot, event: GroupMessageEvent):
-    from ..config import plugin_config, get_effective_chat_model, get_effective_feedback_model
+    from ..config import plugin_config
     from ..utils import render_token_stats_card
     from nonebot.adapters.onebot.v11 import MessageSegment
     from nonebot.exception import FinishedException
     
     group_id = event.group_id
     
-    # 收集当前正在使用的模型
-    current_models = [
-        get_effective_chat_model(),                             # Chat model
-        plugin_config.get("vlm", {}).get("model", ""),          # VLM model
-        get_effective_feedback_model()                          # Feedback model
-    ]
-    # 去重并过滤空字符串
-    current_models = list(set([m.strip() for m in current_models if m and m.strip()]))
-    
-    # 只查询当前模型的统计数据
-    stats = await SessionRepository.get_token_stats(group_id, model_names=current_models)
+    stats = await TokenUsageRepository.get_token_stats(group_id, model_names=get_token_stats_model_names())
     
     # 获取水印配置
     watermark = plugin_config.get("token_stats", {}).get("watermark", "Generated by HakuBot")
@@ -520,7 +549,7 @@ async def handle_token_stats(bot: Bot, event: GroupMessageEvent):
     except Exception as e:
         logger.error(f"渲染 Token 统计图片失败: {e}")
         # 降级：发送文本消息
-        text_msg = f"Token 统计（当前使用的模型: {', '.join(current_models)}）\n\n"
+        text_msg = "Token 统计（当前模型）\n\n"
         text_msg += f"24h本群: {stats.get('1d_local', [])}\n"
         text_msg += f"24h全局: {stats.get('1d_global', [])}\n"
         await token_stats.finish(text_msg)

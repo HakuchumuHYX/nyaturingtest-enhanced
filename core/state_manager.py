@@ -12,70 +12,48 @@ from ..config import (
     plugin_config,
     get_effective_chat_api_key,
     get_effective_chat_base_url,
+    get_effective_chat_provider,
+    get_chat_timeout,
 )
 from ..memory.short_term import Message as MMessage
 from .session import Session
 from ..utils import get_http_client, close_http_client
-from ..models.database import EnabledGroupModel
+from ..database.enabled_group_repository import EnabledGroupRepository
 
 
 def _build_chat_llm_client() -> LLMClient:
-    provider = plugin_config.get("chat", {}).get("provider", "openai_compatible").strip().lower()
-
-    openai_client = None
-    if provider == "openai_compatible":
-        openai_client = AsyncOpenAI(
-            api_key=get_effective_chat_api_key(),
-            base_url=get_effective_chat_base_url(),
-            http_client=get_http_client(),
-        )
-
-    google_key = plugin_config.get("chat", {}).get("google_api_key", "").strip()
-    if not google_key:
-        # allow reuse existing key if user puts google key into legacy field
-        google_key = get_effective_chat_api_key()
-
-    google_base_url = (
-        plugin_config.get("chat", {}).get("google_base_url") or "https://generativelanguage.googleapis.com/v1beta"
-        or "https://generativelanguage.googleapis.com/v1beta"
+    provider = get_effective_chat_provider()
+    openai_client = AsyncOpenAI(
+        api_key=get_effective_chat_api_key(),
+        base_url=get_effective_chat_base_url(),
+        http_client=get_http_client(),
     )
 
     return LLMClient(
         provider=provider,
         openai_client=openai_client,
-        google_api_key=google_key,
-        google_base_url=google_base_url,
+        timeout=get_chat_timeout(),
     )
 
 
 def _build_feedback_llm_client() -> LLMClient:
-    provider = plugin_config.get("feedback", {}).get("provider", "openai_compatible").strip().lower()
+    from ..config import (
+        get_effective_feedback_api_key,
+        get_effective_feedback_base_url,
+        get_effective_feedback_provider,
+        get_feedback_timeout,
+    )
 
-    openai_client = None
-    if provider == "openai_compatible":
-        from ..config import get_effective_feedback_api_key, get_effective_feedback_base_url
-        openai_client = AsyncOpenAI(
-            api_key=get_effective_feedback_api_key(),
-            base_url=get_effective_feedback_base_url(),
-            http_client=get_http_client(),
-        )
-
-    google_key = plugin_config.get("feedback", {}).get("google_api_key", "").strip()
-    if not google_key:
-        # allow reuse existing key if user puts google key into generic field
-        from ..config import get_effective_feedback_api_key
-        google_key = get_effective_feedback_api_key()
-
-    google_base_url = (
-        plugin_config.get("feedback", {}).get("google_base_url") or "https://generativelanguage.googleapis.com/v1beta"
-        or "https://generativelanguage.googleapis.com/v1beta"
+    openai_client = AsyncOpenAI(
+        api_key=get_effective_feedback_api_key(),
+        base_url=get_effective_feedback_base_url(),
+        http_client=get_http_client(),
     )
 
     return LLMClient(
-        provider=provider,
+        provider=get_effective_feedback_provider(),
         openai_client=openai_client,
-        google_api_key=google_key,
-        google_base_url=google_base_url,
+        timeout=get_feedback_timeout(),
     )
 
 SELF_SENT_MSG_IDS = deque(maxlen=50)
@@ -117,23 +95,8 @@ def is_shutting_down() -> bool:
 
 
 async def init_enabled_groups():
-    # 1. 从数据库读取
-    db_groups = await EnabledGroupModel.all()
-    db_ids = {g.group_id for g in db_groups}
+    db_ids = await EnabledGroupRepository.load_enabled_group_ids(set(plugin_config.get("enabled_groups", [])))
 
-    # 2. 读取配置文件 (用于迁移)
-    config_ids = set(plugin_config.get("enabled_groups", []))
-
-    # 3. 如果配置文件里有 DB 里没有的，自动迁移写入 DB
-    new_ids = config_ids - db_ids
-    if new_ids:
-        logger.info(f"检测到配置文件中的新群组，正在迁移至数据库: {new_ids}")
-        await EnabledGroupModel.bulk_create([
-            EnabledGroupModel(group_id=gid) for gid in new_ids
-        ])
-        db_ids.update(new_ids)
-
-    # 4. 更新到内存集合
     runtime_enabled_groups.clear()
     runtime_enabled_groups.update(db_ids)
     logger.info(f"已加载 Autochat 启用群组: {runtime_enabled_groups}")
@@ -198,6 +161,9 @@ async def remove_group_state(group_id: int):
     # 2. 移除状态
     if group_id in group_states:
         logger.info(f"移除群 {group_id} 的 GroupState...")
+        state = group_states[group_id]
+        await state.session.drain_background_tasks(timeout=10.0)
+        await state.session.close()
         del group_states[group_id]
 
 
@@ -221,6 +187,13 @@ async def cleanup_global_resources():
             logger.info(f"会话保存完毕")
         except Exception as e:
             logger.error(f"关机保存错误: {e}")
+
+    for state in group_states.values():
+        try:
+            await state.session.drain_background_tasks(timeout=10.0)
+            await state.session.close()
+        except Exception as e:
+            logger.warning(f"关闭群会话资源失败: {e}")
 
     # 2. 取消后台任务
     for gid in list(_group_tasks.keys()):

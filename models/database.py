@@ -47,6 +47,7 @@ class InteractionLogModel(Model):
 
     class Meta:
         table = "nyabot_interactions"
+        indexes = (("timestamp",),)
 
 
 class GlobalMessageModel(Model):
@@ -60,6 +61,8 @@ class GlobalMessageModel(Model):
 
     class Meta:
         table = "nyabot_global_messages"
+        unique_together = (("session", "msg_id"),)
+        indexes = (("session", "time"), ("session", "user_id", "time"))
 
 
 class EnabledGroupModel(Model):
@@ -75,10 +78,15 @@ class TokenUsageModel(Model):
     id = fields.IntField(pk=True)
     session_id = fields.CharField(max_length=255)  # 群号
     model_name = fields.CharField(max_length=255)  # 模型名称
+    provider = fields.CharField(max_length=64, default="")
     prompt_tokens = fields.IntField()
     completion_tokens = fields.IntField()
+    prompt_cache_hit_tokens = fields.IntField(default=0)
+    prompt_cache_miss_tokens = fields.IntField(default=0)
+    reasoning_tokens = fields.IntField(default=0)
+    finish_reason = fields.CharField(max_length=64, default="")
     timestamp = fields.DatetimeField(auto_now_add=True)  # 自动记录时间
 
     class Meta:
         table = "nyabot_token_usage"
-        indexes = (("session_id", "timestamp"),)  # 联合索引加速查询
+        indexes = (("session_id", "timestamp"), ("model_name", "timestamp"))  # 联合索引加速查询

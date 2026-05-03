@@ -1,13 +1,9 @@
 # nyaturingtest/mem.py
 from collections import deque
-from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 
 from nonebot import logger
-
-from ..llm.client import LLMClient
-from ..config import plugin_config
 
 
 @dataclass
@@ -47,7 +43,6 @@ class MemoryRecord:
 class Memory:
     def __init__(
             self,
-            llm_client: LLMClient,
             compressed_message: str | None = None,
             messages: list[Message] | None = None,
             length_limit: int = 10,
@@ -56,8 +51,6 @@ class Memory:
         self.__compressed_message = compressed_message or ""
         # 上下文窗口：仅用于对话上下文，保留最近 N 条
         self.__messages = deque(messages, maxlen=length_limit * 5) if messages else deque(maxlen=length_limit * 5)
-        # 不再使用内部 LLMClient，因为压缩逻辑已移交给 Session 统一管理
-        # self.__llm_client = llm_client 
 
     def related_users(self) -> list[str]:
         """
@@ -86,7 +79,14 @@ class Memory:
             compressed_history=self.__compressed_message,
         )
 
-    async def update(self, message_chunk: list[Message], after_compress: Callable[[], None] | None = None):
+    def access_context(self, limit: int = 20) -> MemoryRecord:
+        safe_limit = max(1, min(int(limit or self.__length_limit), self.__messages.maxlen or self.__length_limit))
+        return MemoryRecord(
+            messages=list(self.__messages)[-safe_limit:],
+            compressed_history=self.__compressed_message,
+        )
+
+    async def update(self, message_chunk: list[Message]):
         """
         仅更新上下文窗口，不再触发后台压缩任务
         增加基于 message_id 的去重逻辑
@@ -106,7 +106,3 @@ class Memory:
         if to_add:
             # 1. 更新上下文窗口 (Rolling Window)
             self.__messages.extend(to_add)
-        
-        # 为了兼容性，保留 after_compress 参数但暂不使用
-        if after_compress:
-            pass

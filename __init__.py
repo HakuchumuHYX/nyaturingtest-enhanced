@@ -4,6 +4,7 @@ from tortoise import Tortoise
 from pathlib import Path
 
 from .core.state_manager import cleanup_global_resources, init_enabled_groups
+from .database.migrations import ensure_schema_version
 from .handlers import commands
 from .handlers import memory
 from .database.backup import setup_backup_job
@@ -28,6 +29,7 @@ async def init_db():
         _enable_global_fallback=True
     )
     await Tortoise.generate_schemas()
+    await ensure_schema_version()
     logger.info(f"数据库已连接: {db_path}")
 
     # 初始化群组列表
