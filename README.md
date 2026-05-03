@@ -1,63 +1,57 @@
-# nyaturingtest-enhanced
+# nyaturingtest
 
-## 项目简介
+`nyaturingtest` 是一个面向群聊的 NoneBot2 / OneBot V11 自动聊天插件。它基于
+[`nonebot-plugin-nyaturingtest`](https://github.com/shadow3aaa/nonebot-plugin-nyaturingtest)
+改造，核心目标是把原本依赖本地大模型和本地 Embedding 的链路迁移到云端 API，同时保留拟人化插话、长期记忆、情绪状态和角色预设。
 
-本项目是基于 [nonebot-plugin-nyaturingtest](https://github.com/shadow3aaa/nonebot-plugin-nyaturingtest) 的改造版本。
+当前版本以群为单位维护独立会话：每个启用的群都有自己的短时上下文、长期向量记忆、角色设定、用户画像、情绪状态、Token 统计和后台思考任务。
 
-核心目标是将原项目从"重本地算力"转向"重云端API"，在保留核心拟人化交互体验的同时，极大地降低部署门槛和资源消耗。
+## 功能概览
 
-## ✨ 核心特性
+- **自动群聊插话**：启用群组后，插件监听群消息，通过后台 `spawn_state` 循环批量处理消息并决定是否回复。
+- **拟人化状态**：维护潜水、冒泡、活跃三种聊天状态，并用意愿值、冷却时间、强关联检测控制发言频率。
+- **强关联响应**：当消息 `@Bot`、回复 Bot 消息或命中 Bot 名称/别名时，会提升意愿值，降低“叫不答应”的概率。
+- **双阶段 LLM 链路**：Feedback 阶段负责情绪、摘要、画像、记忆提取；Chat 阶段负责生成最终回复。
+- **长期记忆**：使用 ChromaDB 持久化向量记忆，通过 SiliconFlow Embedding 召回，并可使用 Rerank 二次排序。
+- **短时记忆**：保存最近消息和摘要，摘要由 Feedback 阶段更新，不再由短时记忆模块自行调用小模型压缩。
+- **多模态图片理解**：`vlm.enabled=true` 时，会下载并压缩图片/表情包，调用 OpenAI-compatible VLM 生成中文描述后写入上下文。
+- **Token 统计**：记录 Chat、Feedback、VLM 的 prompt/completion/reasoning tokens，以及 DeepSeek prompt cache hit/miss。
+- **SQLite 持久化**：会话状态、消息、用户画像、启用群组和 Token 使用量存入 SQLite，并带基础迁移与索引。
+- **自动备份**：每天 04:00 自动打包插件数据；`reset confirm` 前也会先触发一次备份。
 
-### 1. 轻量化架构 (Lite Architecture)
+## 运行环境
 
-- **去本地化模型**：移除了原项目中庞大的 `HippoRAG` (图神经网络) 和本地 `BGE-M3` Embedding 模型。
-- **云端算力替代**：
-  - **Embedding**: 对接 SiliconFlow (硅基流动) 的 Embedding API，速度更快，效果更强。
-  - **VLM**: 图片理解模块保留 OpenAI-compatible 视觉模型路线，无需本地显存即可实现高精度识图。
-  - **Rerank (重排序)**: 引入 Reranker 模型优化 RAG 检索链路，大幅提升长期记忆召回的准确性。
-- **资源占用骤降**：运行时内存占用从 4GB+ 降低至 **200MB 左右**，启动速度提升至秒级。
+插件依赖宿主 NoneBot 项目提供运行环境。本仓库所在项目的关键依赖包括：
 
-### 2. 增强的交互逻辑
+- Python `>=3.10`
+- `nonebot2[fastapi]`
+- `nonebot-adapter-onebot`
+- `nonebot-plugin-localstore`
+- `nonebot-plugin-apscheduler`
+- `tortoise-orm`
+- `openai`
+- `httpx`
+- `chromadb`
+- `pillow`
 
-- **自主意识循环**：采用 `Producer-Consumer` 模型的后台思考循环 (`spawn_state`)，Bot 会根据群聊上下文自主决定是否发言，而非传统的"一问一答"。
-- **强制响应机制**：解决了"叫不答应"的问题。当检测到 `@Bot` 或 `回复Bot消息` 时，会自动打破"潜水"状态，强制触发响应逻辑。
-- **拟人化状态机**：维护 `潜水` / `冒泡` / `活跃` 三种状态，根据群聊热度动态调整插话频率。
-- **多模态感知**: 当 `vlm.enabled=true` 时，能够通过 VLM 模型"看见"群聊图片，并将图片内容转化为文本纳入对话上下文，实现真正的"看图说话"。
-- **情绪护栏**：基于 VAD 情绪模型动态调整回复风格，并设有护栏机制确保 Bot 在负面情绪下也不会产生攻击性语言。
+如果使用本项目根目录的 `pyproject.toml`，直接安装项目依赖即可。
 
-### 3. 稳定可靠的数据持久化
+## 配置
 
-- **数据库迁移**：从不稳定的 JSON 文件读写全面迁移至 **SQLite + Tortoise-ORM**。
-- **实时记忆**：
-  - **长期记忆**: 使用 **ChromaDB** 存储向量化记忆，支持实时写入和去重，意外断电不丢数据。
-  - **短时记忆**: 采用滑动窗口 + LLM 实时摘要 (`Summary`) 机制，自动压缩历史对话。
-- **自动灾备 (New)**：内置基于 `APScheduler` 的全量数据备份系统。
-  - 每天凌晨 04:00 自动将 SQLite 与向量库文件打包压缩为 zip。
-  - 自动轮转清理机制（仅保留最近 7 天的备份），极大程度避免因意外 `/reset` 带来的"失忆"灾难。
-- **配置持久化**: 群组的 Autochat 开启/关闭状态现已存入数据库，重启后不再丢失。
-- **按群隔离**: 所有数据（消息、画像、交互日志）按群组独立存储，互不影响。
+配置文件位于插件目录：
 
-### 4. 运维与监控
+- 私有配置：`plugins/nyaturingtest/config.json`
+- 提交模板：`plugins/nyaturingtest/config.example.json`
 
-- **Token 智能追踪**: 内置了精确的 Token 消耗统计系统。
-  - **全链路覆盖**: 包含 Chat (对话)、VLM (识图)、Feedback (反思) 三大核心环节。
-  - **多维度报表**: 支持查看 24小时、7天以及历史总计的消耗情况，并按模型细分。
-  - **图片渲染**: 统计结果以精美的卡片图片形式呈现，支持自定义水印。
-- **并发控制**：引入 `asyncio.Semaphore` 限制图片处理并发数，防止瞬间大量图片导致内存溢出。
-- **后台任务保护**: 所有后台异步任务均配备异常捕获，防止静默失败导致数据丢失。
-- **网络优化**：API 请求使用全局 `httpx` 连接池，支持自定义 SSL 配置。
+`config.json` 不应提交到仓库。首次启动时如果文件不存在，插件会创建默认配置，但 API Key 仍需要手动填写。
 
----
+### 最小可用配置
 
-## 🛠️ 配置指南
-
-本插件使用 `config.json` 进行配置（位于插件目录下）。该文件是 gitignored 的本地私有配置，可以放真实 API Key；提交配置模板时使用 `config.example.json`。
-
-```jsonc
+```json
 {
   "chat": {
     "provider": "deepseek_official",
-    "api_key": "sk-your-deepseek-key",
+    "api_key": "YOUR_DEEPSEEK_API_KEY",
     "base_url": "https://api.deepseek.com",
     "model": "deepseek-v4-flash",
     "thinking": {
@@ -68,17 +62,9 @@
     "max_tokens": 4096,
     "timeout": 180
   },
-  "vlm": {
-    "enabled": true, // 是否启用图片理解
-    "provider": "openai_compatible",
-    "api_key": "sk-your-vlm-key",
-    "base_url": "https://api.siliconflow.cn/v1",
-    "model": "zai-org/GLM-4.6V",
-    "timeout": 60
-  },
   "feedback": {
     "provider": "deepseek_official",
-    "api_key": "sk-your-deepseek-key",
+    "api_key": "YOUR_DEEPSEEK_API_KEY",
     "base_url": "https://api.deepseek.com",
     "model": "deepseek-v4-flash",
     "thinking": {
@@ -87,136 +73,258 @@
     "max_tokens": 2048,
     "timeout": 60
   },
-  "siliconflow_api_key": "sk-your-siliconflow-key", // 硅基流动 API Key (Embedding + Rerank)
+  "vlm": {
+    "enabled": true,
+    "provider": "openai_compatible",
+    "api_key": "YOUR_VLM_API_KEY",
+    "base_url": "https://api.siliconflow.cn/v1",
+    "model": "zai-org/GLM-4.6V",
+    "timeout": 60
+  },
+  "siliconflow_api_key": "YOUR_SILICONFLOW_API_KEY",
+  "embedding": {
+    "model": "BAAI/bge-m3",
+    "base_url": "https://api.siliconflow.cn/v1",
+    "timeout": 30
+  },
   "rerank": {
-    "model": "BAAI/bge-reranker-v2-m3", // 重排序模型
-    "threshold": 0.1, // 重排序阈值 (0-1)
+    "model": "Qwen/Qwen3-Reranker-4B",
+    "base_url": "https://api.siliconflow.cn/v1/rerank",
+    "timeout": 10,
+    "threshold": 0.1
   },
   "token_stats": {
-    "watermark": "Generated by HakuBot", // Token 统计卡片水印
+    "watermark": "Generated by HakuBot"
   },
-  "enabled_groups": [], // 初始启用的群号列表
+  "runtime": {
+    "debounce_seconds": 2.0,
+    "queue_max_size": 200,
+    "send_strategy": "split_by_sentence",
+    "max_reply_messages": 2,
+    "humanized_delay_seconds": 1.0,
+    "low_willingness_observe_interval": 5,
+    "role_max_chars": 4000,
+    "examples_max_chars": 2000,
+    "short_context_limit": 20,
+    "interaction_log_recent_days": 180,
+    "history_recall_limit": 20,
+    "speak_cooldown_seconds": 10.0,
+    "willingness_idle_after_seconds": 300.0,
+    "willingness_decay_rate_active": 0.03,
+    "willingness_decay_rate_idle": 0.06,
+    "relevance_willingness_floor": 0.95,
+    "passive_willingness_growth_limit": 0.7,
+    "passive_willingness_growth_per_message": 0.03,
+    "low_willingness_skip_threshold": 0.35,
+    "post_feedback_skip_threshold": 0.4,
+    "rerank_willingness_threshold": 0.6
+  },
+  "enabled_groups": []
 }
 ```
 
-> **注意**: Chat 与 Feedback 默认使用 DeepSeek 官方 API；Embedding/Rerank 继续使用 SiliconFlow；VLM 使用 OpenAI-compatible 视觉模型。
+### Provider 说明
 
----
+- `chat.provider` 和 `feedback.provider` 支持 `deepseek_official` 与 `openai_compatible`。
+- DeepSeek 官方接口默认使用 `https://api.deepseek.com`。
+- `vlm.provider` 只支持 `openai_compatible`。
+- 旧版非 OpenAI-compatible provider 已被移除，配置为已移除 provider 会直接报错。
+- `siliconflow_api_key` 用于长期记忆的 Embedding 和 Rerank。
+- Chat 默认开启 DeepSeek thinking；Feedback 默认关闭 thinking，以保证结构化状态更新稳定。
 
-## 🎮 指令列表
+### Runtime 说明
 
-除 `/查询记忆` 外，管理类指令仅支持 **SUPERUSER** 使用。大部分管理指令同时支持群聊和私聊（私聊需附加群号）；`/查询记忆` 是群聊内公开指令，所有群员可用。
+`runtime` 控制热路径策略，加载时会做基本范围保护：
 
-### 群聊指令
+- `debounce_seconds`：收到消息后等待同一批消息进入队列的防抖时间。
+- `queue_max_size`：每群待处理消息队列上限。
+- `send_strategy`：`single` 表示整段发送；其他值默认按句子拆分。
+- `max_reply_messages`：单次最多发送几条回复。
+- `speak_cooldown_seconds`：非强关联消息触发回复前的发言冷却。
+- `low_willingness_skip_threshold` / `post_feedback_skip_threshold`：意愿值低于阈值时跳过回复。
+- `rerank_willingness_threshold`：意愿值达到阈值或强关联时启用 Rerank 检索。
 
-| 指令                         | 别名          | 说明                                                               |
-| :--------------------------- | :------------ | :----------------------------------------------------------------- |
-| `/help`                      | 帮助          | 显示帮助信息                                                       |
-| `/autochat <enable/disable>` | -             | 在本群启用或禁用 AI 自动插话（持久化）                             |
-| `/status`                    | 状态          | 查看 Bot 状态（情绪、意愿值、记忆等）                              |
-| `/role`                      | 当前角色      | 查看当前加载的角色设定                                             |
-| `/set_role <角色名> <设定>`  | 设置角色      | 动态修改 Bot 的人设                                                |
-| `/presets`                   | preset        | 查看所有可用的预设文件                                             |
-| `/set_preset <文件名>`       | set_presets   | 从文件加载角色预设                                                 |
-| `/calm`                      | 冷静          | 重置情绪、意愿值和活跃状态（保留记忆和人设）                       |
-| `/reset_emotion`             | 重置情绪      | 仅重置 VAD 情绪值（保留意愿值、记忆等）                            |
-| `/reset confirm`             | 重置          | **完全重置**：先自动备份，再清空人设、记忆、情绪，并删除数据库中的消息和画像记录 |
-| `/token统计`                 | -             | 查看本群及全局全部模型的 Token、reasoning token、DeepSeek cache hit/miss 统计 |
-| `/查询记忆 <@某人/空>`       | memory / 印象 | 查看 AI 对特定群友的长期记忆与印象                                 |
-| `/backup_data`               | 备份数据      | **手动触发数据备份**：立即打包所有插件数据到备份文件夹             |
+## 启用方式
 
-### 私聊指令
+确认宿主 NoneBot 项目已加载本地插件目录后，启动 Bot。插件启动时会：
 
-私聊指令通常需要指定群号，格式为：`指令 <群号> [参数]`。
+1. 初始化 SQLite 数据库。
+2. 执行必要的 schema migration。
+3. 从数据库和 `enabled_groups` 配置加载已启用群组。
+4. 注册每日 04:00 的自动备份任务。
 
-| 指令                              | 说明                 |
-| :-------------------------------- | :------------------- |
-| `status <群号>`                   | 查看指定群的状态     |
-| `set_role <群号> <角色名> <设定>` | 修改指定群的角色     |
-| `set_preset <群号> <文件名>`      | 加载指定群的预设     |
-| `calm <群号>`                     | 冷静指定群           |
-| `reset_emotion <群号>`            | 重置指定群情绪       |
-| `reset <群号> confirm`            | 先备份再完全重置指定群 |
-| `list_groups` / 群组列表          | 查看所有已启用的群组 |
-| `backup_data` / 备份数据          | 手动触发全量数据备份 |
+在群聊中由 SUPERUSER 执行：
 
-### 重置指令对比
+```text
+/autochat enable
+```
 
-| 功能                       | `/calm` | `/reset_emotion` | `/reset` |
-| :------------------------- | :-----: | :--------------: | :------: |
-| 重置情绪 (VAD)             |   ✅    |        ✅        |    ✅    |
-| 重置用户画像               |   ✅    |   ✅ (仅情绪)    |    ✅    |
-| 重置意愿值/活跃状态        |   ✅    |        ❌        |    ✅    |
-| 清空短时记忆               |   ❌    |        ❌        |    ✅    |
-| 清空向量记忆 (ChromaDB)    |   ❌    |        ❌        |    ✅    |
-| 删除数据库记录 (消息/日志) |   ❌    |        ❌        |    ✅    |
-| 重置人设为默认             |   ❌    |        ❌        |    ✅    |
+禁用当前群：
 
----
+```text
+/autochat disable
+```
 
-## 📂 项目架构 (Refactored)
+启用状态会写入数据库，重启后不会丢失。`enabled_groups` 只作为初始配置来源，数据库记录会参与合并加载。
 
-为了提高大型项目的可维护性，插件采用扁平化演进的高内聚包结构划分：
+## 命令
 
-### 1. 业务接入层 (`handlers/`)
+以下命令默认以 `/` 作为示例前缀；实际前缀取决于宿主 NoneBot 的 `command_start` 配置。
 
-- **`commands.py`**: Bot 命令处理入口，负责各种群管/交互指令及手动备份。
-- **`memory.py`**: 暴露给普通用户的被动/主动查阅记忆入口，综合生成印象报告。
+### 群聊命令
 
-### 2. 核心调度层 (`core/`)
+除 `/查询记忆` 外，群聊命令都需要 SUPERUSER 权限。
 
-- **`state_manager.py`**: 管理各群组的 `GroupState` 会话隔离，以及并发原语 (Lock/Event/Task)。
-- **`logic.py`**: 包含 `spawn_state` 主循环线程大脑，决策插话策略并控制 Bot 交互时序。
-- **`session.py`**: 各群聊会话生命周期的管理与上下文封装。
+| 命令 | 别名 | 说明 |
+| --- | --- | --- |
+| `/help` | `/帮助` | 显示群聊帮助 |
+| `/autochat enable` | - | 在当前群启用 Autochat |
+| `/autochat disable` | - | 在当前群禁用 Autochat |
+| `/status` | `/状态` | 查看当前群状态、provider 错误和基础 metrics |
+| `/role` | `/当前角色` | 查看当前角色设定 |
+| `/set_role <角色名> <角色设定>` | `/设置角色` | 修改当前群角色，人设文本可包含空格 |
+| `/presets` | `/preset` | 查看可用角色预设 |
+| `/set_preset <文件名>` | `/set_presets` | 加载角色预设，文件名可省略 `.json` |
+| `/calm` | `/冷静` | 重置情绪、用户画像、意愿值和聊天状态，保留记忆与人设 |
+| `/reset_emotion` | `/重置情绪` | 仅重置全局 VAD 情绪和用户画像中的情绪 |
+| `/reset confirm` | `/重置 confirm` | 先备份，再完全重置当前群会话、记忆、画像和消息 |
+| `/token统计` | `/autochat token统计` | 以图片卡片展示 Token 统计 |
+| `/backup_data` | `/备份数据` | 手动触发全量数据备份 |
+| `/查询记忆 [@用户]` | `/memory`、`/印象` | 普通群员可用，查询 Bot 对自己或被 @ 用户的长期印象 |
 
-### 3. 数据层 (`database/`)
+### 私聊命令
 
-- **`repository.py`**: 使用 Tortoise-ORM 封装了底层 SQLite 的所有增删改查逻辑（包含Token统计、长期画像、短时日志等）。
-- **`backup.py`**: 守护核心数据的每日凌晨自动化归档备份逻辑。
+私聊管理命令需要 SUPERUSER 权限。除 `help`、`list_groups`、`backup_data` 外，多数命令需要显式指定群号。
 
-### 4. 大模型通信层 (`llm/`)
+| 命令 | 说明 |
+| --- | --- |
+| `help` | 显示私聊帮助 |
+| `status <群号>` | 查看指定群状态 |
+| `role <群号>` | 查看指定群角色 |
+| `set_role <群号> <角色名> <角色设定>` | 修改指定群角色 |
+| `presets <群号>` | 查看指定群可用预设 |
+| `set_preset <群号> <文件名>` | 为指定群加载预设 |
+| `calm <群号>` | 冷静指定群 |
+| `reset_emotion <群号>` | 重置指定群情绪 |
+| `reset <群号> confirm` | 先备份，再完全重置指定群 |
+| `list_groups` / `群组列表` | 查看数据库中已启用的群 |
+| `backup_data` / `备份数据` | 手动触发全量数据备份 |
 
-- **`client.py`**: 基于 AsyncOpenAI 封装的高可用大模型通信基类。
-- **`vlm.py`**: 提供 OpenAI-compatible 多模态看图服务模块。
+### 重置范围
 
-### 5. 记忆与心智 (`memory/`)
+| 操作 | 情绪 | 用户画像 | 意愿值/状态 | 短时记忆 | 长期向量记忆 | 数据库消息/日志 | 人设 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `/calm` | 重置 | 清空 | 重置 | 保留 | 保留 | 保留 | 保留 |
+| `/reset_emotion` | 重置 | 仅重置画像情绪 | 保留 | 保留 | 保留 | 保留 | 保留 |
+| `/reset confirm` | 重置 | 清空 | 重置 | 清空 | 清空 | 删除 | 恢复默认 |
 
-- **`short_term.py`**: 滑动窗口记忆。基于消息队列进行即时会话缓存；摘要由 Feedback 阶段统一维护。
-- **`vector.py`**: ChromaDB 持久化向量检索。结合 Embedding 与 Rerank 双重引擎。
-- **`image.py`**: 专门处理图片下载、GIF解析以及并发的看图缓存管理。
+## 角色预设
 
-### 6. 模型定义 (`models/`)
+预设文件从 localstore 的插件配置目录加载，在本项目中通常是：
 
-- **`database.py`**: SQLite 的 ORM 结构模型实体 (Table Schema)。
-- **`profile.py`**: 结合了 VAD 模型的心智与衰减公式等逻辑模型实体。
-- **`presets.py`**: 基于 pydantic 的预设实体配置项与加载器。
+```text
+config/nyaturingtest/nya_presets/
+```
 
-### 7. 提示词工程 (`prompts/`)
+预设 JSON 对应 `RolePreset`，主要字段包括：
 
-- 存放了与预设强绑定、分离管理的不同 prompt 文件。
+- `name`：角色名。
+- `role`：人设。
+- `aliases`：别名，用于强关联检测。
+- `knowledges` / `relationships` / `events` / `bot_self`：加载预设时写入长期向量记忆的设定信息。
+- `examples`：对话样本，会拼入角色提示词。
+- `hidden`：是否从 `/presets` 输出中隐藏。
 
-### 8. 公共配置与工具
+新增或修改预设后，使用 `/set_preset <文件名>` 重新加载到对应群。
 
-- **`config.py`**: JSON 动态配置加载器。
-- **`utils.py`**: 通用的工具集 (绘图、格式化、分割等)。
+## 数据与备份
 
----
+插件数据由 `nonebot-plugin-localstore` 管理。本项目中常见路径是：
 
-## ⚠️ 注意事项
+```text
+data/nyaturingtest/
+```
 
-1. **Token 消耗**：
-   - Bot 需要不断读取群聊上下文进行"自我思考"（Feedback 阶段），Token 消耗可观。
-   - **建议**：使用 `/token统计` 指令定期监控消耗、reasoning token 和 DeepSeek cache hit ratio。
+主要内容：
 
-2. **数据库文件**：
-   - 运行时会在插件数据目录生成 `nyabot.sqlite`，请定期备份。
-   - 长期记忆向量库由 ChromaDB 管理，数据位于插件数据目录下。
-   - 使用 `/reset confirm` 会先触发备份，再删除该群的所有数据库记录；删除仍不可逆，请确认备份可用。
+- `nyabot.sqlite`：SQLite 主数据库。
+- `vector_index_<群号>/`：每个群的 ChromaDB 向量库。
+- `image_cache/`：图片识别缓存，位于插件 cache 目录。
+- 字体文件：Token 统计卡片渲染使用。
 
-3. **预设文件**：
-   - 角色预设 JSON 文件存放在 `config/nyaturingtest/nya_presets/` 目录下。
-   - 修改预设后需执行 `/set_preset <文件名>` 重新加载。
+备份文件默认写入插件数据目录同级的：
 
-## Special Thanks
+```text
+nyaturingtest_backups/
+```
 
-- **原作者**: [shadow3aaa](https://github.com/shadow3aaa/) 提供的前沿架构思路。
+备份文件名格式：
+
+```text
+nyabot_backup_YYYYMMDD_HHMMSS.zip
+```
+
+备份逻辑会使用 SQLite backup API 复制数据库快照，并打包向量库等插件数据。当前只按数量保留最近 7 个备份；建议定期把备份复制到外部存储，并在测试环境做恢复演练。
+
+## 模块结构
+
+```text
+plugins/nyaturingtest/
+├── __init__.py              # NoneBot 生命周期入口，初始化数据库、群组和备份任务
+├── config.py                # 配置加载、兼容迁移、provider/runtime 访问器
+├── handlers/
+│   ├── commands.py          # 管理命令、自动消息入口、Token 统计
+│   ├── memory.py            # 公开的 /查询记忆 命令
+│   └── command_meta.py      # help 文本的命令元数据
+├── core/
+│   ├── state_manager.py     # 每群 GroupState、后台任务和资源清理
+│   ├── logic.py             # OneBot 消息转换、LLM 调用包装、spawn_state 主循环
+│   ├── session.py           # 会话状态、记忆、情绪、角色和阶段逻辑
+│   ├── orchestrator.py      # 短时记忆、检索、Feedback、Chat 的编排
+│   ├── services.py          # 面向 orchestrator 的轻量服务封装
+│   └── message_sender.py    # 回复拆分策略
+├── database/
+│   ├── migrations.py        # SQLite schema 迁移
+│   ├── *_repository.py      # 会话、消息、画像、Token、启用群组等窄 repository
+│   └── backup.py            # 自动/手动备份
+├── llm/
+│   ├── client.py            # Chat/Feedback LLMClient
+│   └── vlm.py               # OpenAI-compatible VLM 适配器
+├── memory/
+│   ├── short_term.py        # 短时消息窗口和摘要载体
+│   ├── vector.py            # ChromaDB + SiliconFlow Embedding/Rerank
+│   ├── image.py             # 图片下载、缓存、压缩、GIF 处理和 VLM 描述
+│   └── image_policy.py      # 图片安全限制
+├── models/                  # ORM、情绪、画像、印象模型
+├── prompts/                 # Chat/Feedback prompt 模板与角色预设加载
+└── tests/                   # 单元测试和静态约束测试
+```
+
+## 运维建议
+
+- 先只在低流量群执行 `/autochat enable`，观察 `/status` 和 `/token统计`。
+- `/status` 会显示 Chat/Feedback thinking 状态、消息队列长度、LLM/VLM 成功失败计数和最近 provider 错误。
+- DeepSeek thinking 会增加 reasoning tokens；上线后应重点关注 `/token统计` 中的 reasoning token 和 cache hit ratio。
+- 图片理解会额外消耗 VLM tokens；不需要看图时可设置 `vlm.enabled=false`。
+- `reset confirm` 是不可逆操作，虽然会先备份，但仍应确认备份文件存在且可恢复。
+- 如果 provider 返回 429，`LLMClient` 会短暂打开 circuit breaker，避免持续打满上游。
+
+## 测试
+
+在本项目根目录可运行：
+
+```bash
+/opt/HakuBot-autochat/.venv/bin/python -m compileall -q plugins/nyaturingtest
+/opt/HakuBot-autochat/.venv/bin/python -m unittest discover -s plugins/nyaturingtest/tests -q
+```
+
+在插件仓库目录也可以运行：
+
+```bash
+/opt/HakuBot-autochat/.venv/bin/python -m compileall -q .
+/opt/HakuBot-autochat/.venv/bin/python -m unittest discover -s tests -q
+```
+
+## 致谢
+
+- 原项目作者 [shadow3aaa](https://github.com/shadow3aaa/)。
