@@ -19,6 +19,7 @@ from ..config import (
     get_feedback_thinking_settings,
     get_runtime_settings,
     get_token_stats_model_names,
+    get_config_load_status,
 )
 from ..core.state_manager import (
     ensure_group_state,
@@ -386,6 +387,11 @@ async def do_status(matcher: type[Matcher], group_id: int):
             provider_lines.append(
                 f"- {name} last_error={provider_status.last_error_type} circuit_remaining={provider_status.circuit_remaining_seconds}s"
             )
+    config_status = get_config_load_status()
+    if not config_status.ok or config_status.source != "file":
+        provider_lines.append(
+            f"- Config: source={config_status.source} ok={config_status.ok} error={config_status.error_type}"
+        )
     status_msg += "\n".join(provider_lines)
     await matcher.finish(status_msg)
 

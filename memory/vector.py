@@ -208,6 +208,9 @@ class VectorMemory:
                 documents=candidate_docs,
                 top_n=len(candidate_docs), # 全排，然后本地过滤
             )
+            if not rerank_results:
+                logger.debug("Rerank无结果，回退到初筛候选")
+                return flattened_candidates[:k]
             
             final_results = []
             threshold = plugin_config.get("rerank", {}).get("threshold", 0.05)
@@ -219,7 +222,7 @@ class VectorMemory:
                 if score < threshold:
                     continue
                     
-                if idx < len(flattened_candidates):
+                if isinstance(idx, int) and 0 <= idx < len(flattened_candidates):
                     item = flattened_candidates[idx]
                     # 可以把分数附加上去，方便调试
                     item["metadata"]["rerank_score"] = score
@@ -229,6 +232,9 @@ class VectorMemory:
                     break
             
             logger.debug(f"Rerank完成: 初筛{len(candidate_docs)} -> 终选{len(final_results)} (阈值{threshold})")
+            if not final_results:
+                logger.debug("Rerank结果全部被过滤，回退到初筛候选")
+                return flattened_candidates[:k]
             return final_results
 
         except Exception as e:

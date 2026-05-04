@@ -42,6 +42,38 @@ class PluginSettings:
     rerank_threshold: float
 
 
+@dataclass(frozen=True)
+class ConfigLoadStatus:
+    ok: bool
+    source: str
+    path: str
+    error_type: str = ""
+    error_message: str = ""
+
+
+_config_load_status = ConfigLoadStatus(ok=True, source="not_loaded", path=str(CONFIG_FILE))
+
+
+def _set_config_load_status(
+    *,
+    ok: bool,
+    source: str,
+    error: Exception | None = None,
+) -> None:
+    global _config_load_status
+    _config_load_status = ConfigLoadStatus(
+        ok=ok,
+        source=source,
+        path=str(CONFIG_FILE),
+        error_type=type(error).__name__ if error else "",
+        error_message=str(error)[:300] if error else "",
+    )
+
+
+def get_config_load_status() -> ConfigLoadStatus:
+    return _config_load_status
+
+
 def get_default_config() -> dict:
     """返回默认配置"""
     return {
@@ -105,16 +137,16 @@ def get_default_config() -> dict:
             "short_context_limit": 20,
             "interaction_log_recent_days": 180,
             "history_recall_limit": 20,
-            "speak_cooldown_seconds": 10.0,
+            "speak_cooldown_seconds": 16.0,
             "willingness_idle_after_seconds": 300.0,
             "willingness_decay_rate_active": 0.03,
             "willingness_decay_rate_idle": 0.06,
             "relevance_willingness_floor": 0.95,
-            "passive_willingness_growth_limit": 0.7,
-            "passive_willingness_growth_per_message": 0.03,
-            "low_willingness_skip_threshold": 0.35,
-            "post_feedback_skip_threshold": 0.4,
-            "rerank_willingness_threshold": 0.6,
+            "passive_willingness_growth_limit": 0.72,
+            "passive_willingness_growth_per_message": 0.045,
+            "low_willingness_skip_threshold": 0.30,
+            "post_feedback_skip_threshold": 0.34,
+            "rerank_willingness_threshold": 0.68,
         },
         "enabled_groups": [],
     }
@@ -244,6 +276,7 @@ def load_plugin_config() -> dict:
         logger.warning(f"配置文件不存在，将创建默认配置: {CONFIG_FILE}")
         _plugin_config = get_default_config()
         save_plugin_config(_plugin_config)
+        _set_config_load_status(ok=True, source="default_created")
         return _plugin_config
 
     try:
@@ -251,14 +284,17 @@ def load_plugin_config() -> dict:
             loaded = json.load(f)
         _plugin_config = normalize_config(loaded)
         settings = build_settings(_plugin_config, require_api_keys=False)
+        _set_config_load_status(ok=True, source="file")
         logger.info(f"已加载插件配置: {CONFIG_FILE}")
         logger.info(f"插件配置摘要: {describe_settings(settings)}")
         return _plugin_config
-    except RuntimeError:
+    except RuntimeError as e:
+        _set_config_load_status(ok=False, source="invalid", error=e)
         raise
     except Exception as e:
         logger.error(f"加载配置文件失败: {e}，使用默认配置")
         _plugin_config = get_default_config()
+        _set_config_load_status(ok=False, source="fallback", error=e)
         return _plugin_config
 
 
@@ -398,16 +434,16 @@ def get_runtime_settings() -> dict[str, Any]:
         "short_context_limit": number("short_context_limit", 20, int, minimum=1),
         "interaction_log_recent_days": number("interaction_log_recent_days", 180, int, minimum=1),
         "history_recall_limit": number("history_recall_limit", 20, int, minimum=1),
-        "speak_cooldown_seconds": number("speak_cooldown_seconds", 10.0, float, minimum=0.0),
+        "speak_cooldown_seconds": number("speak_cooldown_seconds", 16.0, float, minimum=0.0),
         "willingness_idle_after_seconds": number("willingness_idle_after_seconds", 300.0, float, minimum=0.0),
         "willingness_decay_rate_active": number("willingness_decay_rate_active", 0.03, float, minimum=0.0),
         "willingness_decay_rate_idle": number("willingness_decay_rate_idle", 0.06, float, minimum=0.0),
         "relevance_willingness_floor": ratio("relevance_willingness_floor", 0.95),
-        "passive_willingness_growth_limit": ratio("passive_willingness_growth_limit", 0.7),
-        "passive_willingness_growth_per_message": number("passive_willingness_growth_per_message", 0.03, float, minimum=0.0),
-        "low_willingness_skip_threshold": ratio("low_willingness_skip_threshold", 0.35),
-        "post_feedback_skip_threshold": ratio("post_feedback_skip_threshold", 0.4),
-        "rerank_willingness_threshold": ratio("rerank_willingness_threshold", 0.6),
+        "passive_willingness_growth_limit": ratio("passive_willingness_growth_limit", 0.72),
+        "passive_willingness_growth_per_message": number("passive_willingness_growth_per_message", 0.045, float, minimum=0.0),
+        "low_willingness_skip_threshold": ratio("low_willingness_skip_threshold", 0.30),
+        "post_feedback_skip_threshold": ratio("post_feedback_skip_threshold", 0.34),
+        "rerank_willingness_threshold": ratio("rerank_willingness_threshold", 0.68),
     }
 
 

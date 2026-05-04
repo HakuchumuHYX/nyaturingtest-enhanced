@@ -390,10 +390,10 @@ async def render_token_stats_card(
                         style=value_style
                     ).set_w(content_w).set_padding((16, 2))
                 )
-                if item.get("reasoning") or item.get("cache_hit") or item.get("cache_miss"):
+                if item.get("reasoning") or item.get("cache_hit"):
                     model_rows.append(
                         TextBox(
-                            f"  Reasoning: {item.get('reasoning', 0):,}  |  Cache hit: {item.get('cache_hit', 0):,}  |  Cache miss: {item.get('cache_miss', 0):,}  |  Hit ratio: {item.get('cache_hit_ratio', 0.0):.1%}",
+                            f"  Reasoning: {item.get('reasoning', 0):,}  |  Cache hit: {item.get('cache_hit', 0):,}",
                             style=label_style
                         ).set_w(content_w).set_padding((16, 2))
                     )
@@ -417,10 +417,10 @@ async def render_token_stats_card(
                         style=value_style
                     ).set_w(content_w).set_padding((16, 2))
                 )
-                if item.get("reasoning") or item.get("cache_hit") or item.get("cache_miss"):
+                if item.get("reasoning") or item.get("cache_hit"):
                     model_rows.append(
                         TextBox(
-                            f"  Reasoning: {item.get('reasoning', 0):,}  |  Cache hit: {item.get('cache_hit', 0):,}  |  Cache miss: {item.get('cache_miss', 0):,}  |  Hit ratio: {item.get('cache_hit_ratio', 0.0):.1%}",
+                            f"  Reasoning: {item.get('reasoning', 0):,}  |  Cache hit: {item.get('cache_hit', 0):,}",
                             style=label_style
                         ).set_w(content_w).set_padding((16, 2))
                     )
@@ -462,10 +462,10 @@ async def render_token_stats_card(
                     style=value_style
                 ).set_w(content_w).set_padding((16, 2))
             )
-            if item.get("reasoning") or item.get("cache_hit") or item.get("cache_miss"):
+            if item.get("reasoning") or item.get("cache_hit"):
                 model_rows.append(
                     TextBox(
-                        f"  Reasoning: {item.get('reasoning', 0):,}  |  Cache hit: {item.get('cache_hit', 0):,}  |  Cache miss: {item.get('cache_miss', 0):,}  |  Hit ratio: {item.get('cache_hit_ratio', 0.0):.1%}",
+                        f"  Reasoning: {item.get('reasoning', 0):,}  |  Cache hit: {item.get('cache_hit', 0):,}",
                         style=label_style
                     ).set_w(content_w).set_padding((16, 2))
                 )

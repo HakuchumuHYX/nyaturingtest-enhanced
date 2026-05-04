@@ -12,8 +12,8 @@ from ..core.state_manager import ensure_group_state
 from ..utils import extract_and_parse_json, calculate_dynamic_k, should_store_memory
 from ..database.message_repository import MessageRepository
 from ..database.profile_repository import ProfileRepository
-from ..database.token_repository import TokenUsageRepository
 from ..core.logic import llm_response
+from ..core.usage import make_usage_recorder
 from ..config import (
     get_effective_chat_model,
     get_effective_feedback_model,
@@ -30,24 +30,6 @@ async def is_group_message(event: Event) -> bool:
 
 # 定义命令
 query_memory = on_command("查询记忆", aliases={"memory", "印象"}, rule=is_group_message, priority=5, block=True)
-
-
-def _make_usage_recorder(session_id: str, model_name_record: str):
-    def _recorder(usage: dict):
-        asyncio.create_task(
-            TokenUsageRepository.log_token_usage(
-                session_id=session_id,
-                model_name=model_name_record,
-                prompt_tokens=usage.get("prompt_tokens", 0),
-                completion_tokens=usage.get("completion_tokens", 0),
-                prompt_cache_hit_tokens=usage.get("prompt_cache_hit_tokens", 0),
-                prompt_cache_miss_tokens=usage.get("prompt_cache_miss_tokens", 0),
-                reasoning_tokens=usage.get("reasoning_tokens", 0),
-                finish_reason=usage.get("finish_reason", ""),
-                provider=usage.get("provider", ""),
-            )
-        )
-    return _recorder
 
 
 def _clamp_vad_value(value, lower: float, upper: float, default: float = 0.0) -> float:
@@ -128,7 +110,7 @@ async def _summarize_long_term_vad(
         extra_body={"thinking": {"type": "disabled"}},
         max_tokens=get_feedback_max_tokens(),
         timeout=get_feedback_timeout(),
-        on_usage=_make_usage_recorder(str(state.session.id), get_effective_feedback_model())
+        on_usage=make_usage_recorder(str(state.session.id), get_effective_feedback_model())
     )
 
     return _normalize_vad_result(extract_and_parse_json(response))
@@ -172,15 +154,13 @@ async def handle_query_memory(bot: Bot, event: GroupMessageEvent, args: Message 
     recent_user_msgs = []
     vector_records = []
     long_term_vad = None
+    long_term_memory = None
 
     async with state.session_lock:
         await state.session.load_session()
+        session_id = state.session.id
         bot_name = state.session.name()
         bot_role = state.session.role()
-
-        # --- 用户画像与交互统计逻辑 ---
-        # 使用 Repository 获取真实的交互次数
-        interaction_count = await ProfileRepository.get_interaction_count(state.session.id, target_id)
 
         # 获取内存中的情绪数据
         profile = state.session.profiles.get(target_id)
@@ -195,89 +175,95 @@ async def handle_query_memory(bot: Bot, event: GroupMessageEvent, args: Message 
             "valence": valence,
             "arousal": arousal,
             "dominance": dominance,
-            "interactions": interaction_count,
+            "interactions": 0,
             "last_seen": last_seen
         }
+        long_term_memory = getattr(state.session, "long_term_memory", None)
 
-        # --- 向量记忆检索 (RAG) ---
-        try:
-            search_queries = [
-                f"关于{target_name}的记忆",
-                f"我对{target_name}的看法",
-                f"{target_name}做过的事",
-                f"{target_name}的性格特点"
+    # --- 用户画像与交互统计逻辑 ---
+    # 使用 Repository 获取真实的交互次数
+    interaction_count = await ProfileRepository.get_interaction_count(session_id, target_id)
+    profile_data["interactions"] = interaction_count
+
+    # --- 向量记忆检索 (RAG) ---
+    try:
+        search_queries = [
+            f"关于{target_name}的记忆",
+            f"我对{target_name}的看法",
+            f"{target_name}做过的事",
+            f"{target_name}的性格特点"
+        ]
+
+        # 构造过滤条件：匹配 target_id 或者 user_id 为空 (全局记忆/未标记记忆)
+        user_filter = []
+        if target_id and target_id.strip():
+            user_filter = [{"user_id": {"$eq": target_id}}, {"user_id": {"$eq": ""}}]
+        else:
+            user_filter = [{"user_id": {"$eq": ""}}]
+
+        search_filter = {
+            "$and": [
+                {"source": {"$eq": "memory"}},
+                {"$or": user_filter}
             ]
+        }
 
-            # 构造过滤条件：匹配 target_id 或者 user_id 为空 (全局记忆/未标记记忆)
-            user_filter = []
-            if target_id and target_id.strip():
-                user_filter = [{"user_id": {"$eq": target_id}}, {"user_id": {"$eq": ""}}]
+        if long_term_memory is not None:
+            # 获取用户记忆数量
+            memory_count = await run_sync(long_term_memory.count_by_user)(target_id)
+
+            # 获取首次交互时间，计算天数
+            first_interaction_time = await ProfileRepository.get_first_interaction_time(
+                session_id, target_id
+            )
+            if first_interaction_time:
+                # 统一为 naive datetime，避免时区问题
+                if first_interaction_time.tzinfo is not None:
+                    first_interaction_time = first_interaction_time.replace(tzinfo=None)
+                days_since_first = (datetime.now() - first_interaction_time).days
             else:
-                user_filter = [{"user_id": {"$eq": ""}}]
+                days_since_first = 0
 
-            search_filter = {
-                "$and": [
-                    {"source": {"$eq": "memory"}},
-                    {"$or": user_filter}
-                ]
-            }
+            # 使用综合评分计算动态 k 值
+            dynamic_k = calculate_dynamic_k(interaction_count, memory_count, days_since_first)
 
-            if hasattr(state.session, 'long_term_memory'):
-                # 获取用户记忆数量
-                memory_count = await run_sync(state.session.long_term_memory.count_by_user)(target_id)
-                
-                # 获取首次交互时间，计算天数
-                first_interaction_time = await ProfileRepository.get_first_interaction_time(
-                    state.session.id, target_id
+            # 使用时间衰减检索（近期记忆权重更高）
+            vector_records = await run_sync(long_term_memory.retrieve_with_decay)(
+                search_queries,
+                k=dynamic_k,
+                where=search_filter,
+                use_rerank=True,
+                decay_rate=0.02  # 衰减率：约35天后权重减半
+            )
+
+            # 后过滤：去重 + 质量过滤
+            if vector_records:
+                unique_recs = []
+                seen = set()
+                for rec in vector_records:
+                    content = rec.get('content', '')
+                    # 质量过滤：排除低质量内容
+                    if content and content not in seen and should_store_memory(content):
+                        seen.add(content)
+                        unique_recs.append(content)
+                vector_records = unique_recs
+
+                logger.debug(
+                    f"查询记忆: 交互={interaction_count}, 记忆量={memory_count}, "
+                    f"天数={days_since_first}, 目标k={dynamic_k}, 实际={len(vector_records)}条"
                 )
-                if first_interaction_time:
-                    # 统一为 naive datetime，避免时区问题
-                    if first_interaction_time.tzinfo is not None:
-                        first_interaction_time = first_interaction_time.replace(tzinfo=None)
-                    days_since_first = (datetime.now() - first_interaction_time).days
-                else:
-                    days_since_first = 0
-                
-                # 使用综合评分计算动态 k 值
-                dynamic_k = calculate_dynamic_k(interaction_count, memory_count, days_since_first)
-                
-                # 使用时间衰减检索（近期记忆权重更高）
-                vector_records = await run_sync(state.session.long_term_memory.retrieve_with_decay)(
-                    search_queries,
-                    k=dynamic_k,
-                    where=search_filter,
-                    use_rerank=True,
-                    decay_rate=0.02  # 衰减率：约35天后权重减半
-                )
-                
-                # 后过滤：去重 + 质量过滤
-                if vector_records:
-                    unique_recs = []
-                    seen = set()
-                    for rec in vector_records:
-                        content = rec.get('content', '')
-                        # 质量过滤：排除低质量内容
-                        if content and content not in seen and should_store_memory(content):
-                            seen.add(content)
-                            unique_recs.append(content)
-                    vector_records = unique_recs
+    except Exception as e:
+        logger.error(f"向量记忆检索失败: {e}")
 
-                    logger.debug(
-                        f"查询记忆: 交互={interaction_count}, 记忆量={memory_count}, "
-                        f"天数={days_since_first}, 目标k={dynamic_k}, 实际={len(vector_records)}条"
-                    )
-        except Exception as e:
-            logger.error(f"向量记忆检索失败: {e}")
-
-        # --- 获取最近聊天记录 ---
-        recent_user_msgs = await MessageRepository.get_recent_messages_by_user(
-            state.session.id, 
-            user_id=target_id, 
-            user_name=target_name, 
-            limit=10
-        )
-        if not recent_user_msgs:
-            recent_user_msgs = ["(暂无最近发言记录)"]
+    # --- 获取最近聊天记录 ---
+    recent_user_msgs = await MessageRepository.get_recent_messages_by_user(
+        session_id,
+        user_id=target_id,
+        user_name=target_name,
+        limit=10
+    )
+    if not recent_user_msgs:
+        recent_user_msgs = ["(暂无最近发言记录)"]
 
     if vector_records:
         try:
@@ -353,7 +339,7 @@ async def handle_query_memory(bot: Bot, event: GroupMessageEvent, args: Message 
                 reasoning_effort=query_memory_chat_thinking.get("reasoning_effort", "high") if query_memory_chat_thinking.get("enabled") else None,
                 max_tokens=min(get_chat_max_tokens(), 2048),
                 timeout=get_chat_timeout(),
-                on_usage=_make_usage_recorder(str(state.session.id), get_effective_chat_model())
+                on_usage=make_usage_recorder(session_id, get_effective_chat_model())
             )
 
             result = extract_and_parse_json(response)

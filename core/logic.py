@@ -27,7 +27,7 @@ from .metrics import metrics
 from .message_sender import build_send_parts
 from .structured_log import log_event
 from .state_manager import GroupState, SELF_SENT_MSG_IDS, is_shutting_down
-from ..database.token_repository import TokenUsageRepository
+from .usage import make_usage_recorder
 
 
 def _build_self_message_id(content: str) -> str:
@@ -37,6 +37,18 @@ def _build_self_message_id(content: str) -> str:
 
 def _is_sticker_segment_data(data: dict) -> bool:
     return str(data.get("sub_type", "")) == "1"
+
+
+def _image_placeholder(is_sticker: bool) -> str:
+    return "\n[表情包]\n" if is_sticker else "\n[图片]\n"
+
+
+def _should_resolve_image(resolve_images: bool) -> bool:
+    return (
+        resolve_images
+        and plugin_config.get("vlm", {}).get("enabled", True)
+        and not is_shutting_down()
+    )
 
 
 async def llm_response(client: LLMClient, message: str, model: str, temperature: float | None = None, json_mode: bool = False,
@@ -107,25 +119,6 @@ async def message2BotMessage(bot_name: str, group_id: int, message: Message, bot
 
     # === 消息段处理逻辑 ===
 
-    # 定义 VLM 使用记录器
-    def make_vlm_recorder(model_name: str):
-        def _recorder(usage: dict):
-            # 异步执行入库
-            asyncio.create_task(
-                TokenUsageRepository.log_token_usage(
-                    session_id=str(group_id),
-                    model_name=model_name,
-                    prompt_tokens=usage.get("prompt_tokens", 0),
-                    completion_tokens=usage.get("completion_tokens", 0),
-                    prompt_cache_hit_tokens=usage.get("prompt_cache_hit_tokens", 0),
-                    prompt_cache_miss_tokens=usage.get("prompt_cache_miss_tokens", 0),
-                    reasoning_tokens=usage.get("reasoning_tokens", 0),
-                    finish_reason=usage.get("finish_reason", ""),
-                    provider=usage.get("provider", ""),
-                )
-            )
-        return _recorder
-
     async def process_segment(seg: MessageSegment) -> str:
         if seg.type == "text":
             return f"{seg.data.get('text', '')}"
@@ -135,21 +128,13 @@ async def message2BotMessage(bot_name: str, group_id: int, message: Message, bot
             file_unique = seg.data.get("file_unique", "")
             is_sticker = _is_sticker_segment_data(seg.data)
 
-            if not resolve_images:
-                return "\n[表情包]\n" if is_sticker else "\n[图片]\n"
-
-            # VLM disabled: skip recognition to avoid token cost / errors
-            if not plugin_config.get("vlm", {}).get("enabled", True):
-                return "\n[表情包]\n" if is_sticker else "\n[图片]\n"
-
-            # Shutdown 检查：避免在关机时进入耗时的 VLM 请求
-            if is_shutting_down():
-                return "\n[表情包]\n" if is_sticker else "\n[图片]\n"
+            if not _should_resolve_image(resolve_images):
+                return _image_placeholder(is_sticker)
 
             # 获取 VLM 的真实模型名称以准确记录 token 消耗
             # 兼容老配置，如果 vlm 未指定模型，则退而求其次使用 chat model
             vlm_model_name = plugin_config.get("vlm", {}).get("model") or get_effective_chat_model()
-            vlm_recorder = make_vlm_recorder(vlm_model_name)
+            vlm_recorder = make_usage_recorder(str(group_id), vlm_model_name)
 
             # 调用通用逻辑，传入提取到的上下文
             return await image_manager.resolve_image_from_url(
@@ -200,23 +185,19 @@ async def message2BotMessage(bot_name: str, group_id: int, message: Message, bot
                                 # 引用里的图片通常不易判断是否为表情包，默认 False，或者尝试获取 sub_type
                                 is_sticker_ref = _is_sticker_segment_data(data)
 
-                                if not resolve_images:
-                                    source_text += "\n[表情包]\n" if is_sticker_ref else "\n[图片]\n"
+                                if not _should_resolve_image(resolve_images):
+                                    source_text += _image_placeholder(is_sticker_ref)
                                     continue
 
-                                # VLM disabled: skip recognition
-                                if not plugin_config.get("vlm", {}).get("enabled", True):
-                                    source_text += "\n[表情包]\n" if is_sticker_ref else "\n[图片]\n"
-                                else:
-                                    vlm_model_name_ref = plugin_config.get("vlm", {}).get("model") or get_effective_chat_model()
-                                    vlm_recorder = make_vlm_recorder(vlm_model_name_ref)
+                                vlm_model_name_ref = plugin_config.get("vlm", {}).get("model") or get_effective_chat_model()
+                                vlm_recorder = make_usage_recorder(str(group_id), vlm_model_name_ref)
 
-                                    # Await 分析结果
-                                    img_desc = await image_manager.resolve_image_from_url(
-                                        img_url, img_file_unique, is_sticker_ref, 
-                                        on_usage=vlm_recorder
-                                    )
-                                    source_text += img_desc
+                                # Await 分析结果
+                                img_desc = await image_manager.resolve_image_from_url(
+                                    img_url, img_file_unique, is_sticker_ref,
+                                    on_usage=vlm_recorder
+                                )
+                                source_text += img_desc
 
                             elif msg_type == "face":
                                 # 简单处理 QQ 表情
@@ -316,8 +297,8 @@ async def spawn_state(state: GroupState):
             # 使用闭包捕获 session.id
                 current_session_id = str(state.session.id)
             
-            def make_usage_recorder(model_name_record: str):
-                def _recorder(usage: dict):
+            def make_llm_usage_recorder(model_name_record: str):
+                def _log_usage_event(usage: dict):
                     log_event(
                         "token_usage",
                         session_id=current_session_id,
@@ -326,21 +307,11 @@ async def spawn_state(state: GroupState):
                         tokens=usage.get("total_tokens", 0),
                         decision=usage.get("finish_reason", ""),
                     )
-                    # 异步执行入库，不阻塞 LLM 返回
-                    asyncio.create_task(
-                        TokenUsageRepository.log_token_usage(
-                            session_id=current_session_id,
-                            model_name=model_name_record,
-                            prompt_tokens=usage.get("prompt_tokens", 0),
-                            completion_tokens=usage.get("completion_tokens", 0),
-                            prompt_cache_hit_tokens=usage.get("prompt_cache_hit_tokens", 0),
-                            prompt_cache_miss_tokens=usage.get("prompt_cache_miss_tokens", 0),
-                            reasoning_tokens=usage.get("reasoning_tokens", 0),
-                            finish_reason=usage.get("finish_reason", ""),
-                            provider=usage.get("provider", ""),
-                        )
-                    )
-                return _recorder
+                return make_usage_recorder(
+                    current_session_id,
+                    model_name_record,
+                    event_logger=_log_usage_event,
+                )
 
             # 定义一个强制的 System Prompt 用于 Roleplay，使用中文指令。
             # 具体人设只放在 user prompt 的 <profile> 中，避免自定义人设污染系统规则。
@@ -369,7 +340,7 @@ async def spawn_state(state: GroupState):
                 max_tokens=get_chat_max_tokens(),
                 timeout=get_chat_timeout(),
                 system_prompt=rp_system_prompt,
-                on_usage=make_usage_recorder(get_effective_chat_model())
+                on_usage=make_llm_usage_recorder(get_effective_chat_model())
             )
 
             # 定义 Feedback 专用的 System Prompt
@@ -392,7 +363,7 @@ async def spawn_state(state: GroupState):
                 extra_body={"thinking": {"type": "disabled"}},
                 max_tokens=get_feedback_max_tokens(),
                 timeout=get_feedback_timeout(),
-                on_usage=make_usage_recorder(get_effective_feedback_model()),
+                on_usage=make_llm_usage_recorder(get_effective_feedback_model()),
                 system_prompt=feedback_system_prompt
             )
 

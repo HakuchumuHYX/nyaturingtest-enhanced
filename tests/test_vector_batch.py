@@ -1,0 +1,135 @@
+import unittest
+import importlib.util
+import sys
+import types
+from pathlib import Path
+
+
+PLUGIN_DIR = Path(__file__).resolve().parents[1]
+
+
+def _install_vector_stubs():
+    nonebot = sys.modules.get("nonebot") or types.ModuleType("nonebot")
+    nonebot.logger = types.SimpleNamespace(
+        warning=lambda *args, **kwargs: None,
+        error=lambda *args, **kwargs: None,
+        info=lambda *args, **kwargs: None,
+        debug=lambda *args, **kwargs: None,
+    )
+    sys.modules["nonebot"] = nonebot
+
+    httpx = sys.modules.get("httpx") or types.ModuleType("httpx")
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    httpx.Client = Client
+    sys.modules["httpx"] = httpx
+
+    openai = sys.modules.get("openai") or types.ModuleType("openai")
+
+    class OpenAI:
+        pass
+
+    openai.OpenAI = OpenAI
+    sys.modules["openai"] = openai
+
+    config = types.ModuleType("vector_test.config")
+    config.plugin_config = {"embedding": {}, "rerank": {}}
+    config.get_memory_endpoint_settings = lambda: {
+        "model": "BAAI/bge-m3",
+        "base_url": "https://api.siliconflow.cn/v1",
+        "timeout": 30.0,
+        "rerank_base_url": "https://api.siliconflow.cn/v1/rerank",
+        "rerank_timeout": 10.0,
+    }
+    sys.modules.setdefault("vector_test.config", config)
+
+    class DummyLock:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    backup_lock = sys.modules.get("vector_test.database.backup_lock") or types.ModuleType("vector_test.database.backup_lock")
+    backup_lock.BACKUP_IO_LOCK = DummyLock()
+    sys.modules["vector_test.database.backup_lock"] = backup_lock
+
+    database = types.ModuleType("vector_test.database")
+    database.__path__ = []
+    sys.modules.setdefault("vector_test.database", database)
+
+    chromadb = types.ModuleType("chromadb")
+    chromadb.PersistentClient = object
+    sys.modules.setdefault("chromadb", chromadb)
+    chromadb_api = types.ModuleType("chromadb.api")
+    chromadb_types = types.ModuleType("chromadb.api.types")
+    chromadb_types.Documents = list
+    chromadb_types.Embeddings = list
+
+    class EmbeddingFunction:
+        pass
+
+    chromadb_types.EmbeddingFunction = EmbeddingFunction
+    sys.modules.setdefault("chromadb.api", chromadb_api)
+    sys.modules.setdefault("chromadb.api.types", chromadb_types)
+
+
+def _load_vector_module():
+    _install_vector_stubs()
+    package = types.ModuleType("vector_test.memory")
+    package.__path__ = []
+    sys.modules.setdefault("vector_test", types.ModuleType("vector_test"))
+    sys.modules.setdefault("vector_test.memory", package)
+    spec = importlib.util.spec_from_file_location(
+        "vector_test.memory.vector",
+        PLUGIN_DIR / "memory" / "vector.py",
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["vector_test.memory.vector"] = module
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+class FakeCollection:
+    def __init__(self):
+        self.query_calls = []
+        self.add_calls = []
+
+    def query(self, **kwargs):
+        self.query_calls.append(kwargs)
+        return {
+            "distances": [
+                [0.05],
+                [0.4],
+            ]
+        }
+
+    def add(self, **kwargs):
+        self.add_calls.append(kwargs)
+
+
+class VectorBatchTests(unittest.TestCase):
+    def test_add_memories_with_dedup_batches_query_and_add(self):
+        module = _load_vector_module()
+        memory = object.__new__(module.VectorMemory)
+        memory.collection = FakeCollection()
+
+        result = memory.add_memories_with_dedup([
+            ("重复记忆", {"source": "memory", "user_id": "1"}),
+            ("新的记忆", {"source": "memory", "user_id": "2"}),
+            ("   ", {"source": "memory", "user_id": "3"}),
+        ], threshold=0.9)
+
+        self.assertEqual({"added": 1, "skipped_empty": 1, "skipped_dedup": 1}, result)
+        self.assertEqual(1, len(memory.collection.query_calls))
+        self.assertEqual(["重复记忆", "新的记忆"], memory.collection.query_calls[0]["query_texts"])
+        self.assertEqual(1, len(memory.collection.add_calls))
+        self.assertEqual(["新的记忆"], memory.collection.add_calls[0]["documents"])
+
+
+if __name__ == "__main__":
+    unittest.main()

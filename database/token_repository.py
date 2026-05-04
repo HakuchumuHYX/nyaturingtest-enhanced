@@ -88,7 +88,6 @@ class TokenUsageRepository:
                     total_prompt=Sum("prompt_tokens"),
                     total_completion=Sum("completion_tokens"),
                     total_cache_hit=Sum("prompt_cache_hit_tokens"),
-                    total_cache_miss=Sum("prompt_cache_miss_tokens"),
                     total_reasoning=Sum("reasoning_tokens"),
                 )
                 .group_by("model_name", "provider")
@@ -98,7 +97,6 @@ class TokenUsageRepository:
                     "total_prompt",
                     "total_completion",
                     "total_cache_hit",
-                    "total_cache_miss",
                     "total_reasoning",
                 )
             )
@@ -108,8 +106,6 @@ class TokenUsageRepository:
                 prompt = s["total_prompt"] or 0
                 completion = s["total_completion"] or 0
                 cache_hit = s["total_cache_hit"] or 0
-                cache_miss = s["total_cache_miss"] or 0
-                cache_total = cache_hit + cache_miss
                 rows.append(
                     {
                         "model": s["model_name"],
@@ -118,8 +114,6 @@ class TokenUsageRepository:
                         "completion": completion,
                         "reasoning": s["total_reasoning"] or 0,
                         "cache_hit": cache_hit,
-                        "cache_miss": cache_miss,
-                        "cache_hit_ratio": (cache_hit / cache_total) if cache_total else 0.0,
                         "total": prompt + completion,
                     }
                 )

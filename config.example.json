@@ -58,16 +58,16 @@
     "short_context_limit": 20,
     "interaction_log_recent_days": 180,
     "history_recall_limit": 20,
-    "speak_cooldown_seconds": 10.0,
+    "speak_cooldown_seconds": 16.0,
     "willingness_idle_after_seconds": 300.0,
     "willingness_decay_rate_active": 0.03,
     "willingness_decay_rate_idle": 0.06,
     "relevance_willingness_floor": 0.95,
-    "passive_willingness_growth_limit": 0.7,
-    "passive_willingness_growth_per_message": 0.03,
-    "low_willingness_skip_threshold": 0.35,
-    "post_feedback_skip_threshold": 0.4,
-    "rerank_willingness_threshold": 0.6
+    "passive_willingness_growth_limit": 0.72,
+    "passive_willingness_growth_per_message": 0.045,
+    "low_willingness_skip_threshold": 0.3,
+    "post_feedback_skip_threshold": 0.34,
+    "rerank_willingness_threshold": 0.68
   },
   "enabled_groups": []
 }
