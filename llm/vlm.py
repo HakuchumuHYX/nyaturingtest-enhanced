@@ -6,6 +6,19 @@ from openai import AsyncOpenAI
 from nonebot import logger
 
 
+def _model_supports_response_format(model: str) -> bool:
+    normalized = (model or "").strip().lower()
+    return "glm-4.6v" not in normalized
+
+
+def _is_json_mode_unsupported_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return (
+        "json mode is not supported" in text
+        or "response_format" in text and "not supported" in text
+    )
+
+
 class VLM:
     """
     OpenAI-compatible vision-language adapter using chat.completions image_url.
@@ -59,6 +72,10 @@ class VLM:
         """
         让 VLM 根据图片和文本提示词生成描述。
         """
+        request_kwargs = dict(kwargs)
+        if not _model_supports_response_format(self.model):
+            request_kwargs.pop("response_format", None)
+
         retries = 0
         while retries <= self.max_retries:
             try:
@@ -80,7 +97,7 @@ class VLM:
                         }
                     ],
                     timeout=self.timeout,
-                    **kwargs,
+                    **request_kwargs,
                 )
 
                 if on_usage and response.usage:
@@ -95,6 +112,10 @@ class VLM:
                 logger.warning(f"VLM 返回内容为空 (尝试 {retries + 1}/{self.max_retries + 1})")
 
             except Exception as e:
+                if "response_format" in request_kwargs and _is_json_mode_unsupported_error(e):
+                    logger.warning("VLM 模型不支持 JSON mode，已降级为普通文本 JSON 提示重试")
+                    request_kwargs.pop("response_format", None)
+                    continue
                 logger.warning(f"VLM 请求失败: {e} (尝试 {retries + 1}/{self.max_retries + 1})")
 
             retries += 1
