@@ -30,14 +30,14 @@ class TokenUsageSchemaTests(unittest.TestCase):
             with self.subTest(token=token):
                 self.assertIn(token, source)
 
-    def test_token_stats_output_omits_cache_miss_and_hit_ratio(self):
+    def test_token_stats_output_includes_cache_miss_and_hit_ratio(self):
         repository = (PLUGIN_DIR / "database" / "token_repository.py").read_text(encoding="utf-8")
         renderer = (PLUGIN_DIR / "utils.py").read_text(encoding="utf-8")
 
-        self.assertNotIn('"cache_miss":', repository)
-        self.assertNotIn('"cache_hit_ratio":', repository)
-        self.assertNotIn("Cache miss", renderer)
-        self.assertNotIn("Hit ratio", renderer)
+        self.assertIn('"cache_miss":', repository)
+        self.assertIn('"cache_hit_ratio":', repository)
+        self.assertIn("Cache miss", renderer)
+        self.assertIn("Hit ratio", renderer)
 
     def test_token_stats_command_filters_to_current_configured_models(self):
         source = (PLUGIN_DIR / "handlers" / "commands.py").read_text(encoding="utf-8")

@@ -436,12 +436,21 @@ async def handle_auto_chat(bot: Bot, event: GroupMessageEvent):
     if is_shutting_down():
         return
 
+    _resolve_images = plugin_config.get("vlm", {}).get("enabled", True)
+    if _resolve_images:
+        _has_image = any(seg.type == "image" for seg in event.original_message)
+        _is_priority = _is_priority_message(event.original_message, str(bot.self_id), bot_name, "")
+        if _has_image and not _is_priority:
+            _skip_threshold = get_runtime_settings()["low_willingness_skip_threshold"]
+            if state.session.willingness < _skip_threshold:
+                _resolve_images = False
+
     message_content = await message2BotMessage(
         bot_name=bot_name,
         group_id=group_id,
         message=event.original_message,
         bot=bot,
-        resolve_images=plugin_config.get("vlm", {}).get("enabled", True),
+        resolve_images=plugin_config.get("vlm", {}).get("enabled", True) and _resolve_images,
     )
     if not message_content:
         return

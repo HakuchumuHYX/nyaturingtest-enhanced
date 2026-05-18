@@ -331,7 +331,7 @@ def get_chat_thinking_settings() -> dict[str, Any]:
     thinking = plugin_config.get("chat", {}).get("thinking") or {}
     return {
         "enabled": bool(thinking.get("enabled", True)),
-        "reasoning_effort": str(thinking.get("reasoning_effort") or "high"),
+        "reasoning_effort": str(thinking.get("reasoning_effort") or "low"),
         "rp_style": str(thinking.get("rp_style") or "off"),
     }
 
@@ -341,7 +341,7 @@ def get_chat_timeout() -> float:
 
 
 def get_chat_max_tokens() -> int:
-    return int(plugin_config.get("chat", {}).get("max_tokens") or 4096)
+    return int(plugin_config.get("chat", {}).get("max_tokens") or 1536)
 
 
 def get_effective_feedback_api_key() -> str:
