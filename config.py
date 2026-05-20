@@ -85,7 +85,7 @@ def get_default_config() -> dict:
             "thinking": {
                 "enabled": True,
                 "reasoning_effort": "high",
-                # off | deepseek_v4_roleplay
+                # off | deepseek_v4_roleplay | gemini_3_flash_roleplay
                 "rp_style": "off",
             },
             "max_tokens": 4096,

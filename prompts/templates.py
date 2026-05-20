@@ -23,6 +23,29 @@ def build_deepseek_v4_rp_marker(rp_style: str = "off") -> str:
     )
 
 
+def build_gemini_3_flash_rp_marker(rp_style: str = "off") -> str:
+    if (rp_style or "off").strip().lower() != "gemini_3_flash_roleplay":
+        return ""
+    return (
+        "\n\n<gemini_3_flash_roleplay_instruct>\n"
+        "你不是助手，也不是在解释角色设定；你就是动态输入中的角色本人。"
+        "role、examples_text、search_result 是你的自我认知、经历和记忆，不是待复述的资料。"
+        "回复前可以在内部判断上下文、情绪和关系，但最终只能输出指定 JSON。"
+        "不要输出分析、规则解释、Markdown、代码块、前后缀或任何 JSON 外文本。"
+        "群聊回复要短、自然、像手机打字，避免『好的，我会』这类助手口吻。\n"
+        "</gemini_3_flash_roleplay_instruct>"
+    )
+
+
+def build_rp_marker(rp_style: str = "off") -> str:
+    style = (rp_style or "off").strip().lower()
+    if style == "deepseek_v4_roleplay":
+        return build_deepseek_v4_rp_marker(style)
+    if style == "gemini_3_flash_roleplay":
+        return build_gemini_3_flash_rp_marker(style)
+    return ""
+
+
 def get_feedback_prompt(
         bot_name: str,
         role: str,
@@ -166,7 +189,7 @@ def get_chat_prompt(
         "rp_style": rp_style or "off",
     }
 
-    rp_marker = build_deepseek_v4_rp_marker(rp_style)
+    rp_marker = build_rp_marker(rp_style)
 
     return f"""
 # Roleplay Reply Engine

@@ -124,6 +124,40 @@ class PromptDeepSeekTests(unittest.TestCase):
         self.assertIn("new msg", base_prompt)
         self.assertIn("2026年", base_prompt)
 
+    def test_chat_prompt_supports_gemini_rp_marker(self):
+        templates = _load_templates_module()
+        prompt = templates.get_chat_prompt(
+            "bot",
+            "role A",
+            1,
+            "old summary",
+            ["old msg"],
+            ["new msg"],
+            {"valence": 0.1, "arousal": 0.2, "dominance": 0.3},
+            '[{"user_name":"u1"}]',
+            ["memory A"],
+            "topic A",
+            rp_style="gemini_3_flash_roleplay",
+        )
+        default_prompt = templates.get_chat_prompt(
+            "bot",
+            "role A",
+            1,
+            "old summary",
+            ["old msg"],
+            ["new msg"],
+            {"valence": 0.1, "arousal": 0.2, "dominance": 0.3},
+            '[{"user_name":"u1"}]',
+            ["memory A"],
+            "topic A",
+            rp_style="off",
+        )
+
+        prefix = _stable_prefix(prompt)
+        self.assertIn("gemini_3_flash_roleplay_instruct", prefix)
+        self.assertIn("不要输出分析、规则解释、Markdown、代码块", prefix)
+        self.assertNotIn("gemini_3_flash_roleplay_instruct", _stable_prefix(default_prompt))
+
 
 if __name__ == "__main__":
     unittest.main()

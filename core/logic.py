@@ -13,7 +13,9 @@ from ..llm.client import LLMClient
 from ..config import (
     plugin_config,
     get_effective_chat_model,
+    get_effective_chat_provider,
     get_effective_feedback_model,
+    get_effective_feedback_provider,
     get_chat_thinking_settings,
     get_chat_max_tokens,
     get_chat_timeout,
@@ -314,13 +316,21 @@ async def spawn_state(state: GroupState):
                 )
 
             # 定义 System Prompt 用于 Roleplay。
-            # rp_style=deepseek_v4_roleplay 时用角色第一视角身份；其他情况保持原有引擎描述。
-            chat_rp_style = get_chat_thinking_settings().get("rp_style", "off")
+            chat_thinking = get_chat_thinking_settings()
+            chat_rp_style = chat_thinking.get("rp_style", "off")
+            chat_provider = get_effective_chat_provider()
             if chat_rp_style == "deepseek_v4_roleplay":
                 rp_system_prompt = (
                     "你就是 <profile> 里的那个角色，正在群聊里用手机和人聊天。"
                     "读 <profile> 时把它当作你自己的经历和性格，不是别人给你的说明书。"
                     "请用中文思考和回复（除非人设另有要求）。"
+                    "最终输出只包含一个合法 JSON 对象，不要输出 Markdown 或额外文字。"
+                )
+            elif chat_rp_style == "gemini_3_flash_roleplay":
+                rp_system_prompt = (
+                    "你就是动态输入里的角色本人，正在群聊里用手机聊天。"
+                    "不要以 AI、助手、模型、角色扮演引擎的身份说话。"
+                    "不要解释设定，不要输出思考过程。"
                     "最终输出只包含一个合法 JSON 对象，不要输出 Markdown 或额外文字。"
                 )
             else:
@@ -331,20 +341,22 @@ async def spawn_state(state: GroupState):
                     "请在内部完成分析，但最终输出只包含一个合法 JSON 对象，不要输出 Markdown、解释或思考过程。"
                 )
 
-            chat_thinking = get_chat_thinking_settings()
-            chat_extra_body = {
-                "thinking": {
-                    "type": "enabled" if chat_thinking.get("enabled") else "disabled"
+            use_deepseek_thinking = chat_provider == "deepseek_official" and bool(chat_thinking.get("enabled"))
+            chat_extra_body = None
+            if chat_provider == "deepseek_official":
+                chat_extra_body = {
+                    "thinking": {
+                        "type": "enabled" if chat_thinking.get("enabled") else "disabled"
+                    }
                 }
-            }
 
             # Chat 函数
             chat_func = lambda msg, json_mode=False: llm_response(
                 state.client, msg,
                 model=get_effective_chat_model(),
-                temperature=None if chat_thinking.get("enabled") else 0.7,
+                temperature=None if use_deepseek_thinking else 0.7,
                 extra_body=chat_extra_body,
-                reasoning_effort=chat_thinking.get("reasoning_effort", "high") if chat_thinking.get("enabled") else None,
+                reasoning_effort=chat_thinking.get("reasoning_effort", "high") if use_deepseek_thinking else None,
                 json_mode=True if json_mode else False,
                 max_tokens=get_chat_max_tokens(),
                 timeout=get_chat_timeout(),
@@ -362,6 +374,10 @@ async def spawn_state(state: GroupState):
                 "请在内部完成分析，但最终输出只包含一个合法 JSON 对象，不要输出 Markdown、解释或思考过程。"
             )
 
+            feedback_extra_body = None
+            if get_effective_feedback_provider() == "deepseek_official":
+                feedback_extra_body = {"thinking": {"type": "disabled"}}
+
             # Feedback 函数：禁用 thinking，保持结构化状态更新稳定。
             feedback_func = lambda msg, json_mode=False: llm_response(
                 state.feedback_client,
@@ -369,7 +385,7 @@ async def spawn_state(state: GroupState):
                 model=get_effective_feedback_model(),
                 temperature=0.1,
                 json_mode=True,
-                extra_body={"thinking": {"type": "disabled"}},
+                extra_body=feedback_extra_body,
                 max_tokens=get_feedback_max_tokens(),
                 timeout=get_feedback_timeout(),
                 on_usage=make_llm_usage_recorder(get_effective_feedback_model()),

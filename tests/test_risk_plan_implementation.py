@@ -44,6 +44,20 @@ class RiskPlanImplementationTests(unittest.TestCase):
         self.assertIn("rp_style=get_chat_thinking_settings().get", session_source)
         self.assertNotIn('"thought"', prompt_source)
 
+    def test_gemini_rp_style_uses_openai_compatible_path(self):
+        config_source = (PLUGIN_DIR / "config.py").read_text(encoding="utf-8")
+        prompt_source = (PLUGIN_DIR / "prompts" / "templates.py").read_text(encoding="utf-8")
+        logic_source = (PLUGIN_DIR / "core" / "logic.py").read_text(encoding="utf-8")
+
+        self.assertIn("gemini_3_flash_roleplay", config_source)
+        self.assertIn("build_gemini_3_flash_rp_marker", prompt_source)
+        self.assertIn("chat_provider == \"deepseek_official\"", logic_source)
+        self.assertIn("get_effective_feedback_provider() == \"deepseek_official\"", logic_source)
+        self.assertIn("extra_body=chat_extra_body", logic_source)
+        self.assertIn("extra_body=feedback_extra_body", logic_source)
+        self.assertNotIn("google_ai_studio", prompt_source)
+        self.assertNotIn("_build_gemini_payload", logic_source)
+
     def test_role_injection_has_length_limits(self):
         config_source = (PLUGIN_DIR / "config.py").read_text(encoding="utf-8")
         session_source = (PLUGIN_DIR / "core" / "session.py").read_text(encoding="utf-8")

@@ -127,7 +127,9 @@
 
 - `chat.provider` 和 `feedback.provider` 支持 `deepseek_official` 与 `openai_compatible`。
 - DeepSeek 官方接口默认使用 `https://api.deepseek.com`。
-- `vlm.provider` 只支持 `openai_compatible`。
+- 通过 CLI Proxy API 中转 Vertex AI Gemini 时，保持 `chat.provider` 为 `openai_compatible`，`chat.base_url` 填代理暴露的 `/v1` OpenAI-compatible 地址，`chat.model` 填代理中的 Gemini 模型别名；建议关闭 `chat.thinking.enabled` 并设置 `chat.thinking.rp_style` 为 `gemini_3_flash_roleplay`。
+- `feedback` 也可以使用同一个 OpenAI-compatible Gemini 代理；建议保持 `feedback.thinking.enabled` 为 `false`，它只做结构化状态分析，不需要 RP preset。
+- `vlm.provider` 只支持 `openai_compatible`；换成 Gemini 时需要代理支持 OpenAI `image_url` 多模态输入，若代理不支持图片 JSON mode，VLM 会降级为普通文本 JSON 提示重试。
 - 旧版非 OpenAI-compatible provider 已被移除，配置为已移除 provider 会直接报错。
 - `siliconflow_api_key` 用于长期记忆的 Embedding 和 Rerank。
 - Chat 默认开启 DeepSeek thinking；Feedback 默认关闭 thinking，以保证结构化状态更新稳定。
