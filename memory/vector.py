@@ -515,6 +515,24 @@ class VectorMemory:
         metadatas = result.get("metadatas", []) if isinstance(result, dict) else []
         return list(ids or []), [dict(meta or {}) for meta in (metadatas or [])]
 
+    def get_metadata_by_id(self, memory_ref: str) -> dict | None:
+        if not memory_ref:
+            return None
+        with BACKUP_IO_LOCK:
+            result = self.collection.get(ids=[memory_ref], include=["metadatas"])
+        if not isinstance(result, dict):
+            return None
+        metadatas = result.get("metadatas") or []
+        if not metadatas:
+            return None
+        return dict(metadatas[0] or {})
+
+    def update_metadata_by_id(self, memory_ref: str, metadata: dict) -> None:
+        if not memory_ref:
+            return
+        with BACKUP_IO_LOCK:
+            self.collection.update(ids=[memory_ref], metadatas=[dict(metadata or {})])
+
     def backfill_active_status(self, *, dry_run: bool = True, batch_size: int = 200, max_rounds: int = 5) -> dict[str, Any]:
         """Backfill missing status metadata without re-embedding records."""
         report = {

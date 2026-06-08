@@ -748,7 +748,11 @@ class Session:
             fallback_uid = list(unique_user_ids)[0] if len(unique_user_ids) == 1 else ""
 
             self._create_safe_task(
-                self.save_long_term_memory(analyze_result, default_user_id=fallback_uid)
+                self.save_long_term_memory(
+                    analyze_result,
+                    default_user_id=fallback_uid,
+                    supersede_candidates=existing_related_memories,
+                )
             )
 
         # 6.5 主动历史溯源 (Historical Recall)
@@ -802,7 +806,12 @@ class Session:
         logger.debug(f"<< 反馈结束: 意愿 {self.willingness:.2f}, 状态 {self.__chatting_state}")
         return recalled_history
 
-    async def save_long_term_memory(self, analyze_result: list, default_user_id: str = ""):
+    async def save_long_term_memory(
+            self,
+            analyze_result: list,
+            default_user_id: str = "",
+            supersede_candidates: list[dict] | None = None,
+    ):
         """
         后台任务：保存长期记忆到向量数据库
         优化：增加质量过滤和去重
@@ -811,7 +820,13 @@ class Session:
             today = int(datetime.now().strftime("%Y%m%d"))
             runtime_settings = get_runtime_settings()
             skipped_quality = 0
+            superseded_count = 0
             pending_memories: list[tuple[str, dict]] = []
+            allowed_supersede_refs = {
+                str(item.get("memory_ref")): item
+                for item in supersede_candidates or []
+                if isinstance(item, dict) and item.get("memory_ref")
+            }
 
             for item in analyze_result:
                 content = ""
@@ -831,7 +846,7 @@ class Session:
                     action = str(item.get("action") or "add").strip().lower()
                     if action == "ignore":
                         continue
-                    if action != "add":
+                    if action not in {"add", "supersede"}:
                         logger.debug(f"[Memory] 暂不处理的记忆 action: {action}")
                         continue
                     content = item.get("content", "").strip()
@@ -847,6 +862,53 @@ class Session:
                         importance = max(0.0, min(1.0, float(item.get("importance", 0.5))))
                     except (TypeError, ValueError):
                         importance = 0.5
+
+                if action == "supersede":
+                    target_ref = str(item.get("target_ref") or "").strip() if isinstance(item, dict) else ""
+                    candidate = allowed_supersede_refs.get(target_ref)
+                    if not candidate:
+                        log_event(
+                            "rag_action_hallucination",
+                            session_id=self.id,
+                            action=action,
+                            target_ref=target_ref,
+                            reason="target_ref_not_in_current_candidates",
+                        )
+                        continue
+
+                    target_metadata = await run_sync(self.long_term_memory.get_metadata_by_id)(target_ref)
+                    if not target_metadata:
+                        log_event(
+                            "rag_action_hallucination",
+                            session_id=self.id,
+                            action=action,
+                            target_ref=target_ref,
+                            reason="target_ref_missing_in_vector_store",
+                        )
+                        continue
+
+                    target_source = str(target_metadata.get("source") or candidate.get("source") or "memory")
+                    target_type = str(target_metadata.get("type") or candidate.get("type") or "event")
+                    target_subtype = str(target_metadata.get("subtype") or candidate.get("subtype") or target_type)
+                    target_category = str(target_metadata.get("category") or candidate.get("category") or target_type)
+                    allowed_target_types = {"event", "preference", "profile", "relationship"}
+                    if (
+                        target_source != "memory"
+                        or target_subtype == "bot_self"
+                        or (target_type not in allowed_target_types and target_category not in allowed_target_types)
+                    ):
+                        log_event(
+                            "rag_action_rejected",
+                            session_id=self.id,
+                            action=action,
+                            target_ref=target_ref,
+                            source=target_source,
+                            type=target_type,
+                            subtype=target_subtype,
+                            category=target_category,
+                            reason="target_not_supersedable",
+                        )
+                        continue
 
                 # 质量过滤：使用 should_store_memory 函数
                 if not should_store_memory(content):
@@ -866,7 +928,18 @@ class Session:
                     "ttl_days": runtime_settings["rag_default_event_ttl_days"],
                 }
 
-                pending_memories.append((content, metadata))
+                if action == "supersede":
+                    target_ref = str(item.get("target_ref") or "").strip()
+                    metadata["supersedes"] = target_ref
+                    await run_sync(self.long_term_memory.add_texts)([content], metadatas=[metadata])
+                    updated_target_metadata = dict(target_metadata)
+                    updated_target_metadata["status"] = "superseded"
+                    updated_target_metadata["superseded_at"] = datetime.now().astimezone().isoformat()
+                    updated_target_metadata["superseded_reason"] = str(item.get("reason") or "")[:200]
+                    await run_sync(self.long_term_memory.update_metadata_by_id)(target_ref, updated_target_metadata)
+                    superseded_count += 1
+                else:
+                    pending_memories.append((content, metadata))
 
             store_result = {"added": 0, "skipped_dedup": 0}
             if pending_memories:
@@ -874,9 +947,9 @@ class Session:
 
             saved_count = store_result.get("added", 0)
             skipped_dedup = store_result.get("skipped_dedup", 0)
-            if saved_count > 0 or skipped_quality > 0 or skipped_dedup > 0:
+            if saved_count > 0 or skipped_quality > 0 or skipped_dedup > 0 or superseded_count > 0:
                 logger.info(
-                    f"[Memory] 存储结果: 成功 {saved_count}, 质量过滤 {skipped_quality}, 去重跳过 {skipped_dedup}"
+                    f"[Memory] 存储结果: 成功 {saved_count}, 替换 {superseded_count}, 质量过滤 {skipped_quality}, 去重跳过 {skipped_dedup}"
                 )
         except Exception as e:
             logger.error(f"[Async] 保存记忆失败: {e}")

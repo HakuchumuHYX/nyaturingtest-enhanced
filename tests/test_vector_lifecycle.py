@@ -33,9 +33,12 @@ class FakeLifecycleCollection:
         self.deleted = []
 
     def get(self, **kwargs):
+        requested_ids = kwargs.get("ids")
+        row_ids = list(requested_ids) if requested_ids is not None else list(self.rows.keys())
+        row_ids = [item_id for item_id in row_ids if item_id in self.rows]
         return {
-            "ids": list(self.rows.keys()),
-            "metadatas": [dict(metadata) for metadata in self.rows.values()],
+            "ids": row_ids,
+            "metadatas": [dict(self.rows[item_id]) for item_id in row_ids],
         }
 
     def update(self, *, ids, metadatas):
@@ -144,6 +147,24 @@ class VectorLifecycleTests(unittest.TestCase):
         self.assertEqual(1.0, result[1]["metadata"]["confidence_weight"])
         self.assertEqual(1.0, result[1]["metadata"]["importance_weight"])
         self.assertEqual(0.0, result[2]["metadata"]["adjusted_score"])
+
+    def test_get_and_update_metadata_by_id_for_supersede(self):
+        module = _load_vector_module()
+        memory = object.__new__(module.VectorMemory)
+        memory.collection = FakeLifecycleCollection([
+            ("mem-1", {"source": "memory", "type": "preference", "status": "active"}),
+        ])
+
+        self.assertEqual(
+            {"source": "memory", "type": "preference", "status": "active"},
+            memory.get_metadata_by_id("mem-1"),
+        )
+        self.assertIsNone(memory.get_metadata_by_id("missing"))
+
+        memory.update_metadata_by_id("mem-1", {"source": "memory", "type": "preference", "status": "superseded"})
+
+        self.assertEqual("superseded", memory.collection.rows["mem-1"]["status"])
+        self.assertEqual([(["mem-1"], [{"source": "memory", "type": "preference", "status": "superseded"}])], memory.collection.updated)
 
 
 if __name__ == "__main__":
