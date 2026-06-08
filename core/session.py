@@ -131,6 +131,45 @@ def _rag_debug_records(records: list[dict]) -> list[dict]:
     return debug_items
 
 
+def _existing_related_memories(
+    raw_records: list[dict] | None,
+    active_user_ids: set[str],
+    *,
+    ids_supported: bool,
+    limit: int = 5,
+) -> list[dict]:
+    related = []
+    for item in raw_records or []:
+        content = str(item.get("content") or "")
+        meta = item.get("metadata", {}) or {}
+        if not content or str(meta.get("source") or "memory") != "memory":
+            continue
+        if str(meta.get("status") or "active") != "active":
+            continue
+        user_id = str(meta.get("user_id") or "").strip()
+        if user_id and user_id not in active_user_ids:
+            continue
+
+        memory_ref = str(meta.get("memory_ref") or "").strip()
+        if ids_supported and not memory_ref:
+            continue
+
+        entry = {
+            "content_preview": content[:80],
+            "source": str(meta.get("source") or "memory"),
+            "type": str(meta.get("type") or "event"),
+            "subtype": str(meta.get("subtype") or meta.get("type") or "event"),
+            "category": str(meta.get("category") or meta.get("type") or "event"),
+            "confidence": meta.get("confidence", 1.0),
+        }
+        if ids_supported:
+            entry["memory_ref"] = memory_ref
+        related.append(entry)
+        if len(related) >= limit:
+            break
+    return related
+
+
 class _ChattingState(Enum):
     IDLE = 0  # 潜水
     BUBBLE = 1  # 冒泡
@@ -586,6 +625,20 @@ class Session:
             ensure_ascii=False, sort_keys=True, separators=(",", ":")
         )
         search_history = search_result.mem_history if search_result else []
+        active_user_ids = {
+            str(msg.user_id)
+            for msg in messages_chunk
+            if msg.user_id and str(msg.user_id).strip()
+        }
+        ids_supported = bool(getattr(self.long_term_memory, "ids_supported", False))
+        existing_related_memories = _existing_related_memories(
+            search_result.raw_records if search_result else [],
+            active_user_ids,
+            ids_supported=ids_supported,
+        )
+        allow_memory_supersede = ids_supported and any(
+            item.get("memory_ref") for item in existing_related_memories
+        )
 
         formatted_msgs = [f"[ID:{msg.user_id}] {msg.user_name}: '{escape_for_prompt(msg.content)}'" for msg in
                           messages_chunk]
@@ -615,7 +668,9 @@ class Session:
             asdict(self.global_emotion),
             related_profiles_json, search_history, self.chat_summary,
             is_relevant=is_relevant,
-            time_info=time_str
+            time_info=time_str,
+            existing_related_memories=existing_related_memories,
+            allow_memory_supersede=allow_memory_supersede,
         )
 
         response_dict = {}
