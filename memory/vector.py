@@ -91,6 +91,16 @@ def _dedupe_preserve_order(items: list[str]) -> list[str]:
     return result
 
 
+def _clamp_float(value: Any, default: float, lower: float, upper: float) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    if math.isnan(number):
+        return default
+    return max(lower, min(upper, number))
+
+
 def _normalized_metadata(meta: dict | None) -> dict[str, Any]:
     data = dict(meta or {})
     source = str(data.get("source") or "memory")
@@ -99,6 +109,10 @@ def _normalized_metadata(meta: dict | None) -> dict[str, Any]:
     data["source"] = source
     data["type"] = memory_type
     data["subtype"] = subtype
+    data["status"] = str(data.get("status") or "active")
+    data["category"] = str(data.get("category") or memory_type)
+    data["confidence"] = _clamp_float(data.get("confidence"), 1.0, 0.0, 1.0)
+    data["importance"] = _clamp_float(data.get("importance"), 0.0, 0.0, 1.0)
     return data
 
 
@@ -711,12 +725,16 @@ class VectorMemory:
             self._set_retrieval_stats(stats)
             return []
         
-        # 2. 应用时间衰减
+        # 2. 应用生命周期过滤和时间衰减
         today_dt = datetime.now()
+        active_results = []
         
         for item in raw_results:
             meta = item.get("metadata", {})
             meta.update(_normalized_metadata(meta))
+            if _metadata_status(meta) != "active":
+                continue
+            active_results.append(item)
             date = meta.get("date", 0)
 
             if meta.get("source") == "preset":
@@ -742,15 +760,19 @@ class VectorMemory:
             
             # 计算调整后的分数
             source_type_weight = _source_type_weight(meta)
-            adjusted_score = original_score * decay_factor * source_type_weight
+            confidence_weight = _clamp_float(meta.get("confidence"), 1.0, 0.0, 1.0)
+            importance_weight = 1.0 + _clamp_float(meta.get("importance"), 0.0, 0.0, 1.0) * 0.15
+            adjusted_score = original_score * decay_factor * source_type_weight * confidence_weight * importance_weight
             meta["adjusted_score"] = adjusted_score
             meta["days_ago"] = days_ago
             meta["decay_factor"] = decay_factor
             meta["source_type_weight"] = source_type_weight
+            meta["confidence_weight"] = confidence_weight
+            meta["importance_weight"] = importance_weight
         
         # 3. 重新排序
         sorted_results = sorted(
-            raw_results, 
+            active_results,
             key=lambda x: x.get("metadata", {}).get("adjusted_score", 0), 
             reverse=True
         )
@@ -759,7 +781,7 @@ class VectorMemory:
         final_results = sorted_results[:k]
         adjusted_scores = [
             float(item.get("metadata", {}).get("adjusted_score", 0.0))
-            for item in raw_results
+            for item in active_results
         ]
         stats.update(_score_distribution(adjusted_scores))
         stats["returned_count"] = len(final_results)

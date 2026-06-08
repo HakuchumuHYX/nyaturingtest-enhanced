@@ -103,6 +103,48 @@ class VectorLifecycleTests(unittest.TestCase):
         self.assertIn("superseded-old", deleted)
         self.assertNotIn("preset-old", deleted)
 
+    def test_retrieve_with_decay_filters_non_active_status_but_keeps_legacy_and_preset(self):
+        module = _load_vector_module()
+        memory = object.__new__(module.VectorMemory)
+
+        def fake_retrieve(queries, k=5, where=None, use_rerank=True):
+            return [
+                {"content": "superseded memory", "metadata": {"source": "memory", "type": "event", "status": "superseded", "retrieval_score": 0.99}},
+                {"content": "archived memory", "metadata": {"source": "memory", "type": "event", "status": "archived", "retrieval_score": 0.98}},
+                {"content": "legacy active memory", "metadata": {"source": "memory", "type": "event", "retrieval_score": 0.90}},
+                {"content": "preset memory", "metadata": {"source": "preset", "type": "rule", "retrieval_score": 0.50}},
+            ]
+
+        memory.retrieve = fake_retrieve
+
+        result = memory.retrieve_with_decay(["query"], k=4, use_rerank=False, decay_rate=0)
+
+        self.assertEqual(["legacy active memory", "preset memory"], [item["content"] for item in result])
+        self.assertEqual("active", result[0]["metadata"]["status"])
+        self.assertEqual("active", result[1]["metadata"]["status"])
+        self.assertEqual(2, memory.last_retrieval_stats["returned_count"])
+
+    def test_retrieve_with_decay_applies_confidence_and_importance_with_legacy_neutral_defaults(self):
+        module = _load_vector_module()
+        memory = object.__new__(module.VectorMemory)
+        today = int(datetime.now().strftime("%Y%m%d"))
+
+        def fake_retrieve(queries, k=5, where=None, use_rerank=True):
+            return [
+                {"content": "legacy neutral", "metadata": {"source": "memory", "type": "event", "date": today, "retrieval_score": 0.80}},
+                {"content": "important update", "metadata": {"source": "memory", "type": "event", "date": today, "retrieval_score": 0.70, "confidence": 1.0, "importance": 1.0}},
+                {"content": "zero confidence", "metadata": {"source": "memory", "type": "event", "date": today, "retrieval_score": 1.0, "confidence": 0.0, "importance": 1.0}},
+            ]
+
+        memory.retrieve = fake_retrieve
+
+        result = memory.retrieve_with_decay(["query"], k=3, use_rerank=False, decay_rate=0)
+
+        self.assertEqual(["important update", "legacy neutral", "zero confidence"], [item["content"] for item in result])
+        self.assertEqual(1.0, result[1]["metadata"]["confidence_weight"])
+        self.assertEqual(1.0, result[1]["metadata"]["importance_weight"])
+        self.assertEqual(0.0, result[2]["metadata"]["adjusted_score"])
+
 
 if __name__ == "__main__":
     unittest.main()
