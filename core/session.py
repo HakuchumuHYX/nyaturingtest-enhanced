@@ -754,12 +754,17 @@ class Session:
         """
         try:
             today = int(datetime.now().strftime("%Y%m%d"))
+            runtime_settings = get_runtime_settings()
             skipped_quality = 0
             pending_memories: list[tuple[str, dict]] = []
 
             for item in analyze_result:
                 content = ""
                 uid = ""
+                action = "add"
+                category = "event"
+                confidence = 0.7
+                importance = 0.5
 
                 # 情况 1: LLM 还是返回了字符串 (Prompt 没生效或模型太笨)
                 if isinstance(item, str) and item.strip():
@@ -768,10 +773,25 @@ class Session:
 
                 # 情况 2: LLM 返回了我们要求的标准字典
                 elif isinstance(item, dict):
+                    action = str(item.get("action") or "add").strip().lower()
+                    if action == "ignore":
+                        continue
+                    if action != "add":
+                        logger.debug(f"[Memory] 暂不处理的记忆 action: {action}")
+                        continue
                     content = item.get("content", "").strip()
                     uid = str(item.get("related_user_id", ""))
                     if not uid and default_user_id:
                         uid = default_user_id
+                    category = str(item.get("category") or "event").strip() or "event"
+                    try:
+                        confidence = max(0.0, min(1.0, float(item.get("confidence", 0.7))))
+                    except (TypeError, ValueError):
+                        confidence = 0.7
+                    try:
+                        importance = max(0.0, min(1.0, float(item.get("importance", 0.5))))
+                    except (TypeError, ValueError):
+                        importance = 0.5
 
                 # 质量过滤：使用 should_store_memory 函数
                 if not should_store_memory(content):
@@ -781,9 +801,14 @@ class Session:
 
                 metadata = {
                     "source": "memory",
-                    "type": "event",
+                    "type": category,
                     "date": today,
-                    "user_id": uid
+                    "user_id": uid,
+                    "status": "active",
+                    "category": category,
+                    "confidence": confidence,
+                    "importance": importance,
+                    "ttl_days": runtime_settings["rag_default_event_ttl_days"],
                 }
 
                 pending_memories.append((content, metadata))

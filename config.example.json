@@ -71,7 +71,8 @@
     "rerank_willingness_threshold": 0.68,
     "rag_debug_log": false,
     "rag_final_k": 20,
-    "rag_candidate_k": 40
+    "rag_candidate_k": 40,
+    "rag_default_event_ttl_days": 90
   },
   "enabled_groups": []
 }

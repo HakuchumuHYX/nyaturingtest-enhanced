@@ -2,6 +2,7 @@
 import os
 import uuid
 import math
+import json
 import httpx
 from datetime import datetime, timedelta
 from typing import List, Dict, Any
@@ -118,6 +119,26 @@ def _collection_metric_state(collection) -> str:
     if not space:
         return "unknown"
     return "cosine" if str(space).lower() == "cosine" else "mismatch"
+
+
+def _batched(items: list[Any], batch_size: int) -> list[list[Any]]:
+    safe_size = max(1, int(batch_size or 1))
+    return [items[index:index + safe_size] for index in range(0, len(items), safe_size)]
+
+
+def _metadata_status(meta: dict | None) -> str:
+    return str((meta or {}).get("status") or "active")
+
+
+def _date_days_ago(meta: dict, *, now: datetime) -> int | None:
+    date = meta.get("date")
+    if not date or not isinstance(date, int) or date <= 0:
+        return None
+    try:
+        memory_dt = datetime.strptime(str(date), "%Y%m%d")
+    except ValueError:
+        return None
+    return max(0, (now - memory_dt).days)
 
 
 class SiliconFlowReranker:
@@ -239,6 +260,7 @@ class VectorMemory:
         )
         self._last_retrieval_stats = _empty_retrieval_stats()
         self._check_collection_metric_once()
+        self._ids_supported = self._probe_ids_support()
 
     @property
     def last_retrieval_stats(self) -> dict[str, Any]:
@@ -258,6 +280,21 @@ class VectorMemory:
             metadata = getattr(self.collection, "metadata", None)
             logger.error(f"Vector collection metric mismatch: {self.persist_directory} metadata={metadata}")
         return state
+
+    @property
+    def ids_supported(self) -> bool:
+        return bool(getattr(self, "_ids_supported", False))
+
+    def _probe_ids_support(self) -> bool:
+        try:
+            with BACKUP_IO_LOCK:
+                probe = self.collection.get(limit=1, include=[])
+            supported = isinstance(probe, dict) and "ids" in probe
+            logger.info(f"Vector collection capability: ids_supported={supported} path={self.persist_directory}")
+            return supported
+        except Exception as e:
+            logger.warning(f"Vector collection ids probe failed: {e}")
+            return False
 
     def add_texts(self, texts: List[str], metadatas: List[dict] | None = None):
         if not texts: return
@@ -306,11 +343,13 @@ class VectorMemory:
             documents = results.get("documents") or []
             metadatas = results.get("metadatas") or []
             distances = results.get("distances") or []
+            ids = results.get("ids") or []
 
             if documents:
                 for i, docs in enumerate(documents):
                     metas = metadatas[i] if i < len(metadatas) else []
                     row_distances = distances[i] if i < len(distances) else []
+                    row_ids = ids[i] if i < len(ids) else []
                     
                     for j, doc in enumerate(docs):
                         if not doc:
@@ -318,6 +357,8 @@ class VectorMemory:
                         metadata = _normalized_metadata(metas[j] if j < len(metas) else {})
                         distance = row_distances[j] if j < len(row_distances) else None
                         metadata["retrieval_score"] = _score_from_distance(distance)
+                        if j < len(row_ids):
+                            metadata["memory_ref"] = row_ids[j]
                         existing = candidate_by_content.get(doc)
                         if (
                             existing is None
@@ -427,21 +468,94 @@ class VectorMemory:
     def cleanup(self, days_retention: int = 90):
         """生命周期管理：清理过期事件"""
         try:
-            # 将 cutoff_date 转为整数 (例如 20251018)
-            cutoff_date = int((datetime.now() - timedelta(days=days_retention)).strftime("%Y%m%d"))
+            ids, metadatas = self._get_all_ids_metadatas()
+            now = datetime.now()
+            delete_ids = []
+            for item_id, meta in zip(ids, metadatas):
+                metadata = _normalized_metadata(meta)
+                if metadata.get("source") == "preset":
+                    continue
+                days_ago = _date_days_ago(metadata, now=now)
+                if days_ago is None:
+                    continue
+                status = _metadata_status(metadata)
+                ttl_days = int(metadata.get("ttl_days") or days_retention)
+                should_delete = (
+                    (status in {"archived", "superseded"} and days_ago > days_retention)
+                    or (metadata.get("type") == "event" and days_ago > ttl_days)
+                )
+                if should_delete:
+                    delete_ids.append(item_id)
 
-            # 仅清理 type=event 且日期早于 cutoff 的记录
-            where_filter = {
-                "$and": [
-                    {"type": {"$eq": "event"}},
-                    {"date": {"$lt": cutoff_date}}  # 现在是整数比较整数，ChromaDB 支持
-                ]
-            }
-            with BACKUP_IO_LOCK:
-                self.collection.delete(where=where_filter)
-            logger.info(f"Cleaned up memories before {cutoff_date}")
+            for batch in _batched(delete_ids, 200):
+                with BACKUP_IO_LOCK:
+                    self.collection.delete(ids=batch)
+            logger.info(f"Cleaned up {len(delete_ids)} expired vector memories")
         except Exception as e:
             logger.error(f"Cleanup failed: {e}")
+
+    def _get_all_ids_metadatas(self) -> tuple[list[str], list[dict]]:
+        with BACKUP_IO_LOCK:
+            result = self.collection.get(include=["metadatas"])
+        ids = result.get("ids", []) if isinstance(result, dict) else []
+        metadatas = result.get("metadatas", []) if isinstance(result, dict) else []
+        return list(ids or []), [dict(meta or {}) for meta in (metadatas or [])]
+
+    def backfill_active_status(self, *, dry_run: bool = True, batch_size: int = 200, max_rounds: int = 5) -> dict[str, Any]:
+        """Backfill missing status metadata without re-embedding records."""
+        report = {
+            "dry_run": dry_run,
+            "total_count": 0,
+            "missing_status_count": 0,
+            "backfilled_count": 0,
+            "verify_rounds": 0,
+            "complete": False,
+        }
+        zero_rounds = 0
+        for _ in range(max(1, max_rounds)):
+            ids, metadatas = self._get_all_ids_metadatas()
+            missing = [
+                (item_id, metadata)
+                for item_id, metadata in zip(ids, metadatas)
+                if not metadata.get("status")
+            ]
+            report["total_count"] = len(ids)
+            report["missing_status_count"] = len(missing)
+            if dry_run:
+                report["complete"] = not missing
+                return report
+            if not missing:
+                zero_rounds += 1
+                report["verify_rounds"] = zero_rounds
+                if zero_rounds >= 2:
+                    report["complete"] = True
+                    self._write_status_backfill_marker(report)
+                    return report
+                continue
+            zero_rounds = 0
+            for batch in _batched(missing, batch_size):
+                batch_ids = [item_id for item_id, _ in batch]
+                batch_metadatas = []
+                for _, metadata in batch:
+                    updated = dict(metadata or {})
+                    updated["status"] = "active"
+                    batch_metadatas.append(updated)
+                with BACKUP_IO_LOCK:
+                    self.collection.update(ids=batch_ids, metadatas=batch_metadatas)
+                report["backfilled_count"] += len(batch)
+        return report
+
+    def _write_status_backfill_marker(self, report: dict[str, Any]) -> None:
+        marker_path = os.path.join(self.persist_directory, ".rag_status_backfill_complete.json")
+        payload = {
+            "collection": MEMORY_COLLECTION_NAME,
+            "completed_at": datetime.now().astimezone().isoformat(),
+            "total_count": report.get("total_count", 0),
+            "backfilled_count": report.get("backfilled_count", 0),
+            "verify_rounds": report.get("verify_rounds", 0),
+        }
+        with open(marker_path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, sort_keys=True, indent=2)
 
     def clear(self):
         try:
