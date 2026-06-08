@@ -28,6 +28,7 @@ from ..prompts.templates import get_feedback_prompt, get_chat_prompt
 from ..database.message_repository import MessageRepository
 from ..database.profile_repository import ProfileRepository
 from ..database.session_repository import SessionStateRepository
+from .services import RagSearchService
 from .orchestrator import ConversationOrchestrator
 from .structured_log import log_event
 
@@ -557,7 +558,7 @@ class Session:
 
                 where_filter = where_any("source", ["preset", "memory"])
 
-                raw_results = await run_sync(self.long_term_memory.retrieve_with_decay)(
+                raw_results = await RagSearchService(self.long_term_memory).search_for_chat(
                     queries,
                     k=runtime_settings["rag_final_k"],
                     where=where_filter,

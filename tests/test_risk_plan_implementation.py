@@ -80,8 +80,10 @@ class RiskPlanImplementationTests(unittest.TestCase):
 
     def test_chat_rag_uses_decay_retrieval(self):
         session_source = (PLUGIN_DIR / "core" / "session.py").read_text(encoding="utf-8")
+        services_source = (PLUGIN_DIR / "core" / "services.py").read_text(encoding="utf-8")
 
-        self.assertIn("retrieve_with_decay", session_source)
+        self.assertIn("search_for_chat", session_source)
+        self.assertIn("retrieve_with_decay", services_source)
 
     def test_runtime_resources_are_closed(self):
         vector_source = (PLUGIN_DIR / "memory" / "vector.py").read_text(encoding="utf-8")

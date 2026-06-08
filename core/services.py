@@ -1,6 +1,44 @@
 from collections.abc import Awaitable, Callable
+from typing import Any
+
+from nonebot.utils import run_sync
 
 from ..memory.short_term import Message
+
+
+class RagSearchService:
+    def __init__(self, long_term_memory):
+        self.long_term_memory = long_term_memory
+
+    @staticmethod
+    def normalize_record(record: dict) -> dict:
+        content = str(record.get("content") or "")
+        meta = dict(record.get("metadata") or {})
+        score = meta.get("adjusted_score")
+        if score is None:
+            score = meta.get("rerank_score")
+        if score is None:
+            score = meta.get("retrieval_score")
+        return {
+            "content": content,
+            "metadata": meta,
+            "score": score,
+            "memory_ref": meta.get("memory_ref"),
+            "preview": content[:80],
+        }
+
+    async def _retrieve(self, queries: list[str], **kwargs: Any) -> list[dict]:
+        records = await run_sync(self.long_term_memory.retrieve_with_decay)(queries, **kwargs)
+        return [self.normalize_record(record) for record in records]
+
+    async def search_for_chat(self, queries: list[str], **kwargs: Any) -> list[dict]:
+        return await self._retrieve(queries, **kwargs)
+
+    async def search_for_user_profile(self, queries: list[str], **kwargs: Any) -> list[dict]:
+        return await self._retrieve(queries, **kwargs)
+
+    async def search_for_debug(self, queries: list[str], **kwargs: Any) -> list[dict]:
+        return await self._retrieve(queries, **kwargs)
 
 
 class MemoryService:

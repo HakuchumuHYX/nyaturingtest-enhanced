@@ -14,6 +14,7 @@ from ..database.message_repository import MessageRepository
 from ..database.profile_repository import ProfileRepository
 from ..core.logic import llm_response
 from ..core.usage import make_usage_recorder
+from ..core.services import RagSearchService
 from ..config import (
     get_effective_chat_model,
     get_effective_feedback_model,
@@ -228,7 +229,7 @@ async def handle_query_memory(bot: Bot, event: GroupMessageEvent, args: Message 
             dynamic_k = calculate_dynamic_k(interaction_count, memory_count, days_since_first)
 
             # 使用时间衰减检索（近期记忆权重更高）
-            vector_records = await run_sync(long_term_memory.retrieve_with_decay)(
+            vector_records = await RagSearchService(long_term_memory).search_for_user_profile(
                 search_queries,
                 k=dynamic_k,
                 where=search_filter,

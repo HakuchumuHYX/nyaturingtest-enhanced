@@ -18,7 +18,7 @@ class MemoryCommandPublicGroupOnlyTests(unittest.TestCase):
 
         progress_index = source.index('await query_memory.send("正在回溯记忆深处...")')
         lock_index = source.index("async with state.session_lock")
-        vector_index = source.index("retrieve_with_decay")
+        vector_index = source.index("search_for_user_profile")
         vad_index = source.index("long_term_vad = await _summarize_long_term_vad")
 
         self.assertLess(progress_index, lock_index)
