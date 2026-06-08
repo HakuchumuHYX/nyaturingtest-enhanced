@@ -177,6 +177,22 @@ class VectorBatchTests(unittest.TestCase):
         self.assertEqual(0.9, result[0]["metadata"]["retrieval_score"])
         self.assertEqual(0.3, round(result[1]["metadata"]["retrieval_score"], 2))
 
+    def test_retrieve_with_decay_records_aggregate_stats(self):
+        module = _load_vector_module()
+        memory = object.__new__(module.VectorMemory)
+        memory.collection = FakeRetrievalCollection()
+        memory.reranker = None
+
+        result = memory.retrieve_with_decay(["alpha"], k=1, use_rerank=False, decay_rate=0)
+        stats = memory.last_retrieval_stats
+
+        self.assertEqual(["memory alpha"], [item["content"] for item in result])
+        self.assertEqual(2, stats["candidate_count"])
+        self.assertEqual(1, stats["returned_count"])
+        self.assertEqual("rerank_disabled", stats["fallback_reason"])
+        self.assertEqual(0.3, round(stats["adjusted_score_min"], 2))
+        self.assertEqual(0.9, stats["adjusted_score_max"])
+
     def test_clear_recreates_collection_with_cosine_metadata(self):
         module = _load_vector_module()
         memory = object.__new__(module.VectorMemory)

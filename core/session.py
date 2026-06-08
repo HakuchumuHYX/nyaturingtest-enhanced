@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 from enum import Enum
 import json
 import random
+import time
 import traceback
 
 import httpx
@@ -28,6 +29,7 @@ from ..database.message_repository import MessageRepository
 from ..database.profile_repository import ProfileRepository
 from ..database.session_repository import SessionStateRepository
 from .orchestrator import ConversationOrchestrator
+from .structured_log import log_event
 
 
 def _limit_role_text(text: str, max_chars: int) -> str:
@@ -51,6 +53,35 @@ def _history_without_current_chunk(all_messages: list[Message], messages_chunk: 
 @dataclass
 class _SearchResult:
     mem_history: list[str]
+    raw_records: list[dict] | None = None
+    stats: dict | None = None
+
+
+def _score_stat_fields(stats: dict) -> dict:
+    return {
+        "adjusted_score_min": stats.get("adjusted_score_min"),
+        "adjusted_score_p50": stats.get("adjusted_score_p50"),
+        "adjusted_score_p90": stats.get("adjusted_score_p90"),
+        "adjusted_score_max": stats.get("adjusted_score_max"),
+    }
+
+
+def _rag_debug_records(records: list[dict]) -> list[dict]:
+    debug_items = []
+    for item in records:
+        content = item.get("content", "")
+        meta = item.get("metadata", {}) or {}
+        debug_items.append({
+            "source": meta.get("source"),
+            "type": meta.get("type"),
+            "subtype": meta.get("subtype"),
+            "retrieval_score": meta.get("retrieval_score"),
+            "rerank_score": meta.get("rerank_score"),
+            "adjusted_score": meta.get("adjusted_score"),
+            "days_ago": meta.get("days_ago"),
+            "content_preview": str(content)[:80],
+        })
+    return debug_items
 
 
 class _ChattingState(Enum):
@@ -367,7 +398,26 @@ class Session:
         """
         优化检索阶段
         """
+        started_at = time.perf_counter()
         logger.debug(f"检索阶段开始 (Use Rerank: {use_rerank})")
+        runtime_settings = get_runtime_settings()
+        rag_stats = {
+            "session_id": self.id,
+            "query_count": 0,
+            "queries_preview": [],
+            "use_rerank": bool(use_rerank),
+            "skip_reason": "none",
+            "fallback_reason": "none",
+            "candidate_count": 0,
+            "returned_count": 0,
+            "injected_count": 0,
+            "injected_chars": 0,
+            "elapsed_ms": 0,
+            "adjusted_score_min": None,
+            "adjusted_score_p50": None,
+            "adjusted_score_p90": None,
+            "adjusted_score_max": None,
+        }
 
         if self.chat_summary:
             queries.append(self.chat_summary)
@@ -376,50 +426,75 @@ class Session:
             queries.extend([f"关于{name}" for name in active_user_names])
 
         queries = list(set([q for q in queries if q and q.strip()]))
+        rag_stats["query_count"] = len(queries)
+        rag_stats["queries_preview"] = [q[:40] for q in queries[:3]]
 
         should_retrieve = self.willingness > 0.3
 
         long_term_memory = []
-        if should_retrieve and queries:
-            logger.debug(f"触发长期记忆检索: {queries[:5]}...")
+        raw_results = []
+        try:
+            if not queries:
+                rag_stats["skip_reason"] = "no_queries"
+            elif not should_retrieve:
+                rag_stats["skip_reason"] = "low_willingness"
+            else:
+                logger.debug(f"触发长期记忆检索: {queries[:5]}...")
 
-            where_filter = {
-                "$or": [
-                    {"source": {"$eq": "preset"}},
-                    {"source": {"$eq": "memory"}}
-                ]
-            }
+                where_filter = {
+                    "$or": [
+                        {"source": {"$eq": "preset"}},
+                        {"source": {"$eq": "memory"}}
+                    ]
+                }
 
-            raw_results = await run_sync(self.long_term_memory.retrieve_with_decay)(
-                queries,
-                k=20,
-                where=where_filter,
-                use_rerank=use_rerank
+                raw_results = await run_sync(self.long_term_memory.retrieve_with_decay)(
+                    queries,
+                    k=20,
+                    where=where_filter,
+                    use_rerank=use_rerank
+                )
+                retrieval_stats = getattr(self.long_term_memory, "last_retrieval_stats", {}) or {}
+                rag_stats.update({
+                    "candidate_count": int(retrieval_stats.get("candidate_count") or 0),
+                    "returned_count": int(retrieval_stats.get("returned_count") or len(raw_results)),
+                    "fallback_reason": str(retrieval_stats.get("fallback_reason") or "none"),
+                })
+                rag_stats.update(_score_stat_fields(retrieval_stats))
+
+                if raw_results:
+                    formatted_results = []
+                    total_len = 0
+                    max_len = 1500
+
+                    for item in raw_results:
+                        if total_len > max_len: break
+
+                        content = item.get("content", "")
+                        meta = item.get("metadata", {})
+                        source = meta.get("source", "unknown")
+                        date_str = str(meta.get("date", ""))
+
+                        prefix = "【设定】" if source == "preset" else f"【记忆/d:{date_str}】"
+                        line = f"{prefix} {content}"
+
+                        formatted_results.append(line)
+                        total_len += len(line)
+
+                    long_term_memory = formatted_results
+                    rag_stats["injected_count"] = len(long_term_memory)
+                    rag_stats["injected_chars"] = sum(len(item) for item in long_term_memory)
+                    logger.debug(f"搜索结果：命中 {len(long_term_memory)} 条")
+        finally:
+            rag_stats["elapsed_ms"] = int((time.perf_counter() - started_at) * 1000)
+            if runtime_settings["rag_debug_log"]:
+                rag_stats["result_debug"] = _rag_debug_records(raw_results)
+            log_event("rag_search", **rag_stats)
+            self.__search_result = _SearchResult(
+                mem_history=long_term_memory,
+                raw_records=raw_results,
+                stats=rag_stats,
             )
-
-            if raw_results:
-                formatted_results = []
-                total_len = 0
-                max_len = 1500
-
-                for item in raw_results:
-                    if total_len > max_len: break
-
-                    content = item.get("content", "")
-                    meta = item.get("metadata", {})
-                    source = meta.get("source", "unknown")
-                    date_str = str(meta.get("date", ""))
-
-                    prefix = "【设定】" if source == "preset" else f"【记忆/d:{date_str}】"
-                    line = f"{prefix} {content}"
-
-                    formatted_results.append(line)
-                    total_len += len(line)
-
-                long_term_memory = formatted_results
-                logger.debug(f"搜索结果：命中 {len(long_term_memory)} 条")
-
-        self.__search_result = _SearchResult(mem_history=long_term_memory)
 
     async def feedback_stage(self, messages_chunk: list[Message], llm_func: Callable,
                                is_relevant: bool = False) -> list[str]:
@@ -696,6 +771,16 @@ class Session:
             recalled_history=recalled_str,
             time_info=time_str,
             rp_style=get_chat_thinking_settings().get("rp_style", "off"),
+        )
+        log_event("rag_prompt_budget",
+            session_id=self.id,
+            chat_prompt_total_chars=len(prompt),
+            rag_injected_count=len(search_history),
+            rag_injected_chars=sum(len(item) for item in search_history),
+            history_chars=len(context_record.compressed_history or "") + sum(len(item) for item in history_msgs_formatted),
+            recent_chars=sum(len(item) for item in formatted_msgs),
+            recalled_history_chars=len(recalled_str),
+            examples_chars=len(self.__examples_str or ""),
         )
 
         last_error = None

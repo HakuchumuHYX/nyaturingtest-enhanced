@@ -27,6 +27,44 @@ def _score_from_distance(distance: float | int | None) -> float:
     return max(0.0, min(1.0, score))
 
 
+def _empty_retrieval_stats(*, use_rerank: bool = False, fallback_reason: str = "none") -> dict[str, Any]:
+    return {
+        "candidate_count": 0,
+        "returned_count": 0,
+        "use_rerank": bool(use_rerank),
+        "fallback_reason": fallback_reason,
+        "adjusted_score_min": None,
+        "adjusted_score_p50": None,
+        "adjusted_score_p90": None,
+        "adjusted_score_max": None,
+    }
+
+
+def _percentile(values: list[float], ratio: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    index = int((len(ordered) - 1) * ratio + 0.5)
+    index = max(0, min(len(ordered) - 1, index))
+    return ordered[index]
+
+
+def _score_distribution(values: list[float]) -> dict[str, float | None]:
+    if not values:
+        return {
+            "adjusted_score_min": None,
+            "adjusted_score_p50": None,
+            "adjusted_score_p90": None,
+            "adjusted_score_max": None,
+        }
+    return {
+        "adjusted_score_min": min(values),
+        "adjusted_score_p50": _percentile(values, 0.50),
+        "adjusted_score_p90": _percentile(values, 0.90),
+        "adjusted_score_max": max(values),
+    }
+
+
 class SiliconFlowReranker:
     def __init__(self, api_key: str, model: str, api_url: str | None = None, timeout: float | None = None):
         settings = get_memory_endpoint_settings()
@@ -144,6 +182,14 @@ class VectorMemory:
             embedding_function=self.emb_fn,
             metadata=MEMORY_COLLECTION_METADATA
         )
+        self._last_retrieval_stats = _empty_retrieval_stats()
+
+    @property
+    def last_retrieval_stats(self) -> dict[str, Any]:
+        return dict(getattr(self, "_last_retrieval_stats", _empty_retrieval_stats()))
+
+    def _set_retrieval_stats(self, stats: dict[str, Any]) -> None:
+        self._last_retrieval_stats = dict(stats)
 
     def add_texts(self, texts: List[str], metadatas: List[dict] | None = None):
         if not texts: return
@@ -169,8 +215,13 @@ class VectorMemory:
         1. 如果启用 Rerank，先扩大召回 (k * 2, max 50)，然后 Rerank 取 Top K
         2. 如果未启用，直接召回 Top K
         """
-        if not queries: return []
+        if not queries:
+            self._set_retrieval_stats(_empty_retrieval_stats(use_rerank=use_rerank))
+            return []
         unique_queries = list(set([q for q in queries if q.strip()]))
+        if not unique_queries:
+            self._set_retrieval_stats(_empty_retrieval_stats(use_rerank=use_rerank))
+            return []
         
         # 决定初筛数量 (优化：降低倍率至2倍，且设置硬性上限50，防止Token爆炸)
         if use_rerank and self.reranker:
@@ -207,11 +258,18 @@ class VectorMemory:
             
             # 如果没有结果，直接返回
             if not flattened_candidates:
+                self._set_retrieval_stats(_empty_retrieval_stats(use_rerank=use_rerank))
                 return []
 
             # 如果不使用 Rerank 或 Reranker 未初始化，直接截断返回
             if not use_rerank or not self.reranker:
-                return flattened_candidates[:k]
+                results = flattened_candidates[:k]
+                self._set_retrieval_stats({
+                    **_empty_retrieval_stats(use_rerank=use_rerank, fallback_reason="rerank_disabled"),
+                    "candidate_count": len(flattened_candidates),
+                    "returned_count": len(results),
+                })
+                return results
 
             # 第二步：Rerank
             # 由于 Rerank 通常是一对多（一个 Query 对多个 Doc），这里简化处理：
@@ -231,7 +289,13 @@ class VectorMemory:
             )
             if not rerank_results:
                 logger.debug("Rerank无结果，回退到初筛候选")
-                return flattened_candidates[:k]
+                results = flattened_candidates[:k]
+                self._set_retrieval_stats({
+                    **_empty_retrieval_stats(use_rerank=use_rerank, fallback_reason="rerank_api_empty"),
+                    "candidate_count": len(flattened_candidates),
+                    "returned_count": len(results),
+                })
+                return results
             
             final_results = []
             threshold = plugin_config.get("rerank", {}).get("threshold", 0.05)
@@ -255,11 +319,23 @@ class VectorMemory:
             logger.debug(f"Rerank完成: 初筛{len(candidate_docs)} -> 终选{len(final_results)} (阈值{threshold})")
             if not final_results:
                 logger.debug("Rerank结果全部被过滤，回退到初筛候选")
-                return flattened_candidates[:k]
+                results = flattened_candidates[:k]
+                self._set_retrieval_stats({
+                    **_empty_retrieval_stats(use_rerank=use_rerank, fallback_reason="rerank_all_filtered"),
+                    "candidate_count": len(flattened_candidates),
+                    "returned_count": len(results),
+                })
+                return results
+            self._set_retrieval_stats({
+                **_empty_retrieval_stats(use_rerank=use_rerank),
+                "candidate_count": len(flattened_candidates),
+                "returned_count": len(final_results),
+            })
             return final_results
 
         except Exception as e:
             logger.error(f"Vector retrieve failed: {e}")
+            self._set_retrieval_stats(_empty_retrieval_stats(use_rerank=use_rerank, fallback_reason="retrieve_error"))
             return []
 
     def delete_by_metadata(self, where: dict):
@@ -430,8 +506,10 @@ class VectorMemory:
         """
         # 1. 调用原有检索方法
         raw_results = self.retrieve(queries, k=k * 2, where=where, use_rerank=use_rerank)
+        stats = self.last_retrieval_stats
         
         if not raw_results:
+            self._set_retrieval_stats(stats)
             return []
         
         # 2. 应用时间衰减
@@ -473,4 +551,12 @@ class VectorMemory:
         )
         
         # 4. 截取前 k 个
-        return sorted_results[:k]
+        final_results = sorted_results[:k]
+        adjusted_scores = [
+            float(item.get("metadata", {}).get("adjusted_score", 0.0))
+            for item in raw_results
+        ]
+        stats.update(_score_distribution(adjusted_scores))
+        stats["returned_count"] = len(final_results)
+        self._set_retrieval_stats(stats)
+        return final_results

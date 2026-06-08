@@ -148,6 +148,7 @@ def get_default_config() -> dict:
             "post_feedback_skip_threshold": 0.34,
             "active_to_bubble_threshold": 0.50,
             "rerank_willingness_threshold": 0.68,
+            "rag_debug_log": False,
         },
         "enabled_groups": [],
     }
@@ -423,6 +424,12 @@ def get_runtime_settings() -> dict[str, Any]:
     def ratio(name: str, default: float) -> float:
         return number(name, default, float, minimum=0.0, maximum=1.0)
 
+    def flag(name: str, default: bool) -> bool:
+        value = runtime.get(name, default)
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
+
     return {
         "debounce_seconds": number("debounce_seconds", 2.0, float, minimum=0.0),
         "queue_max_size": number("queue_max_size", 200, int, minimum=1),
@@ -446,6 +453,7 @@ def get_runtime_settings() -> dict[str, Any]:
         "post_feedback_skip_threshold": ratio("post_feedback_skip_threshold", 0.34),
         "active_to_bubble_threshold": ratio("active_to_bubble_threshold", 0.50),
         "rerank_willingness_threshold": ratio("rerank_willingness_threshold", 0.68),
+        "rag_debug_log": flag("rag_debug_log", False),
     }
 
 
