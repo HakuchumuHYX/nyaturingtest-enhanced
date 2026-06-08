@@ -15,6 +15,20 @@ from ..database.backup_lock import BACKUP_IO_LOCK
 
 MEMORY_COLLECTION_NAME = "nyabot_memory"
 MEMORY_COLLECTION_METADATA = {"hnsw:space": "cosine"}
+PRESET_TYPE_WEIGHT = {
+    "bot_self": 0.95,
+    "relationship": 0.90,
+    "legacy_rule": 0.85,
+    "knowledge": 0.82,
+    "event": 0.75,
+}
+MEMORY_TYPE_WEIGHT = {
+    "event": 1.0,
+    "preference": 1.05,
+    "profile": 1.05,
+    "relationship": 1.0,
+}
+_metric_check_done: set[str] = set()
 
 
 def _score_from_distance(distance: float | int | None) -> float:
@@ -63,6 +77,47 @@ def _score_distribution(values: list[float]) -> dict[str, float | None]:
         "adjusted_score_p90": _percentile(values, 0.90),
         "adjusted_score_max": max(values),
     }
+
+
+def _dedupe_preserve_order(items: list[str]) -> list[str]:
+    result = []
+    seen = set()
+    for item in items:
+        if item in seen:
+            continue
+        seen.add(item)
+        result.append(item)
+    return result
+
+
+def _normalized_metadata(meta: dict | None) -> dict[str, Any]:
+    data = dict(meta or {})
+    source = str(data.get("source") or "memory")
+    memory_type = str(data.get("type") or "event")
+    subtype = str(data.get("subtype") or ("legacy_rule" if source == "preset" else memory_type))
+    data["source"] = source
+    data["type"] = memory_type
+    data["subtype"] = subtype
+    return data
+
+
+def _source_type_weight(meta: dict) -> float:
+    source = str(meta.get("source") or "memory")
+    memory_type = str(meta.get("type") or "event")
+    subtype = str(meta.get("subtype") or ("legacy_rule" if source == "preset" else memory_type))
+    if source == "preset":
+        return PRESET_TYPE_WEIGHT.get(subtype, PRESET_TYPE_WEIGHT["legacy_rule"])
+    return MEMORY_TYPE_WEIGHT.get(memory_type, 1.0)
+
+
+def _collection_metric_state(collection) -> str:
+    metadata = getattr(collection, "metadata", None)
+    if not isinstance(metadata, dict):
+        return "unknown"
+    space = metadata.get("hnsw:space")
+    if not space:
+        return "unknown"
+    return "cosine" if str(space).lower() == "cosine" else "mismatch"
 
 
 class SiliconFlowReranker:
@@ -183,6 +238,7 @@ class VectorMemory:
             metadata=MEMORY_COLLECTION_METADATA
         )
         self._last_retrieval_stats = _empty_retrieval_stats()
+        self._check_collection_metric_once()
 
     @property
     def last_retrieval_stats(self) -> dict[str, Any]:
@@ -190,6 +246,18 @@ class VectorMemory:
 
     def _set_retrieval_stats(self, stats: dict[str, Any]) -> None:
         self._last_retrieval_stats = dict(stats)
+
+    def _check_collection_metric_once(self) -> str:
+        state = _collection_metric_state(self.collection)
+        if self.persist_directory in _metric_check_done:
+            return state
+        _metric_check_done.add(self.persist_directory)
+        if state == "unknown":
+            logger.warning(f"Vector collection metric metadata unknown: {self.persist_directory}")
+        elif state == "mismatch":
+            metadata = getattr(self.collection, "metadata", None)
+            logger.error(f"Vector collection metric mismatch: {self.persist_directory} metadata={metadata}")
+        return state
 
     def add_texts(self, texts: List[str], metadatas: List[dict] | None = None):
         if not texts: return
@@ -218,7 +286,7 @@ class VectorMemory:
         if not queries:
             self._set_retrieval_stats(_empty_retrieval_stats(use_rerank=use_rerank))
             return []
-        unique_queries = list(set([q for q in queries if q.strip()]))
+        unique_queries = _dedupe_preserve_order([q for q in queries if q.strip()])
         if not unique_queries:
             self._set_retrieval_stats(_empty_retrieval_stats(use_rerank=use_rerank))
             return []
@@ -233,8 +301,7 @@ class VectorMemory:
             results = self.collection.query(query_texts=unique_queries, n_results=initial_k, where=where)
             
             # 第一步：合并去重初筛结果
-            flattened_candidates = []
-            seen = set()
+            candidate_by_content: dict[str, dict[str, Any]] = {}
             
             documents = results.get("documents") or []
             metadatas = results.get("metadatas") or []
@@ -246,15 +313,25 @@ class VectorMemory:
                     row_distances = distances[i] if i < len(distances) else []
                     
                     for j, doc in enumerate(docs):
-                        if doc and doc not in seen:
-                            metadata = dict(metas[j] or {}) if j < len(metas) else {}
-                            distance = row_distances[j] if j < len(row_distances) else None
-                            metadata["retrieval_score"] = _score_from_distance(distance)
-                            flattened_candidates.append({
-                                "content": doc, 
+                        if not doc:
+                            continue
+                        metadata = _normalized_metadata(metas[j] if j < len(metas) else {})
+                        distance = row_distances[j] if j < len(row_distances) else None
+                        metadata["retrieval_score"] = _score_from_distance(distance)
+                        existing = candidate_by_content.get(doc)
+                        if (
+                            existing is None
+                            or metadata["retrieval_score"] > existing["metadata"].get("retrieval_score", 0.0)
+                        ):
+                            candidate_by_content[doc] = {
+                                "content": doc,
                                 "metadata": metadata
-                            })
-                            seen.add(doc)
+                            }
+            flattened_candidates = sorted(
+                candidate_by_content.values(),
+                key=lambda item: item.get("metadata", {}).get("retrieval_score", 0.0),
+                reverse=True,
+            )
             
             # 如果没有结果，直接返回
             if not flattened_candidates:
@@ -427,11 +504,16 @@ class VectorMemory:
         """
         result = {"added": 0, "skipped_empty": 0, "skipped_dedup": 0}
         valid: list[tuple[str, dict]] = []
+        seen_batch = set()
         for content, metadata in memories:
             normalized = (content or "").strip()
             if not normalized:
                 result["skipped_empty"] += 1
                 continue
+            if normalized in seen_batch:
+                result["skipped_dedup"] += 1
+                continue
+            seen_batch.add(normalized)
             valid.append((normalized, metadata or {}))
 
         if not valid:
@@ -517,21 +599,24 @@ class VectorMemory:
         
         for item in raw_results:
             meta = item.get("metadata", {})
+            meta.update(_normalized_metadata(meta))
             date = meta.get("date", 0)
-            
-            # 计算天数差
-            if date and isinstance(date, int) and date > 0:
+
+            if meta.get("source") == "preset":
+                days_ago = 0
+                decay_factor = 1.0
+            elif date and isinstance(date, int) and date > 0:
+                # 计算天数差
                 try:
                     memory_dt = datetime.strptime(str(date), "%Y%m%d")
                     days_ago = max(0, (today_dt - memory_dt).days)
                 except ValueError:
                     days_ago = 60
+                decay_factor = math.exp(-decay_rate * days_ago)
             else:
                 # 没有日期的记忆，视为较久以前
                 days_ago = 60
-            
-            # 指数衰减
-            decay_factor = math.exp(-decay_rate * days_ago)
+                decay_factor = math.exp(-decay_rate * days_ago)
             
             # 获取原始分数
             original_score = meta.get("rerank_score")
@@ -539,9 +624,12 @@ class VectorMemory:
                 original_score = meta.get("retrieval_score", 0.5)
             
             # 计算调整后的分数
-            adjusted_score = original_score * decay_factor
+            source_type_weight = _source_type_weight(meta)
+            adjusted_score = original_score * decay_factor * source_type_weight
             meta["adjusted_score"] = adjusted_score
             meta["days_ago"] = days_ago
+            meta["decay_factor"] = decay_factor
+            meta["source_type_weight"] = source_type_weight
         
         # 3. 重新排序
         sorted_results = sorted(

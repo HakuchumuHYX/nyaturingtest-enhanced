@@ -115,6 +115,7 @@ class FakeCollection:
 class FakeRetrievalCollection:
     def __init__(self):
         self.query_calls = []
+        self.metadata = {"hnsw:space": "cosine"}
 
     def query(self, **kwargs):
         self.query_calls.append(kwargs)
@@ -122,6 +123,29 @@ class FakeRetrievalCollection:
             "documents": [["memory alpha", "memory beta"]],
             "metadatas": [[{"source": "memory"}, {"source": "preset"}]],
             "distances": [[0.1, 0.7]],
+        }
+
+
+class FakeDuplicateRetrievalCollection:
+    def __init__(self):
+        self.query_calls = []
+        self.metadata = {"hnsw:space": "cosine"}
+
+    def query(self, **kwargs):
+        self.query_calls.append(kwargs)
+        return {
+            "documents": [
+                ["shared memory", "weak memory"],
+                ["shared memory", "strong memory"],
+            ],
+            "metadatas": [
+                [{"source": "memory"}, {"source": "memory"}],
+                [{"source": "memory"}, {"source": "memory"}],
+            ],
+            "distances": [
+                [0.6, 0.4],
+                [0.1, 0.2],
+            ],
         }
 
 
@@ -165,6 +189,20 @@ class VectorBatchTests(unittest.TestCase):
         self.assertEqual(1, len(memory.collection.add_calls))
         self.assertEqual(["新的记忆"], memory.collection.add_calls[0]["documents"])
 
+    def test_add_memories_with_dedup_skips_same_batch_exact_duplicates(self):
+        module = _load_vector_module()
+        memory = object.__new__(module.VectorMemory)
+        memory.collection = FakeCollection()
+
+        result = memory.add_memories_with_dedup([
+            ("同一条记忆", {"source": "memory", "user_id": "1"}),
+            ("同一条记忆", {"source": "memory", "user_id": "1"}),
+            ("另一条记忆", {"source": "memory", "user_id": "2"}),
+        ], threshold=0.99)
+
+        self.assertEqual({"added": 2, "skipped_empty": 0, "skipped_dedup": 1}, result)
+        self.assertEqual(["同一条记忆", "另一条记忆"], memory.collection.query_calls[0]["query_texts"])
+
     def test_retrieve_attaches_distance_score_without_rerank(self):
         module = _load_vector_module()
         memory = object.__new__(module.VectorMemory)
@@ -176,6 +214,29 @@ class VectorBatchTests(unittest.TestCase):
         self.assertEqual(["memory alpha", "memory beta"], [item["content"] for item in result])
         self.assertEqual(0.9, result[0]["metadata"]["retrieval_score"])
         self.assertEqual(0.3, round(result[1]["metadata"]["retrieval_score"], 2))
+
+    def test_retrieve_preserves_query_order_for_chroma_call(self):
+        module = _load_vector_module()
+        memory = object.__new__(module.VectorMemory)
+        memory.collection = FakeRetrievalCollection()
+        memory.reranker = None
+
+        memory.retrieve(["beta", "alpha", "beta"], k=2, use_rerank=False)
+
+        self.assertEqual(["beta", "alpha"], memory.collection.query_calls[0]["query_texts"])
+
+    def test_retrieve_merges_duplicate_docs_by_highest_score_and_sorts(self):
+        module = _load_vector_module()
+        memory = object.__new__(module.VectorMemory)
+        memory.collection = FakeDuplicateRetrievalCollection()
+        memory.reranker = None
+
+        result = memory.retrieve(["weak", "strong"], k=3, use_rerank=False)
+
+        self.assertEqual(["shared memory", "strong memory", "weak memory"], [item["content"] for item in result])
+        self.assertEqual(0.9, result[0]["metadata"]["retrieval_score"])
+        self.assertEqual(0.8, result[1]["metadata"]["retrieval_score"])
+        self.assertEqual(0.6, result[2]["metadata"]["retrieval_score"])
 
     def test_retrieve_with_decay_records_aggregate_stats(self):
         module = _load_vector_module()
@@ -190,7 +251,7 @@ class VectorBatchTests(unittest.TestCase):
         self.assertEqual(2, stats["candidate_count"])
         self.assertEqual(1, stats["returned_count"])
         self.assertEqual("rerank_disabled", stats["fallback_reason"])
-        self.assertEqual(0.3, round(stats["adjusted_score_min"], 2))
+        self.assertEqual(0.26, round(stats["adjusted_score_min"], 2))
         self.assertEqual(0.9, stats["adjusted_score_max"])
 
     def test_clear_recreates_collection_with_cosine_metadata(self):
@@ -205,6 +266,19 @@ class VectorBatchTests(unittest.TestCase):
         self.assertEqual(module.MEMORY_COLLECTION_NAME, memory.client.created[0]["name"])
         self.assertEqual(module.MEMORY_COLLECTION_METADATA, memory.client.created[0]["metadata"])
         self.assertEqual("new-collection", memory.collection)
+
+    def test_collection_metric_state_distinguishes_cosine_unknown_and_mismatch(self):
+        module = _load_vector_module()
+
+        self.assertEqual(
+            "cosine",
+            module._collection_metric_state(types.SimpleNamespace(metadata={"hnsw:space": "cosine"})),
+        )
+        self.assertEqual("unknown", module._collection_metric_state(types.SimpleNamespace(metadata={})))
+        self.assertEqual(
+            "mismatch",
+            module._collection_metric_state(types.SimpleNamespace(metadata={"hnsw:space": "l2"})),
+        )
 
 
 if __name__ == "__main__":

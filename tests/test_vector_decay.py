@@ -32,6 +32,43 @@ class VectorDecayTests(unittest.TestCase):
 
         self.assertEqual(["high", "low"], [item["content"] for item in result])
 
+    def test_preset_records_do_not_receive_missing_date_decay(self):
+        module = _load_vector_module()
+        memory = object.__new__(module.VectorMemory)
+
+        def fake_retrieve(queries, k=5, where=None, use_rerank=True):
+            return [
+                {"content": "preset", "metadata": {"source": "preset", "retrieval_score": 0.9}},
+            ]
+
+        memory.retrieve = fake_retrieve
+
+        result = memory.retrieve_with_decay(["query"], k=1, use_rerank=False, decay_rate=1)
+
+        self.assertEqual("preset", result[0]["content"])
+        self.assertEqual(0, result[0]["metadata"]["days_ago"])
+        self.assertEqual(1.0, result[0]["metadata"]["decay_factor"])
+        self.assertEqual(0.85, result[0]["metadata"]["source_type_weight"])
+
+    def test_memory_event_uses_memory_weight_not_preset_event_weight(self):
+        module = _load_vector_module()
+        memory = object.__new__(module.VectorMemory)
+        today = int(datetime.now().strftime("%Y%m%d"))
+
+        def fake_retrieve(queries, k=5, where=None, use_rerank=True):
+            return [
+                {"content": "memory", "metadata": {"source": "memory", "type": "event", "date": today, "retrieval_score": 0.75}},
+                {"content": "preset", "metadata": {"source": "preset", "type": "rule", "retrieval_score": 0.75}},
+            ]
+
+        memory.retrieve = fake_retrieve
+
+        result = memory.retrieve_with_decay(["query"], k=2, use_rerank=False, decay_rate=0)
+
+        self.assertEqual(["memory", "preset"], [item["content"] for item in result])
+        self.assertEqual(1.0, result[0]["metadata"]["source_type_weight"])
+        self.assertEqual(0.85, result[1]["metadata"]["source_type_weight"])
+
 
 if __name__ == "__main__":
     unittest.main()

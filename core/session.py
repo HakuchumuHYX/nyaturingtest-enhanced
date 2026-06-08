@@ -50,6 +50,17 @@ def _history_without_current_chunk(all_messages: list[Message], messages_chunk: 
     ]
 
 
+def _dedupe_preserve_order(items: list[str]) -> list[str]:
+    result = []
+    seen = set()
+    for item in items:
+        if item in seen:
+            continue
+        seen.add(item)
+        result.append(item)
+    return result
+
+
 @dataclass
 class _SearchResult:
     mem_history: list[str]
@@ -425,7 +436,7 @@ class Session:
         if active_user_names:
             queries.extend([f"关于{name}" for name in active_user_names])
 
-        queries = list(set([q for q in queries if q and q.strip()]))
+        queries = _dedupe_preserve_order([q for q in queries if q and q.strip()])
         rag_stats["query_count"] = len(queries)
         rag_stats["queries_preview"] = [q[:40] for q in queries[:3]]
 
