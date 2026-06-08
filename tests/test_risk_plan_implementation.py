@@ -20,6 +20,15 @@ class RiskPlanImplementationTests(unittest.TestCase):
         self.assertIn("def access_context", memory_source)
         self.assertIn("access_context(", session_source)
 
+    def test_summary_empty_string_keeps_session_and_memory_consistent(self):
+        memory_source = (PLUGIN_DIR / "memory" / "short_term.py").read_text(encoding="utf-8")
+        session_source = (PLUGIN_DIR / "core" / "session.py").read_text(encoding="utf-8")
+
+        self.assertIn("if new_summary is not None", memory_source)
+        self.assertIn('summary = response_dict.get("summary")', session_source)
+        self.assertIn("if summary is not None:", session_source)
+        self.assertNotIn('str(response_dict.get("summary", self.chat_summary))', session_source)
+
     def test_low_willingness_observation_is_configured(self):
         config_source = (PLUGIN_DIR / "config.py").read_text(encoding="utf-8")
         orchestrator_source = (PLUGIN_DIR / "core" / "orchestrator.py").read_text(encoding="utf-8")

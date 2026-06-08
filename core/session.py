@@ -37,19 +37,30 @@ def _limit_role_text(text: str, max_chars: int) -> str:
     return text
 
 
+def _history_without_current_chunk(all_messages: list[Message], messages_chunk: list[Message]) -> list[Message]:
+    chunk_message_ids = {str(msg.id) for msg in messages_chunk if msg.id}
+    return [
+        m for m in all_messages
+        if not (
+            (m.id and str(m.id) in chunk_message_ids)
+            or any(m is chunk_msg for chunk_msg in messages_chunk)
+        )
+    ]
+
+
 @dataclass
 class _SearchResult:
     mem_history: list[str]
 
 
 class _ChattingState(Enum):
-    ILDE = 0  # 潜水
+    IDLE = 0  # 潜水
     BUBBLE = 1  # 冒泡
     ACTIVE = 2  # 活跃
 
     def __str__(self):
         match self:
-            case _ChattingState.ILDE:
+            case _ChattingState.IDLE:
                 return "潜水状态"
             case _ChattingState.BUBBLE:
                 return "冒泡状态"
@@ -109,7 +120,7 @@ class Session:
 
         # 意愿值系统
         self.willingness: float = 0.0
-        self.__chatting_state = _ChattingState.ILDE
+        self.__chatting_state = _ChattingState.IDLE
 
         self.__search_result = None
         self._last_activity_time = datetime.now()
@@ -122,6 +133,8 @@ class Session:
     async def set_role(self, name: str, role: str):
         self.__role = _limit_role_text(role, get_runtime_settings()["role_max_chars"])
         self.__name = name
+        self.__aliases = []
+        self.__examples_str = ""
         await self.save_session()
 
     def role(self) -> str:
@@ -143,7 +156,7 @@ class Session:
         self.profiles = {}
         self.global_emotion = EmotionState()
         self.chat_summary = ""
-        self.__chatting_state = _ChattingState.ILDE
+        self.__chatting_state = _ChattingState.IDLE
         self.willingness = 0.0
         self._active_count = 0
         self._last_activity_time = datetime.now()
@@ -156,7 +169,7 @@ class Session:
     async def calm_down(self):
         self.global_emotion = EmotionState()
         self.profiles = {}
-        self.__chatting_state = _ChattingState.ILDE
+        self.__chatting_state = _ChattingState.IDLE
         self.willingness = 0.0
         self._active_count = 0
         self._last_activity_time = datetime.now()
@@ -312,7 +325,7 @@ class Session:
                 u = ex.get("user", "")
                 b = ex.get("bot", "")
                 if u and b:
-                    ex_lines.append(f"User: {u}\n{preset.name}: {b}")
+                    ex_lines.append(f"用户: {u}\n{preset.name}: {b}")
             self.__examples_str = _limit_role_text("\n".join(ex_lines), get_runtime_settings()["examples_max_chars"])
         else:
             self.__examples_str = ""
@@ -424,7 +437,7 @@ class Session:
             if p.user_id not in self.profiles: self.profiles[p.user_id] = p
 
         related_profiles_json = json.dumps(
-            [{"user_name": p.user_id, "emotion_tends_to_user": asdict(p.emotion)} for p in related_profiles],
+            [{"user_id": p.user_id, "emotion_tends_to_user": asdict(p.emotion)} for p in related_profiles],
             ensure_ascii=False, sort_keys=True, separators=(",", ":")
         )
         search_history = self.__search_result.mem_history if self.__search_result else []
@@ -435,7 +448,7 @@ class Session:
         # 过滤掉本次的新消息，避免 Prompt 上下文重复
         context_record = self.global_memory.access_context(limit=get_runtime_settings()["short_context_limit"])
         all_messages = context_record.messages
-        history_msgs = [m for m in all_messages if m not in messages_chunk]
+        history_msgs = _history_without_current_chunk(all_messages, messages_chunk)
         # 格式化一下 history_msgs，使其更易读 (不再直接 dump repr)
         # 格式化为：[ID:xxx] Name: Content
         # 但 get_feedback_prompt 原本接收 list，可能需要的是 raw object list 或者 dict list？
@@ -519,7 +532,9 @@ class Session:
             p.merge_old_interactions()
 
         # 5. 更新摘要
-        self.chat_summary = str(response_dict.get("summary", self.chat_summary))
+        summary = response_dict.get("summary")
+        if summary is not None:
+            self.chat_summary = str(summary)
         # 同步更新到 Memory，确保下一次 Prompt 使用最新摘要
         self.global_memory.update_summary(self.chat_summary)
 
@@ -532,11 +547,9 @@ class Session:
             }
             fallback_uid = list(unique_user_ids)[0] if len(unique_user_ids) == 1 else ""
 
-            task = asyncio.create_task(
+            self._create_safe_task(
                 self.save_long_term_memory(analyze_result, default_user_id=fallback_uid)
             )
-            self._background_tasks.add(task)
-            task.add_done_callback(self._background_tasks.discard)
 
         # 6.5 主动历史溯源 (Historical Recall)
         need_history = response_dict.get("need_history", False)
@@ -565,19 +578,26 @@ class Session:
         try:
             new_willing = float(response_dict.get("willing", self.willingness))
             self.willingness = max(0.0, min(1.0, new_willing))
-            if is_relevant and self.willingness < 0.8:
-                self.willingness = 0.85
-                logger.debug(f"[Session {self.id}] 强关联强制提升意愿值至 0.85")
+            relevance_floor = get_runtime_settings()["relevance_willingness_floor"]
+            if is_relevant and self.willingness < relevance_floor:
+                self.willingness = relevance_floor
+                logger.debug(f"[Session {self.id}] 强关联强制提升意愿值至 {relevance_floor:.2f}")
         except:
             pass
 
         # 8. 状态流转
+        runtime_settings = get_runtime_settings()
         random_threshold = random.uniform(0.4, 0.7)
-        if self.willingness > random_threshold:
-            if self.__chatting_state == _ChattingState.ILDE:
+        if self.willingness < 0.2:
+            self.__chatting_state = _ChattingState.IDLE
+        elif (
+            self.__chatting_state == _ChattingState.ACTIVE
+            and self.willingness < runtime_settings["active_to_bubble_threshold"]
+        ):
+            self.__chatting_state = _ChattingState.BUBBLE
+        elif self.willingness > random_threshold:
+            if self.__chatting_state == _ChattingState.IDLE:
                 self.__chatting_state = _ChattingState.BUBBLE
-        elif self.willingness < 0.2:
-            self.__chatting_state = _ChattingState.ILDE
 
         logger.debug(f"<< 反馈结束: 意愿 {self.willingness:.2f}, 状态 {self.__chatting_state}")
         return recalled_history
@@ -649,7 +669,7 @@ class Session:
         # 过滤掉本次的新消息，避免 Prompt 上下文重复
         context_record = self.global_memory.access_context(limit=get_runtime_settings()["short_context_limit"])
         all_messages = context_record.messages
-        history_msgs = [m for m in all_messages if m not in messages_chunk]
+        history_msgs = _history_without_current_chunk(all_messages, messages_chunk)
         history_msgs_formatted = [
             f"[{m.time.strftime('%H:%M')}] {m.user_name}: {escape_for_prompt(m.content)}" 
             for m in history_msgs
@@ -661,7 +681,7 @@ class Session:
         reaction_users = list({msg.user_id if msg.user_id else msg.user_name for msg in messages_chunk})
         related_profiles = [self.profiles.get(uid, PersonProfile(user_id=uid)) for uid in reaction_users]
         related_profiles_json = json.dumps(
-            [{"user_name": p.user_id, "emotion_tends_to_user": asdict(p.emotion)} for p in related_profiles],
+            [{"user_id": p.user_id, "emotion_tends_to_user": asdict(p.emotion)} for p in related_profiles],
             ensure_ascii=False, sort_keys=True, separators=(",", ":")
         )
         prompt = get_chat_prompt(

@@ -146,6 +146,7 @@ def get_default_config() -> dict:
             "passive_willingness_growth_per_message": 0.045,
             "low_willingness_skip_threshold": 0.30,
             "post_feedback_skip_threshold": 0.34,
+            "active_to_bubble_threshold": 0.50,
             "rerank_willingness_threshold": 0.68,
         },
         "enabled_groups": [],
@@ -443,6 +444,7 @@ def get_runtime_settings() -> dict[str, Any]:
         "passive_willingness_growth_per_message": number("passive_willingness_growth_per_message", 0.045, float, minimum=0.0),
         "low_willingness_skip_threshold": ratio("low_willingness_skip_threshold", 0.30),
         "post_feedback_skip_threshold": ratio("post_feedback_skip_threshold", 0.34),
+        "active_to_bubble_threshold": ratio("active_to_bubble_threshold", 0.50),
         "rerank_willingness_threshold": ratio("rerank_willingness_threshold", 0.68),
     }
 

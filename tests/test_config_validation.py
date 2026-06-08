@@ -54,6 +54,7 @@ class ConfigValidationTests(unittest.TestCase):
         self.assertIn("short_context_limit", text)
         self.assertIn("interaction_log_recent_days", text)
         self.assertIn("history_recall_limit", text)
+        self.assertIn("active_to_bubble_threshold", text)
         self.assertIn('"embedding"', text)
         self.assertIn('"base_url": "https://api.siliconflow.cn/v1/rerank"', text)
         self.assertNotIn("sk-", text)
@@ -113,6 +114,7 @@ class ConfigValidationTests(unittest.TestCase):
         cfg["runtime"]["rerank_willingness_threshold"] = 0.8
         cfg["runtime"]["low_willingness_skip_threshold"] = 0.2
         cfg["runtime"]["post_feedback_skip_threshold"] = 0.25
+        cfg["runtime"]["active_to_bubble_threshold"] = 0.45
         module.plugin_config = cfg
 
         settings = module.get_runtime_settings()
@@ -124,6 +126,7 @@ class ConfigValidationTests(unittest.TestCase):
         self.assertEqual(0.8, settings["rerank_willingness_threshold"])
         self.assertEqual(0.2, settings["low_willingness_skip_threshold"])
         self.assertEqual(0.25, settings["post_feedback_skip_threshold"])
+        self.assertEqual(0.45, settings["active_to_bubble_threshold"])
 
     def test_memory_endpoint_settings_are_configurable(self):
         module = _load_config_module()
@@ -155,6 +158,7 @@ class ConfigValidationTests(unittest.TestCase):
         cfg["runtime"]["speak_cooldown_seconds"] = -10
         cfg["runtime"]["low_willingness_skip_threshold"] = 2
         cfg["runtime"]["post_feedback_skip_threshold"] = -1
+        cfg["runtime"]["active_to_bubble_threshold"] = 2
         cfg["runtime"]["rerank_willingness_threshold"] = 1.5
         cfg["runtime"]["short_context_limit"] = 0
         cfg["runtime"]["interaction_log_recent_days"] = 0
@@ -169,6 +173,7 @@ class ConfigValidationTests(unittest.TestCase):
         self.assertEqual(0.0, settings["speak_cooldown_seconds"])
         self.assertEqual(1.0, settings["low_willingness_skip_threshold"])
         self.assertEqual(0.0, settings["post_feedback_skip_threshold"])
+        self.assertEqual(1.0, settings["active_to_bubble_threshold"])
         self.assertEqual(1.0, settings["rerank_willingness_threshold"])
         self.assertEqual(1, settings["short_context_limit"])
         self.assertEqual(1, settings["interaction_log_recent_days"])

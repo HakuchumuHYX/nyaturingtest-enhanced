@@ -13,6 +13,20 @@ from ..config import plugin_config, get_memory_endpoint_settings
 from ..database.backup_lock import BACKUP_IO_LOCK
 
 
+MEMORY_COLLECTION_NAME = "nyabot_memory"
+MEMORY_COLLECTION_METADATA = {"hnsw:space": "cosine"}
+
+
+def _score_from_distance(distance: float | int | None) -> float:
+    if distance is None:
+        return 0.5
+    try:
+        score = 1.0 - float(distance)
+    except (TypeError, ValueError):
+        return 0.5
+    return max(0.0, min(1.0, score))
+
+
 class SiliconFlowReranker:
     def __init__(self, api_key: str, model: str, api_url: str | None = None, timeout: float | None = None):
         settings = get_memory_endpoint_settings()
@@ -126,9 +140,9 @@ class VectorMemory:
 
         self.client = chromadb.PersistentClient(path=self.persist_directory)
         self.collection = self.client.get_or_create_collection(
-            name="nyabot_memory",
+            name=MEMORY_COLLECTION_NAME,
             embedding_function=self.emb_fn,
-            metadata={"hnsw:space": "cosine"}
+            metadata=MEMORY_COLLECTION_METADATA
         )
 
     def add_texts(self, texts: List[str], metadatas: List[dict] | None = None):
@@ -171,16 +185,23 @@ class VectorMemory:
             flattened_candidates = []
             seen = set()
             
-            if results['documents']:
-                for i, docs in enumerate(results['documents']):
-                    metas = results['metadatas'][i]
-                    # distances = results['distances'][i] # 如果需要
+            documents = results.get("documents") or []
+            metadatas = results.get("metadatas") or []
+            distances = results.get("distances") or []
+
+            if documents:
+                for i, docs in enumerate(documents):
+                    metas = metadatas[i] if i < len(metadatas) else []
+                    row_distances = distances[i] if i < len(distances) else []
                     
                     for j, doc in enumerate(docs):
                         if doc and doc not in seen:
+                            metadata = dict(metas[j] or {}) if j < len(metas) else {}
+                            distance = row_distances[j] if j < len(row_distances) else None
+                            metadata["retrieval_score"] = _score_from_distance(distance)
                             flattened_candidates.append({
                                 "content": doc, 
-                                "metadata": metas[j]
+                                "metadata": metadata
                             })
                             seen.add(doc)
             
@@ -272,8 +293,12 @@ class VectorMemory:
     def clear(self):
         try:
             with BACKUP_IO_LOCK:
-                self.client.delete_collection("nyabot_memory")
-                self.collection = self.client.get_or_create_collection(name="nyabot_memory", embedding_function=self.emb_fn)
+                self.client.delete_collection(MEMORY_COLLECTION_NAME)
+                self.collection = self.client.get_or_create_collection(
+                    name=MEMORY_COLLECTION_NAME,
+                    embedding_function=self.emb_fn,
+                    metadata=MEMORY_COLLECTION_METADATA,
+                )
         except Exception as e:
             logger.error(f"Clear failed: {e}")
 
@@ -340,7 +365,12 @@ class VectorMemory:
             existing = self.collection.query(
                 query_texts=[content for content, _ in valid],
                 n_results=1,
-                where={"source": {"$eq": "memory"}}
+                where={
+                    "$or": [
+                        {"source": {"$eq": "memory"}},
+                        {"source": {"$eq": "preset"}},
+                    ]
+                },
             )
 
             to_add: list[tuple[str, dict]] = []
@@ -426,7 +456,9 @@ class VectorMemory:
             decay_factor = math.exp(-decay_rate * days_ago)
             
             # 获取原始分数
-            original_score = meta.get("rerank_score", 0.5)  # 如果没有 rerank 分数，默认 0.5
+            original_score = meta.get("rerank_score")
+            if original_score is None:
+                original_score = meta.get("retrieval_score", 0.5)
             
             # 计算调整后的分数
             adjusted_score = original_score * decay_factor

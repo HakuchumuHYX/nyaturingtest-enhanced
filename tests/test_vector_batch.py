@@ -112,6 +112,32 @@ class FakeCollection:
         self.add_calls.append(kwargs)
 
 
+class FakeRetrievalCollection:
+    def __init__(self):
+        self.query_calls = []
+
+    def query(self, **kwargs):
+        self.query_calls.append(kwargs)
+        return {
+            "documents": [["memory alpha", "memory beta"]],
+            "metadatas": [[{"source": "memory"}, {"source": "preset"}]],
+            "distances": [[0.1, 0.7]],
+        }
+
+
+class FakeClient:
+    def __init__(self):
+        self.deleted = []
+        self.created = []
+
+    def delete_collection(self, name):
+        self.deleted.append(name)
+
+    def get_or_create_collection(self, **kwargs):
+        self.created.append(kwargs)
+        return "new-collection"
+
+
 class VectorBatchTests(unittest.TestCase):
     def test_add_memories_with_dedup_batches_query_and_add(self):
         module = _load_vector_module()
@@ -127,8 +153,42 @@ class VectorBatchTests(unittest.TestCase):
         self.assertEqual({"added": 1, "skipped_empty": 1, "skipped_dedup": 1}, result)
         self.assertEqual(1, len(memory.collection.query_calls))
         self.assertEqual(["重复记忆", "新的记忆"], memory.collection.query_calls[0]["query_texts"])
+        self.assertEqual(
+            {
+                "$or": [
+                    {"source": {"$eq": "memory"}},
+                    {"source": {"$eq": "preset"}},
+                ]
+            },
+            memory.collection.query_calls[0]["where"],
+        )
         self.assertEqual(1, len(memory.collection.add_calls))
         self.assertEqual(["新的记忆"], memory.collection.add_calls[0]["documents"])
+
+    def test_retrieve_attaches_distance_score_without_rerank(self):
+        module = _load_vector_module()
+        memory = object.__new__(module.VectorMemory)
+        memory.collection = FakeRetrievalCollection()
+        memory.reranker = None
+
+        result = memory.retrieve(["alpha"], k=2, use_rerank=False)
+
+        self.assertEqual(["memory alpha", "memory beta"], [item["content"] for item in result])
+        self.assertEqual(0.9, result[0]["metadata"]["retrieval_score"])
+        self.assertEqual(0.3, round(result[1]["metadata"]["retrieval_score"], 2))
+
+    def test_clear_recreates_collection_with_cosine_metadata(self):
+        module = _load_vector_module()
+        memory = object.__new__(module.VectorMemory)
+        memory.client = FakeClient()
+        memory.emb_fn = object()
+
+        memory.clear()
+
+        self.assertEqual([module.MEMORY_COLLECTION_NAME], memory.client.deleted)
+        self.assertEqual(module.MEMORY_COLLECTION_NAME, memory.client.created[0]["name"])
+        self.assertEqual(module.MEMORY_COLLECTION_METADATA, memory.client.created[0]["metadata"])
+        self.assertEqual("new-collection", memory.collection)
 
 
 if __name__ == "__main__":

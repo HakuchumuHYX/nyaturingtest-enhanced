@@ -1,5 +1,10 @@
 import asyncio
+from pathlib import Path
+import sys
 import unittest
+
+PLUGIN_DIR = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PLUGIN_DIR))
 
 from llm.vlm import VLM
 

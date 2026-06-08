@@ -1,6 +1,6 @@
 import unittest
 
-from tests.test_vector_batch import _load_vector_module
+from test_vector_batch import _load_vector_module
 
 
 class FakeCollection:

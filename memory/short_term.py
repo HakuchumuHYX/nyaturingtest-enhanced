@@ -70,8 +70,8 @@ class Memory:
         """
         手动更新记忆摘要
         """
-        if new_summary:
-            self.__compressed_message = new_summary
+        if new_summary is not None:
+            self.__compressed_message = str(new_summary)
 
     def access(self) -> MemoryRecord:
         return MemoryRecord(

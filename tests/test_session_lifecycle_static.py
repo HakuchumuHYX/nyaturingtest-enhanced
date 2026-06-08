@@ -33,6 +33,38 @@ class SessionLifecycleStaticTests(unittest.TestCase):
         self.assertIn("user_id=bot_user_id", session_source)
         self.assertNotIn("user_id=self.id # Bot", session_source)
 
+    def test_set_role_clears_preset_residue(self):
+        session_source = (PLUGIN_DIR / "core" / "session.py").read_text(encoding="utf-8")
+
+        set_role_start = session_source.index("async def set_role")
+        role_method_start = session_source.index("    def role", set_role_start)
+        set_role_source = session_source[set_role_start:role_method_start]
+
+        self.assertIn("self.__aliases = []", set_role_source)
+        self.assertIn('self.__examples_str = ""', set_role_source)
+
+    def test_chatting_state_uses_idle_and_can_leave_active(self):
+        session_source = (PLUGIN_DIR / "core" / "session.py").read_text(encoding="utf-8")
+
+        self.assertIn("IDLE = 0", session_source)
+        self.assertNotIn("ILDE", session_source)
+        self.assertIn('_ChattingState.ACTIVE\n            and self.willingness < runtime_settings["active_to_bubble_threshold"]', session_source)
+        self.assertIn("self.__chatting_state = _ChattingState.BUBBLE", session_source)
+
+    def test_long_term_memory_task_uses_safe_task_wrapper(self):
+        session_source = (PLUGIN_DIR / "core" / "session.py").read_text(encoding="utf-8")
+
+        save_memory_index = session_source.index("self.save_long_term_memory")
+        task_block = session_source[save_memory_index - 120:save_memory_index + 160]
+        self.assertIn("self._create_safe_task", task_block)
+
+    def test_current_chunk_filter_does_not_use_dataclass_equality(self):
+        session_source = (PLUGIN_DIR / "core" / "session.py").read_text(encoding="utf-8")
+
+        self.assertIn("chunk_message_ids", session_source)
+        self.assertIn("m is chunk_msg", session_source)
+        self.assertNotIn("if m not in messages_chunk", session_source)
+
 
 if __name__ == "__main__":
     unittest.main()

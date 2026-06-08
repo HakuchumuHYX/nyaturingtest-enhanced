@@ -67,6 +67,7 @@
     "passive_willingness_growth_per_message": 0.045,
     "low_willingness_skip_threshold": 0.3,
     "post_feedback_skip_threshold": 0.34,
+    "active_to_bubble_threshold": 0.5,
     "rerank_willingness_threshold": 0.68
   },
   "enabled_groups": []
