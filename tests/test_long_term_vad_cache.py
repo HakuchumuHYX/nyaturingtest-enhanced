@@ -54,6 +54,10 @@ def _install_stub_modules(package_name: str):
     params.CommandArg = lambda: None
     install("nonebot.params", params)
 
+    permission = types.ModuleType("nonebot.permission")
+    permission.SUPERUSER = object()
+    install("nonebot.permission", permission)
+
     utils = types.ModuleType("nonebot.utils")
     utils.run_sync = lambda func: func
     install("nonebot.utils", utils)
@@ -70,7 +74,7 @@ def _install_stub_modules(package_name: str):
     handlers.__path__ = [str(PLUGIN_DIR / "handlers")]
     install(f"{package_name}.handlers", handlers)
 
-    for subpackage in ["core", "database"]:
+    for subpackage in ["core", "database", "memory"]:
         module = types.ModuleType(f"{package_name}.{subpackage}")
         module.__path__ = [str(PLUGIN_DIR / subpackage)]
         install(f"{package_name}.{subpackage}", module)
@@ -109,9 +113,14 @@ def _install_stub_modules(package_name: str):
     services.RagSearchService = object
     install(f"{package_name}.core.services", services)
 
+    vector = types.ModuleType(f"{package_name}.memory.vector")
+    vector.where_any = lambda field, values: {"$or": [{field: {"$eq": value}} for value in values]}
+    install(f"{package_name}.memory.vector", vector)
+
     config = types.ModuleType(f"{package_name}.config")
     config.get_effective_chat_model = lambda: "chat-model"
     config.get_effective_feedback_model = lambda: "feedback-model"
+    config.get_runtime_settings = lambda: {"rag_final_k": 20, "rag_candidate_k": 40}
     config.get_chat_thinking_settings = lambda: {"enabled": False}
     config.get_chat_max_tokens = lambda: 1024
     config.get_chat_timeout = lambda: 30

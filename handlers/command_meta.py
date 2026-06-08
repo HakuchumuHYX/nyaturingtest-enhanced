@@ -15,6 +15,7 @@ COMMANDS: tuple[CommandMeta, ...] = (
     CommandMeta("set_role <角色名> <角色设定>", "设置角色，设定可包含空格", "set_role <群号> <角色名> <角色设定>"),
     CommandMeta("presets", "查看可用预设", "presets <群号>"),
     CommandMeta("set_preset <文件名>", "加载预设", "set_preset <群号> <文件名>"),
+    CommandMeta("rag_debug <query>", "诊断 RAG 记忆检索"),
     CommandMeta("calm", "冷静并重置短期状态", "calm <群号>"),
     CommandMeta("reset_emotion", "仅重置 VAD 情绪", "reset_emotion <群号>"),
     CommandMeta("reset confirm", "先备份再完全重置本群", "reset <群号> confirm"),

@@ -11,15 +11,20 @@ class MemoryCommandPublicGroupOnlyTests(unittest.TestCase):
 
         self.assertIn("async def is_group_message", source)
         self.assertIn('query_memory = on_command("查询记忆", aliases={"memory", "印象"}, rule=is_group_message', source)
-        self.assertNotIn("permission=SUPERUSER", source)
+        query_definition = source[
+            source.index('query_memory = on_command("查询记忆"'):
+            source.index("_LONG_TERM_VAD_CACHE_TTL_SECONDS")
+        ]
+        self.assertNotIn("permission=SUPERUSER", query_definition)
 
     def test_query_memory_sends_progress_before_expensive_work(self):
         source = (PLUGIN_DIR / "handlers" / "memory.py").read_text(encoding="utf-8")
+        query_handler = source[source.index("@query_memory.handle()"):]
 
-        progress_index = source.index('await query_memory.send("正在回溯记忆深处...")')
-        lock_index = source.index("async with state.session_lock")
-        vector_index = source.index("search_for_user_profile")
-        vad_index = source.index("long_term_vad = await _summarize_long_term_vad")
+        progress_index = query_handler.index('await query_memory.send("正在回溯记忆深处...")')
+        lock_index = query_handler.index("async with state.session_lock")
+        vector_index = query_handler.index("search_for_user_profile")
+        vad_index = query_handler.index("long_term_vad = await _summarize_long_term_vad")
 
         self.assertLess(progress_index, lock_index)
         self.assertLess(progress_index, vector_index)

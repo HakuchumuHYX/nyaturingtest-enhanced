@@ -7,6 +7,7 @@ from datetime import datetime
 from nonebot import on_command, logger
 from nonebot.adapters.onebot.v11 import Bot, Event, GroupMessageEvent, Message
 from nonebot.params import CommandArg
+from nonebot.permission import SUPERUSER
 from nonebot.utils import run_sync
 from nonebot.exception import FinishedException
 
@@ -17,9 +18,11 @@ from ..database.profile_repository import ProfileRepository
 from ..core.logic import llm_response
 from ..core.usage import make_usage_recorder
 from ..core.services import RagSearchService
+from ..memory.vector import where_any
 from ..config import (
     get_effective_chat_model,
     get_effective_feedback_model,
+    get_runtime_settings,
     get_chat_thinking_settings,
     get_chat_max_tokens,
     get_chat_timeout,
@@ -36,6 +39,7 @@ query_memory = on_command("查询记忆", aliases={"memory", "印象"}, rule=is_
 
 _LONG_TERM_VAD_CACHE_TTL_SECONDS = 24 * 60 * 60
 _LONG_TERM_VAD_CACHE: dict[tuple[str, str, str, str, str, str], tuple[float, dict]] = {}
+rag_debug = on_command("rag_debug", aliases={"记忆诊断"}, rule=is_group_message, permission=SUPERUSER, priority=0, block=True)
 
 
 def _clamp_vad_value(value, lower: float, upper: float, default: float = 0.0) -> float:
@@ -92,6 +96,33 @@ def _prune_long_term_vad_cache(now: float) -> None:
     ]
     for key in expired_keys:
         _LONG_TERM_VAD_CACHE.pop(key, None)
+
+
+def _format_rag_debug_score(value) -> str:
+    if value is None:
+        return "-"
+    try:
+        return f"{float(value):.4f}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _format_rag_debug_record(index: int, record: dict) -> str:
+    metadata = dict(record.get("metadata") or {})
+    preview = str(record.get("preview") or "")
+    preview = preview.replace("\n", " ")[:80]
+    return (
+        f"{index}. ref={record.get('memory_ref') or '-'} "
+        f"source={metadata.get('source') or '-'} "
+        f"type={metadata.get('type') or '-'} "
+        f"subtype={metadata.get('subtype') or '-'} "
+        f"user_id={metadata.get('user_id') or '-'} "
+        f"score={_format_rag_debug_score(record.get('score'))} "
+        f"adjusted_score={_format_rag_debug_score(metadata.get('adjusted_score'))} "
+        f"retrieval_score={_format_rag_debug_score(metadata.get('retrieval_score'))} "
+        f"rerank_score={_format_rag_debug_score(metadata.get('rerank_score'))}\n"
+        f"   preview={preview}"
+    )
 
 
 async def _summarize_long_term_vad(
@@ -172,6 +203,55 @@ async def _summarize_long_term_vad(
         return None
     _LONG_TERM_VAD_CACHE[cache_key] = (time.time(), dict(result))
     return dict(result)
+
+
+@rag_debug.handle()
+async def handle_rag_debug(event: GroupMessageEvent, args: Message = CommandArg()):
+    query = args.extract_plain_text().strip()
+    if not query:
+        await rag_debug.finish("用法: rag_debug <query>")
+        return
+
+    state = ensure_group_state(event.group_id)
+    if not state:
+        await rag_debug.finish("本群尚未启用 AI 功能。")
+        return
+
+    runtime_settings = get_runtime_settings()
+    where_filter = where_any("source", ["preset", "memory"])
+    async with state.session_lock:
+        await state.session.load_session()
+        long_term_memory = getattr(state.session, "long_term_memory", None)
+        if long_term_memory is None:
+            await rag_debug.finish("长期记忆库不可用。")
+            return
+
+        records = await RagSearchService(long_term_memory).search_for_debug(
+            [query],
+            k=runtime_settings["rag_final_k"],
+            where=where_filter,
+            use_rerank=True,
+            candidate_k=runtime_settings["rag_candidate_k"],
+        )
+        stats = long_term_memory.last_retrieval_stats
+
+    top_records = records[:5]
+    score_fields = ["adjusted_score", "retrieval_score", "rerank_score"]
+    lines = [
+        "RAG debug",
+        f"query: {query}",
+        f"where: {json.dumps(where_filter, ensure_ascii=False, sort_keys=True)}",
+        f'candidate_count: {stats.get("candidate_count", 0)}',
+        f'returned_count: {stats.get("returned_count", len(records))}',
+        f'fallback_reason: {stats.get("fallback_reason") or "none"}',
+        f"score_fields: {', '.join(score_fields)}",
+        "top_records:",
+    ]
+    if top_records:
+        lines.extend(_format_rag_debug_record(index, record) for index, record in enumerate(top_records, start=1))
+    else:
+        lines.append("(none)")
+    await rag_debug.finish("\n".join(lines))
 
 
 @query_memory.handle()
