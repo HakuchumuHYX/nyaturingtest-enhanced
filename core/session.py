@@ -53,11 +53,47 @@ def _history_without_current_chunk(all_messages: list[Message], messages_chunk: 
 def _dedupe_preserve_order(items: list[str]) -> list[str]:
     result = []
     seen = set()
+    seen_names = set()
     for item in items:
         if item in seen:
             continue
         seen.add(item)
         result.append(item)
+    return result
+
+
+def _active_user_query_names(
+    active_user_names: list[str] | None,
+    active_users: list[dict] | None,
+) -> list[str]:
+    result = []
+    seen = set()
+
+    for user in active_users or []:
+        if not isinstance(user, dict):
+            continue
+        user_id = str(user.get("user_id") or "").strip()
+        user_name = str(user.get("user_name") or "").strip()
+        if not user_name:
+            continue
+        key = f"id:{user_id}" if user_id else f"name:{user_name}"
+        if key in seen or user_name in seen_names:
+            continue
+        seen.add(key)
+        seen_names.add(user_name)
+        result.append(user_name)
+
+    for user_name in active_user_names or []:
+        user_name = str(user_name or "").strip()
+        if not user_name:
+            continue
+        key = f"name:{user_name}"
+        if key in seen or user_name in seen_names:
+            continue
+        seen.add(key)
+        seen_names.add(user_name)
+        result.append(user_name)
+
     return result
 
 
@@ -413,7 +449,14 @@ class Session:
 {recent_str}
 """
 
-    async def search_stage(self, queries: list[str], active_user_names: list[str], use_rerank: bool = True):
+    async def search_stage(
+        self,
+        queries: list[str],
+        active_user_names: list[str] | None = None,
+        *,
+        active_users: list[dict] | None = None,
+        use_rerank: bool = True,
+    ):
         """
         优化检索阶段
         """
@@ -441,8 +484,9 @@ class Session:
         if self.chat_summary:
             queries.append(self.chat_summary)
 
-        if active_user_names:
-            queries.extend([f"关于{name}" for name in active_user_names])
+        active_query_names = _active_user_query_names(active_user_names, active_users)
+        if active_query_names:
+            queries.extend([f"关于{name}" for name in active_query_names])
 
         queries = _dedupe_preserve_order([q for q in queries if q and q.strip()])
         rag_stats["query_count"] = len(queries)
@@ -469,9 +513,10 @@ class Session:
 
                 raw_results = await run_sync(self.long_term_memory.retrieve_with_decay)(
                     queries,
-                    k=20,
+                    k=runtime_settings["rag_final_k"],
                     where=where_filter,
-                    use_rerank=use_rerank
+                    use_rerank=use_rerank,
+                    candidate_k=runtime_settings["rag_candidate_k"],
                 )
                 retrieval_stats = getattr(self.long_term_memory, "last_retrieval_stats", {}) or {}
                 rag_stats.update({

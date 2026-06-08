@@ -11,10 +11,18 @@ class MemoryService:
         await self.session.global_memory.update(messages_chunk)
         self.session._create_safe_task(self.session.save_session())
 
-    async def search(self, queries: list[str], active_user_names: list[str], use_rerank: bool):
+    async def search(
+        self,
+        queries: list[str],
+        active_user_names: list[str] | None = None,
+        use_rerank: bool = True,
+        *,
+        active_users: list[dict] | None = None,
+    ):
         await self.session.search_stage(
             queries,
             active_user_names=active_user_names,
+            active_users=active_users,
             use_rerank=use_rerank,
         )
 

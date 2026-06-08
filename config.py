@@ -149,6 +149,8 @@ def get_default_config() -> dict:
             "active_to_bubble_threshold": 0.50,
             "rerank_willingness_threshold": 0.68,
             "rag_debug_log": False,
+            "rag_final_k": 20,
+            "rag_candidate_k": 40,
         },
         "enabled_groups": [],
     }
@@ -454,6 +456,8 @@ def get_runtime_settings() -> dict[str, Any]:
         "active_to_bubble_threshold": ratio("active_to_bubble_threshold", 0.50),
         "rerank_willingness_threshold": ratio("rerank_willingness_threshold", 0.68),
         "rag_debug_log": flag("rag_debug_log", False),
+        "rag_final_k": number("rag_final_k", 20, int, minimum=1),
+        "rag_candidate_k": number("rag_candidate_k", 40, int, minimum=1),
     }
 
 

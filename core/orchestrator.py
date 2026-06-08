@@ -90,12 +90,21 @@ class ConversationOrchestrator:
             return None
 
         queries = [msg.content for msg in messages_chunk[-2:]]
-        active_users = [msg.user_name for msg in messages_chunk if msg.user_name]
+        active_user_names = [msg.user_name for msg in messages_chunk if msg.user_name]
+        active_users = [
+            {
+                "user_id": str(msg.user_id or ""),
+                "user_name": msg.user_name,
+            }
+            for msg in messages_chunk
+            if msg.user_name
+        ]
         use_rerank_strategy = self.session.willingness > runtime_settings["rerank_willingness_threshold"] or is_relevant
 
         await self.memory_service.search(
             queries,
-            active_user_names=active_users,
+            active_user_names=active_user_names,
+            active_users=active_users,
             use_rerank=use_rerank_strategy,
         )
 

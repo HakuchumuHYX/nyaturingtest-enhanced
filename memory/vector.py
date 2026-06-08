@@ -571,7 +571,8 @@ class VectorMemory:
         k: int = 5, 
         where: dict | None = None, 
         use_rerank: bool = True,
-        decay_rate: float = 0.02
+        decay_rate: float = 0.02,
+        candidate_k: int | None = None,
     ) -> List[Dict[str, Any]]:
         """
         带时间衰减的检索
@@ -582,12 +583,14 @@ class VectorMemory:
             where: 过滤条件
             use_rerank: 是否使用 Rerank
             decay_rate: 时间衰减率（默认 0.02，约 35 天半衰期）
+            candidate_k: 召回候选数量，None 时保持旧 k*2 行为
             
         Returns:
             检索结果列表，按综合分数排序
         """
         # 1. 调用原有检索方法
-        raw_results = self.retrieve(queries, k=k * 2, where=where, use_rerank=use_rerank)
+        effective_candidate_k = candidate_k if candidate_k is not None else k * 2
+        raw_results = self.retrieve(queries, k=effective_candidate_k, where=where, use_rerank=use_rerank)
         stats = self.last_retrieval_stats
         
         if not raw_results:

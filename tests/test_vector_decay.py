@@ -69,6 +69,36 @@ class VectorDecayTests(unittest.TestCase):
         self.assertEqual(1.0, result[0]["metadata"]["source_type_weight"])
         self.assertEqual(0.85, result[1]["metadata"]["source_type_weight"])
 
+    def test_candidate_k_none_preserves_old_double_k_behavior(self):
+        module = _load_vector_module()
+        memory = object.__new__(module.VectorMemory)
+        calls = []
+
+        def fake_retrieve(queries, k=5, where=None, use_rerank=True):
+            calls.append(k)
+            return []
+
+        memory.retrieve = fake_retrieve
+
+        memory.retrieve_with_decay(["query"], k=7, use_rerank=False)
+
+        self.assertEqual([14], calls)
+
+    def test_candidate_k_overrides_internal_double_k(self):
+        module = _load_vector_module()
+        memory = object.__new__(module.VectorMemory)
+        calls = []
+
+        def fake_retrieve(queries, k=5, where=None, use_rerank=True):
+            calls.append(k)
+            return []
+
+        memory.retrieve = fake_retrieve
+
+        memory.retrieve_with_decay(["query"], k=7, candidate_k=9, use_rerank=False)
+
+        self.assertEqual([9], calls)
+
 
 if __name__ == "__main__":
     unittest.main()
