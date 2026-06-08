@@ -382,9 +382,17 @@ class Session:
 
         await run_sync(self.long_term_memory.delete_by_metadata)({"source": "preset"})
 
-        to_add = (preset.knowledges + preset.relationships + preset.events + preset.bot_self)
+        preset_items: list[tuple[str, str]] = []
+        preset_items.extend((item, "knowledge") for item in preset.knowledges)
+        preset_items.extend((item, "relationship") for item in preset.relationships)
+        preset_items.extend((item, "event") for item in preset.events)
+        preset_items.extend((item, "bot_self") for item in preset.bot_self)
+        to_add = [item for item, _ in preset_items]
         if to_add:
-            metadatas = [{"source": "preset", "type": "rule"} for _ in to_add]
+            metadatas = [
+                {"source": "preset", "type": "rule", "subtype": subtype}
+                for _, subtype in preset_items
+            ]
             await run_sync(self.long_term_memory.add_texts)(to_add, metadatas=metadatas)
 
         await self.save_session()
@@ -486,7 +494,11 @@ class Session:
                         source = meta.get("source", "unknown")
                         date_str = str(meta.get("date", ""))
 
-                        prefix = "【设定】" if source == "preset" else f"【记忆/d:{date_str}】"
+                        if source == "preset":
+                            subtype = str(meta.get("subtype") or "legacy_rule")
+                            prefix = f"【设定/{subtype}】"
+                        else:
+                            prefix = f"【记忆/d:{date_str}】"
                         line = f"{prefix} {content}"
 
                         formatted_results.append(line)
