@@ -200,7 +200,6 @@ class Session:
         self.willingness: float = 0.0
         self.__chatting_state = _ChattingState.IDLE
 
-        self.__search_result = None
         self._last_activity_time = datetime.now()
         self._last_speak_time = datetime.min
         self._active_count = 0
@@ -496,6 +495,7 @@ class Session:
 
         long_term_memory = []
         raw_results = []
+        search_result = _SearchResult(mem_history=[], raw_records=[], stats=rag_stats)
         try:
             if not queries:
                 rag_stats["skip_reason"] = "no_queries"
@@ -558,14 +558,16 @@ class Session:
             if runtime_settings["rag_debug_log"]:
                 rag_stats["result_debug"] = _rag_debug_records(raw_results)
             log_event("rag_search", **rag_stats)
-            self.__search_result = _SearchResult(
+            search_result = _SearchResult(
                 mem_history=long_term_memory,
                 raw_records=raw_results,
                 stats=rag_stats,
             )
+        return search_result
 
     async def feedback_stage(self, messages_chunk: list[Message], llm_func: Callable,
-                               is_relevant: bool = False) -> list[str]:
+                               is_relevant: bool = False,
+                               search_result: _SearchResult | None = None) -> list[str]:
         """
         反馈阶段：分析情绪、提取记忆、更新摘要
         返回：recalled_history (溯源到的历史消息列表)
@@ -583,7 +585,7 @@ class Session:
             [{"user_id": p.user_id, "emotion_tends_to_user": asdict(p.emotion)} for p in related_profiles],
             ensure_ascii=False, sort_keys=True, separators=(",", ":")
         )
-        search_history = self.__search_result.mem_history if self.__search_result else []
+        search_history = search_result.mem_history if search_result else []
 
         formatted_msgs = [f"[ID:{msg.user_id}] {msg.user_name}: '{escape_for_prompt(msg.content)}'" for msg in
                           messages_chunk]
@@ -800,9 +802,10 @@ class Session:
             logger.error(f"[Async] 保存记忆失败: {e}")
 
     async def chat_stage(self, messages_chunk: list[Message], llm_func: Callable,
-                           recalled_history: list[str]) -> list[dict]:
+                           recalled_history: list[str],
+                           search_result: _SearchResult | None = None) -> list[dict]:
         logger.debug(">> 对话阶段 (Chat) 开始")
-        search_history = self.__search_result.mem_history if self.__search_result else []
+        search_history = search_result.mem_history if search_result else []
         formatted_msgs = [f"[ID:{msg.id}] {msg.user_name}: '{escape_for_prompt(msg.content)}'" for msg in
                           messages_chunk]
 

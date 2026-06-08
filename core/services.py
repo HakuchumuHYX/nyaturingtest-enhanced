@@ -19,7 +19,7 @@ class MemoryService:
         *,
         active_users: list[dict] | None = None,
     ):
-        await self.session.search_stage(
+        return await self.session.search_stage(
             queries,
             active_user_names=active_user_names,
             active_users=active_users,
@@ -40,12 +40,14 @@ class FeedbackService:
         llm_func: Callable[[str, bool], Awaitable[str]],
         *,
         is_relevant: bool = False,
+        search_result=None,
     ) -> list[str]:
         try:
             return await self.session.feedback_stage(
                 messages_chunk,
                 llm_func,
                 is_relevant=is_relevant,
+                search_result=search_result,
             )
         finally:
             await self.session.save_session()
@@ -60,9 +62,11 @@ class ChatService:
         messages_chunk: list[Message],
         llm_func: Callable[[str, bool], Awaitable[str]],
         recalled_history: list[str],
+        search_result=None,
     ) -> list[dict]:
         return await self.session.chat_stage(
             messages_chunk,
             llm_func,
             recalled_history=recalled_history,
+            search_result=search_result,
         )

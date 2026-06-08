@@ -101,7 +101,7 @@ class ConversationOrchestrator:
         ]
         use_rerank_strategy = self.session.willingness > runtime_settings["rerank_willingness_threshold"] or is_relevant
 
-        await self.memory_service.search(
+        search_result = await self.memory_service.search(
             queries,
             active_user_names=active_user_names,
             active_users=active_users,
@@ -114,6 +114,7 @@ class ConversationOrchestrator:
             messages_chunk,
             feedback_llm_func,
             is_relevant=is_relevant,
+            search_result=search_result,
         )
 
         if self.session.willingness < runtime_settings["post_feedback_skip_threshold"] and not is_relevant:
@@ -123,6 +124,7 @@ class ConversationOrchestrator:
             messages_chunk,
             chat_llm_func,
             recalled_history=recalled_history,
+            search_result=search_result,
         )
 
         if reply_messages:
