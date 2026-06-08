@@ -1,6 +1,8 @@
 # nyaturingtest/memory_query.py
+import hashlib
 import json
 import asyncio
+import time
 from datetime import datetime
 from nonebot import on_command, logger
 from nonebot.adapters.onebot.v11 import Bot, Event, GroupMessageEvent, Message
@@ -32,6 +34,9 @@ async def is_group_message(event: Event) -> bool:
 # 定义命令
 query_memory = on_command("查询记忆", aliases={"memory", "印象"}, rule=is_group_message, priority=5, block=True)
 
+_LONG_TERM_VAD_CACHE_TTL_SECONDS = 24 * 60 * 60
+_LONG_TERM_VAD_CACHE: dict[tuple[str, str, str, str, str, str], tuple[float, dict]] = {}
+
 
 def _clamp_vad_value(value, lower: float, upper: float, default: float = 0.0) -> float:
     try:
@@ -56,6 +61,39 @@ def _normalize_vad_result(result: dict | None) -> dict | None:
     }
 
 
+def _hash_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _long_term_vad_cache_key(
+    *,
+    state,
+    bot_name: str,
+    bot_role: str,
+    target_id: str,
+    vector_records: list[str],
+    feedback_model: str,
+) -> tuple[str, str, str, str, str, str]:
+    records_payload = json.dumps(vector_records, ensure_ascii=False, sort_keys=True)
+    return (
+        str(state.session.id),
+        target_id,
+        bot_name,
+        _hash_text(bot_role),
+        feedback_model,
+        _hash_text(records_payload),
+    )
+
+
+def _prune_long_term_vad_cache(now: float) -> None:
+    expired_keys = [
+        key for key, (created_at, _) in _LONG_TERM_VAD_CACHE.items()
+        if now - created_at >= _LONG_TERM_VAD_CACHE_TTL_SECONDS
+    ]
+    for key in expired_keys:
+        _LONG_TERM_VAD_CACHE.pop(key, None)
+
+
 async def _summarize_long_term_vad(
         state,
         bot_name: str,
@@ -66,6 +104,21 @@ async def _summarize_long_term_vad(
 ) -> dict | None:
     if not vector_records:
         return None
+
+    feedback_model = get_effective_feedback_model()
+    now = time.time()
+    _prune_long_term_vad_cache(now)
+    cache_key = _long_term_vad_cache_key(
+        state=state,
+        bot_name=bot_name,
+        bot_role=bot_role,
+        target_id=target_id,
+        vector_records=vector_records,
+        feedback_model=feedback_model,
+    )
+    cached = _LONG_TERM_VAD_CACHE.get(cache_key)
+    if cached is not None:
+        return dict(cached[1])
 
     prompt = f"""
 你是一个长期关系记忆分析器。
@@ -105,16 +158,20 @@ async def _summarize_long_term_vad(
     response = await llm_response(
         state.feedback_client,
         prompt,
-        model=get_effective_feedback_model(),
+        model=feedback_model,
         temperature=0.1,
         json_mode=True,
         extra_body={"thinking": {"type": "disabled"}},
         max_tokens=get_feedback_max_tokens(),
         timeout=get_feedback_timeout(),
-        on_usage=make_usage_recorder(str(state.session.id), get_effective_feedback_model())
+        on_usage=make_usage_recorder(str(state.session.id), feedback_model)
     )
 
-    return _normalize_vad_result(extract_and_parse_json(response))
+    result = _normalize_vad_result(extract_and_parse_json(response))
+    if result is None:
+        return None
+    _LONG_TERM_VAD_CACHE[cache_key] = (time.time(), dict(result))
+    return dict(result)
 
 
 @query_memory.handle()
