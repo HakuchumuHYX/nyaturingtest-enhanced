@@ -99,6 +99,52 @@ class VectorDecayTests(unittest.TestCase):
 
         self.assertEqual([9], calls)
 
+    def test_active_user_scope_filters_other_users_and_weights_active_memories(self):
+        module = _load_vector_module()
+        memory = object.__new__(module.VectorMemory)
+        today = int(datetime.now().strftime("%Y%m%d"))
+
+        def fake_retrieve(queries, k=5, where=None, use_rerank=True):
+            return [
+                {"content": "other user", "metadata": {"source": "memory", "type": "event", "user_id": "2", "date": today, "retrieval_score": 0.99}},
+                {"content": "global memory", "metadata": {"source": "memory", "type": "event", "user_id": "", "date": today, "retrieval_score": 0.75}},
+                {"content": "active user", "metadata": {"source": "memory", "type": "event", "user_id": "1", "date": today, "retrieval_score": 0.70}},
+                {"content": "preset", "metadata": {"source": "preset", "type": "rule", "retrieval_score": 0.60}},
+            ]
+
+        memory.retrieve = fake_retrieve
+
+        result = memory.retrieve_with_decay(["query"], k=4, use_rerank=False, decay_rate=0, active_user_ids={"1"})
+
+        self.assertEqual(["active user", "global memory", "preset"], [item["content"] for item in result])
+        self.assertEqual(1.10, result[0]["metadata"]["scope_weight"])
+        self.assertEqual(1.0, result[1]["metadata"]["scope_weight"])
+        self.assertEqual(1.0, result[2]["metadata"]["scope_weight"])
+
+    def test_old_callers_without_active_user_ids_keep_user_specific_memories(self):
+        module = _load_vector_module()
+        memory = object.__new__(module.VectorMemory)
+        today = int(datetime.now().strftime("%Y%m%d"))
+
+        def fake_retrieve(queries, k=5, where=None, use_rerank=True):
+            return [
+                {"content": "user specific", "metadata": {"source": "memory", "type": "event", "user_id": "2", "date": today, "retrieval_score": 0.90}},
+            ]
+
+        memory.retrieve = fake_retrieve
+
+        result = memory.retrieve_with_decay(["query"], k=1, use_rerank=False, decay_rate=0)
+
+        self.assertEqual(["user specific"], [item["content"] for item in result])
+
+    def test_where_adapter_uses_or_without_in_operator(self):
+        module = _load_vector_module()
+
+        where = module.where_any("source", ["preset", "memory"])
+
+        self.assertEqual({"$or": [{"source": {"$eq": "preset"}}, {"source": {"$eq": "memory"}}]}, where)
+        self.assertNotIn("$in", str(where))
+
 
 if __name__ == "__main__":
     unittest.main()

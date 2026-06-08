@@ -40,6 +40,13 @@ class RagPhase2StaticTests(unittest.TestCase):
         self.assertIn('k=runtime_settings["rag_final_k"]', session_source)
         self.assertIn('candidate_k=runtime_settings["rag_candidate_k"]', session_source)
 
+    def test_chat_path_passes_active_user_ids_for_scope_ranking(self):
+        session_source = (PLUGIN_DIR / "core" / "session.py").read_text(encoding="utf-8")
+
+        self.assertIn("active_scope_user_ids", session_source)
+        self.assertIn("active_user_ids=active_scope_user_ids", session_source)
+        self.assertIn('where_any("source", ["preset", "memory"])', session_source)
+
 
 if __name__ == "__main__":
     unittest.main()

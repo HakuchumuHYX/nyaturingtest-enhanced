@@ -18,7 +18,7 @@ from openai import AsyncOpenAI
 from ..llm.client import LLMClient
 from ..config import get_chat_thinking_settings, get_runtime_settings
 from ..models.emotion import EmotionState, clamp_vad_value
-from ..memory.vector import VectorMemory
+from ..memory.vector import VectorMemory, where_any
 from ..models.impression import Impression
 from ..memory.short_term import Memory, Message
 from ..prompts.presets import PRESETS
@@ -94,6 +94,17 @@ def _active_user_query_names(
         seen_names.add(user_name)
         result.append(user_name)
 
+    return result
+
+
+def _active_user_scope_ids(active_users: list[dict] | None) -> set[str]:
+    result = set()
+    for user in active_users or []:
+        if not isinstance(user, dict):
+            continue
+        user_id = str(user.get("user_id") or "").strip()
+        if user_id:
+            result.add(user_id)
     return result
 
 
@@ -523,6 +534,7 @@ class Session:
             queries.append(self.chat_summary)
 
         active_query_names = _active_user_query_names(active_user_names, active_users)
+        active_scope_user_ids = _active_user_scope_ids(active_users)
         if active_query_names:
             queries.extend([f"关于{name}" for name in active_query_names])
 
@@ -543,12 +555,7 @@ class Session:
             else:
                 logger.debug(f"触发长期记忆检索: {queries[:5]}...")
 
-                where_filter = {
-                    "$or": [
-                        {"source": {"$eq": "preset"}},
-                        {"source": {"$eq": "memory"}}
-                    ]
-                }
+                where_filter = where_any("source", ["preset", "memory"])
 
                 raw_results = await run_sync(self.long_term_memory.retrieve_with_decay)(
                     queries,
@@ -556,6 +563,7 @@ class Session:
                     where=where_filter,
                     use_rerank=use_rerank,
                     candidate_k=runtime_settings["rag_candidate_k"],
+                    active_user_ids=active_scope_user_ids,
                 )
                 retrieval_stats = getattr(self.long_term_memory, "last_retrieval_stats", {}) or {}
                 rag_stats.update({

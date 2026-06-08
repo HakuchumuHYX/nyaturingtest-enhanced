@@ -29,6 +29,11 @@ MEMORY_TYPE_WEIGHT = {
     "profile": 1.05,
     "relationship": 1.0,
 }
+SCOPE_WEIGHT = {
+    "active_user": 1.10,
+    "global": 1.0,
+    "other_user": 0.5,
+}
 _metric_check_done: set[str] = set()
 
 
@@ -89,6 +94,24 @@ def _dedupe_preserve_order(items: list[str]) -> list[str]:
         seen.add(item)
         result.append(item)
     return result
+
+
+def where_any(field: str, values: list[Any]) -> dict:
+    cleaned = [value for value in values if value is not None]
+    if not cleaned:
+        return {}
+    if len(cleaned) == 1:
+        return {field: {"$eq": cleaned[0]}}
+    return {"$or": [{field: {"$eq": value}} for value in cleaned]}
+
+
+def where_all(*conditions: dict) -> dict:
+    cleaned = [condition for condition in conditions if condition]
+    if not cleaned:
+        return {}
+    if len(cleaned) == 1:
+        return cleaned[0]
+    return {"$and": cleaned}
 
 
 def _clamp_float(value: Any, default: float, lower: float, upper: float) -> float:
@@ -719,6 +742,7 @@ class VectorMemory:
         use_rerank: bool = True,
         decay_rate: float = 0.02,
         candidate_k: int | None = None,
+        active_user_ids: set[str] | list[str] | tuple[str, ...] | None = None,
     ) -> List[Dict[str, Any]]:
         """
         带时间衰减的检索
@@ -730,6 +754,7 @@ class VectorMemory:
             use_rerank: 是否使用 Rerank
             decay_rate: 时间衰减率（默认 0.02，约 35 天半衰期）
             candidate_k: 召回候选数量，None 时保持旧 k*2 行为
+            active_user_ids: 当前活跃用户 ID；不传时保持旧 caller 行为
             
         Returns:
             检索结果列表，按综合分数排序
@@ -746,12 +771,28 @@ class VectorMemory:
         # 2. 应用生命周期过滤和时间衰减
         today_dt = datetime.now()
         active_results = []
+        active_scope_ids = {
+            str(user_id).strip()
+            for user_id in active_user_ids or []
+            if str(user_id).strip()
+        }
+        other_user_filtered_count = 0
         
         for item in raw_results:
             meta = item.get("metadata", {})
             meta.update(_normalized_metadata(meta))
             if _metadata_status(meta) != "active":
                 continue
+            user_id = str(meta.get("user_id") or "").strip()
+            if meta.get("source") == "preset":
+                scope_weight = SCOPE_WEIGHT["global"]
+            elif active_scope_ids and user_id and user_id not in active_scope_ids:
+                other_user_filtered_count += 1
+                continue
+            elif active_scope_ids and user_id in active_scope_ids:
+                scope_weight = SCOPE_WEIGHT["active_user"]
+            else:
+                scope_weight = SCOPE_WEIGHT["global"]
             active_results.append(item)
             date = meta.get("date", 0)
 
@@ -780,13 +821,14 @@ class VectorMemory:
             source_type_weight = _source_type_weight(meta)
             confidence_weight = _clamp_float(meta.get("confidence"), 1.0, 0.0, 1.0)
             importance_weight = 1.0 + _clamp_float(meta.get("importance"), 0.0, 0.0, 1.0) * 0.15
-            adjusted_score = original_score * decay_factor * source_type_weight * confidence_weight * importance_weight
+            adjusted_score = original_score * decay_factor * source_type_weight * confidence_weight * importance_weight * scope_weight
             meta["adjusted_score"] = adjusted_score
             meta["days_ago"] = days_ago
             meta["decay_factor"] = decay_factor
             meta["source_type_weight"] = source_type_weight
             meta["confidence_weight"] = confidence_weight
             meta["importance_weight"] = importance_weight
+            meta["scope_weight"] = scope_weight
         
         # 3. 重新排序
         sorted_results = sorted(
@@ -803,5 +845,6 @@ class VectorMemory:
         ]
         stats.update(_score_distribution(adjusted_scores))
         stats["returned_count"] = len(final_results)
+        stats["other_user_filtered_count"] = other_user_filtered_count
         self._set_retrieval_stats(stats)
         return final_results
