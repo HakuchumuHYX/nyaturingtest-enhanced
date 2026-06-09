@@ -6,6 +6,16 @@ PLUGIN_DIR = Path(__file__).resolve().parents[1]
 
 
 class FeedbackSubjectSpeakerMetadataTests(unittest.TestCase):
+    def test_existing_related_memories_filters_by_subject_user_id(self):
+        source = (PLUGIN_DIR / "core" / "session.py").read_text(encoding="utf-8")
+        helper_block = source[
+            source.index("def _existing_related_memories"):
+            source.index("class _ChattingState")
+        ]
+
+        self.assertIn("subject_user_id", helper_block)
+        self.assertIn('meta.get("subject_user_id") or meta.get("user_id")', helper_block)
+
     def test_save_long_term_memory_writes_subject_speaker_metadata_fields(self):
         source = (PLUGIN_DIR / "core" / "session.py").read_text(encoding="utf-8")
         save_block = source[

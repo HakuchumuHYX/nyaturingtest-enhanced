@@ -36,6 +36,17 @@ class RagDebugCommandStaticTests(unittest.TestCase):
         self.assertNotIn('record["content"]', formatter)
         self.assertNotIn("json.dumps(record", formatter)
 
+    def test_rag_debug_formatter_includes_subject_and_speaker_short_fields(self):
+        source = (PLUGIN_DIR / "handlers" / "memory.py").read_text(encoding="utf-8")
+        formatter_block = source[
+            source.index("def _format_rag_debug_record"):
+            source.index("async def _summarize_long_term_vad")
+        ]
+
+        self.assertIn("subject=", formatter_block)
+        self.assertIn("speaker=", formatter_block)
+        self.assertNotIn('record.get("content")', formatter_block)
+
     def test_rag_debug_handler_reports_counts_scores_and_fallback(self):
         source = (PLUGIN_DIR / "handlers" / "memory.py").read_text(encoding="utf-8")
         handler = source[source.index("@rag_debug.handle()"):]

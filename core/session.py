@@ -158,8 +158,8 @@ def _existing_related_memories(
             continue
         if str(meta.get("status") or "active") != "active":
             continue
-        user_id = str(meta.get("user_id") or "").strip()
-        if user_id and user_id not in active_user_ids:
+        subject_user_id = str(meta.get("subject_user_id") or meta.get("user_id") or "").strip()
+        if subject_user_id and subject_user_id not in active_user_ids:
             continue
 
         memory_ref = str(meta.get("memory_ref") or "").strip()
@@ -173,6 +173,10 @@ def _existing_related_memories(
             "subtype": str(meta.get("subtype") or meta.get("type") or "event"),
             "category": str(meta.get("category") or meta.get("type") or "event"),
             "confidence": meta.get("confidence", 1.0),
+            "subject_user_id": subject_user_id,
+            "subject_user_name": str(meta.get("subject_user_name") or ""),
+            "speaker_user_id": str(meta.get("speaker_user_id") or ""),
+            "speaker_user_name": str(meta.get("speaker_user_name") or ""),
         }
         if ids_supported:
             entry["memory_ref"] = memory_ref

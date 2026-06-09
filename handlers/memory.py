@@ -111,12 +111,17 @@ def _format_rag_debug_record(index: int, record: dict) -> str:
     metadata = dict(record.get("metadata") or {})
     preview = str(record.get("preview") or "")
     preview = preview.replace("\n", " ")[:80]
+    subject = metadata.get("subject_user_id") or metadata.get("user_id") or "-"
+    speaker = metadata.get("speaker_user_id") or "-"
     return (
         f"{index}. ref={record.get('memory_ref') or '-'} "
         f"source={metadata.get('source') or '-'} "
         f"type={metadata.get('type') or '-'} "
         f"subtype={metadata.get('subtype') or '-'} "
         f"user_id={metadata.get('user_id') or '-'} "
+        f"subject={subject} "
+        f"speaker={speaker} "
+        f"scope={metadata.get('scope') or '-'} "
         f"score={_format_rag_debug_score(record.get('score'))} "
         f"adjusted_score={_format_rag_debug_score(metadata.get('adjusted_score'))} "
         f"retrieval_score={_format_rag_debug_score(metadata.get('retrieval_score'))} "
