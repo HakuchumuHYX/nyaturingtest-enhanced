@@ -831,6 +831,7 @@ class VectorMemory:
         other_user_filtered_count = 0
         other_subject_downweighted_count = 0
         legacy_subject_count = 0
+        scope_counts: dict[str, int] = {}
         
         for item in raw_results:
             meta = item.get("metadata", {})
@@ -838,6 +839,7 @@ class VectorMemory:
             if _metadata_status(meta) != "active":
                 continue
             scope, scope_weight = _memory_scope(meta, active_scope_ids, queries)
+            scope_counts[scope] = scope_counts.get(scope, 0) + 1
             if scope == "other_subject":
                 other_subject_downweighted_count += 1
             elif scope == "legacy_subject":
@@ -898,5 +900,6 @@ class VectorMemory:
         stats["other_user_filtered_count"] = other_user_filtered_count
         stats["other_subject_downweighted_count"] = other_subject_downweighted_count
         stats["legacy_subject_count"] = legacy_subject_count
+        stats["scope_counts"] = dict(scope_counts)
         self._set_retrieval_stats(stats)
         return final_results

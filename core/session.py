@@ -533,6 +533,9 @@ class Session:
             "adjusted_score_p50": None,
             "adjusted_score_p90": None,
             "adjusted_score_max": None,
+            "other_subject_downweighted_count": 0,
+            "legacy_subject_count": 0,
+            "scope_counts": {},
         }
 
         if self.chat_summary:
@@ -575,6 +578,9 @@ class Session:
                     "candidate_count": int(retrieval_stats.get("candidate_count") or 0),
                     "returned_count": int(retrieval_stats.get("returned_count") or len(raw_results)),
                     "fallback_reason": str(retrieval_stats.get("fallback_reason") or "none"),
+                    "other_subject_downweighted_count": int(retrieval_stats.get("other_subject_downweighted_count") or 0),
+                    "legacy_subject_count": int(retrieval_stats.get("legacy_subject_count") or 0),
+                    "scope_counts": dict(retrieval_stats.get("scope_counts") or {}),
                 })
                 rag_stats.update(_score_stat_fields(retrieval_stats))
 

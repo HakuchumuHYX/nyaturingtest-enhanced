@@ -70,6 +70,17 @@ class RagObservabilityStaticTests(unittest.TestCase):
         self.assertIn("_score_distribution", vector_source)
         self.assertNotIn('log_event("rag_search"', vector_source)
 
+    def test_rag_search_stats_include_subject_speaker_scope_counts(self):
+        vector_source = (PLUGIN_DIR / "memory" / "vector.py").read_text(encoding="utf-8")
+        session_source = (PLUGIN_DIR / "core" / "session.py").read_text(encoding="utf-8")
+
+        self.assertIn("other_subject_downweighted_count", vector_source)
+        self.assertIn("legacy_subject_count", vector_source)
+        self.assertIn("scope_counts", vector_source)
+        self.assertIn("other_subject_downweighted_count", session_source)
+        self.assertIn("legacy_subject_count", session_source)
+        self.assertIn("scope_counts", session_source)
+
 
 if __name__ == "__main__":
     unittest.main()
