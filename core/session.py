@@ -54,7 +54,6 @@ def _history_without_current_chunk(all_messages: list[Message], messages_chunk: 
 def _dedupe_preserve_order(items: list[str]) -> list[str]:
     result = []
     seen = set()
-    seen_names = set()
     for item in items:
         if item in seen:
             continue
@@ -69,6 +68,7 @@ def _active_user_query_names(
 ) -> list[str]:
     result = []
     seen = set()
+    seen_names = set()
 
     for user in active_users or []:
         if not isinstance(user, dict):

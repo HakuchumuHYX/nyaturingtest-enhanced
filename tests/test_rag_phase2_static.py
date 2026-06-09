@@ -34,6 +34,16 @@ class RagPhase2StaticTests(unittest.TestCase):
         self.assertIn("active_users: list[dict] | None = None", session_source)
         self.assertIn('key = f"id:{user_id}" if user_id else f"name:{user_name}"', session_source)
 
+    def test_active_user_query_names_initializes_seen_names_locally(self):
+        session_source = (PLUGIN_DIR / "core" / "session.py").read_text(encoding="utf-8")
+        helper_source = session_source[
+            session_source.index("def _active_user_query_names"):
+            session_source.index("def _active_user_scope_ids")
+        ]
+
+        self.assertIn("seen_names = set()", helper_source)
+        self.assertLess(helper_source.index("seen_names = set()"), helper_source.index("user_name in seen_names"))
+
     def test_chat_path_passes_explicit_candidate_and_final_k(self):
         session_source = (PLUGIN_DIR / "core" / "session.py").read_text(encoding="utf-8")
 
