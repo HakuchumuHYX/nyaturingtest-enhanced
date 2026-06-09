@@ -31,8 +31,13 @@ MEMORY_TYPE_WEIGHT = {
 }
 SCOPE_WEIGHT = {
     "active_user": 1.10,
+    "active_subject": 1.10,
+    "mentioned_subject": 1.08,
+    "active_speaker": 1.04,
     "global": 1.0,
+    "legacy_subject": 0.75,
     "other_user": 0.5,
+    "other_subject": 0.5,
 }
 _metric_check_done: set[str] = set()
 
@@ -165,6 +170,34 @@ def _source_type_weight(meta: dict) -> float:
     if source == "preset":
         return PRESET_TYPE_WEIGHT.get(subtype, PRESET_TYPE_WEIGHT["legacy_rule"])
     return MEMORY_TYPE_WEIGHT.get(memory_type, 1.0)
+
+
+def _query_mentions_name(queries: list[str], name: str) -> bool:
+    clean_name = _clean_metadata_string(name)
+    if len(clean_name) < 2:
+        return False
+    return any(clean_name in str(query or "") for query in queries or [])
+
+
+def _memory_scope(meta: dict, active_scope_ids: set[str], queries: list[str]) -> tuple[str, float]:
+    if meta.get("source") == "preset":
+        return "global", SCOPE_WEIGHT["global"]
+
+    subject_user_id = _clean_metadata_string(meta.get("subject_user_id") or meta.get("user_id"))
+    subject_user_name = _clean_metadata_string(meta.get("subject_user_name"))
+    speaker_user_id = _clean_metadata_string(meta.get("speaker_user_id"))
+
+    if active_scope_ids and subject_user_id and subject_user_id in active_scope_ids:
+        return "active_subject", SCOPE_WEIGHT["active_subject"]
+    if _query_mentions_name(queries, subject_user_name):
+        return "mentioned_subject", SCOPE_WEIGHT["mentioned_subject"]
+    if active_scope_ids and speaker_user_id and speaker_user_id in active_scope_ids:
+        return "active_speaker", SCOPE_WEIGHT["active_speaker"]
+    if subject_user_id:
+        if int(meta.get("schema_version") or 1) < 2 and not subject_user_name:
+            return "legacy_subject", SCOPE_WEIGHT["legacy_subject"]
+        return "other_subject", SCOPE_WEIGHT["other_subject"]
+    return "global", SCOPE_WEIGHT["global"]
 
 
 def _collection_metric_state(collection) -> str:
@@ -796,22 +829,19 @@ class VectorMemory:
             if str(user_id).strip()
         }
         other_user_filtered_count = 0
+        other_subject_downweighted_count = 0
+        legacy_subject_count = 0
         
         for item in raw_results:
             meta = item.get("metadata", {})
             meta.update(_normalized_metadata(meta))
             if _metadata_status(meta) != "active":
                 continue
-            user_id = str(meta.get("user_id") or "").strip()
-            if meta.get("source") == "preset":
-                scope_weight = SCOPE_WEIGHT["global"]
-            elif active_scope_ids and user_id and user_id not in active_scope_ids:
-                other_user_filtered_count += 1
-                continue
-            elif active_scope_ids and user_id in active_scope_ids:
-                scope_weight = SCOPE_WEIGHT["active_user"]
-            else:
-                scope_weight = SCOPE_WEIGHT["global"]
+            scope, scope_weight = _memory_scope(meta, active_scope_ids, queries)
+            if scope == "other_subject":
+                other_subject_downweighted_count += 1
+            elif scope == "legacy_subject":
+                legacy_subject_count += 1
             active_results.append(item)
             date = meta.get("date", 0)
 
@@ -847,6 +877,7 @@ class VectorMemory:
             meta["source_type_weight"] = source_type_weight
             meta["confidence_weight"] = confidence_weight
             meta["importance_weight"] = importance_weight
+            meta["scope"] = scope
             meta["scope_weight"] = scope_weight
         
         # 3. 重新排序
@@ -865,5 +896,7 @@ class VectorMemory:
         stats.update(_score_distribution(adjusted_scores))
         stats["returned_count"] = len(final_results)
         stats["other_user_filtered_count"] = other_user_filtered_count
+        stats["other_subject_downweighted_count"] = other_subject_downweighted_count
+        stats["legacy_subject_count"] = legacy_subject_count
         self._set_retrieval_stats(stats)
         return final_results

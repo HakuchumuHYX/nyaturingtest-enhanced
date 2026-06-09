@@ -99,7 +99,7 @@ class VectorDecayTests(unittest.TestCase):
 
         self.assertEqual([9], calls)
 
-    def test_active_user_scope_filters_other_users_and_weights_active_memories(self):
+    def test_active_user_scope_downweights_other_users_and_weights_active_memories(self):
         module = _load_vector_module()
         memory = object.__new__(module.VectorMemory)
         today = int(datetime.now().strftime("%Y%m%d"))
@@ -116,10 +116,12 @@ class VectorDecayTests(unittest.TestCase):
 
         result = memory.retrieve_with_decay(["query"], k=4, use_rerank=False, decay_rate=0, active_user_ids={"1"})
 
-        self.assertEqual(["active user", "global memory", "preset"], [item["content"] for item in result])
+        self.assertEqual(["active user", "global memory", "other user", "preset"], [item["content"] for item in result])
         self.assertEqual(1.10, result[0]["metadata"]["scope_weight"])
         self.assertEqual(1.0, result[1]["metadata"]["scope_weight"])
-        self.assertEqual(1.0, result[2]["metadata"]["scope_weight"])
+        self.assertEqual("legacy_subject", result[2]["metadata"]["scope"])
+        self.assertEqual(0.75, result[2]["metadata"]["scope_weight"])
+        self.assertEqual(1.0, result[3]["metadata"]["scope_weight"])
 
     def test_old_callers_without_active_user_ids_keep_user_specific_memories(self):
         module = _load_vector_module()
