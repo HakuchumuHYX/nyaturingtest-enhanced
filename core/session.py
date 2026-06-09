@@ -651,6 +651,14 @@ class Session:
 
         formatted_msgs = [f"[ID:{msg.user_id}] {msg.user_name}: '{escape_for_prompt(msg.content)}'" for msg in
                           messages_chunk]
+        new_msg_speakers = [
+            {
+                "index": index,
+                "user_id": str(msg.user_id or ""),
+                "user_name": msg.user_name,
+            }
+            for index, msg in enumerate(messages_chunk)
+        ]
 
         # 过滤掉本次的新消息，避免 Prompt 上下文重复
         context_record = self.global_memory.access_context(limit=get_runtime_settings()["short_context_limit"])
@@ -680,6 +688,7 @@ class Session:
             time_info=time_str,
             existing_related_memories=existing_related_memories,
             allow_memory_supersede=allow_memory_supersede,
+            new_msg_speakers=new_msg_speakers,
         )
 
         response_dict = {}
@@ -839,7 +848,10 @@ class Session:
 
             for item in analyze_result:
                 content = ""
-                uid = ""
+                subject_user_id = ""
+                subject_user_name = ""
+                speaker_user_id = ""
+                speaker_user_name = ""
                 action = "add"
                 category = "event"
                 confidence = 0.7
@@ -848,7 +860,7 @@ class Session:
                 # 情况 1: LLM 还是返回了字符串 (Prompt 没生效或模型太笨)
                 if isinstance(item, str) and item.strip():
                     content = item.strip()
-                    uid = default_user_id if default_user_id else ""
+                    subject_user_id = default_user_id if default_user_id else ""
 
                 # 情况 2: LLM 返回了我们要求的标准字典
                 elif isinstance(item, dict):
@@ -859,9 +871,12 @@ class Session:
                         logger.debug(f"[Memory] 暂不处理的记忆 action: {action}")
                         continue
                     content = item.get("content", "").strip()
-                    uid = str(item.get("related_user_id", ""))
-                    if not uid and default_user_id:
-                        uid = default_user_id
+                    subject_user_id = str(item.get("subject_user_id") or item.get("related_user_id") or "").strip()
+                    subject_user_name = str(item.get("subject_user_name") or "").strip()
+                    speaker_user_id = str(item.get("speaker_user_id") or "").strip()
+                    speaker_user_name = str(item.get("speaker_user_name") or "").strip()
+                    if not subject_user_id and default_user_id:
+                        subject_user_id = default_user_id
                     category = str(item.get("category") or "event").strip() or "event"
                     try:
                         confidence = max(0.0, min(1.0, float(item.get("confidence", 0.7))))
@@ -926,10 +941,15 @@ class Session:
                     continue
 
                 metadata = {
+                    "schema_version": 2,
                     "source": "memory",
                     "type": category,
                     "date": today,
-                    "user_id": uid,
+                    "user_id": subject_user_id,
+                    "subject_user_id": subject_user_id,
+                    "subject_user_name": subject_user_name,
+                    "speaker_user_id": speaker_user_id,
+                    "speaker_user_name": speaker_user_name,
                     "status": "active",
                     "category": category,
                     "confidence": confidence,
