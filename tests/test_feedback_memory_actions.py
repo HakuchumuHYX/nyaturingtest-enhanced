@@ -18,6 +18,21 @@ def _load_templates_module():
 
 
 class FeedbackMemoryActionTests(unittest.TestCase):
+    def test_feedback_memory_action_schema_includes_subject_and_speaker_fields(self):
+        source = (PLUGIN_DIR / "prompts" / "templates.py").read_text(encoding="utf-8")
+
+        self.assertIn('"subject_user_id"', source)
+        self.assertIn('"subject_user_name"', source)
+        self.assertIn('"speaker_user_id"', source)
+        self.assertIn('"speaker_user_name"', source)
+        self.assertIn('"related_user_id"', source)
+
+    def test_feedback_prompt_dynamic_payload_includes_new_msg_speakers(self):
+        source = (PLUGIN_DIR / "prompts" / "templates.py").read_text(encoding="utf-8")
+
+        self.assertIn('"new_msg_speakers"', source)
+        self.assertIn("- new_msg_speakers:", source)
+
     def test_feedback_prompt_includes_supersede_schema_when_memory_refs_are_supported(self):
         templates = _load_templates_module()
 
