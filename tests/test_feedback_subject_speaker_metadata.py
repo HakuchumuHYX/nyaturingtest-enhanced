@@ -43,6 +43,13 @@ class FeedbackSubjectSpeakerMetadataTests(unittest.TestCase):
         self.assertIn('"user_id": str(msg.user_id or "")', feedback_block)
         self.assertIn('"user_name": msg.user_name', feedback_block)
 
+    def test_query_memory_keeps_user_id_as_subject_filter(self):
+        source = (PLUGIN_DIR / "handlers" / "memory.py").read_text(encoding="utf-8")
+        query_block = source[source.index("@query_memory.handle()"):]
+
+        self.assertIn('{"user_id": {"$eq": target_id}}', query_block)
+        self.assertNotIn('{"speaker_user_id": {"$eq": target_id}}', query_block)
+
 
 if __name__ == "__main__":
     unittest.main()

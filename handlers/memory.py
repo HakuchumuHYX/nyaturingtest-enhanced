@@ -337,6 +337,7 @@ async def handle_query_memory(bot: Bot, event: GroupMessageEvent, args: Message 
             f"{target_name}的性格特点"
         ]
 
+        # user_id 是 subject_user_id 的兼容别名；/查询记忆 查询的是目标用户相关事实，不是该用户说过的所有话。
         # 构造过滤条件：匹配 target_id 或者 user_id 为空 (全局记忆/未标记记忆)
         user_filter = []
         if target_id and target_id.strip():
