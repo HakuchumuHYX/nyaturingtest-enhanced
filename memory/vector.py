@@ -124,11 +124,24 @@ def _clamp_float(value: Any, default: float, lower: float, upper: float) -> floa
     return max(lower, min(upper, number))
 
 
+def _clean_metadata_string(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _metadata_schema_version(value: Any) -> int:
+    try:
+        version = int(value)
+    except (TypeError, ValueError):
+        return 1
+    return version if version > 0 else 1
+
+
 def _normalized_metadata(meta: dict | None) -> dict[str, Any]:
     data = dict(meta or {})
     source = str(data.get("source") or "memory")
     memory_type = str(data.get("type") or "event")
     subtype = str(data.get("subtype") or ("legacy_rule" if source == "preset" else memory_type))
+    subject_user_id = _clean_metadata_string(data.get("subject_user_id") or data.get("user_id"))
     data["source"] = source
     data["type"] = memory_type
     data["subtype"] = subtype
@@ -136,6 +149,12 @@ def _normalized_metadata(meta: dict | None) -> dict[str, Any]:
     data["category"] = str(data.get("category") or memory_type)
     data["confidence"] = _clamp_float(data.get("confidence"), 1.0, 0.0, 1.0)
     data["importance"] = _clamp_float(data.get("importance"), 0.0, 0.0, 1.0)
+    data["schema_version"] = _metadata_schema_version(data.get("schema_version"))
+    data["subject_user_id"] = subject_user_id
+    data["subject_user_name"] = _clean_metadata_string(data.get("subject_user_name"))
+    data["speaker_user_id"] = _clean_metadata_string(data.get("speaker_user_id"))
+    data["speaker_user_name"] = _clean_metadata_string(data.get("speaker_user_name"))
+    data["user_id"] = subject_user_id
     return data
 
 
