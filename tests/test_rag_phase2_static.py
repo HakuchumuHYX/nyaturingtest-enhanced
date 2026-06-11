@@ -12,10 +12,19 @@ class RagPhase2StaticTests(unittest.TestCase):
 
         self.assertIn('"rag_final_k": 20', config_source)
         self.assertIn('"rag_candidate_k": 40', config_source)
+        self.assertIn('"rag_per_query_recall_k": 40', config_source)
+        self.assertIn('"rag_merged_candidate_cap": 64', config_source)
+        self.assertIn('"rag_memory_char_budget": 1500', config_source)
         self.assertIn('"rag_final_k": number("rag_final_k", 20, int, minimum=1)', config_source)
         self.assertIn('"rag_candidate_k": number("rag_candidate_k", 40, int, minimum=1)', config_source)
+        self.assertIn('"rag_per_query_recall_k": number("rag_per_query_recall_k", runtime.get("rag_candidate_k", 40), int, minimum=1)', config_source)
+        self.assertIn('"rag_merged_candidate_cap": number("rag_merged_candidate_cap", 64, int, minimum=1)', config_source)
+        self.assertIn('"rag_memory_char_budget": number("rag_memory_char_budget", 1500, int, minimum=1)', config_source)
         self.assertIn('"rag_final_k": 20', example_source)
         self.assertIn('"rag_candidate_k": 40', example_source)
+        self.assertIn('"rag_per_query_recall_k": 40', example_source)
+        self.assertIn('"rag_merged_candidate_cap": 64', example_source)
+        self.assertIn('"rag_memory_char_budget": 1500', example_source)
 
     def test_orchestrator_services_session_support_active_users_double_track(self):
         orchestrator_source = (PLUGIN_DIR / "core" / "orchestrator.py").read_text(encoding="utf-8")
@@ -48,7 +57,14 @@ class RagPhase2StaticTests(unittest.TestCase):
         session_source = (PLUGIN_DIR / "core" / "session.py").read_text(encoding="utf-8")
 
         self.assertIn('k=runtime_settings["rag_final_k"]', session_source)
-        self.assertIn('candidate_k=runtime_settings["rag_candidate_k"]', session_source)
+        self.assertIn('candidate_k=runtime_settings["rag_per_query_recall_k"]', session_source)
+        self.assertIn('merged_candidate_cap=runtime_settings["rag_merged_candidate_cap"]', session_source)
+
+    def test_chat_path_uses_runtime_rag_memory_char_budget_before_appending(self):
+        session_source = (PLUGIN_DIR / "core" / "session.py").read_text(encoding="utf-8")
+
+        self.assertIn('max_len = runtime_settings["rag_memory_char_budget"]', session_source)
+        self.assertIn("if formatted_results and total_len + len(line) > max_len:", session_source)
 
     def test_chat_path_passes_active_user_ids_for_scope_ranking(self):
         session_source = (PLUGIN_DIR / "core" / "session.py").read_text(encoding="utf-8")

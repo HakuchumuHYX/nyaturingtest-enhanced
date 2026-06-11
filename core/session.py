@@ -31,6 +31,7 @@ from ..database.session_repository import SessionStateRepository
 from .services import RagSearchService
 from .orchestrator import ConversationOrchestrator
 from .structured_log import log_event
+from .rag_query import build_chat_rag_queries
 
 
 def _limit_role_text(text: str, max_chars: int) -> str:
@@ -538,15 +539,13 @@ class Session:
             "scope_counts": {},
         }
 
-        if self.chat_summary:
-            queries.append(self.chat_summary)
-
-        active_query_names = _active_user_query_names(active_user_names, active_users)
         active_scope_user_ids = _active_user_scope_ids(active_users)
-        if active_query_names:
-            queries.extend([f"关于{name}" for name in active_query_names])
-
-        queries = _dedupe_preserve_order([q for q in queries if q and q.strip()])
+        queries = build_chat_rag_queries(
+            queries,
+            chat_summary=self.chat_summary,
+            active_user_names=active_user_names,
+            active_users=active_users,
+        )
         rag_stats["query_count"] = len(queries)
         rag_stats["queries_preview"] = [q[:40] for q in queries[:3]]
 
@@ -570,7 +569,8 @@ class Session:
                     k=runtime_settings["rag_final_k"],
                     where=where_filter,
                     use_rerank=use_rerank,
-                    candidate_k=runtime_settings["rag_candidate_k"],
+                    candidate_k=runtime_settings["rag_per_query_recall_k"],
+                    merged_candidate_cap=runtime_settings["rag_merged_candidate_cap"],
                     active_user_ids=active_scope_user_ids,
                 )
                 retrieval_stats = getattr(self.long_term_memory, "last_retrieval_stats", {}) or {}
@@ -587,11 +587,9 @@ class Session:
                 if raw_results:
                     formatted_results = []
                     total_len = 0
-                    max_len = 1500
+                    max_len = runtime_settings["rag_memory_char_budget"]
 
                     for item in raw_results:
-                        if total_len > max_len: break
-
                         content = item.get("content", "")
                         meta = item.get("metadata", {})
                         source = meta.get("source", "unknown")
@@ -604,6 +602,8 @@ class Session:
                             prefix = f"【记忆/d:{date_str}】"
                         line = f"{prefix} {content}"
 
+                        if formatted_results and total_len + len(line) > max_len:
+                            break
                         formatted_results.append(line)
                         total_len += len(line)
 
@@ -716,6 +716,25 @@ class Session:
                 if attempt == 1:
                     logger.error("反馈阶段最终失败，跳过本次处理")
                     return []
+
+        expected_feedback_fields = [
+            "analyze_result",
+            "willing",
+            "new_emotion",
+            "emotion_tends",
+            "summary",
+            "need_history",
+        ]
+        missing_feedback_fields = [
+            field for field in expected_feedback_fields
+            if field not in response_dict
+        ]
+        if missing_feedback_fields:
+            log_event("feedback_fields_missing",
+                session_id=self.id,
+                missing_feedback_fields=missing_feedback_fields,
+                response_keys=sorted(str(key) for key in response_dict.keys()),
+            )
 
         # 3. 更新情绪
         new_emo = response_dict.get("new_emotion", {})

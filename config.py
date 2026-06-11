@@ -151,6 +151,9 @@ def get_default_config() -> dict:
             "rag_debug_log": False,
             "rag_final_k": 20,
             "rag_candidate_k": 40,
+            "rag_per_query_recall_k": 40,
+            "rag_merged_candidate_cap": 64,
+            "rag_memory_char_budget": 1500,
             "rag_default_event_ttl_days": 90,
         },
         "enabled_groups": [],
@@ -459,6 +462,9 @@ def get_runtime_settings() -> dict[str, Any]:
         "rag_debug_log": flag("rag_debug_log", False),
         "rag_final_k": number("rag_final_k", 20, int, minimum=1),
         "rag_candidate_k": number("rag_candidate_k", 40, int, minimum=1),
+        "rag_per_query_recall_k": number("rag_per_query_recall_k", runtime.get("rag_candidate_k", 40), int, minimum=1),
+        "rag_merged_candidate_cap": number("rag_merged_candidate_cap", 64, int, minimum=1),
+        "rag_memory_char_budget": number("rag_memory_char_budget", 1500, int, minimum=1),
         "rag_default_event_ttl_days": number("rag_default_event_ttl_days", 90, int, minimum=1),
     }
 

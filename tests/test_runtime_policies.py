@@ -43,12 +43,19 @@ def _load_module(name: str, path: Path):
 
 
 class RuntimePolicyTests(unittest.TestCase):
-    def test_send_policy_preserves_sentence_punctuation_and_limits_parts(self):
+    def test_send_policy_removes_formal_periods_and_limits_parts(self):
         module = _load_module("message_sender_policy", PLUGIN_DIR / "core" / "message_sender.py")
 
-        parts = module.build_send_parts("第一句。第二句！第三句？", max_messages=2)
+        parts = module.build_send_parts("第一句。第二句.第三句？", max_messages=2)
 
-        self.assertEqual(["第一句。", "第二句！"], parts)
+        self.assertEqual(["第一句", "第二句"], parts)
+
+    def test_send_policy_preserves_expressive_chat_punctuation(self):
+        module = _load_module("message_sender_policy", PLUGIN_DIR / "core" / "message_sender.py")
+
+        parts = module.build_send_parts("真的假的？好耶！还行~算了...", max_messages=0)
+
+        self.assertEqual(["真的假的？", "好耶！", "还行~", "算了..."], parts)
 
     def test_image_cache_key_rejects_path_traversal_and_long_values(self):
         module = _load_module("image_policy", PLUGIN_DIR / "memory" / "image_policy.py")

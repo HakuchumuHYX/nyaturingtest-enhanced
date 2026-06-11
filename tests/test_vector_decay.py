@@ -1,5 +1,5 @@
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from test_vector_batch import _load_vector_module
@@ -20,7 +20,7 @@ class VectorDecayTests(unittest.TestCase):
         memory = object.__new__(module.VectorMemory)
         today = int(datetime.now().strftime("%Y%m%d"))
 
-        def fake_retrieve(queries, k=5, where=None, use_rerank=True):
+        def fake_retrieve(queries, k=5, where=None, use_rerank=True, merged_candidate_cap=None):
             return [
                 {"content": "low", "metadata": {"date": today, "retrieval_score": 0.2}},
                 {"content": "high", "metadata": {"date": today, "retrieval_score": 0.9}},
@@ -36,7 +36,7 @@ class VectorDecayTests(unittest.TestCase):
         module = _load_vector_module()
         memory = object.__new__(module.VectorMemory)
 
-        def fake_retrieve(queries, k=5, where=None, use_rerank=True):
+        def fake_retrieve(queries, k=5, where=None, use_rerank=True, merged_candidate_cap=None):
             return [
                 {"content": "preset", "metadata": {"source": "preset", "retrieval_score": 0.9}},
             ]
@@ -55,7 +55,7 @@ class VectorDecayTests(unittest.TestCase):
         memory = object.__new__(module.VectorMemory)
         today = int(datetime.now().strftime("%Y%m%d"))
 
-        def fake_retrieve(queries, k=5, where=None, use_rerank=True):
+        def fake_retrieve(queries, k=5, where=None, use_rerank=True, merged_candidate_cap=None):
             return [
                 {"content": "memory", "metadata": {"source": "memory", "type": "event", "date": today, "retrieval_score": 0.75}},
                 {"content": "preset", "metadata": {"source": "preset", "type": "rule", "retrieval_score": 0.75}},
@@ -69,27 +69,46 @@ class VectorDecayTests(unittest.TestCase):
         self.assertEqual(1.0, result[0]["metadata"]["source_type_weight"])
         self.assertEqual(0.85, result[1]["metadata"]["source_type_weight"])
 
-    def test_candidate_k_none_preserves_old_double_k_behavior(self):
+    def test_stable_fact_types_decay_slower_than_events(self):
+        module = _load_vector_module()
+        memory = object.__new__(module.VectorMemory)
+        today = int(datetime.now().strftime("%Y%m%d"))
+        old_date = int((datetime.now() - timedelta(days=120)).strftime("%Y%m%d"))
+
+        def fake_retrieve(queries, k=5, where=None, use_rerank=True, merged_candidate_cap=None):
+            return [
+                {"content": "recent event", "metadata": {"source": "memory", "type": "event", "date": today, "retrieval_score": 0.40}},
+                {"content": "old preference", "metadata": {"source": "memory", "type": "preference", "date": old_date, "retrieval_score": 0.80}},
+            ]
+
+        memory.retrieve = fake_retrieve
+
+        result = memory.retrieve_with_decay(["query"], k=2, use_rerank=False, decay_rate=0.02)
+
+        self.assertEqual(["old preference", "recent event"], [item["content"] for item in result])
+        self.assertLess(result[0]["metadata"]["decay_rate"], 0.02)
+
+    def test_candidate_k_none_uses_final_k_without_hidden_multiplier(self):
         module = _load_vector_module()
         memory = object.__new__(module.VectorMemory)
         calls = []
 
-        def fake_retrieve(queries, k=5, where=None, use_rerank=True):
-            calls.append(k)
+        def fake_retrieve(queries, k=5, where=None, use_rerank=True, merged_candidate_cap=None):
+            calls.append((k, merged_candidate_cap))
             return []
 
         memory.retrieve = fake_retrieve
 
         memory.retrieve_with_decay(["query"], k=7, use_rerank=False)
 
-        self.assertEqual([14], calls)
+        self.assertEqual([(7, None)], calls)
 
     def test_candidate_k_overrides_internal_double_k(self):
         module = _load_vector_module()
         memory = object.__new__(module.VectorMemory)
         calls = []
 
-        def fake_retrieve(queries, k=5, where=None, use_rerank=True):
+        def fake_retrieve(queries, k=5, where=None, use_rerank=True, merged_candidate_cap=None):
             calls.append(k)
             return []
 
@@ -99,12 +118,27 @@ class VectorDecayTests(unittest.TestCase):
 
         self.assertEqual([9], calls)
 
+    def test_merged_candidate_cap_is_passed_to_retrieve(self):
+        module = _load_vector_module()
+        memory = object.__new__(module.VectorMemory)
+        calls = []
+
+        def fake_retrieve(queries, k=5, where=None, use_rerank=True, merged_candidate_cap=None):
+            calls.append(merged_candidate_cap)
+            return []
+
+        memory.retrieve = fake_retrieve
+
+        memory.retrieve_with_decay(["query"], k=7, candidate_k=9, merged_candidate_cap=12, use_rerank=False)
+
+        self.assertEqual([12], calls)
+
     def test_active_user_scope_downweights_other_users_and_weights_active_memories(self):
         module = _load_vector_module()
         memory = object.__new__(module.VectorMemory)
         today = int(datetime.now().strftime("%Y%m%d"))
 
-        def fake_retrieve(queries, k=5, where=None, use_rerank=True):
+        def fake_retrieve(queries, k=5, where=None, use_rerank=True, merged_candidate_cap=None):
             return [
                 {"content": "other user", "metadata": {"source": "memory", "type": "event", "user_id": "2", "date": today, "retrieval_score": 0.99}},
                 {"content": "global memory", "metadata": {"source": "memory", "type": "event", "user_id": "", "date": today, "retrieval_score": 0.75}},
@@ -128,7 +162,7 @@ class VectorDecayTests(unittest.TestCase):
         memory = object.__new__(module.VectorMemory)
         today = int(datetime.now().strftime("%Y%m%d"))
 
-        def fake_retrieve(queries, k=5, where=None, use_rerank=True):
+        def fake_retrieve(queries, k=5, where=None, use_rerank=True, merged_candidate_cap=None):
             return [
                 {"content": "user specific", "metadata": {"source": "memory", "type": "event", "user_id": "2", "date": today, "retrieval_score": 0.90}},
             ]

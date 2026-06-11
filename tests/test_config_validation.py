@@ -110,6 +110,9 @@ class ConfigValidationTests(unittest.TestCase):
         cfg["runtime"]["short_context_limit"] = 24
         cfg["runtime"]["interaction_log_recent_days"] = 90
         cfg["runtime"]["history_recall_limit"] = 12
+        cfg["runtime"]["rag_per_query_recall_k"] = 18
+        cfg["runtime"]["rag_merged_candidate_cap"] = 32
+        cfg["runtime"]["rag_memory_char_budget"] = 1200
         cfg["runtime"]["speak_cooldown_seconds"] = 3
         cfg["runtime"]["rerank_willingness_threshold"] = 0.8
         cfg["runtime"]["low_willingness_skip_threshold"] = 0.2
@@ -122,6 +125,9 @@ class ConfigValidationTests(unittest.TestCase):
         self.assertEqual(24, settings["short_context_limit"])
         self.assertEqual(90, settings["interaction_log_recent_days"])
         self.assertEqual(12, settings["history_recall_limit"])
+        self.assertEqual(18, settings["rag_per_query_recall_k"])
+        self.assertEqual(32, settings["rag_merged_candidate_cap"])
+        self.assertEqual(1200, settings["rag_memory_char_budget"])
         self.assertEqual(3.0, settings["speak_cooldown_seconds"])
         self.assertEqual(0.8, settings["rerank_willingness_threshold"])
         self.assertEqual(0.2, settings["low_willingness_skip_threshold"])
@@ -163,6 +169,9 @@ class ConfigValidationTests(unittest.TestCase):
         cfg["runtime"]["short_context_limit"] = 0
         cfg["runtime"]["interaction_log_recent_days"] = 0
         cfg["runtime"]["history_recall_limit"] = -5
+        cfg["runtime"]["rag_per_query_recall_k"] = 0
+        cfg["runtime"]["rag_merged_candidate_cap"] = -3
+        cfg["runtime"]["rag_memory_char_budget"] = 0
         module.plugin_config = cfg
 
         settings = module.get_runtime_settings()
@@ -178,6 +187,9 @@ class ConfigValidationTests(unittest.TestCase):
         self.assertEqual(1, settings["short_context_limit"])
         self.assertEqual(1, settings["interaction_log_recent_days"])
         self.assertEqual(1, settings["history_recall_limit"])
+        self.assertEqual(1, settings["rag_per_query_recall_k"])
+        self.assertEqual(1, settings["rag_merged_candidate_cap"])
+        self.assertEqual(1, settings["rag_memory_char_budget"])
 
     def test_load_plugin_config_records_fallback_diagnostic_for_invalid_json(self):
         module = _load_config_module()

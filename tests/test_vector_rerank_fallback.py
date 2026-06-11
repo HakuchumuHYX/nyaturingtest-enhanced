@@ -25,6 +25,15 @@ class InvalidIndexReranker:
         ]
 
 
+class RecordingReranker:
+    def __init__(self):
+        self.queries = []
+
+    def rerank(self, query, documents, top_n):
+        self.queries.append(query)
+        return [{"index": 0, "relevance_score": 0.99}]
+
+
 class VectorRerankFallbackTests(unittest.TestCase):
     def _memory_with_reranker(self, reranker):
         module = _load_vector_module()
@@ -46,6 +55,14 @@ class VectorRerankFallbackTests(unittest.TestCase):
         result = memory.retrieve(["alpha"], k=2, use_rerank=True)
 
         self.assertEqual([item["content"] for item in result], ["memory alpha", "memory beta"])
+
+    def test_retrieve_uses_first_effective_query_as_rerank_anchor(self):
+        reranker = RecordingReranker()
+        memory = self._memory_with_reranker(reranker)
+
+        memory.retrieve(["最新有效消息", "这是一段很长很长很长的上一轮摘要"], k=1, use_rerank=True)
+
+        self.assertEqual(["最新有效消息"], reranker.queries)
 
 
 if __name__ == "__main__":

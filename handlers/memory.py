@@ -236,7 +236,8 @@ async def handle_rag_debug(event: GroupMessageEvent, args: Message = CommandArg(
             k=runtime_settings["rag_final_k"],
             where=where_filter,
             use_rerank=True,
-            candidate_k=runtime_settings["rag_candidate_k"],
+            candidate_k=runtime_settings["rag_per_query_recall_k"],
+            merged_candidate_cap=runtime_settings["rag_merged_candidate_cap"],
         )
         stats = long_term_memory.last_retrieval_stats
 
@@ -377,6 +378,7 @@ async def handle_query_memory(bot: Bot, event: GroupMessageEvent, args: Message 
                 k=dynamic_k,
                 where=search_filter,
                 use_rerank=True,
+                merged_candidate_cap=runtime_settings["rag_merged_candidate_cap"],
                 decay_rate=0.02  # 衰减率：约35天后权重减半
             )
 

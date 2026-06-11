@@ -4,6 +4,31 @@ from datetime import datetime
 from test_vector_batch import _load_vector_module
 
 
+class FakeSubjectRecallCollection:
+    metadata = {"hnsw:space": "cosine"}
+
+    def __init__(self):
+        self.get_calls = []
+
+    def get(self, **kwargs):
+        self.get_calls.append(kwargs)
+        return {
+            "ids": ["subject-1"],
+            "documents": ["Alice 讨厌香菜"],
+            "metadatas": [{
+                "schema_version": 2,
+                "source": "memory",
+                "type": "preference",
+                "status": "active",
+                "subject_user_id": "10001",
+                "subject_user_name": "Alice",
+                "date": int(datetime.now().strftime("%Y%m%d")),
+                "importance": 0.8,
+                "confidence": 0.9,
+            }],
+        }
+
+
 class VectorSubjectSpeakerScopeTests(unittest.TestCase):
     def test_normalized_metadata_maps_legacy_user_id_to_subject_alias(self):
         module = _load_vector_module()
@@ -47,7 +72,7 @@ class VectorSubjectSpeakerScopeTests(unittest.TestCase):
         memory = object.__new__(module.VectorMemory)
         today = int(datetime.now().strftime("%Y%m%d"))
 
-        def fake_retrieve(queries, k=5, where=None, use_rerank=True):
+        def fake_retrieve(queries, k=5, where=None, use_rerank=True, merged_candidate_cap=None):
             return [{
                 "content": "B 说小明最近在准备考试",
                 "metadata": {
@@ -83,7 +108,7 @@ class VectorSubjectSpeakerScopeTests(unittest.TestCase):
         memory = object.__new__(module.VectorMemory)
         today = int(datetime.now().strftime("%Y%m%d"))
 
-        def fake_retrieve(queries, k=5, where=None, use_rerank=True):
+        def fake_retrieve(queries, k=5, where=None, use_rerank=True, merged_candidate_cap=None):
             return [{
                 "content": "B 说 A 最近在准备考试",
                 "metadata": {
@@ -116,7 +141,7 @@ class VectorSubjectSpeakerScopeTests(unittest.TestCase):
         memory = object.__new__(module.VectorMemory)
         today = int(datetime.now().strftime("%Y%m%d"))
 
-        def fake_retrieve(queries, k=5, where=None, use_rerank=True):
+        def fake_retrieve(queries, k=5, where=None, use_rerank=True, merged_candidate_cap=None):
             return [{
                 "content": "E 喜欢夜跑",
                 "metadata": {
@@ -151,7 +176,7 @@ class VectorSubjectSpeakerScopeTests(unittest.TestCase):
         memory = object.__new__(module.VectorMemory)
         today = int(datetime.now().strftime("%Y%m%d"))
 
-        def fake_retrieve(queries, k=5, where=None, use_rerank=True):
+        def fake_retrieve(queries, k=5, where=None, use_rerank=True, merged_candidate_cap=None):
             return [{
                 "content": "A 最近在准备考试",
                 "metadata": {
@@ -176,6 +201,40 @@ class VectorSubjectSpeakerScopeTests(unittest.TestCase):
         self.assertEqual(["A 最近在准备考试"], [item["content"] for item in result])
         self.assertEqual("legacy_subject", result[0]["metadata"]["scope"])
         self.assertEqual(0.75, result[0]["metadata"]["scope_weight"])
+
+    def test_active_subject_metadata_recall_adds_records_missed_by_semantic_search(self):
+        module = _load_vector_module()
+        memory = object.__new__(module.VectorMemory)
+        memory.collection = FakeSubjectRecallCollection()
+        today = int(datetime.now().strftime("%Y%m%d"))
+
+        def fake_retrieve(queries, k=5, where=None, use_rerank=True, merged_candidate_cap=None):
+            return [{
+                "content": "全局群聊规则",
+                "metadata": {
+                    "source": "memory",
+                    "type": "event",
+                    "date": today,
+                    "retrieval_score": 0.60,
+                },
+            }]
+
+        memory.retrieve = fake_retrieve
+
+        result = memory.retrieve_with_decay(
+            ["今天吃什么"],
+            k=3,
+            use_rerank=False,
+            decay_rate=0,
+            active_user_ids={"10001"},
+        )
+
+        self.assertIn("Alice 讨厌香菜", [item["content"] for item in result])
+        recalled = next(item for item in result if item["content"] == "Alice 讨厌香菜")
+        self.assertEqual("subject-1", recalled["metadata"]["memory_ref"])
+        self.assertEqual("active_subject", recalled["metadata"]["scope"])
+        self.assertEqual(1.10, recalled["metadata"]["scope_weight"])
+        self.assertTrue(memory.collection.get_calls)
 
 
 if __name__ == "__main__":

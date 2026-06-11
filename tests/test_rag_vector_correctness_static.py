@@ -8,13 +8,16 @@ PLUGIN_DIR = Path(__file__).resolve().parents[1]
 class RagVectorCorrectnessStaticTests(unittest.TestCase):
     def test_query_dedupe_preserves_order_in_session_and_vector(self):
         session_source = (PLUGIN_DIR / "core" / "session.py").read_text(encoding="utf-8")
+        rag_query_source = (PLUGIN_DIR / "core" / "rag_query.py").read_text(encoding="utf-8")
         vector_source = (PLUGIN_DIR / "memory" / "vector.py").read_text(encoding="utf-8")
 
-        self.assertIn("def _dedupe_preserve_order", session_source)
+        self.assertIn("build_chat_rag_queries(", session_source)
+        self.assertIn("def _dedupe_preserve_order", rag_query_source)
         self.assertIn("def _dedupe_preserve_order", vector_source)
-        self.assertIn("_dedupe_preserve_order([q for q in queries", session_source)
+        self.assertIn("return _dedupe_preserve_order(effective_queries)", rag_query_source)
         self.assertIn("_dedupe_preserve_order([q for q in queries", vector_source)
         self.assertNotIn("list(set([q for q in queries", session_source)
+        self.assertNotIn("list(set(", rag_query_source)
         self.assertNotIn("list(set([q for q in queries", vector_source)
 
     def test_vector_has_separate_preset_and_memory_weight_tables(self):

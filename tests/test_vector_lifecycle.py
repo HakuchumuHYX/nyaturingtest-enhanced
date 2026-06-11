@@ -95,6 +95,7 @@ class VectorLifecycleTests(unittest.TestCase):
         old_date = int((datetime.now() - timedelta(days=120)).strftime("%Y%m%d"))
         memory.collection = FakeLifecycleCollection([
             ("event-old", {"source": "memory", "type": "event", "date": old_date}),
+            ("event-important-old", {"source": "memory", "type": "event", "date": old_date, "importance": 1.0, "ttl_days": 90}),
             ("preset-old", {"source": "preset", "type": "rule", "date": old_date}),
             ("superseded-old", {"source": "memory", "type": "profile", "status": "superseded", "date": old_date}),
         ])
@@ -104,13 +105,14 @@ class VectorLifecycleTests(unittest.TestCase):
         deleted = [item_id for batch in memory.collection.deleted for item_id in batch]
         self.assertIn("event-old", deleted)
         self.assertIn("superseded-old", deleted)
+        self.assertNotIn("event-important-old", deleted)
         self.assertNotIn("preset-old", deleted)
 
     def test_retrieve_with_decay_filters_non_active_status_but_keeps_legacy_and_preset(self):
         module = _load_vector_module()
         memory = object.__new__(module.VectorMemory)
 
-        def fake_retrieve(queries, k=5, where=None, use_rerank=True):
+        def fake_retrieve(queries, k=5, where=None, use_rerank=True, merged_candidate_cap=None):
             return [
                 {"content": "superseded memory", "metadata": {"source": "memory", "type": "event", "status": "superseded", "retrieval_score": 0.99}},
                 {"content": "archived memory", "metadata": {"source": "memory", "type": "event", "status": "archived", "retrieval_score": 0.98}},
@@ -132,7 +134,7 @@ class VectorLifecycleTests(unittest.TestCase):
         memory = object.__new__(module.VectorMemory)
         today = int(datetime.now().strftime("%Y%m%d"))
 
-        def fake_retrieve(queries, k=5, where=None, use_rerank=True):
+        def fake_retrieve(queries, k=5, where=None, use_rerank=True, merged_candidate_cap=None):
             return [
                 {"content": "legacy neutral", "metadata": {"source": "memory", "type": "event", "date": today, "retrieval_score": 0.80}},
                 {"content": "important update", "metadata": {"source": "memory", "type": "event", "date": today, "retrieval_score": 0.70, "confidence": 1.0, "importance": 1.0}},
@@ -143,10 +145,10 @@ class VectorLifecycleTests(unittest.TestCase):
 
         result = memory.retrieve_with_decay(["query"], k=3, use_rerank=False, decay_rate=0)
 
-        self.assertEqual(["important update", "legacy neutral", "zero confidence"], [item["content"] for item in result])
-        self.assertEqual(1.0, result[1]["metadata"]["confidence_weight"])
-        self.assertEqual(1.0, result[1]["metadata"]["importance_weight"])
-        self.assertEqual(0.0, result[2]["metadata"]["adjusted_score"])
+        self.assertEqual(["important update", "zero confidence", "legacy neutral"], [item["content"] for item in result])
+        self.assertEqual(0.7, result[1]["metadata"]["confidence_weight"])
+        self.assertEqual(1.15, result[1]["metadata"]["importance_weight"])
+        self.assertGreater(result[1]["metadata"]["adjusted_score"], 0.0)
 
     def test_get_and_update_metadata_by_id_for_supersede(self):
         module = _load_vector_module()

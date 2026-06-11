@@ -30,7 +30,7 @@ class RagSearchServiceStaticTests(unittest.TestCase):
         self.assertIn("RagSearchService(self.long_term_memory).search_for_chat", session_source)
         self.assertIn('prefix = f"【设定/{subtype}】"', session_source)
         self.assertIn('prefix = f"【记忆/d:{date_str}】"', session_source)
-        self.assertIn("max_len = 1500", session_source)
+        self.assertIn('max_len = runtime_settings["rag_memory_char_budget"]', session_source)
 
     def test_query_memory_uses_service_and_keeps_long_term_vad_semantics(self):
         source = (PLUGIN_DIR / "handlers" / "memory.py").read_text(encoding="utf-8")

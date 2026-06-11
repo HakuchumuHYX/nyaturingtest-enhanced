@@ -112,6 +112,48 @@ class FakeCollection:
         self.add_calls.append(kwargs)
 
 
+class FakeDedupReinforceCollection:
+    def __init__(self):
+        self.query_calls = []
+        self.add_calls = []
+        self.update_calls = []
+
+    def query(self, **kwargs):
+        self.query_calls.append(kwargs)
+        return {
+            "ids": [["mem-1"]],
+            "distances": [[0.05]],
+            "metadatas": [[{
+                "schema_version": 2,
+                "source": "memory",
+                "type": "preference",
+                "status": "active",
+                "date": 20250101,
+                "confidence": 0.5,
+                "reaffirm_count": 2,
+                "subject_user_id": "10001",
+                "user_id": "10001",
+            }]],
+        }
+
+    def add(self, **kwargs):
+        self.add_calls.append(kwargs)
+
+    def update(self, *, ids, metadatas):
+        self.update_calls.append((list(ids), [dict(metadata) for metadata in metadatas]))
+
+
+class FakeFailingQueryCollection:
+    def __init__(self):
+        self.add_calls = []
+
+    def query(self, **kwargs):
+        raise RuntimeError("query failed")
+
+    def add(self, **kwargs):
+        self.add_calls.append(kwargs)
+
+
 class FakeRetrievalCollection:
     def __init__(self):
         self.query_calls = []
@@ -162,6 +204,11 @@ class FakeClient:
         return "new-collection"
 
 
+class FirstResultReranker:
+    def rerank(self, query, documents, top_n):
+        return [{"index": 0, "relevance_score": 0.99}]
+
+
 class VectorBatchTests(unittest.TestCase):
     def test_add_memories_with_dedup_batches_query_and_add(self):
         module = _load_vector_module()
@@ -174,7 +221,7 @@ class VectorBatchTests(unittest.TestCase):
             ("   ", {"source": "memory", "user_id": "3"}),
         ], threshold=0.9)
 
-        self.assertEqual({"added": 1, "skipped_empty": 1, "skipped_dedup": 1}, result)
+        self.assertEqual({"added": 1, "skipped_empty": 1, "skipped_dedup": 1, "reinforced": 0, "dedup_errors": 0}, result)
         self.assertEqual(1, len(memory.collection.query_calls))
         self.assertEqual(["重复记忆", "新的记忆"], memory.collection.query_calls[0]["query_texts"])
         self.assertEqual(
@@ -200,8 +247,46 @@ class VectorBatchTests(unittest.TestCase):
             ("另一条记忆", {"source": "memory", "user_id": "2"}),
         ], threshold=0.99)
 
-        self.assertEqual({"added": 2, "skipped_empty": 0, "skipped_dedup": 1}, result)
+        self.assertEqual({"added": 2, "skipped_empty": 0, "skipped_dedup": 1, "reinforced": 0, "dedup_errors": 0}, result)
         self.assertEqual(["同一条记忆", "另一条记忆"], memory.collection.query_calls[0]["query_texts"])
+
+    def test_add_memories_with_dedup_reinforces_active_memory_duplicate(self):
+        module = _load_vector_module()
+        memory = object.__new__(module.VectorMemory)
+        memory.collection = FakeDedupReinforceCollection()
+
+        result = memory.add_memories_with_dedup([
+            ("Alice 讨厌香菜", {
+                "source": "memory",
+                "type": "preference",
+                "date": 20260611,
+                "confidence": 0.7,
+                "subject_user_id": "10001",
+                "user_id": "10001",
+            }),
+        ], threshold=0.9)
+
+        self.assertEqual({"added": 0, "skipped_empty": 0, "skipped_dedup": 1, "reinforced": 1, "dedup_errors": 0}, result)
+        self.assertEqual([], memory.collection.add_calls)
+        self.assertEqual(["mem-1"], memory.collection.update_calls[0][0])
+        updated = memory.collection.update_calls[0][1][0]
+        self.assertEqual(20260611, updated["date"])
+        self.assertEqual(3, updated["reaffirm_count"])
+        self.assertGreater(updated["confidence"], 0.5)
+        self.assertEqual("10001", updated["user_id"])
+        self.assertEqual("10001", updated["subject_user_id"])
+
+    def test_add_memories_with_dedup_does_not_write_batch_when_query_fails(self):
+        module = _load_vector_module()
+        memory = object.__new__(module.VectorMemory)
+        memory.collection = FakeFailingQueryCollection()
+
+        result = memory.add_memories_with_dedup([
+            ("Alice 讨厌香菜", {"source": "memory", "type": "preference"}),
+        ])
+
+        self.assertEqual({"added": 0, "skipped_empty": 0, "skipped_dedup": 0, "reinforced": 0, "dedup_errors": 1}, result)
+        self.assertEqual([], memory.collection.add_calls)
 
     def test_retrieve_attaches_distance_score_without_rerank(self):
         module = _load_vector_module()
@@ -238,6 +323,16 @@ class VectorBatchTests(unittest.TestCase):
         self.assertEqual(0.8, result[1]["metadata"]["retrieval_score"])
         self.assertEqual(0.6, result[2]["metadata"]["retrieval_score"])
 
+    def test_retrieve_uses_k_as_per_query_recall_without_hidden_rerank_multiplier(self):
+        module = _load_vector_module()
+        memory = object.__new__(module.VectorMemory)
+        memory.collection = FakeRetrievalCollection()
+        memory.reranker = FirstResultReranker()
+
+        memory.retrieve(["alpha"], k=3, use_rerank=True)
+
+        self.assertEqual(3, memory.collection.query_calls[0]["n_results"])
+
     def test_retrieve_with_decay_records_aggregate_stats(self):
         module = _load_vector_module()
         memory = object.__new__(module.VectorMemory)
@@ -251,7 +346,7 @@ class VectorBatchTests(unittest.TestCase):
         self.assertEqual(2, stats["candidate_count"])
         self.assertEqual(1, stats["returned_count"])
         self.assertEqual("rerank_disabled", stats["fallback_reason"])
-        self.assertEqual(0.26, round(stats["adjusted_score_min"], 2))
+        self.assertEqual(0.9, round(stats["adjusted_score_min"], 2))
         self.assertEqual(0.9, stats["adjusted_score_max"])
 
     def test_clear_recreates_collection_with_cosine_metadata(self):

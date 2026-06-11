@@ -81,6 +81,14 @@ class RagObservabilityStaticTests(unittest.TestCase):
         self.assertIn("legacy_subject_count", session_source)
         self.assertIn("scope_counts", session_source)
 
+    def test_feedback_missing_fields_are_observable(self):
+        session_source = (PLUGIN_DIR / "core" / "session.py").read_text(encoding="utf-8")
+
+        self.assertIn('log_event("feedback_fields_missing"', session_source)
+        self.assertIn("missing_feedback_fields", session_source)
+        self.assertIn('"analyze_result"', session_source)
+        self.assertIn('"new_emotion"', session_source)
+
 
 if __name__ == "__main__":
     unittest.main()
