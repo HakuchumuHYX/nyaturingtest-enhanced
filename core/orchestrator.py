@@ -79,11 +79,20 @@ class ConversationOrchestrator:
                     runtime_settings["interest_topic_willingness_floor"],
                 )
 
-        if self.session.willingness < runtime_settings["low_willingness_skip_threshold"] and not is_relevant:
+        enter_threshold = runtime_settings["willingness_reply_threshold"]
+        exit_threshold = runtime_settings["low_willingness_skip_threshold"]
+        if is_relevant:
+            self.session._engaged = True
+        elif self.session._engaged and self.session.willingness < exit_threshold:
+            self.session._engaged = False
+        elif not self.session._engaged and self.session.willingness >= enter_threshold:
+            self.session._engaged = True
+
+        if not self.session._engaged and not is_relevant:
             if runtime_settings["consolidation_enabled"] and self._consolidation_due(runtime_settings):
                 max_messages = runtime_settings["consolidation_max_messages"]
                 await self.memory_service.consolidate(messages_chunk[-max_messages:], feedback_llm_func)
-            logger.debug(f"意愿值过低 ({self.session.willingness:.2f}) 且无强关联，跳过响应")
+            logger.debug(f"未进入参与态 (意愿 {self.session.willingness:.2f})，跳过响应")
             return None
 
         last_speak = self.session._last_speak_time

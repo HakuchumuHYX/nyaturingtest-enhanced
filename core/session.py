@@ -273,6 +273,7 @@ class Session:
         self._last_speak_time = datetime.min
         self._active_count = 0
         self._passive_observe_skips = 0
+        self._engaged = False
         self.last_consolidated_time = None
         self._messages_since_consolidation = 0
         self._last_consolidation_attempt = datetime.min
@@ -311,6 +312,7 @@ class Session:
         self._last_activity_time = datetime.now()
         self._last_decay_time = datetime.now()
         self._last_speak_time = datetime.min
+        self._engaged = False
         self.last_consolidated_time = None
         self._messages_since_consolidation = 0
         self._last_consolidation_attempt = datetime.min
@@ -326,6 +328,7 @@ class Session:
         self.willingness = 0.0
         self._active_count = 0
         self._last_activity_time = datetime.now()
+        self._engaged = False
         await self.save_session()
 
     async def reset_emotion(self):

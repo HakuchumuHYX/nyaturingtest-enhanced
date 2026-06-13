@@ -86,5 +86,12 @@ class WillingnessDecayTests(unittest.TestCase):
         self.assertIn("_last_speak_time", source)
 
 
+class WillingnessHysteresisTests(unittest.TestCase):
+    def test_reply_gate_uses_enter_exit_thresholds(self):
+        source = (PLUGIN_DIR / "core" / "orchestrator.py").read_text(encoding="utf-8")
+        self.assertIn("willingness_reply_threshold", source)
+        self.assertIn("_engaged", source)
+
+
 if __name__ == "__main__":
     unittest.main()
