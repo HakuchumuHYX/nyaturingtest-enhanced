@@ -174,6 +174,35 @@ def check_relevance(bot_name: str, aliases: list[str], messages: list[Message]) 
     return False
 
 
+def score_message_interest(contents, bot_name="", aliases=None, *, lo=0.3, hi=2.0):
+    """轻量内容兴趣评分：返回作用于被动意愿成长的乘数，范围 [lo, hi]。"""
+    aliases = aliases or []
+    text = " ".join(str(content or "") for content in (contents or []))
+    if not text.strip():
+        return lo
+
+    score = 1.0
+    if "?" in text or "？" in text:
+        score += 0.6
+
+    names = []
+    if str(bot_name or "").strip():
+        names.append(str(bot_name).strip())
+    names.extend(str(alias).strip() for alias in aliases if alias and len(str(alias).strip()) >= 2)
+    if any(name in text for name in names):
+        score += 0.7
+
+    stripped = text.strip()
+    if len(set(stripped)) <= 2 and len(stripped) >= 3:
+        score -= 0.6
+    if stripped in {"[图片]", "[表情包]"}:
+        score -= 0.5
+    if len(stripped) >= 15:
+        score += 0.2
+
+    return max(lo, min(hi, score))
+
+
 def should_store_memory(content: str) -> bool:
     """
     判断记忆是否值得存储
