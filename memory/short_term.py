@@ -45,12 +45,14 @@ class Memory:
             self,
             compressed_message: str | None = None,
             messages: list[Message] | None = None,
-            length_limit: int = 10,
+            context_limit: int = 20,
+            buffer_size: int | None = None,
     ):
-        self.__length_limit = length_limit
+        self.__context_limit = max(1, int(context_limit))
         self.__compressed_message = compressed_message or ""
-        # 上下文窗口：仅用于对话上下文，保留最近 N 条
-        self.__messages = deque(messages, maxlen=length_limit * 5) if messages else deque(maxlen=length_limit * 5)
+        maxlen = max(self.__context_limit, int(buffer_size or self.__context_limit * 10))
+        # 上下文窗口：保留缓冲区，access 只返回最近 context_limit 条
+        self.__messages = deque(messages, maxlen=maxlen) if messages else deque(maxlen=maxlen)
 
     def related_users(self) -> list[str]:
         """
@@ -75,16 +77,19 @@ class Memory:
 
     def access(self) -> MemoryRecord:
         return MemoryRecord(
-            messages=list(self.__messages)[-self.__length_limit:],
+            messages=list(self.__messages)[-self.__context_limit:],
             compressed_history=self.__compressed_message,
         )
 
     def access_context(self, limit: int = 20) -> MemoryRecord:
-        safe_limit = max(1, min(int(limit or self.__length_limit), self.__messages.maxlen or self.__length_limit))
+        safe_limit = max(1, min(int(limit or self.__context_limit), self.__messages.maxlen or self.__context_limit))
         return MemoryRecord(
             messages=list(self.__messages)[-safe_limit:],
             compressed_history=self.__compressed_message,
         )
+
+    def snapshot(self) -> list[Message]:
+        return list(self.__messages)
 
     async def update(self, message_chunk: list[Message]):
         """
