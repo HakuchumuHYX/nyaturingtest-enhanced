@@ -434,6 +434,10 @@ class Session:
                 self.__examples_str = parts[1].strip()
 
         self.willingness = get_runtime_settings()["willingness_load_value"]
+        # 重启一致性：低意愿时强制回到潜水态，避免「状态=对话中但意愿=静音」的矛盾
+        if self.willingness < get_runtime_settings()["low_willingness_skip_threshold"]:
+            self.__chatting_state = _ChattingState.IDLE
+            self._engaged = False
         self.profiles = {}
         
         # 恢复用户画像

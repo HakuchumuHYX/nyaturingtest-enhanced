@@ -93,5 +93,11 @@ class WillingnessHysteresisTests(unittest.TestCase):
         self.assertIn("_engaged", source)
 
 
+class WillingnessLoadConsistencyTests(unittest.TestCase):
+    def test_chatting_state_reconciled_with_willingness_on_load(self):
+        source = (PLUGIN_DIR / "core" / "session.py").read_text(encoding="utf-8")
+        self.assertIn("# 重启一致性", source)
+
+
 if __name__ == "__main__":
     unittest.main()
