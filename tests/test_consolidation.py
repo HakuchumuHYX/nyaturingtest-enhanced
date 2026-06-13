@@ -14,6 +14,10 @@ class ConsolidationSchemaTests(unittest.TestCase):
         self.assertIn("SCHEMA_VERSION = 3", source)
         self.assertIn("last_consolidated_time", source)
 
+    def test_repository_persists_watermark(self):
+        source = (PLUGIN_DIR / "database" / "session_repository.py").read_text(encoding="utf-8")
+        self.assertIn('"last_consolidated_time"', source)
+
 
 if __name__ == "__main__":
     unittest.main()

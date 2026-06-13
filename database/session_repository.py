@@ -52,6 +52,7 @@ class SessionStateRepository:
                     "dominance": data.get("dominance", 0.0),
                     "chat_summary": sanitize_text(data.get("chat_summary", "")),
                     "last_speak_time": data.get("last_speak_time"),
+                    "last_consolidated_time": data.get("last_consolidated_time"),
                     "chatting_state": data.get("chatting_state", 0),
                 },
             )
@@ -125,4 +126,5 @@ class SessionStateRepository:
             "session": session_db,
             "users": users_data,
             "messages": history_msgs,
+            "last_consolidated_time": session_db.last_consolidated_time,
         }
