@@ -382,6 +382,7 @@ class VectorMemory:
         self._last_retrieval_stats = _empty_retrieval_stats()
         self._check_collection_metric_once()
         self._ids_supported = self._probe_ids_support()
+        self.replay_pending()
 
     @property
     def last_retrieval_stats(self) -> dict[str, Any]:
@@ -431,6 +432,50 @@ class VectorMemory:
                     ) + "\n")
         except Exception as e:
             logger.error(f"WAL append failed: {e}")
+
+    def replay_pending(self) -> int:
+        path = self._wal_path()
+        if not os.path.exists(path):
+            return 0
+        try:
+            with open(path, encoding="utf-8") as handle:
+                lines = [line for line in handle.read().splitlines() if line.strip()]
+        except Exception as e:
+            logger.error(f"WAL read failed: {e}")
+            return 0
+
+        items: list[tuple[str, dict]] = []
+        for line in lines:
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            content = str(obj.get("content") or "").strip()
+            if not content:
+                continue
+            metadata = obj.get("metadata") if isinstance(obj.get("metadata"), dict) else {}
+            items.append((content, metadata))
+
+        if not items:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            return 0
+
+        try:
+            with BACKUP_IO_LOCK:
+                self.collection.add(
+                    documents=[content for content, _ in items],
+                    metadatas=[metadata for _, metadata in items],
+                    ids=[str(uuid.uuid4()) for _ in items],
+                )
+            os.remove(path)
+            logger.info(f"Replayed {len(items)} pending memories from WAL")
+            return len(items)
+        except Exception as e:
+            logger.error(f"WAL replay failed, keeping file: {e}")
+            return 0
 
     def add_texts(self, texts: List[str], metadatas: List[dict] | None = None):
         if not texts: return

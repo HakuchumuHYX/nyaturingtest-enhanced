@@ -49,5 +49,34 @@ class AddTextsWALTests(unittest.TestCase):
         self.assertEqual("记住这件事", line["content"])
 
 
+class WALReplayTests(unittest.TestCase):
+    def test_replay_reads_and_clears_wal(self):
+        import json
+        import os
+        import tempfile
+
+        from test_vector_batch import _load_vector_module
+
+        module = _load_vector_module()
+        mem = object.__new__(module.VectorMemory)
+        tmp = tempfile.mkdtemp()
+        mem.persist_directory = tmp
+        added = []
+
+        class OkCollection:
+            def add(self, **kwargs):
+                added.extend(kwargs["documents"])
+
+        mem.collection = OkCollection()
+
+        with open(os.path.join(tmp, "pending_memories.jsonl"), "w", encoding="utf-8") as handle:
+            handle.write(json.dumps({"content": "旧的待写记忆", "metadata": {"source": "memory"}}) + "\n")
+
+        mem.replay_pending()
+
+        self.assertIn("旧的待写记忆", added)
+        self.assertFalse(os.path.exists(os.path.join(tmp, "pending_memories.jsonl")))
+
+
 if __name__ == "__main__":
     unittest.main()
