@@ -965,6 +965,7 @@ class VectorMemory:
             result["dedup_errors"] += 1
             result["added"] = 0
             result["skipped_dedup"] = 0
+            self._append_wal(valid)
             return result
 
     def retrieve_with_decay(
