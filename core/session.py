@@ -428,7 +428,7 @@ class Session:
             if len(parts) > 1:
                 self.__examples_str = parts[1].strip()
 
-        self.willingness = 0.1
+        self.willingness = get_runtime_settings()["willingness_load_value"]
         self.profiles = {}
         
         # 恢复用户画像
@@ -1176,8 +1176,8 @@ class Session:
                     return []
 
                 if replies:
-                    # 发言后意愿值大幅扣除
-                    self.willingness = max(0.0, self.willingness - 0.5)
+                    retain = get_runtime_settings()["speak_willingness_retain_factor"]
+                    self.willingness = max(0.0, self.willingness * retain)
                     self.__chatting_state = _ChattingState.ACTIVE
 
                 return replies

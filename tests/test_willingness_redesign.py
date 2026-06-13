@@ -70,5 +70,13 @@ class WillingnessGrowthTests(unittest.TestCase):
         self.assertIn("interest_topic_willingness_floor", source)
 
 
+class WillingnessDeductionTests(unittest.TestCase):
+    def test_proportional_deduction_and_configurable_load(self):
+        source = (PLUGIN_DIR / "core" / "session.py").read_text(encoding="utf-8")
+        self.assertIn("speak_willingness_retain_factor", source)
+        self.assertNotIn("self.willingness - 0.5", source)
+        self.assertIn('"willingness_load_value"', source)
+
+
 if __name__ == "__main__":
     unittest.main()
