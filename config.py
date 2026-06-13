@@ -166,6 +166,8 @@ def get_default_config() -> dict:
             "rag_merged_candidate_cap": 64,
             "rag_memory_char_budget": 1500,
             "rag_default_event_ttl_days": 90,
+            "memory_write_max_retries": 3,
+            "memory_write_retry_base_delay": 0.5,
         },
         "enabled_groups": [],
     }
@@ -488,6 +490,8 @@ def get_runtime_settings() -> dict[str, Any]:
         "rag_merged_candidate_cap": number("rag_merged_candidate_cap", 64, int, minimum=1),
         "rag_memory_char_budget": number("rag_memory_char_budget", 1500, int, minimum=1),
         "rag_default_event_ttl_days": number("rag_default_event_ttl_days", 90, int, minimum=1),
+        "memory_write_max_retries": number("memory_write_max_retries", 3, int, minimum=0),
+        "memory_write_retry_base_delay": number("memory_write_retry_base_delay", 0.5, float, minimum=0.0),
     }
 
 

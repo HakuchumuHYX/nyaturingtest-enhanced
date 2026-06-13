@@ -86,7 +86,9 @@
     "rag_per_query_recall_k": 40,
     "rag_merged_candidate_cap": 64,
     "rag_memory_char_budget": 1500,
-    "rag_default_event_ttl_days": 90
+    "rag_default_event_ttl_days": 90,
+    "memory_write_max_retries": 3,
+    "memory_write_retry_base_delay": 0.5
   },
   "enabled_groups": []
 }
