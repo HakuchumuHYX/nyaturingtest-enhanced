@@ -31,6 +31,13 @@ class ShortTermPersistenceStaticTests(unittest.TestCase):
         self.assertIn("buffer_size=", source)
         self.assertIn("short_term_buffer_size", source)
 
+    def test_sync_messages_writes_every_new_message(self):
+        source = (PLUGIN_DIR / "database" / "message_repository.py").read_text(encoding="utf-8")
+        # 必须遍历 recent_msgs 全量构建 bulk，而非截断
+        self.assertIn("for msg in recent_msgs:", source)
+        self.assertIn("bulk_create(bulk_msgs)", source)
+        self.assertNotIn("[-10:]", source)
+
 
 if __name__ == "__main__":
     unittest.main()
