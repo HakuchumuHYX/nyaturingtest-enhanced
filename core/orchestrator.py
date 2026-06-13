@@ -38,15 +38,20 @@ class ConversationOrchestrator:
 
         now = datetime.now()
         runtime_settings = get_runtime_settings()
-        seconds_passed = (now - self.session._last_activity_time).total_seconds()
+        last_decay = getattr(self.session, "_last_decay_time", None) or now
+        seconds_since_decay = max(0.0, (now - last_decay).total_seconds())
 
+        last_speak_for_decay = self.session._last_speak_time
+        if last_speak_for_decay.tzinfo is not None:
+            last_speak_for_decay = last_speak_for_decay.astimezone(None).replace(tzinfo=None)
+        idle = (now - last_speak_for_decay).total_seconds() >= runtime_settings["willingness_idle_after_seconds"]
         decay_rate = (
-            runtime_settings["willingness_decay_rate_active"]
-            if seconds_passed < runtime_settings["willingness_idle_after_seconds"]
-            else runtime_settings["willingness_decay_rate_idle"]
+            runtime_settings["willingness_decay_rate_idle"] if idle
+            else runtime_settings["willingness_decay_rate_active"]
         )
-        decay = (seconds_passed / 60.0) * decay_rate
+        decay = (seconds_since_decay / 60.0) * decay_rate
         self.session.willingness = max(0.0, self.session.willingness - decay)
+        self.session._last_decay_time = now
         self.session._last_activity_time = now
 
         is_relevant = check_relevance(

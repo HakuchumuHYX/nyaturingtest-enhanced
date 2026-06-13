@@ -78,5 +78,13 @@ class WillingnessDeductionTests(unittest.TestCase):
         self.assertIn('"willingness_load_value"', source)
 
 
+class WillingnessDecayTests(unittest.TestCase):
+    def test_decay_uses_dedicated_timer_not_activity_reset(self):
+        source = (PLUGIN_DIR / "core" / "orchestrator.py").read_text(encoding="utf-8")
+        self.assertIn("_last_decay_time", source)
+        # 活跃/空闲速率应由「距上次发言」判断
+        self.assertIn("_last_speak_time", source)
+
+
 if __name__ == "__main__":
     unittest.main()
