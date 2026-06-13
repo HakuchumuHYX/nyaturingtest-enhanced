@@ -38,6 +38,11 @@ class ShortTermPersistenceStaticTests(unittest.TestCase):
         self.assertIn("bulk_create(bulk_msgs)", source)
         self.assertNotIn("[-10:]", source)
 
+    def test_load_uses_runtime_buffer_limit(self):
+        source = (PLUGIN_DIR / "database" / "session_repository.py").read_text(encoding="utf-8")
+        self.assertIn("short_term_buffer_size", source)
+        self.assertNotIn(".limit(50)", source)
+
 
 if __name__ == "__main__":
     unittest.main()

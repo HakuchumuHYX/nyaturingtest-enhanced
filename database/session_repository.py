@@ -107,7 +107,8 @@ class SessionStateRepository:
                 }
             )
 
-        msgs_db = await GlobalMessageModel.filter(session=session_db).order_by("-time").limit(50)
+        buffer_limit = get_runtime_settings()["short_term_buffer_size"]
+        msgs_db = await GlobalMessageModel.filter(session=session_db).order_by("-time").limit(buffer_limit)
         history_msgs = []
         for msg_db in reversed(msgs_db):
             history_msgs.append(
