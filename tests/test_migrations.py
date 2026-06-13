@@ -10,7 +10,7 @@ class MigrationTests(unittest.TestCase):
         source = (PLUGIN_DIR / "database" / "migrations.py").read_text(encoding="utf-8")
 
         self.assertIn("nyabot_schema_version", source)
-        self.assertIn("SCHEMA_VERSION = 2", source)
+        self.assertIn("SCHEMA_VERSION = 3", source)
         self.assertIn("CREATE UNIQUE INDEX IF NOT EXISTS uq_messages_session_msg_id", source)
 
 

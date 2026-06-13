@@ -117,6 +117,14 @@ class _SearchResult:
     stats: dict | None = None
 
 
+@dataclass
+class _FeedbackContext:
+    response_dict: dict
+    existing_related_memories: list[dict]
+    allow_memory_supersede: bool
+    active_user_ids: set[str]
+
+
 def _score_stat_fields(stats: dict) -> dict:
     return {
         "adjusted_score_min": stats.get("adjusted_score_min"),
@@ -630,21 +638,19 @@ class Session:
             )
         return search_result
 
-    async def feedback_stage(self, messages_chunk: list[Message], llm_func: Callable,
-                               is_relevant: bool = False,
-                               search_result: _SearchResult | None = None) -> list[str]:
-        """
-        反馈阶段：分析情绪、提取记忆、更新摘要
-        返回：recalled_history (溯源到的历史消息列表)
-        """
-        logger.debug(">> 反馈阶段 (Feedback) 开始")
-        recalled_history = []
-
-        # 1. 准备画像数据
+    async def _run_feedback_llm(
+            self,
+            messages_chunk: list[Message],
+            llm_func: Callable,
+            is_relevant: bool = False,
+            search_result: _SearchResult | None = None,
+    ) -> _FeedbackContext | None:
+        """运行 Feedback LLM 并返回可复用的分析上下文。"""
         reaction_users = list({msg.user_id if msg.user_id else msg.user_name for msg in messages_chunk})
         related_profiles = [self.profiles.get(uid, PersonProfile(user_id=uid)) for uid in reaction_users]
         for p in related_profiles:
-            if p.user_id not in self.profiles: self.profiles[p.user_id] = p
+            if p.user_id not in self.profiles:
+                self.profiles[p.user_id] = p
 
         related_profiles_json = json.dumps(
             [{"user_id": p.user_id, "emotion_tends_to_user": asdict(p.emotion)} for p in related_profiles],
@@ -722,7 +728,7 @@ class Session:
                 logger.warning(f"反馈阶段 LLM 错误 (尝试 {attempt + 1}/2): {e}")
                 if attempt == 1:
                     logger.error("反馈阶段最终失败，跳过本次处理")
-                    return []
+                    return None
 
         expected_feedback_fields = [
             "analyze_result",
@@ -742,6 +748,17 @@ class Session:
                 missing_feedback_fields=missing_feedback_fields,
                 response_keys=sorted(str(key) for key in response_dict.keys()),
             )
+
+        return _FeedbackContext(
+            response_dict=response_dict,
+            existing_related_memories=existing_related_memories,
+            allow_memory_supersede=allow_memory_supersede,
+            active_user_ids=active_user_ids,
+        )
+
+    def _apply_sediment(self, ctx: _FeedbackContext, messages_chunk: list[Message]) -> None:
+        """应用 Feedback 的沉淀结果：情绪、画像、摘要、长期记忆。"""
+        response_dict = ctx.response_dict
 
         # 3. 更新情绪
         new_emo = response_dict.get("new_emotion", {})
@@ -805,9 +822,19 @@ class Session:
                 self.save_long_term_memory(
                     analyze_result,
                     default_user_id=fallback_uid,
-                    supersede_candidates=existing_related_memories,
+                    supersede_candidates=ctx.existing_related_memories,
                 )
             )
+
+    async def _apply_decision(
+            self,
+            ctx: _FeedbackContext,
+            messages_chunk: list[Message],
+            is_relevant: bool,
+    ) -> list[str]:
+        """应用 Feedback 的发言决策结果：历史溯源、意愿、状态。"""
+        response_dict = ctx.response_dict
+        recalled_history = []
 
         # 6.5 主动历史溯源 (Historical Recall)
         need_history = response_dict.get("need_history", False)
@@ -857,6 +884,21 @@ class Session:
             if self.__chatting_state == _ChattingState.IDLE:
                 self.__chatting_state = _ChattingState.BUBBLE
 
+        return recalled_history
+
+    async def feedback_stage(self, messages_chunk: list[Message], llm_func: Callable,
+                               is_relevant: bool = False,
+                               search_result: _SearchResult | None = None) -> list[str]:
+        """
+        反馈阶段：分析情绪、提取记忆、更新摘要
+        返回：recalled_history (溯源到的历史消息列表)
+        """
+        logger.debug(">> 反馈阶段 (Feedback) 开始")
+        ctx = await self._run_feedback_llm(messages_chunk, llm_func, is_relevant, search_result)
+        if ctx is None:
+            return []
+        self._apply_sediment(ctx, messages_chunk)
+        recalled_history = await self._apply_decision(ctx, messages_chunk, is_relevant)
         logger.debug(f"<< 反馈结束: 意愿 {self.willingness:.2f}, 状态 {self.__chatting_state}")
         return recalled_history
 

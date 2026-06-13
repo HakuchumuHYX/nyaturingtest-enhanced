@@ -35,8 +35,8 @@ class FeedbackSubjectSpeakerMetadataTests(unittest.TestCase):
     def test_feedback_stage_passes_new_msg_speakers_to_prompt(self):
         source = (PLUGIN_DIR / "core" / "session.py").read_text(encoding="utf-8")
         feedback_block = source[
-            source.index("async def feedback_stage"):
-            source.index("async def save_long_term_memory")
+            source.index("async def _run_feedback_llm"):
+            source.index("def _apply_sediment")
         ]
 
         self.assertIn("new_msg_speakers", feedback_block)

@@ -18,6 +18,14 @@ class ConsolidationSchemaTests(unittest.TestCase):
         source = (PLUGIN_DIR / "database" / "session_repository.py").read_text(encoding="utf-8")
         self.assertIn('"last_consolidated_time"', source)
 
+    def test_feedback_split_into_three_phases(self):
+        source = (PLUGIN_DIR / "core" / "session.py").read_text(encoding="utf-8")
+        self.assertIn("async def _run_feedback_llm", source)
+        self.assertIn("def _apply_sediment", source)
+        self.assertIn("def _apply_decision", source)
+        # feedback_stage 仍存在且现在由三段组合
+        self.assertIn("async def feedback_stage", source)
+
 
 if __name__ == "__main__":
     unittest.main()
