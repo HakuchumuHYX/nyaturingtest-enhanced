@@ -26,6 +26,11 @@ class ConsolidationSchemaTests(unittest.TestCase):
         # feedback_stage 仍存在且现在由三段组合
         self.assertIn("async def feedback_stage", source)
 
+    def test_search_stage_supports_force_retrieve(self):
+        source = (PLUGIN_DIR / "core" / "session.py").read_text(encoding="utf-8")
+        self.assertIn("force_retrieve", source)
+        self.assertIn("should_retrieve = force_retrieve or", source)
+
 
 if __name__ == "__main__":
     unittest.main()

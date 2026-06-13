@@ -526,6 +526,7 @@ class Session:
         *,
         active_users: list[dict] | None = None,
         use_rerank: bool = True,
+        force_retrieve: bool = False,
     ):
         """
         优化检索阶段
@@ -564,7 +565,7 @@ class Session:
         rag_stats["query_count"] = len(queries)
         rag_stats["queries_preview"] = [q[:40] for q in queries[:3]]
 
-        should_retrieve = self.willingness > 0.3
+        should_retrieve = force_retrieve or self.willingness > runtime_settings["low_willingness_skip_threshold"]
 
         long_term_memory = []
         raw_results = []
