@@ -63,5 +63,12 @@ class InterestScoreTests(unittest.TestCase):
         self.assertGreaterEqual(value, 0.3)
 
 
+class WillingnessGrowthTests(unittest.TestCase):
+    def test_passive_growth_uses_interest_score(self):
+        source = (PLUGIN_DIR / "core" / "orchestrator.py").read_text(encoding="utf-8")
+        self.assertIn("score_message_interest", source)
+        self.assertIn("interest_topic_willingness_floor", source)
+
+
 if __name__ == "__main__":
     unittest.main()

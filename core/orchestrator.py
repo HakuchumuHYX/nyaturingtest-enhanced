@@ -6,7 +6,7 @@ from nonebot import logger
 
 from ..config import get_runtime_settings
 from ..memory.short_term import Message
-from ..utils import check_relevance
+from ..utils import check_relevance, score_message_interest
 from .services import ChatService, FeedbackService, MemoryService
 
 
@@ -59,10 +59,20 @@ class ConversationOrchestrator:
             self.session._passive_observe_skips = 0
             logger.info("检测到强关联，意愿值提升")
         elif self.session.willingness < runtime_settings["passive_willingness_growth_limit"]:
-            self.session.willingness = min(
-                1.0,
-                self.session.willingness + runtime_settings["passive_willingness_growth_per_message"] * len(messages_chunk),
+            interest = score_message_interest(
+                [msg.content for msg in messages_chunk],
+                bot_name=self.session.name(),
+                aliases=self.session.aliases(),
+                lo=runtime_settings["passive_growth_min_factor"],
+                hi=runtime_settings["passive_growth_max_factor"],
             )
+            growth = runtime_settings["passive_willingness_growth_per_message"] * interest * len(messages_chunk)
+            self.session.willingness = min(1.0, self.session.willingness + growth)
+            if interest >= 1.6:
+                self.session.willingness = max(
+                    self.session.willingness,
+                    runtime_settings["interest_topic_willingness_floor"],
+                )
 
         if self.session.willingness < runtime_settings["low_willingness_skip_threshold"] and not is_relevant:
             if runtime_settings["consolidation_enabled"] and self._consolidation_due(runtime_settings):
