@@ -168,6 +168,7 @@ def get_default_config() -> dict:
             "rag_default_event_ttl_days": 90,
             "memory_write_max_retries": 3,
             "memory_write_retry_base_delay": 0.5,
+            "memory_drain_timeout_seconds": 10.0,
         },
         "enabled_groups": [],
     }
@@ -492,6 +493,7 @@ def get_runtime_settings() -> dict[str, Any]:
         "rag_default_event_ttl_days": number("rag_default_event_ttl_days", 90, int, minimum=1),
         "memory_write_max_retries": number("memory_write_max_retries", 3, int, minimum=0),
         "memory_write_retry_base_delay": number("memory_write_retry_base_delay", 0.5, float, minimum=0.0),
+        "memory_drain_timeout_seconds": number("memory_drain_timeout_seconds", 10.0, float, minimum=0.0),
     }
 
 

@@ -78,5 +78,13 @@ class WALReplayTests(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(tmp, "pending_memories.jsonl")))
 
 
+class DrainTimeoutTests(unittest.TestCase):
+    def test_drain_timeout_configurable(self):
+        config_source = (PLUGIN_DIR / "config.py").read_text(encoding="utf-8")
+        self.assertIn('"memory_drain_timeout_seconds"', config_source)
+        state_source = (PLUGIN_DIR / "core" / "state_manager.py").read_text(encoding="utf-8")
+        self.assertIn("memory_drain_timeout_seconds", state_source)
+
+
 if __name__ == "__main__":
     unittest.main()

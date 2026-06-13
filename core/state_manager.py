@@ -14,6 +14,7 @@ from ..config import (
     get_effective_chat_base_url,
     get_effective_chat_provider,
     get_chat_timeout,
+    get_runtime_settings,
 )
 from ..memory.short_term import Message as MMessage
 from .session import Session
@@ -162,7 +163,7 @@ async def remove_group_state(group_id: int):
     if group_id in group_states:
         logger.info(f"移除群 {group_id} 的 GroupState...")
         state = group_states[group_id]
-        await state.session.drain_background_tasks(timeout=10.0)
+        await state.session.drain_background_tasks(timeout=get_runtime_settings()["memory_drain_timeout_seconds"])
         await state.session.close()
         del group_states[group_id]
 
@@ -190,7 +191,7 @@ async def cleanup_global_resources():
 
     for state in group_states.values():
         try:
-            await state.session.drain_background_tasks(timeout=10.0)
+            await state.session.drain_background_tasks(timeout=get_runtime_settings()["memory_drain_timeout_seconds"])
             await state.session.close()
         except Exception as e:
             logger.warning(f"关闭群会话资源失败: {e}")

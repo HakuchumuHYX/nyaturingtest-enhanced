@@ -1224,7 +1224,9 @@ class Session:
         await self.global_memory.update(messages_chunk)
         self._create_safe_task(self.save_session())
 
-    async def drain_background_tasks(self, timeout: float = 10.0):
+    async def drain_background_tasks(self, timeout: float | None = None):
+        if timeout is None:
+            timeout = get_runtime_settings()["memory_drain_timeout_seconds"]
         pending = [task for task in self._background_tasks if not task.done()]
         if not pending:
             return
