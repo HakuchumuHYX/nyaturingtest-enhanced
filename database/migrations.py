@@ -2,7 +2,7 @@ from nonebot import logger
 from tortoise import Tortoise
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 async def _execute_ignore_duplicate(conn, statement: str):
@@ -41,3 +41,11 @@ async def ensure_schema_version():
         ]:
             await _execute_ignore_duplicate(conn, statement)
         await conn.execute_query("UPDATE nyabot_schema_version SET version=2 WHERE id=1")
+        current = 2
+
+    if current < 3:
+        for statement in [
+            "ALTER TABLE nyabot_sessions ADD COLUMN last_consolidated_time TIMESTAMP",
+        ]:
+            await _execute_ignore_duplicate(conn, statement)
+        await conn.execute_query("UPDATE nyabot_schema_version SET version=3 WHERE id=1")

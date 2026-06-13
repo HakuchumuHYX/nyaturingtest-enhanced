@@ -15,6 +15,7 @@ class SessionModel(Model):
 
     chat_summary = fields.TextField(default="")
     last_speak_time = fields.DatetimeField(null=True)
+    last_consolidated_time = fields.DatetimeField(null=True)
     chatting_state = fields.IntField(default=0)
 
     class Meta:
