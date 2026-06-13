@@ -272,6 +272,9 @@ class Session:
         self._last_speak_time = datetime.min
         self._active_count = 0
         self._passive_observe_skips = 0
+        self.last_consolidated_time = None
+        self._messages_since_consolidation = 0
+        self._last_consolidation_attempt = datetime.min
         self._loaded = False
         self._background_tasks = set()
 
@@ -306,6 +309,9 @@ class Session:
         self._active_count = 0
         self._last_activity_time = datetime.now()
         self._last_speak_time = datetime.min
+        self.last_consolidated_time = None
+        self._messages_since_consolidation = 0
+        self._last_consolidation_attempt = datetime.min
         # 清理数据库中的所有关联数据
         await SessionStateRepository.delete_session_data(self.id)
         await self.save_session()
@@ -360,6 +366,7 @@ class Session:
                     "dominance": self.global_emotion.dominance,
                     "chat_summary": self.chat_summary,
                     "last_speak_time": self._last_speak_time,
+                    "last_consolidated_time": self.last_consolidated_time,
                     "chatting_state": self.__chatting_state.value
                 }
             )
@@ -413,6 +420,7 @@ class Session:
             if t.tzinfo is not None:
                 t = t.astimezone(None).replace(tzinfo=None)
             self._last_speak_time = t
+        self.last_consolidated_time = session_db.last_consolidated_time
         self.__chatting_state = _ChattingState(session_db.chatting_state)
 
         if "[对话样本]" in self.__role:
@@ -902,6 +910,41 @@ class Session:
         recalled_history = await self._apply_decision(ctx, messages_chunk, is_relevant)
         logger.debug(f"<< 反馈结束: 意愿 {self.willingness:.2f}, 状态 {self.__chatting_state}")
         return recalled_history
+
+    async def consolidate_stage(self, messages_chunk: list[Message], feedback_llm_func: Callable) -> None:
+        """常驻记忆固化：分析+沉淀，但不改回复意愿、不做发言决策。"""
+        if not messages_chunk:
+            return
+        logger.debug(f"[Session {self.id}] >> 记忆固化 (Consolidate) {len(messages_chunk)} 条")
+        queries = [m.content for m in messages_chunk[-2:]]
+        active_user_names = [m.user_name for m in messages_chunk if m.user_name]
+        active_users = [
+            {"user_id": str(m.user_id or ""), "user_name": m.user_name}
+            for m in messages_chunk if m.user_name
+        ]
+        search_result = await self.search_stage(
+            queries,
+            active_user_names=active_user_names,
+            active_users=active_users,
+            use_rerank=False,
+            force_retrieve=True,
+        )
+        ctx = await self._run_feedback_llm(
+            messages_chunk,
+            feedback_llm_func,
+            is_relevant=False,
+            search_result=search_result,
+        )
+        if ctx is None:
+            return
+        self._apply_sediment(ctx, messages_chunk)
+        latest = max((m.time for m in messages_chunk), default=None)
+        if latest is not None:
+            if self.last_consolidated_time is None or latest > self.last_consolidated_time:
+                self.last_consolidated_time = latest
+        self._messages_since_consolidation = 0
+        self._last_consolidation_attempt = datetime.now()
+        await self.save_session()
 
     async def save_long_term_memory(
             self,

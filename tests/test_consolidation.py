@@ -31,6 +31,15 @@ class ConsolidationSchemaTests(unittest.TestCase):
         self.assertIn("force_retrieve", source)
         self.assertIn("should_retrieve = force_retrieve or", source)
 
+    def test_consolidate_stage_exists_and_advances_watermark(self):
+        source = (PLUGIN_DIR / "core" / "session.py").read_text(encoding="utf-8")
+        self.assertIn("async def consolidate_stage", source)
+        self.assertIn("self.last_consolidated_time", source)
+        # 固化路径不得触碰回复意愿（不调用 _apply_decision）
+        cs = source[source.index("async def consolidate_stage"):]
+        cs = cs[:cs.index("\n    async def ", 1)] if "\n    async def " in cs[1:] else cs
+        self.assertNotIn("_apply_decision", cs)
+
 
 if __name__ == "__main__":
     unittest.main()
