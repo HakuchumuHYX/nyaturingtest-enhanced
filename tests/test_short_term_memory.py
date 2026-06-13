@@ -2,6 +2,7 @@ import importlib.util
 import sys
 import types
 import unittest
+import asyncio
 from datetime import datetime
 from pathlib import Path
 
@@ -34,8 +35,7 @@ class ShortTermMemoryTests(unittest.TestCase):
         module = _load_short_term()
         mem = module.Memory(context_limit=20, buffer_size=200)
 
-        import asyncio
-        asyncio.get_event_loop().run_until_complete(mem.update(self._msgs(module, 60)))
+        asyncio.run(mem.update(self._msgs(module, 60)))
 
         snap = mem.snapshot()
         self.assertEqual(60, len(snap))
@@ -45,8 +45,7 @@ class ShortTermMemoryTests(unittest.TestCase):
         module = _load_short_term()
         mem = module.Memory(context_limit=20, buffer_size=50)
 
-        import asyncio
-        asyncio.get_event_loop().run_until_complete(mem.update(self._msgs(module, 80)))
+        asyncio.run(mem.update(self._msgs(module, 80)))
 
         self.assertEqual(50, len(mem.snapshot()))
 
