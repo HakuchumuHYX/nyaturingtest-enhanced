@@ -40,6 +40,17 @@ class ConsolidationSchemaTests(unittest.TestCase):
         cs = cs[:cs.index("\n    async def ", 1)] if "\n    async def " in cs[1:] else cs
         self.assertNotIn("_apply_decision", cs)
 
+    def test_config_defines_consolidation_keys(self):
+        source = (PLUGIN_DIR / "config.py").read_text(encoding="utf-8")
+        for snippet in [
+            '"consolidation_enabled": True',
+            '"consolidation_message_threshold": 8',
+            '"consolidation_interval_seconds": 180.0',
+            '"consolidation_max_messages": 60',
+            '"consolidation_message_threshold": number("consolidation_message_threshold", 8, int, minimum=1)',
+        ]:
+            self.assertIn(snippet, source)
+
 
 if __name__ == "__main__":
     unittest.main()
