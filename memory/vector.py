@@ -4,6 +4,7 @@ import uuid
 import math
 import json
 import httpx
+import time
 from datetime import datetime, timedelta
 from typing import List, Dict, Any
 import chromadb
@@ -416,23 +417,47 @@ class VectorMemory:
             logger.warning(f"Vector collection ids probe failed: {e}")
             return False
 
+    def _wal_path(self) -> str:
+        return os.path.join(self.persist_directory, "pending_memories.jsonl")
+
+    def _append_wal(self, items: list[tuple[str, dict]]) -> None:
+        try:
+            os.makedirs(self.persist_directory, exist_ok=True)
+            with open(self._wal_path(), "a", encoding="utf-8") as handle:
+                for content, metadata in items:
+                    handle.write(json.dumps(
+                        {"content": content, "metadata": metadata},
+                        ensure_ascii=False,
+                    ) + "\n")
+        except Exception as e:
+            logger.error(f"WAL append failed: {e}")
+
     def add_texts(self, texts: List[str], metadatas: List[dict] | None = None):
         if not texts: return
         valid_data = [(t, metadatas[i] if metadatas and i < len(metadatas) else {})
                       for i, t in enumerate(texts) if t and t.strip()]
         if not valid_data: return
 
-        # 使用 UUID 防止重复覆盖
+        runtime = plugin_config.get("runtime", {}) or {}
+        max_retries = int(runtime.get("memory_write_max_retries", 0) or 0)
+        base_delay = float(runtime.get("memory_write_retry_base_delay", 0.5) or 0.0)
         ids = [str(uuid.uuid4()) for _ in valid_data]
-        try:
-            with BACKUP_IO_LOCK:
-                self.collection.add(
-                    documents=[d[0] for d in valid_data],
-                    metadatas=[d[1] for d in valid_data],
-                    ids=ids
-                )
-        except Exception as e:
-            logger.error(f"Vector add failed: {e}")
+        for attempt in range(max_retries + 1):
+            try:
+                with BACKUP_IO_LOCK:
+                    self.collection.add(
+                        documents=[d[0] for d in valid_data],
+                        metadatas=[d[1] for d in valid_data],
+                        ids=ids
+                    )
+                return
+            except Exception as e:
+                logger.error(f"Vector add failed (attempt {attempt + 1}/{max_retries + 1}): {e}")
+                if attempt < max_retries and base_delay > 0:
+                    time.sleep(base_delay * (2 ** attempt))
+
+        self._append_wal(valid_data)
+        logger.warning(f"Vector add exhausted retries, wrote {len(valid_data)} memories to WAL")
 
     def retrieve(
         self,
