@@ -1,10 +1,22 @@
+import importlib.util
 import unittest
 from pathlib import Path
 
-from core.rag_query import build_chat_rag_queries
-
 
 PLUGIN_DIR = Path(__file__).resolve().parents[1]
+
+
+def _load_rag_query():
+    spec = importlib.util.spec_from_file_location(
+        "nyaturingtest_rag_query", PLUGIN_DIR / "core" / "rag_query.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+build_chat_rag_queries = _load_rag_query().build_chat_rag_queries
 
 
 class RagQueryBuildingTests(unittest.TestCase):
