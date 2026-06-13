@@ -237,7 +237,11 @@ class Session:
             ),
         )
 
-        self.global_memory: Memory = Memory()
+        runtime_settings = get_runtime_settings()
+        self.global_memory: Memory = Memory(
+            context_limit=runtime_settings["short_context_limit"],
+            buffer_size=runtime_settings["short_term_buffer_size"],
+        )
 
         self.long_term_memory: VectorMemory = VectorMemory(
             api_key=self._siliconflow_api_key,
@@ -363,8 +367,8 @@ class Session:
                 for profile in dirty_profiles.values():
                     profile.mark_clean()
 
-            # 3. 同步消息
-            recent_msgs = self.global_memory.access().messages
+            # 3. 同步消息（持久化整个缓冲区快照，避免只存最近 N 条导致丢消息）
+            recent_msgs = self.global_memory.snapshot()
             if recent_msgs:
                 await MessageRepository.sync_messages(self.id, recent_msgs)
 
@@ -431,9 +435,12 @@ class Session:
 
         # 恢复短时记忆
         # 注意：这里将数据库中的 chat_summary 同步给 Memory，确保摘要不丢失
+        rt = get_runtime_settings()
         self.global_memory = Memory(
             compressed_message=self.chat_summary,
-            messages=data["messages"]
+            messages=data["messages"],
+            context_limit=rt["short_context_limit"],
+            buffer_size=rt["short_term_buffer_size"],
         )
 
         self._loaded = True
