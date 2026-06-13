@@ -45,8 +45,14 @@ class MemoryService:
     def __init__(self, session):
         self.session = session
 
+    def note_incoming(self, count: int) -> None:
+        self.session._messages_since_consolidation = (
+            getattr(self.session, "_messages_since_consolidation", 0) + count
+        )
+
     async def update_short_term(self, messages_chunk: list[Message]):
         await self.session.global_memory.update(messages_chunk)
+        self.note_incoming(len(messages_chunk))
         self.session._create_safe_task(self.session.save_session())
 
     async def search(
@@ -66,6 +72,9 @@ class MemoryService:
 
     async def save_long_term(self, analyze_result: list, default_user_id: str = ""):
         await self.session.save_long_term_memory(analyze_result, default_user_id=default_user_id)
+
+    async def consolidate(self, messages_chunk, feedback_llm_func):
+        await self.session.consolidate_stage(messages_chunk, feedback_llm_func)
 
 
 class FeedbackService:

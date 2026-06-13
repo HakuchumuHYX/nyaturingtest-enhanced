@@ -65,15 +65,9 @@ class ConversationOrchestrator:
             )
 
         if self.session.willingness < runtime_settings["low_willingness_skip_threshold"] and not is_relevant:
-            interval = runtime_settings["low_willingness_observe_interval"]
-            self.session._passive_observe_skips = getattr(self.session, "_passive_observe_skips", 0) + 1
-            if interval > 0 and self.session._passive_observe_skips >= interval:
-                self.session._passive_observe_skips = 0
-                await self.feedback_service.process(
-                    messages_chunk,
-                    feedback_llm_func,
-                    is_relevant=False,
-                )
+            if runtime_settings["consolidation_enabled"] and self._consolidation_due(runtime_settings):
+                max_messages = runtime_settings["consolidation_max_messages"]
+                await self.memory_service.consolidate(messages_chunk[-max_messages:], feedback_llm_func)
             logger.debug(f"意愿值过低 ({self.session.willingness:.2f}) 且无强关联，跳过响应")
             return None
 
@@ -116,6 +110,15 @@ class ConversationOrchestrator:
             is_relevant=is_relevant,
             search_result=search_result,
         )
+        latest = max((msg.time for msg in messages_chunk), default=None)
+        if latest is not None and (
+            self.session.last_consolidated_time is None
+            or latest > self.session.last_consolidated_time
+        ):
+            self.session.last_consolidated_time = latest
+        self.session._messages_since_consolidation = 0
+        self.session._last_consolidation_attempt = datetime.now()
+        await self.session.save_session()
 
         if self.session.willingness < runtime_settings["post_feedback_skip_threshold"] and not is_relevant:
             return None
@@ -131,3 +134,11 @@ class ConversationOrchestrator:
             self.session._last_speak_time = datetime.now()
 
         return reply_messages
+
+    def _consolidation_due(self, runtime_settings) -> bool:
+        pending = getattr(self.session, "_messages_since_consolidation", 0)
+        if pending >= runtime_settings["consolidation_message_threshold"]:
+            return True
+        last = getattr(self.session, "_last_consolidation_attempt", datetime.min)
+        interval = runtime_settings["consolidation_interval_seconds"]
+        return pending > 0 and interval > 0 and (datetime.now() - last).total_seconds() >= interval

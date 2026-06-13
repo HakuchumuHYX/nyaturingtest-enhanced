@@ -51,6 +51,16 @@ class ConsolidationSchemaTests(unittest.TestCase):
         ]:
             self.assertIn(snippet, source)
 
+    def test_orchestrator_triggers_consolidation_not_periodic_feedback(self):
+        source = (PLUGIN_DIR / "core" / "orchestrator.py").read_text(encoding="utf-8")
+        self.assertIn("consolidate", source)
+        self.assertIn("consolidation_message_threshold", source)
+
+    def test_memory_service_has_consolidate(self):
+        source = (PLUGIN_DIR / "core" / "services.py").read_text(encoding="utf-8")
+        self.assertIn("async def consolidate", source)
+        self.assertIn("def note_incoming", source)
+
 
 if __name__ == "__main__":
     unittest.main()
