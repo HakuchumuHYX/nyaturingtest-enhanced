@@ -690,8 +690,15 @@ class Session:
             item.get("memory_ref") for item in existing_related_memories
         )
 
-        formatted_msgs = [f"[ID:{msg.user_id}] {msg.user_name}: '{escape_for_prompt(msg.content)}'" for msg in
-                          messages_chunk]
+        formatted_msgs = [
+            {
+                "id": str(msg.user_id or ""),
+                "name": msg.user_name,
+                "content": escape_for_prompt(msg.content),
+                "image_meta": msg.image_meta,
+            }
+            for msg in messages_chunk
+        ]
         new_msg_speakers = [
             {
                 "index": index,
@@ -705,13 +712,14 @@ class Session:
         context_record = self.global_memory.access_context(limit=get_runtime_settings()["short_context_limit"])
         all_messages = context_record.messages
         history_msgs = _history_without_current_chunk(all_messages, messages_chunk)
-        # 格式化一下 history_msgs，使其更易读 (不再直接 dump repr)
-        # 格式化为：[ID:xxx] Name: Content
-        # 但 get_feedback_prompt 原本接收 list，可能需要的是 raw object list 或者 dict list？
-        # 原 Prompt 定义接收 list，然后直接放入 f-string。如果是 Object list，会显示 repr。
-        # 为了 LLM 友好，我们这里转换成易读的文本列表
+        # 历史消息格式化为结构化 dict（含 image_meta，重启后/过窗口的图多为 None）
         history_msgs_formatted = [
-            f"[{m.time.strftime('%H:%M')}] {m.user_name}: {escape_for_prompt(m.content)}" 
+            {
+                "time": m.time.strftime('%H:%M'),
+                "name": m.user_name,
+                "content": escape_for_prompt(m.content),
+                "image_meta": m.image_meta,
+            }
             for m in history_msgs
         ]
 
@@ -1119,8 +1127,15 @@ class Session:
                            search_result: _SearchResult | None = None) -> list[dict]:
         logger.debug(">> 对话阶段 (Chat) 开始")
         search_history = search_result.mem_history if search_result else []
-        formatted_msgs = [f"[ID:{msg.id}] {msg.user_name}: '{escape_for_prompt(msg.content)}'" for msg in
-                          messages_chunk]
+        formatted_msgs = [
+            {
+                "id": str(msg.id or ""),
+                "name": msg.user_name,
+                "content": escape_for_prompt(msg.content),
+                "image_meta": msg.image_meta,
+            }
+            for msg in messages_chunk
+        ]
 
         # 格式化回溯的历史记录
         recalled_str = "\n".join(recalled_history) if recalled_history else "无"
@@ -1130,7 +1145,12 @@ class Session:
         all_messages = context_record.messages
         history_msgs = _history_without_current_chunk(all_messages, messages_chunk)
         history_msgs_formatted = [
-            f"[{m.time.strftime('%H:%M')}] {m.user_name}: {escape_for_prompt(m.content)}" 
+            {
+                "time": m.time.strftime('%H:%M'),
+                "name": m.user_name,
+                "content": escape_for_prompt(m.content),
+                "image_meta": m.image_meta,
+            }
             for m in history_msgs
         ]
 
@@ -1161,8 +1181,8 @@ class Session:
             chat_prompt_total_chars=len(prompt),
             rag_injected_count=len(search_history),
             rag_injected_chars=sum(len(item) for item in search_history),
-            history_chars=len(context_record.compressed_history or "") + sum(len(item) for item in history_msgs_formatted),
-            recent_chars=sum(len(item) for item in formatted_msgs),
+            history_chars=len(context_record.compressed_history or "") + sum(len(item.get("content", "")) for item in history_msgs_formatted),
+            recent_chars=sum(len(item.get("content", "")) for item in formatted_msgs),
             recalled_history_chars=len(recalled_str),
             examples_chars=len(self.__examples_str or ""),
         )

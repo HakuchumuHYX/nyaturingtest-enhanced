@@ -2,10 +2,8 @@
 import asyncio
 import base64
 from collections import OrderedDict
-from dataclasses import asdict, dataclass
 import hashlib
 import io
-import json
 import math
 from pathlib import Path
 import re
@@ -41,33 +39,15 @@ from .image_policy import (
     SAFE_IMAGE_CONTENT_TYPES,
     sanitize_image_cache_key,
 )
+from .image_schema import (
+    ImageWithDescription,
+    parse_vlm_response,
+    render_image_text,
+    gif_target_count,
+)
 
 IMAGE_CACHE_DIR = Path(f"{store.get_plugin_cache_dir()}/image_cache")
 _IMG_SEMAPHORE = asyncio.Semaphore(3)
-
-
-@dataclass
-class ImageWithDescription:
-    description: str
-    emotion: str
-    is_sticker: bool = False
-
-    def to_json(self) -> str:
-        return json.dumps(asdict(self), ensure_ascii=False)
-
-    @staticmethod
-    def from_json(json_str: str) -> "ImageWithDescription":
-        image_with_desc = ImageWithDescription("", "", False)
-        try:
-            data = json.loads(json_str)
-            if not all(key in data for key in ["description", "emotion", "is_sticker"]):
-                raise ValueError("缺少必要的字段")
-            image_with_desc.description = data["description"]
-            image_with_desc.emotion = data["emotion"]
-            image_with_desc.is_sticker = data["is_sticker"]
-            return image_with_desc
-        except Exception:
-            raise ValueError("JSON解析失败")
 
 
 class ImageManager:
@@ -114,32 +94,14 @@ class ImageManager:
             while len(self._mem_cache) > MEM_CACHE_MAX_ITEMS:
                 self._mem_cache.popitem(last=False)
 
-    def _extract_json(self, response: str) -> dict | None:
-        try:
-            return json.loads(response)
-        except json.JSONDecodeError:
-            pass
-        match = re.search(r"```(?:json)?\s*(.*?)\s*```", response, re.DOTALL)
-        if match:
-            try:
-                return json.loads(match.group(1))
-            except json.JSONDecodeError:
-                pass
-        match = re.search(r"(\{[\s\S]*\})", response)
-        if match:
-            try:
-                return json.loads(match.group(1))
-            except json.JSONDecodeError:
-                pass
-        return None
-
     async def resolve_image_from_url(self, url: str, file_unique: str, is_sticker: bool, context_text: str = "",
-                                     on_usage: Callable[[dict], None] | None = None) -> str:
+                                     on_usage: Callable[[dict], None] | None = None) -> tuple[str, dict | None]:
         """
-        高层接口：下载并分析图片，返回格式化的描述文本
+        高层接口：下载并分析图片，返回 (格式化描述文本, 结构化元数据)。
+        元数据为 None 表示无结构化观测（占位/失败/未识别）。
         """
         if not url:
-            return "[无效图片]"
+            return ("[无效图片]", None)
 
         async with _IMG_SEMAPHORE:
             try:
@@ -147,10 +109,7 @@ class ImageManager:
                 if file_unique:
                     cached_desc = self.get_from_cache(file_unique)
                     if cached_desc:
-                        if is_sticker:
-                            return f"\n[表情包] [情感:{cached_desc.emotion}] [内容:{cached_desc.description}]\n"
-                        else:
-                            return f"\n[图片] {cached_desc.description}\n"
+                        return (render_image_text(cached_desc, is_sticker), cached_desc.to_meta())
 
                 # 2. 准备文件缓存路径
                 cache_path = IMAGE_CACHE_DIR.joinpath("raw")
@@ -184,10 +143,10 @@ class ImageManager:
                             content_type = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
                             if content_type and content_type not in SAFE_IMAGE_CONTENT_TYPES:
                                 logger.warning(f"拒绝非图片响应: {content_type}")
-                                return "\n[图片类型不支持]\n"
+                                return ("\n[图片类型不支持]\n", None)
                             if len(resp.content) > MAX_IMAGE_BYTES:
                                 logger.warning(f"拒绝过大图片: {len(resp.content)} bytes")
-                                return "\n[图片过大]\n"
+                                return ("\n[图片过大]\n", None)
                             image_bytes = resp.content
                             break
                         except Exception:
@@ -202,7 +161,7 @@ class ImageManager:
                             logger.warning(f"写入图片缓存失败: {e}")
 
                 if not image_bytes:
-                    return "\n[图片下载失败]\n"
+                    return ("\n[图片下载失败]\n", None)
 
                 # 5. 调用 VLM 进行识别
                 image_base64 = base64.b64encode(image_bytes).decode("utf-8")
@@ -212,15 +171,12 @@ class ImageManager:
                 )
 
                 if description:
-                    if is_sticker:
-                        return f"\n[表情包] [情感:{description.emotion}] [内容:{description.description}]\n"
-                    else:
-                        return f"\n[图片] {description.description}\n"
-                return "\n[图片识别无结果]\n"
+                    return (render_image_text(description, is_sticker), description.to_meta())
+                return ("\n[图片识别无结果]\n", None)
 
             except Exception as e:
                 logger.error(f"Image resolve error: {e}")
-                return "\n[图片处理出错]\n"
+                return ("\n[图片处理出错]\n", None)
 
     async def get_image_description(self, image_base64: str, is_sticker: bool,
                                     cache_key: str | None = None,
@@ -267,19 +223,29 @@ class ImageManager:
         target_format = raw_format
 
         code_mark = "```"
-        
-        # 构建基础 Prompt
-        base_prompt = "请分析这张图片。\n"
+
+        # 构建基础 Prompt（群聊语境理解任务，非通用标注）
+        base_prompt = "你正在观察一个群聊里的图片。请从「群聊语境理解」角度分析这张图片。\n"
         if context_text:
-            base_prompt += f"【背景信息】这张图片是在对话中发送的，相关文本内容是：“{context_text}”。请结合此背景理解图片的含义。\n"
-            
-        base_prompt += f"""1. 用中文详细描述图片内容（'description'），如果是表情包请把上面的文字也识别出来，最多100字。
-2. 分析图片表达的情感（'emotion'），格式为'情感, 类型, 含义'，例如"开心, 表情包, 嘲讽"。
-请直接输出纯 JSON 格式，不要包含其他内容：
+            base_prompt += (
+                f"【背景信息】这张图片是在对话中发送的，相关文本内容是：“{context_text}”。"
+                "请判断这张图是对哪句话的回应、传达什么意图。\n"
+            )
+
+        base_prompt += f"""请输出以下字段：
+1. visual_description：用中文描述图片画面内容，最多60字。
+2. ocr_text：原样提取图片里出现的文字（表情包配字、截图文字等），没有文字就留空字符串。
+3. entities：凭你已有的知识判断图中出现的角色/IP/真人/品牌/meme 名称，给出数组，每项含 name(名称)、type(取值: character/real_person/meme/brand/object)、confidence(0~1)。不认识就返回空数组 []，禁止编造不存在的名字。
+4. pragmatic_intent：这张图在对话里的语用功能，从以下封闭标签里选一个：嘲讽/自嘲/附和/破冰/卖萌/终结话题/否认/求助/感叹/无。
+5. affect：图片表达的情感，用 VAD 三元组：{{"valence":-1~1(愉悦度),"arousal":0~1(兴奋度),"dominance":-1~1(支配度)}}。
+请直接输出纯 JSON，不要包含任何其他内容：
 {code_mark}json
 {{
-    "description": "...",
-    "emotion": "..."
+    "visual_description": "...",
+    "ocr_text": "...",
+    "entities": [{{"name": "...", "type": "character", "confidence": 0.0}}],
+    "pragmatic_intent": "无",
+    "affect": {{"valence": 0.0, "arousal": 0.0, "dominance": 0.0}}
 }}
 {code_mark}
 """
@@ -296,11 +262,13 @@ class ImageManager:
                 grid_info = await _process_gif_to_grid(image_base64)
                 if grid_info:
                     grid_b64, frame_count = grid_info
-                    # 更新 Prompt，告诉 LLM 这是一张拼图
+                    # 更新 Prompt，告诉 LLM 这是一张拼图，并要求 temporal 时序输出
                     prompt = (
                                  f"这是一张包含 {frame_count} 个关键帧的动图分解拼图。"
                                  "图片左上角标有数字序号（1, 2, 3...），代表时间顺序。"
-                                 "请结合这些关键帧，分析这个动图发生了什么动作或情节。"
+                                 "请结合这些关键帧，分析这个动图发生了什么动作或情节，"
+                                 "并在 JSON 中额外输出 temporal 字段：按帧序号给出动作序列，"
+                                 "形如 [{\"frame\":1,\"action\":\"举手\"}, ...]。"
                              ) + base_prompt
                     target_image_base64 = grid_b64
                     target_format = "jpeg"
@@ -327,12 +295,17 @@ class ImageManager:
             if target_format not in ["jpeg", "png", "webp"]:
                 return None
 
-        # 5. 发送请求
+        # 5. 发送请求（分级 detail：表情包走 high 提升配字/角色细节识别率）
+        high_detail_for_sticker = bool(
+            plugin_config.get("vlm", {}).get("high_detail_for_sticker", True)
+        )
+        detail = "high" if (is_sticker and high_detail_for_sticker) else "low"
         response = await self._vlm.request(
             prompt=prompt,
             image_base64=target_image_base64,
             image_format=target_format,
             on_usage=on_usage,
+            detail=detail,
             response_format={"type": "json_object"},
         )
 
@@ -341,19 +314,8 @@ class ImageManager:
             return None
         metrics.vlm_success += 1
 
-        data = self._extract_json(response)
-        if not data:
-            description = response[:100]
-            emotion = "未知, 图片, 未知"
-        else:
-            description = data.get("description", "图片识别失败")
-            emotion = data.get("emotion", "未知, 图片, 未知")
-
-        result = ImageWithDescription(
-            description=description,
-            emotion=emotion,
-            is_sticker=is_sticker,
-        )
+        # 解析 VLM 响应为多正交槽结构（逐字段缺省降级，解析失败也不抛错）
+        result = parse_vlm_response(response, is_sticker=is_sticker)
 
         async with await anyio.open_file(cache, "w", encoding="utf-8") as f:
             await f.write(result.to_json())
@@ -385,19 +347,8 @@ def _process_gif_to_grid(gif_base64: str) -> tuple[str, int] | None:
             return None
 
         # --- 策略：根据帧数决定抽多少帧 ---
-        # 规则：
-        # 2-4帧 -> 全取 (2x2)
-        # 5-6帧 -> 取 6 帧 (2x3)
-        # 7-9帧 -> 取 9 帧 (3x3)
-        # >9帧  -> 均匀抽取 16 帧 (4x4)
-
-        target_count = 9
-        if total_frames <= 4:
-            target_count = 4
-        elif total_frames <= 6:
-            target_count = 6
-        else:
-            target_count = 9
+        # 2-4帧 -> 4 (2x2)；5-6帧 -> 6 (2x3)；7-9帧 -> 9 (3x3)；>9帧 -> 16 (4x4)
+        target_count = gif_target_count(total_frames)
 
         # 计算采样索引 (均匀分布)
         # step = (total - 1) / (target - 1)

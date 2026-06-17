@@ -67,10 +67,12 @@ class VLM:
         image_base64: str,
         image_format: str,
         on_usage: Callable[[dict], None] | None = None,
+        detail: str = "low",
         **kwargs,
     ) -> str | None:
         """
         让 VLM 根据图片和文本提示词生成描述。
+        detail: OpenAI 视觉档位 "low"/"high"/"auto"，默认 "low"。
         """
         request_kwargs = dict(kwargs)
         if not _model_supports_response_format(self.model):
@@ -89,7 +91,7 @@ class VLM:
                                     "type": "image_url",
                                     "image_url": {
                                         "url": f"data:image/{image_format};base64,{image_base64}",
-                                        "detail": "low",
+                                        "detail": detail,
                                     },
                                 },
                                 {"type": "text", "text": prompt},

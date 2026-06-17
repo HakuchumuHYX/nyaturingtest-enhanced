@@ -445,7 +445,7 @@ async def handle_auto_chat(bot: Bot, event: GroupMessageEvent):
             if state.session.willingness < _skip_threshold:
                 _resolve_images = False
 
-    message_content = await message2BotMessage(
+    message_content, image_meta = await message2BotMessage(
         bot_name=bot_name,
         group_id=group_id,
         message=event.original_message,
@@ -495,7 +495,8 @@ async def handle_auto_chat(bot: Bot, event: GroupMessageEvent):
                 user_name=nickname,
                 content=message_content,
                 id=msg_id,
-                user_id=user_id
+                user_id=user_id,
+                image_meta=image_meta
             )
         )
         state.new_message_signal.set()

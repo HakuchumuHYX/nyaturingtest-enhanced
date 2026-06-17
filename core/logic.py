@@ -24,6 +24,7 @@ from ..config import (
     get_runtime_settings,
 )
 from ..memory.image import image_manager
+from ..memory.image_schema import merge_segment_metas
 from ..memory.short_term import Message as MMessage
 from .metrics import metrics
 from .message_sender import build_send_parts
@@ -105,10 +106,14 @@ async def llm_response(client: LLMClient, message: str, model: str, temperature:
         return "Error occurred."
 
 
-async def message2BotMessage(bot_name: str, group_id: int, message: Message, bot: Bot, resolve_images: bool = True) -> str:
+async def message2BotMessage(bot_name: str, group_id: int, message: Message, bot: Bot, resolve_images: bool = True) -> tuple[str, dict | None]:
     """
-    将 OneBot 消息转换为 Bot 可读文本
-    支持解析引用消息(Reply)中的图片内容
+    将 OneBot 消息转换为 Bot 可读文本，并附带图片的结构化元数据。
+    返回 (text, image_meta)：
+      - text: 拼接后的可读文本（与历史行为一致，含图片管道标签）
+      - image_meta: 图片结构化观测，None 表示无图片/无结构信息。
+        多图时结构为 {"primary": <首张非空 meta>, "referenced": [<引用消息图片 meta 列表>]}。
+    支持解析引用消息(Reply)中的图片内容。
     """
 
     # === 0. 预提取当前消息中的纯文本上下文 ===
@@ -120,10 +125,11 @@ async def message2BotMessage(bot_name: str, group_id: int, message: Message, bot
         full_context_text = full_context_text[:200]
 
     # === 消息段处理逻辑 ===
+    # 每段返回 (text, meta)；meta 为该段产出的图片结构化观测（None 表示无）
 
-    async def process_segment(seg: MessageSegment) -> str:
+    async def process_segment(seg: MessageSegment) -> tuple[str, dict | None]:
         if seg.type == "text":
-            return f"{seg.data.get('text', '')}"
+            return (f"{seg.data.get('text', '')}", None)
 
         elif seg.type == "image":
             url = seg.data.get("url", "")
@@ -131,7 +137,7 @@ async def message2BotMessage(bot_name: str, group_id: int, message: Message, bot
             is_sticker = _is_sticker_segment_data(seg.data)
 
             if not _should_resolve_image(resolve_images):
-                return _image_placeholder(is_sticker)
+                return (_image_placeholder(is_sticker), None)
 
             # 获取 VLM 的真实模型名称以准确记录 token 消耗
             # 兼容老配置，如果 vlm 未指定模型，则退而求其次使用 chat model
@@ -139,24 +145,25 @@ async def message2BotMessage(bot_name: str, group_id: int, message: Message, bot
             vlm_recorder = make_usage_recorder(str(group_id), vlm_model_name)
 
             # 调用通用逻辑，传入提取到的上下文
-            return await image_manager.resolve_image_from_url(
-                url, file_unique, is_sticker, 
+            text, meta = await image_manager.resolve_image_from_url(
+                url, file_unique, is_sticker,
                 context_text=full_context_text,
                 on_usage=vlm_recorder
             )
+            return (text, meta)
 
         elif seg.type == "at":
             id = seg.data.get("qq")
-            if not id: return ""
+            if not id: return ("", None)
             if id == str(bot.self_id):
-                return f" @{bot_name} "
+                return (f" @{bot_name} ", None)
             else:
                 try:
                     user_info = await bot.get_group_member_info(group_id=group_id, user_id=int(id))
                     nickname = user_info.get("card") or user_info.get("nickname") or str(id)
-                    return f" @{nickname} "
+                    return (f" @{nickname} ", None)
                 except Exception:
-                    return f" @{id} "
+                    return (f" @{id} ", None)
 
         elif seg.type == "reply":
             reply_id = seg.data.get("id")
@@ -167,6 +174,7 @@ async def message2BotMessage(bot_name: str, group_id: int, message: Message, bot
 
                     content_data = source_msg.get("message", [])
                     source_text = ""
+                    referenced_metas: list[dict] = []  # 引用消息里图片的结构化观测
 
                     # 统一转为列表处理
                     if isinstance(content_data, str):
@@ -195,11 +203,13 @@ async def message2BotMessage(bot_name: str, group_id: int, message: Message, bot
                                 vlm_recorder = make_usage_recorder(str(group_id), vlm_model_name_ref)
 
                                 # Await 分析结果
-                                img_desc = await image_manager.resolve_image_from_url(
+                                img_text, img_meta = await image_manager.resolve_image_from_url(
                                     img_url, img_file_unique, is_sticker_ref,
                                     on_usage=vlm_recorder
                                 )
-                                source_text += img_desc
+                                source_text += img_text
+                                if img_meta:
+                                    referenced_metas.append(img_meta)
 
                             elif msg_type == "face":
                                 # 简单处理 QQ 表情
@@ -210,17 +220,23 @@ async def message2BotMessage(bot_name: str, group_id: int, message: Message, bot
                     if len(source_text) > 200:
                         source_text = source_text[:200] + "..."
 
-                    return f" [回复 {sender}: \"{source_text}\"] "
+                    ref_meta: dict | None = {"referenced": referenced_metas} if referenced_metas else None
+                    return (f" [回复 {sender}: \"{source_text}\"] ", ref_meta)
                 except Exception as e:
                     logger.warning(f"获取回复内容失败: {e}")
-                    return " [回复] "
-            return ""
+                    return (" [回复] ", None)
+            return ("", None)
 
-        return ""
+        return ("", None)
 
     tasks = [process_segment(seg) for seg in message]
     results = await asyncio.gather(*tasks)
-    return "".join(results).strip()
+
+    # 聚合文本与元数据
+    content = "".join(r[0] for r in results).strip()
+    image_meta = merge_segment_metas([r[1] for r in results])
+
+    return (content, image_meta)
 
 
 async def spawn_state(state: GroupState):

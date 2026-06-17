@@ -13,6 +13,7 @@ class Message:
     content: str
     id: str = ""
     user_id: str = ""
+    image_meta: dict | None = None     # 图片结构化观测，纯内存，不持久化
 
     def to_json(self) -> dict:
         return {
@@ -21,6 +22,7 @@ class Message:
             "content": self.content,
             "id": self.id,
             "user_id": self.user_id,
+            "image_meta": self.image_meta,
         }
 
     @staticmethod
@@ -31,6 +33,7 @@ class Message:
             content=data["content"],
             id=data.get("id", ""),
             user_id=data.get("user_id", ""),
+            image_meta=data.get("image_meta"),
         )
 
 
