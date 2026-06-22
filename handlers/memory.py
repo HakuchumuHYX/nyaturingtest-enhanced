@@ -35,7 +35,7 @@ async def is_group_message(event: Event) -> bool:
 
 
 # 定义命令
-query_memory = on_command("查询记忆", aliases={"memory", "印象"}, rule=is_group_message, priority=5, block=True)
+query_memory = on_command("查询记忆", aliases={"memory"}, rule=is_group_message, priority=5, block=True)
 
 _LONG_TERM_VAD_CACHE_TTL_SECONDS = 24 * 60 * 60
 _LONG_TERM_VAD_CACHE: dict[tuple[str, str, str, str, str, str], tuple[float, dict]] = {}
