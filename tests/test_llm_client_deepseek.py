@@ -89,6 +89,28 @@ class _RaisingOpenAIClient:
         raise self.exc
 
 
+class _FlakyOpenAIClient:
+    def __init__(self, failures: int, exc):
+        self.calls = 0
+        self.failures = failures
+        self.exc = exc
+        self.chat = types.SimpleNamespace(
+            completions=types.SimpleNamespace(create=self.create)
+        )
+
+    async def create(self, **kwargs):
+        self.calls += 1
+        if self.calls <= self.failures:
+            raise self.exc
+        message = types.SimpleNamespace(content='{"reply":["ok"]}', reasoning_content="")
+        choice = types.SimpleNamespace(message=message, finish_reason="stop")
+        return types.SimpleNamespace(
+            choices=[choice],
+            usage=_FakeUsage(),
+            model="deepseek-v4-flash",
+        )
+
+
 class _StatusError(Exception):
     def __init__(self, status_code, text):
         super().__init__(text)
@@ -207,6 +229,27 @@ class DeepSeekLLMClientTests(unittest.TestCase):
         self.assertEqual("", response.content)
         self.assertEqual("content_filter", response.usage["error_type"])
         self.assertEqual(1, fake.calls)
+
+    def test_network_errors_are_retried_by_llm_client_once_per_attempt(self):
+        module = _load_client_module()
+        sleep_calls = []
+        original_sleep = module.asyncio.sleep
+
+        async def fake_sleep(delay):
+            sleep_calls.append(delay)
+
+        try:
+            module.asyncio.sleep = fake_sleep
+            fake = _FlakyOpenAIClient(failures=2, exc=module.httpx.ConnectError("temporary network"))
+            client = module.LLMClient(provider="deepseek_official", openai_client=fake)
+
+            response = asyncio.run(client.generate("p", "deepseek-v4-flash"))
+        finally:
+            module.asyncio.sleep = original_sleep
+
+        self.assertEqual('{"reply":["ok"]}', response.content)
+        self.assertEqual(3, fake.calls)
+        self.assertEqual([2, 4], sleep_calls)
 
 
 if __name__ == "__main__":

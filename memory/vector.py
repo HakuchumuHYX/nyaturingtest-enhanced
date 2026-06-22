@@ -322,7 +322,7 @@ class SiliconFlowEmbeddingFunction(EmbeddingFunction):
             api_key=api_key,
             base_url=base_url or str(settings["base_url"]),
             timeout=timeout or float(settings["timeout"]),
-            max_retries=1,
+            max_retries=0,
         )
 
     def __call__(self, input: Documents) -> Embeddings:

@@ -28,6 +28,7 @@ def _build_chat_llm_client() -> LLMClient:
         api_key=get_effective_chat_api_key(),
         base_url=get_effective_chat_base_url(),
         http_client=get_http_client(),
+        max_retries=0,
     )
 
     return LLMClient(
@@ -49,6 +50,7 @@ def _build_feedback_llm_client() -> LLMClient:
         api_key=get_effective_feedback_api_key(),
         base_url=get_effective_feedback_base_url(),
         http_client=get_http_client(),
+        max_retries=0,
     )
 
     return LLMClient(

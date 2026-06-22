@@ -242,6 +242,7 @@ class Session:
                 api_key=self._siliconflow_api_key,
                 base_url="https://api.siliconflow.cn/v1",
                 http_client=self._client_instance,
+                max_retries=0,
             ),
         )
 
@@ -741,20 +742,14 @@ class Session:
         )
 
         response_dict = {}
-        # 简单的重试逻辑
-        for attempt in range(2):
-            try:
-                response = await llm_func(prompt, json_mode=True)
-                # logger.debug(f"[Session {self.id}] Feedback 原始返回 (attempt {attempt+1}): {response[:500] if response else '<empty>'}")
-                parsed = extract_and_parse_json(response)
-                if parsed and isinstance(parsed, dict):
-                    response_dict = parsed
-                    break
-            except Exception as e:
-                logger.warning(f"反馈阶段 LLM 错误 (尝试 {attempt + 1}/2): {e}")
-                if attempt == 1:
-                    logger.error("反馈阶段最终失败，跳过本次处理")
-                    return None
+        try:
+            response = await llm_func(prompt, json_mode=True)
+            parsed = extract_and_parse_json(response)
+            if parsed and isinstance(parsed, dict):
+                response_dict = parsed
+        except Exception as e:
+            logger.error(f"反馈阶段 LLM 错误，跳过本次处理: {e}")
+            return None
 
         expected_feedback_fields = [
             "analyze_result",
@@ -1187,36 +1182,31 @@ class Session:
             examples_chars=len(self.__examples_str or ""),
         )
 
-        last_error = None
-        for attempt in range(2):
-            try:
-                # 使用传入的 chat_llm_func
-                response = await llm_func(prompt, json_mode=True)
-                response_data = extract_and_parse_json(response)
+        try:
+            # 使用传入的 chat_llm_func
+            response = await llm_func(prompt, json_mode=True)
+            response_data = extract_and_parse_json(response)
 
-                replies = []
-                if isinstance(response_data, dict):
-                    replies = response_data.get("reply", [])
-                elif isinstance(response_data, list):
-                    replies = response_data
-                    logger.warning("LLM 返回了 List 而非 Object，已自动兼容")
+            replies = []
+            if isinstance(response_data, dict):
+                replies = response_data.get("reply", [])
+            elif isinstance(response_data, list):
+                replies = response_data
+                logger.warning("LLM 返回了 List 而非 Object，已自动兼容")
 
-                if not isinstance(replies, list):
-                    return []
+            if not isinstance(replies, list):
+                return []
 
-                if replies:
-                    retain = get_runtime_settings()["speak_willingness_retain_factor"]
-                    self.willingness = max(0.0, self.willingness * retain)
-                    self.__chatting_state = _ChattingState.ACTIVE
+            if replies:
+                retain = get_runtime_settings()["speak_willingness_retain_factor"]
+                self.willingness = max(0.0, self.willingness * retain)
+                self.__chatting_state = _ChattingState.ACTIVE
 
-                return replies
+            return replies
 
-            except Exception as e:
-                last_error = e
-                logger.warning(f"对话阶段异常 (尝试 {attempt + 1}/2): {e}")
-
-        logger.error(f"对话阶段最终失败: {last_error}")
-        return []
+        except Exception as e:
+            logger.error(f"对话阶段异常: {e}")
+            return []
 
     # 提高插话阈值，防止连击
     async def append_self_message(self, content: str, msg_id: str, bot_user_id: str):

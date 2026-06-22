@@ -10,7 +10,7 @@ class MemoryCommandPublicGroupOnlyTests(unittest.TestCase):
         source = (PLUGIN_DIR / "handlers" / "memory.py").read_text(encoding="utf-8")
 
         self.assertIn("async def is_group_message", source)
-        self.assertIn('query_memory = on_command("查询记忆", aliases={"memory", "印象"}, rule=is_group_message', source)
+        self.assertIn('query_memory = on_command("查询记忆", aliases={"memory"}, rule=is_group_message', source)
         query_definition = source[
             source.index('query_memory = on_command("查询记忆"'):
             source.index("_LONG_TERM_VAD_CACHE_TTL_SECONDS")
@@ -38,7 +38,8 @@ class MemoryCommandPublicGroupOnlyTests(unittest.TestCase):
         self.assertIn("query_memory_chat_thinking = get_chat_thinking_settings()", generation_source)
         self.assertIn('"type": "enabled" if query_memory_chat_thinking.get("enabled") else "disabled"', generation_source)
         self.assertIn('reasoning_effort=query_memory_chat_thinking.get("reasoning_effort", "high") if query_memory_chat_thinking.get("enabled") else None', generation_source)
-        self.assertIn('temperature=None if query_memory_chat_thinking.get("enabled") else 0.8 + (attempt * 0.2)', generation_source)
+        self.assertIn('temperature=None if query_memory_chat_thinking.get("enabled") else 0.8', generation_source)
+        self.assertNotIn("attempt * 0.2", generation_source)
         self.assertNotIn('extra_body={"thinking": {"type": "disabled"}}', generation_source)
 
 

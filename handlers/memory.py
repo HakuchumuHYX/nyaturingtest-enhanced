@@ -1,7 +1,6 @@
 # nyaturingtest/memory_query.py
 import hashlib
 import json
-import asyncio
 import time
 from datetime import datetime
 from nonebot import on_command, logger
@@ -467,7 +466,6 @@ async def handle_query_memory(bot: Bot, event: GroupMessageEvent, args: Message 
 """
 
     # 6. 调用 LLM
-    max_retries = 2
     query_memory_chat_thinking = get_chat_thinking_settings()
     query_memory_chat_extra_body = {
         "thinking": {
@@ -475,46 +473,41 @@ async def handle_query_memory(bot: Bot, event: GroupMessageEvent, args: Message 
         }
     }
 
-    for attempt in range(max_retries + 1):
-        try:
-            # 使用统一的 llm_response 封装
-            response = await llm_response(
-                state.client,
-                prompt,
-                model=get_effective_chat_model(),
-                temperature=None if query_memory_chat_thinking.get("enabled") else 0.8 + (attempt * 0.2),
-                json_mode=True,
-                extra_body=query_memory_chat_extra_body,
-                reasoning_effort=query_memory_chat_thinking.get("reasoning_effort", "high") if query_memory_chat_thinking.get("enabled") else None,
-                max_tokens=min(get_chat_max_tokens(), 2048),
-                timeout=get_chat_timeout(),
-                on_usage=make_usage_recorder(session_id, get_effective_chat_model())
-            )
+    try:
+        # 使用统一的 llm_response 封装；传输层重试由 LLMClient 统一负责。
+        response = await llm_response(
+            state.client,
+            prompt,
+            model=get_effective_chat_model(),
+            temperature=None if query_memory_chat_thinking.get("enabled") else 0.8,
+            json_mode=True,
+            extra_body=query_memory_chat_extra_body,
+            reasoning_effort=query_memory_chat_thinking.get("reasoning_effort", "high") if query_memory_chat_thinking.get("enabled") else None,
+            max_tokens=min(get_chat_max_tokens(), 2048),
+            timeout=get_chat_timeout(),
+            on_usage=make_usage_recorder(session_id, get_effective_chat_model())
+        )
 
-            result = extract_and_parse_json(response)
+        result = extract_and_parse_json(response)
 
-            if result and "description" in result:
-                description = result.get("description", "数据解析错误")
-                emotion = result.get("emotion", "未知")
+        if result and "description" in result:
+            description = result.get("description", "数据解析错误")
+            emotion = result.get("emotion", "未知")
 
-                msg = f"=== {target_name} 的印象档案 ===\n\n"
-                msg += f"「{description}」\n\n"
-                msg += f"标签: {emotion}\n"
-                msg += f"------------------\n"
-                msg += f"记忆深度: {profile_data['interactions']} | VAD: {profile_data['valence']:.1f}/{profile_data['arousal']:.1f}/{profile_data['dominance']:.1f}"
+            msg = f"=== {target_name} 的印象档案 ===\n\n"
+            msg += f"「{description}」\n\n"
+            msg += f"标签: {emotion}\n"
+            msg += f"------------------\n"
+            msg += f"记忆深度: {profile_data['interactions']} | VAD: {profile_data['valence']:.1f}/{profile_data['arousal']:.1f}/{profile_data['dominance']:.1f}"
 
-                await query_memory.finish(msg)
-                return
+            await query_memory.finish(msg)
+            return
 
-            else:
-                logger.warning(f"印象生成 JSON 解析失败: {response}")
+        logger.warning(f"印象生成 JSON 解析失败: {response}")
 
-        except FinishedException:
-            raise
-        except Exception as e:
-            logger.error(f"LLM 请求异常: {e}")
-
-        if attempt < max_retries:
-            await asyncio.sleep(1)
+    except FinishedException:
+        raise
+    except Exception as e:
+        logger.error(f"LLM 请求异常: {e}")
 
     await query_memory.finish("大脑处理过载，记忆读取失败，请稍后再试。")

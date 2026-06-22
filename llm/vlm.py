@@ -52,6 +52,7 @@ class VLM:
             api_key=api_key,
             base_url=endpoint,
             http_client=self._http_client,
+            max_retries=0,
         )
 
     async def close(self):
