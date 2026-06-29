@@ -5,13 +5,20 @@ from tortoise import Tortoise
 SCHEMA_VERSION = 3
 
 
+def _is_duplicate_schema_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return "duplicate column" in text or "already exists" in text
+
+
 async def _execute_ignore_duplicate(conn, statement: str):
     try:
         await conn.execute_query(statement)
     except Exception as e:
-        text = str(e).lower()
-        if "duplicate column" not in text and "already exists" not in text:
-            logger.warning(f"[Migration] skipped statement: {e}")
+        if _is_duplicate_schema_error(e):
+            logger.warning(f"[Migration] skipped already-applied statement: {e}")
+            return
+        logger.error(f"[Migration] failed statement: {e}")
+        raise
 
 
 async def ensure_schema_version():

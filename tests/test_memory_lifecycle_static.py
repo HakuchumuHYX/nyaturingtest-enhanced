@@ -44,7 +44,10 @@ class MemoryLifecycleStaticTests(unittest.TestCase):
             'metadata["supersedes"] = target_ref',
             "get_metadata_by_id",
             "update_metadata_by_id",
-            "add_texts)([content]",
+            "_run_sync_if_generation_current",
+            "self.long_term_memory.add_texts",
+            "stage=\"long_term_memory_add\"",
+            "stage=\"long_term_memory_supersede\"",
         ]:
             self.assertIn(snippet, save_source)
 

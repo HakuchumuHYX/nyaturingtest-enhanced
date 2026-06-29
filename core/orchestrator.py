@@ -10,6 +10,21 @@ from ..utils import check_relevance, score_message_interest
 from .services import ChatService, FeedbackService, MemoryService
 
 
+def _is_generation_stale(session, expected_generation: int | None) -> bool:
+    checker = getattr(session, "is_generation_stale", None)
+    if checker is None:
+        return False
+    return bool(checker(expected_generation))
+
+
+def _log_stale_generation(session, stage: str, expected_generation: int | None) -> None:
+    logger_func = getattr(session, "_log_stale_generation", None)
+    if logger_func is not None:
+        logger_func(stage, expected_generation)
+    else:
+        logger.info(f"[Session {getattr(session, 'id', '-')}] 丢弃过期 turn: {stage}")
+
+
 class ConversationOrchestrator:
     def __init__(
         self,
@@ -30,8 +45,16 @@ class ConversationOrchestrator:
         chat_llm_func: Callable[[str, bool], Awaitable[str]],
         feedback_llm_func: Callable[[str, bool], Awaitable[str]],
         publish: bool = True,
+        expected_generation: int | None = None,
     ) -> list[dict] | None:
+        if _is_generation_stale(self.session, expected_generation):
+            _log_stale_generation(self.session, "process_start", expected_generation)
+            return None
+
         await self.memory_service.update_short_term(messages_chunk)
+        if _is_generation_stale(self.session, expected_generation):
+            _log_stale_generation(self.session, "short_term_memory", expected_generation)
+            return None
 
         if not publish:
             return None
@@ -61,7 +84,6 @@ class ConversationOrchestrator:
         )
         if is_relevant:
             self.session.willingness = max(self.session.willingness, runtime_settings["relevance_willingness_floor"])
-            self.session._passive_observe_skips = 0
             logger.info("检测到强关联，意愿值提升")
         elif self.session.willingness < runtime_settings["passive_willingness_growth_limit"]:
             interest = score_message_interest(
@@ -91,7 +113,11 @@ class ConversationOrchestrator:
         if not self.session._engaged and not is_relevant:
             if runtime_settings["consolidation_enabled"] and self._consolidation_due(runtime_settings):
                 max_messages = runtime_settings["consolidation_max_messages"]
-                await self.memory_service.consolidate(messages_chunk[-max_messages:], feedback_llm_func)
+                await self.memory_service.consolidate(
+                    messages_chunk[-max_messages:],
+                    feedback_llm_func,
+                    expected_generation=expected_generation,
+                )
             logger.debug(f"未进入参与态 (意愿 {self.session.willingness:.2f})，跳过响应")
             return None
 
@@ -125,6 +151,9 @@ class ConversationOrchestrator:
             active_users=active_users,
             use_rerank=use_rerank_strategy,
         )
+        if _is_generation_stale(self.session, expected_generation):
+            _log_stale_generation(self.session, "rag_search", expected_generation)
+            return None
 
         logger.debug("启用拟人化串行模式: Feedback -> Check -> Chat")
 
@@ -133,7 +162,11 @@ class ConversationOrchestrator:
             feedback_llm_func,
             is_relevant=is_relevant,
             search_result=search_result,
+            expected_generation=expected_generation,
         )
+        if _is_generation_stale(self.session, expected_generation):
+            _log_stale_generation(self.session, "feedback", expected_generation)
+            return None
         latest = max((msg.time for msg in messages_chunk), default=None)
         if latest is not None and (
             self.session.last_consolidated_time is None
@@ -142,7 +175,7 @@ class ConversationOrchestrator:
             self.session.last_consolidated_time = latest
         self.session._messages_since_consolidation = 0
         self.session._last_consolidation_attempt = datetime.now()
-        await self.session.save_session()
+        await self.session.save_session(expected_generation=expected_generation)
 
         if self.session.willingness < runtime_settings["post_feedback_skip_threshold"] and not is_relevant:
             return None
@@ -152,7 +185,11 @@ class ConversationOrchestrator:
             chat_llm_func,
             recalled_history=recalled_history,
             search_result=search_result,
+            expected_generation=expected_generation,
         )
+        if _is_generation_stale(self.session, expected_generation):
+            _log_stale_generation(self.session, "chat", expected_generation)
+            return None
 
         if reply_messages:
             self.session._last_speak_time = datetime.now()

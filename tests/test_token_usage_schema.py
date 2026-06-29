@@ -39,12 +39,29 @@ class TokenUsageSchemaTests(unittest.TestCase):
         self.assertIn("Cache miss", renderer)
         self.assertIn("Hit ratio", renderer)
 
-    def test_token_stats_command_filters_to_current_configured_models(self):
+    def test_token_stats_command_filters_to_current_configured_models_by_default(self):
         source = (PLUGIN_DIR / "handlers" / "commands.py").read_text(encoding="utf-8")
 
         self.assertIn("get_token_stats_model_names", source)
-        self.assertIn("model_names=get_token_stats_model_names()", source)
-        self.assertNotIn("model_names=None", source)
+        self.assertIn("stats_model_names = get_token_stats_model_names()", source)
+        self.assertIn("if token_stats_scope_all:", source)
+
+    def test_token_stats_command_can_include_historical_models(self):
+        source = (PLUGIN_DIR / "handlers" / "commands.py").read_text(encoding="utf-8")
+
+        self.assertIn("token_stats_scope_all", source)
+        self.assertIn("stats_model_names = None", source)
+        self.assertIn("model_names=stats_model_names", source)
+        self.assertIn("scope_label=scope_label", source)
+        self.assertIn('"all"', source)
+        self.assertIn('"全部"', source)
+        self.assertIn('"历史"', source)
+
+    def test_token_stats_card_labels_model_scope(self):
+        source = (PLUGIN_DIR / "utils.py").read_text(encoding="utf-8")
+
+        self.assertIn("scope_label: str = \"当前模型\"", source)
+        self.assertIn('TextBox(f"Token 使用统计（{scope_label}）"', source)
 
     def test_config_exposes_current_token_stats_model_names(self):
         source = (PLUGIN_DIR / "config.py").read_text(encoding="utf-8")

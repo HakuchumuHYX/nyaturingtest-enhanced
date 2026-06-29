@@ -421,7 +421,7 @@ class VectorMemory:
     def _wal_path(self) -> str:
         return os.path.join(self.persist_directory, "pending_memories.jsonl")
 
-    def _append_wal(self, items: list[tuple[str, dict]]) -> None:
+    def _append_wal(self, items: list[tuple[str, dict]]) -> bool:
         try:
             os.makedirs(self.persist_directory, exist_ok=True)
             with open(self._wal_path(), "a", encoding="utf-8") as handle:
@@ -430,8 +430,10 @@ class VectorMemory:
                         {"content": content, "metadata": metadata},
                         ensure_ascii=False,
                     ) + "\n")
+            return True
         except Exception as e:
             logger.error(f"WAL append failed: {e}")
+            return False
 
     def replay_pending(self) -> int:
         path = self._wal_path()
@@ -477,11 +479,14 @@ class VectorMemory:
             logger.error(f"WAL replay failed, keeping file: {e}")
             return 0
 
-    def add_texts(self, texts: List[str], metadatas: List[dict] | None = None):
-        if not texts: return
+    def add_texts(self, texts: List[str], metadatas: List[dict] | None = None) -> dict[str, int]:
+        empty_result = {"added": 0, "queued_wal": 0, "failed": 0}
+        if not texts:
+            return empty_result
         valid_data = [(t, metadatas[i] if metadatas and i < len(metadatas) else {})
                       for i, t in enumerate(texts) if t and t.strip()]
-        if not valid_data: return
+        if not valid_data:
+            return empty_result
 
         runtime = plugin_config.get("runtime", {}) or {}
         max_retries = int(runtime.get("memory_write_max_retries", 0) or 0)
@@ -495,14 +500,17 @@ class VectorMemory:
                         metadatas=[d[1] for d in valid_data],
                         ids=ids
                     )
-                return
+                return {"added": len(valid_data), "queued_wal": 0, "failed": 0}
             except Exception as e:
                 logger.error(f"Vector add failed (attempt {attempt + 1}/{max_retries + 1}): {e}")
                 if attempt < max_retries and base_delay > 0:
                     time.sleep(base_delay * (2 ** attempt))
 
-        self._append_wal(valid_data)
-        logger.warning(f"Vector add exhausted retries, wrote {len(valid_data)} memories to WAL")
+        if self._append_wal(valid_data):
+            logger.warning(f"Vector add exhausted retries, wrote {len(valid_data)} memories to WAL")
+            return {"added": 0, "queued_wal": len(valid_data), "failed": 0}
+        logger.error(f"Vector add exhausted retries and WAL append failed for {len(valid_data)} memories")
+        return {"added": 0, "queued_wal": 0, "failed": len(valid_data)}
 
     def retrieve(
         self,
@@ -953,11 +961,14 @@ class VectorMemory:
                     to_add.append((content, metadata))
 
             if to_add:
-                self.add_texts(
+                write_result = self.add_texts(
                     [content for content, _ in to_add],
                     metadatas=[metadata for _, metadata in to_add],
                 )
-                result["added"] = len(to_add)
+                if isinstance(write_result, dict):
+                    result["added"] = int(write_result.get("added") or 0)
+                else:
+                    result["added"] = len(to_add)
             return result
 
         except Exception as e:

@@ -3,6 +3,7 @@ from pathlib import Path
 
 
 PLUGIN_DIR = Path(__file__).resolve().parents[1]
+WORKSPACE_DIR = PLUGIN_DIR.parents[1]
 
 
 class RiskPlanImplementationTests(unittest.TestCase):
@@ -11,7 +12,7 @@ class RiskPlanImplementationTests(unittest.TestCase):
 
         self.assertIn("class FeedbackService", source)
         self.assertIn("finally:", source)
-        self.assertIn("await self.session.save_session()", source)
+        self.assertIn("await self.session.save_session(expected_generation=expected_generation)", source)
 
     def test_short_term_memory_has_extended_context_api(self):
         memory_source = (PLUGIN_DIR / "memory" / "short_term.py").read_text(encoding="utf-8")
@@ -29,19 +30,29 @@ class RiskPlanImplementationTests(unittest.TestCase):
         self.assertIn("if summary is not None:", session_source)
         self.assertNotIn('str(response_dict.get("summary", self.chat_summary))', session_source)
 
-    def test_low_willingness_observation_is_configured(self):
+    def test_low_willingness_observation_is_documented_as_consolidation(self):
         config_source = (PLUGIN_DIR / "config.py").read_text(encoding="utf-8")
+        example_source = (PLUGIN_DIR / "config.example.json").read_text(encoding="utf-8")
+        readme_source = (PLUGIN_DIR / "README.md").read_text(encoding="utf-8")
+        memory_analysis_source = (WORKSPACE_DIR / "docs" / "memory-analysis.md").read_text(encoding="utf-8")
         orchestrator_source = (PLUGIN_DIR / "core" / "orchestrator.py").read_text(encoding="utf-8")
 
-        self.assertIn("low_willingness_observe_interval", config_source)
-        self.assertIn("_passive_observe_skips", orchestrator_source)
-        self.assertIn("await self.feedback_service.process", orchestrator_source)
+        self.assertNotIn('"low_willingness_observe_interval":', config_source)
+        self.assertNotIn("low_willingness_observe_interval", example_source)
+        self.assertNotIn("low_willingness_observe_interval", readme_source)
+        self.assertNotIn("low_willingness_observe_interval", memory_analysis_source)
+        self.assertNotIn("_passive_observe_skips", orchestrator_source)
+        self.assertIn("await self.memory_service.consolidate", orchestrator_source)
+        self.assertIn("consolidation_message_threshold", readme_source)
+        self.assertIn("consolidation_message_threshold", memory_analysis_source)
+        self.assertIn("被动记忆固化", readme_source)
 
     def test_self_message_fallback_id_exists(self):
         logic_source = (PLUGIN_DIR / "core" / "logic.py").read_text(encoding="utf-8")
 
         self.assertIn("def _build_self_message_id", logic_source)
-        self.assertIn("append_self_message(sent_content, msg_id, str(state.bot.self_id))", logic_source)
+        self.assertIn("chunk_bot = state.bot", logic_source)
+        self.assertIn("append_self_message(sent_content, msg_id, str(chunk_bot.self_id))", logic_source)
 
     def test_deepseek_v4_rp_marker_is_configurable(self):
         config_source = (PLUGIN_DIR / "config.py").read_text(encoding="utf-8")
@@ -108,7 +119,8 @@ class RiskPlanImplementationTests(unittest.TestCase):
         self.assertIn("def _is_priority_message", source)
         self.assertIn('seg.type == "at"', source)
         self.assertIn('seg.type == "reply"', source)
-        self.assertIn("_is_priority_message(event.original_message", source)
+        self.assertIn("pre_queue_priority = _is_priority_message(", source)
+        self.assertIn("event.original_message,", source)
 
 
 if __name__ == "__main__":

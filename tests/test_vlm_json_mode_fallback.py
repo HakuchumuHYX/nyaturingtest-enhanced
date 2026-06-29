@@ -95,7 +95,15 @@ class VLMJsonModeFallbackTests(unittest.TestCase):
         self.assertEqual(2, len(calls))
         self.assertIn("response_format", calls[0])
         self.assertNotIn("response_format", calls[1])
-        self.assertEqual([{"prompt_tokens": 1, "completion_tokens": 2}], usage_rows)
+        self.assertEqual([
+            {
+                "prompt_tokens": 1,
+                "completion_tokens": 2,
+                "total_tokens": 3,
+                "provider": "openai_compatible",
+                "finish_reason": "",
+            }
+        ], usage_rows)
 
 
 if __name__ == "__main__":

@@ -12,7 +12,7 @@ class ProfileRepository:
         try:
             session_db = await SessionModel.get_or_none(id=session_id)
             if not session_db:
-                return
+                raise RuntimeError(f"session not found: {session_id}")
 
             for user_id, profile in profiles.items():
                 await UserProfileModel.update_or_create(
@@ -26,6 +26,7 @@ class ProfileRepository:
                 )
         except Exception as e:
             logger.error(f"[Repo] 更新用户画像失败: {e}")
+            raise
 
     @staticmethod
     async def log_interaction(session_id: str, user_id: str, delta: dict):

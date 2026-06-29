@@ -102,12 +102,20 @@
     "send_strategy": "split_by_sentence",
     "max_reply_messages": 2,
     "humanized_delay_seconds": 1.0,
-    "low_willingness_observe_interval": 5,
     "role_max_chars": 4000,
     "examples_max_chars": 2000,
     "short_context_limit": 20,
+    "short_term_buffer_size": 200,
+    "consolidation_enabled": true,
+    "consolidation_message_threshold": 8,
+    "consolidation_interval_seconds": 180.0,
+    "consolidation_max_messages": 60,
     "interaction_log_recent_days": 180,
     "history_recall_limit": 20,
+    "backup_retention_count": 7,
+    "raw_message_retention_days": 0,
+    "raw_interaction_retention_days": 0,
+    "token_usage_retention_days": 0,
     "speak_cooldown_seconds": 10.0,
     "willingness_idle_after_seconds": 300.0,
     "willingness_decay_rate_active": 0.03,
@@ -144,7 +152,25 @@
 - `max_reply_messages`：单次最多发送几条回复。
 - `speak_cooldown_seconds`：非强关联消息触发回复前的发言冷却。
 - `low_willingness_skip_threshold` / `post_feedback_skip_threshold`：意愿值低于阈值时跳过回复。
+- `consolidation_enabled` / `consolidation_message_threshold` / `consolidation_interval_seconds` / `consolidation_max_messages`：控制低意愿潜水时的被动记忆固化；该路径只沉淀记忆，不触发回复决策。
 - `rerank_willingness_threshold`：意愿值达到阈值或强关联时启用 Rerank 检索。
+- `backup_retention_count`：按数量保留最近多少个备份文件。
+- `raw_message_retention_days` / `raw_interaction_retention_days` / `token_usage_retention_days`：原始消息、画像交互日志和 Token 使用量的保留天数；默认 `0` 表示不清理，不影响长期向量记忆。
+
+### 配置加载与重启语义
+
+插件当前不监听 `config.json` 变更。修改配置文件后需要重启 Bot 才能保证所有群状态、LLM 客户端、VLM 客户端、Embedding/Rerank 客户端和定时任务使用同一份配置。
+
+以下字段尤其依赖启动期或客户端创建期状态，变更后需要重启：
+
+- `chat.provider` / `chat.base_url` / `chat.api_key`
+- `feedback.provider` / `feedback.base_url` / `feedback.api_key`
+- `vlm.provider` / `vlm.base_url` / `vlm.api_key`
+- `embedding.base_url` / `embedding.model` / `siliconflow_api_key`
+- `rerank.base_url` / `rerank.model`
+- `enabled_groups`
+
+运行中的 `/autochat enable` 和 `/autochat disable` 会写入数据库并立即影响当前进程；`enabled_groups` 只作为启动时的初始来源。
 
 ## 启用方式
 
@@ -266,7 +292,9 @@ nyaturingtest_backups/
 nyabot_backup_YYYYMMDD_HHMMSS.zip
 ```
 
-备份逻辑会使用 SQLite backup API 复制数据库快照，并打包向量库等插件数据。当前只按数量保留最近 7 个备份；建议定期把备份复制到外部存储，并在测试环境做恢复演练。
+备份逻辑会使用 SQLite backup API 复制数据库快照，并打包向量库等插件数据。备份包含聊天内容、用户 ID、Token 使用量、用户画像和长期向量记忆，属于敏感数据；建议加密保存，定期复制到外部存储，并在测试环境做恢复演练。
+
+`backup_retention_count` 按数量保留最近的备份文件，默认保留 7 个。原始数据库表的自动清理由 `raw_message_retention_days`、`raw_interaction_retention_days` 和 `token_usage_retention_days` 控制，默认关闭；启用后每次成功的自动、手动或重置前备份都会先生成备份快照，再清理 SQLite 中的原始行，不删除 ChromaDB 长期向量记忆。
 
 ## 模块结构
 
@@ -288,7 +316,8 @@ plugins/nyaturingtest/
 ├── database/
 │   ├── migrations.py        # SQLite schema 迁移
 │   ├── *_repository.py      # 会话、消息、画像、Token、启用群组等窄 repository
-│   └── backup.py            # 自动/手动备份
+│   ├── backup.py            # 自动/手动备份
+│   └── retention.py         # 原始数据库表保留策略
 ├── llm/
 │   ├── client.py            # Chat/Feedback LLMClient
 │   └── vlm.py               # OpenAI-compatible VLM 适配器

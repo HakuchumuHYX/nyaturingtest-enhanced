@@ -208,7 +208,12 @@ class DeepSeekLLMClientTests(unittest.TestCase):
     def test_429_sets_short_circuit_and_reports_provider_error(self):
         module = _load_client_module()
         fake = _RaisingOpenAIClient(_StatusError(429, "rate limit"))
-        client = module.LLMClient(provider="deepseek_official", openai_client=fake)
+        client = module.LLMClient(
+            provider="deepseek_official",
+            openai_client=fake,
+            base_url="https://api.deepseek.com",
+            api_key="same-key",
+        )
 
         first = asyncio.run(client.generate("p", "deepseek-v4-flash"))
         second = asyncio.run(client.generate("p", "deepseek-v4-flash"))
@@ -218,6 +223,119 @@ class DeepSeekLLMClientTests(unittest.TestCase):
         self.assertEqual("circuit_open", second.usage["error_type"])
         self.assertEqual(1, fake.calls)
         self.assertEqual("rate_limit", client.provider_status.last_error_type)
+
+    def test_429_creates_shared_advisory_backoff_without_global_hard_circuit(self):
+        module = _load_client_module()
+        sleep_calls = []
+        original_sleep = module.asyncio.sleep
+
+        async def fake_sleep(delay):
+            sleep_calls.append(delay)
+
+        try:
+            module.asyncio.sleep = fake_sleep
+            first_fake = _RaisingOpenAIClient(_StatusError(429, "rate limit"))
+            first_client = module.LLMClient(
+                provider="deepseek_official",
+                openai_client=first_fake,
+                base_url="https://api.deepseek.com",
+                api_key="same-key",
+            )
+            first = asyncio.run(first_client.generate("p", "deepseek-v4-flash"))
+
+            second_fake = _FakeOpenAIClient()
+            second_client = module.LLMClient(
+                provider="deepseek_official",
+                openai_client=second_fake,
+                base_url="https://api.deepseek.com",
+                api_key="same-key",
+            )
+            second = asyncio.run(second_client.generate("p", "deepseek-v4-flash"))
+        finally:
+            module.asyncio.sleep = original_sleep
+
+        self.assertEqual("rate_limit", first.usage["error_type"])
+        self.assertEqual('{"reply":[]}', second.content)
+        self.assertTrue(second_fake.last_kwargs is not None)
+        self.assertTrue(sleep_calls)
+        self.assertLessEqual(max(sleep_calls), module.PROVIDER_ADVISORY_BACKOFF_MAX_SLEEP_SECONDS)
+        self.assertNotEqual("circuit_open", second.usage.get("error_type"))
+
+    def test_shared_advisory_backoff_key_includes_model(self):
+        module = _load_client_module()
+        sleep_calls = []
+        original_sleep = module.asyncio.sleep
+
+        async def fake_sleep(delay):
+            sleep_calls.append(delay)
+
+        try:
+            module.asyncio.sleep = fake_sleep
+            first_fake = _RaisingOpenAIClient(_StatusError(429, "rate limit"))
+            first_client = module.LLMClient(
+                provider="openai_compatible",
+                openai_client=first_fake,
+                base_url="https://proxy.example/v1",
+                api_key="same-key",
+            )
+            asyncio.run(first_client.generate("p", "model-a"))
+
+            second_fake = _FakeOpenAIClient()
+            second_client = module.LLMClient(
+                provider="openai_compatible",
+                openai_client=second_fake,
+                base_url="https://proxy.example/v1",
+                api_key="same-key",
+            )
+            response = asyncio.run(second_client.generate("p", "model-b"))
+        finally:
+            module.asyncio.sleep = original_sleep
+
+        self.assertEqual('{"reply":[]}', response.content)
+        self.assertEqual([], sleep_calls)
+
+    def test_shared_advisory_backoff_key_isolates_base_url_and_api_key(self):
+        module = _load_client_module()
+        sleep_calls = []
+        original_sleep = module.asyncio.sleep
+
+        async def fake_sleep(delay):
+            sleep_calls.append(delay)
+
+        try:
+            module.asyncio.sleep = fake_sleep
+            first_fake = _RaisingOpenAIClient(_StatusError(429, "rate limit"))
+            first_client = module.LLMClient(
+                provider="openai_compatible",
+                openai_client=first_fake,
+                base_url="https://proxy-a.example/v1",
+                api_key="key-a",
+            )
+            asyncio.run(first_client.generate("p", "same-model"))
+
+            other_base_url_fake = _FakeOpenAIClient()
+            other_base_url_client = module.LLMClient(
+                provider="openai_compatible",
+                openai_client=other_base_url_fake,
+                base_url="https://proxy-b.example/v1",
+                api_key="key-a",
+            )
+            other_base_url = asyncio.run(other_base_url_client.generate("p", "same-model"))
+
+            other_api_key_fake = _FakeOpenAIClient()
+            other_api_key_client = module.LLMClient(
+                provider="openai_compatible",
+                openai_client=other_api_key_fake,
+                base_url="https://proxy-a.example/v1",
+                api_key="key-b",
+            )
+            other_api_key = asyncio.run(other_api_key_client.generate("p", "same-model"))
+        finally:
+            module.asyncio.sleep = original_sleep
+
+        self.assertEqual('{"reply":[]}', other_base_url.content)
+        self.assertEqual('{"reply":[]}', other_api_key.content)
+        self.assertEqual([], sleep_calls)
 
     def test_content_filter_returns_empty_without_retry(self):
         module = _load_client_module()

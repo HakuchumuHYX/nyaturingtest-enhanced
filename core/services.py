@@ -53,7 +53,11 @@ class MemoryService:
     async def update_short_term(self, messages_chunk: list[Message]):
         await self.session.global_memory.update(messages_chunk)
         self.note_incoming(len(messages_chunk))
-        self.session._create_safe_task(self.session.save_session())
+        schedule_save = getattr(self.session, "_schedule_save_session", None)
+        if schedule_save is not None:
+            schedule_save()
+        else:
+            self.session._create_safe_task(self.session.save_session())
 
     async def search(
         self,
@@ -73,8 +77,12 @@ class MemoryService:
     async def save_long_term(self, analyze_result: list, default_user_id: str = ""):
         await self.session.save_long_term_memory(analyze_result, default_user_id=default_user_id)
 
-    async def consolidate(self, messages_chunk, feedback_llm_func):
-        await self.session.consolidate_stage(messages_chunk, feedback_llm_func)
+    async def consolidate(self, messages_chunk, feedback_llm_func, *, expected_generation: int | None = None):
+        await self.session.consolidate_stage(
+            messages_chunk,
+            feedback_llm_func,
+            expected_generation=expected_generation,
+        )
 
 
 class FeedbackService:
@@ -88,6 +96,7 @@ class FeedbackService:
         *,
         is_relevant: bool = False,
         search_result=None,
+        expected_generation: int | None = None,
     ) -> list[str]:
         try:
             return await self.session.feedback_stage(
@@ -95,9 +104,10 @@ class FeedbackService:
                 llm_func,
                 is_relevant=is_relevant,
                 search_result=search_result,
+                expected_generation=expected_generation,
             )
         finally:
-            await self.session.save_session()
+            await self.session.save_session(expected_generation=expected_generation)
 
 
 class ChatService:
@@ -110,10 +120,12 @@ class ChatService:
         llm_func: Callable[[str, bool], Awaitable[str]],
         recalled_history: list[str],
         search_result=None,
+        expected_generation: int | None = None,
     ) -> list[dict]:
         return await self.session.chat_stage(
             messages_chunk,
             llm_func,
             recalled_history=recalled_history,
             search_result=search_result,
+            expected_generation=expected_generation,
         )

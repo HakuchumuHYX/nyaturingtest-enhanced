@@ -1,4 +1,5 @@
 import importlib.util
+import json
 from tempfile import TemporaryDirectory
 import sys
 import types
@@ -48,10 +49,14 @@ class ConfigValidationTests(unittest.TestCase):
         text = example.read_text(encoding="utf-8")
 
         self.assertIn("deepseek-v4-flash", text)
-        self.assertIn("low_willingness_observe_interval", text)
+        self.assertNotIn("low_willingness_observe_interval", text)
         self.assertIn("role_max_chars", text)
         self.assertIn("examples_max_chars", text)
         self.assertIn("short_context_limit", text)
+        self.assertIn("consolidation_enabled", text)
+        self.assertIn("consolidation_message_threshold", text)
+        self.assertIn("consolidation_interval_seconds", text)
+        self.assertIn("consolidation_max_messages", text)
         self.assertIn("interaction_log_recent_days", text)
         self.assertIn("history_recall_limit", text)
         self.assertIn("active_to_bubble_threshold", text)
@@ -59,6 +64,23 @@ class ConfigValidationTests(unittest.TestCase):
         self.assertIn('"base_url": "https://api.siliconflow.cn/v1/rerank"', text)
         self.assertNotIn("sk-", text)
         self.assertNotIn("google" + "_api_key", text)
+
+    def test_readme_documents_restart_required_config_fields(self):
+        readme = (PLUGIN_DIR / "README.md").read_text(encoding="utf-8")
+
+        for snippet in [
+            "需要重启",
+            "chat.provider",
+            "chat.base_url",
+            "chat.api_key",
+            "feedback.provider",
+            "feedback.base_url",
+            "feedback.api_key",
+            "vlm.base_url",
+            "embedding.base_url",
+            "enabled_groups",
+        ]:
+            self.assertIn(snippet, readme)
 
     def test_legacy_config_is_normalized_to_current_schema(self):
         module = _load_config_module()
@@ -96,13 +118,16 @@ class ConfigValidationTests(unittest.TestCase):
         self.assertNotIn("openai_api_key", normalized["vlm"])
         self.assertNotIn("google" + "_api_key", normalized["chat"])
 
-    def test_low_willingness_observe_interval_allows_zero(self):
+    def test_legacy_low_willingness_observe_interval_is_accepted_but_not_exposed(self):
         module = _load_config_module()
         cfg = module.get_default_config()
         cfg["runtime"]["low_willingness_observe_interval"] = 0
+        normalized = module.normalize_config(cfg)
         module.plugin_config = cfg
 
-        self.assertEqual(0, module.get_runtime_settings()["low_willingness_observe_interval"])
+        self.assertIn("low_willingness_observe_interval", normalized["runtime"])
+        self.assertNotIn("low_willingness_observe_interval", module.get_default_config()["runtime"])
+        self.assertNotIn("low_willingness_observe_interval", module.get_runtime_settings())
 
     def test_runtime_exposes_recent_context_and_repository_limits(self):
         module = _load_config_module()
@@ -191,8 +216,28 @@ class ConfigValidationTests(unittest.TestCase):
         self.assertEqual(1, settings["rag_merged_candidate_cap"])
         self.assertEqual(1, settings["rag_memory_char_budget"])
 
-    def test_load_plugin_config_records_fallback_diagnostic_for_invalid_json(self):
+    def test_load_plugin_config_fails_fast_for_invalid_json_without_last_known_good(self):
         module = _load_config_module()
+        module._plugin_config = {}
+        with TemporaryDirectory() as tmp:
+            bad_config = Path(tmp) / "config.json"
+            bad_config.write_text("{ bad json", encoding="utf-8")
+            module.CONFIG_FILE = bad_config
+
+            with self.assertRaises(json.JSONDecodeError):
+                module.load_plugin_config()
+            status = module.get_config_load_status()
+
+        self.assertEqual("invalid", status.source)
+        self.assertFalse(status.ok)
+        self.assertIn("JSONDecodeError", status.error_type)
+        self.assertIn("config.json", status.path)
+
+    def test_invalid_config_keeps_last_known_good_config_when_available(self):
+        module = _load_config_module()
+        previous = module.get_default_config()
+        previous["chat"]["model"] = "known-good-model"
+        module._plugin_config = previous
         with TemporaryDirectory() as tmp:
             bad_config = Path(tmp) / "config.json"
             bad_config.write_text("{ bad json", encoding="utf-8")
@@ -201,11 +246,10 @@ class ConfigValidationTests(unittest.TestCase):
             loaded = module.load_plugin_config()
             status = module.get_config_load_status()
 
-        self.assertEqual(module.get_default_config(), loaded)
-        self.assertEqual("fallback", status.source)
+        self.assertEqual("known-good-model", loaded["chat"]["model"])
+        self.assertEqual("last_known_good", status.source)
         self.assertFalse(status.ok)
         self.assertIn("JSONDecodeError", status.error_type)
-        self.assertIn("config.json", status.path)
 
     def test_status_command_reports_config_load_diagnostics(self):
         source = (PLUGIN_DIR / "handlers" / "commands.py").read_text(encoding="utf-8")

@@ -9,6 +9,19 @@ def _canonical_json(data) -> str:
     return json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
+def _coerce_json_array(value) -> list:
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+            if isinstance(parsed, list):
+                return parsed
+        except Exception:
+            return []
+    return []
+
+
 def _memory_action_schema(allow_memory_supersede: bool) -> str:
     base_schema = """
    - {{"action":"add","content":"完整的记忆内容，必须包含明确主语","related_user_id":"兼容字段，必须等于 subject_user_id；无法确定则为空字符串","subject_user_id":"事实主要描述的用户ID；无法确定则为空字符串","subject_user_name":"事实主要描述的用户名称；无法确定则为空字符串","speaker_user_id":"说出或确认该事实的新消息发送者ID","speaker_user_name":"说出或确认该事实的新消息发送者名称","category":"event|preference|profile|relationship","confidence":0.7,"importance":0.5}}
@@ -111,7 +124,7 @@ def get_feedback_prompt(
         },
         "history_summary": history_summary or "",
         "last_summary": last_summary or "",
-        "related_profiles": related_profiles_json or "[]",
+        "related_profiles": _coerce_json_array(related_profiles_json),
         "search_result": search_result or [],
         "existing_related_memories": safe_existing_related_memories,
         "memory_actions_allowed": memory_actions_allowed,
@@ -238,7 +251,7 @@ def get_chat_prompt(
             "arousal": arousal_guide,
             "dominance": dominance_guide,
         },
-        "related_profiles": related_profiles_json or "[]",
+        "related_profiles": _coerce_json_array(related_profiles_json),
         "search_result": search_result or [],
         "chat_summary": chat_summary or "",
         "examples_text": examples_text or "",

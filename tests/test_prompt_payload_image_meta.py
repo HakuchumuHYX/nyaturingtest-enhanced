@@ -77,6 +77,27 @@ class PromptPayloadImageMetaTests(unittest.TestCase):
         payload = _extract_payload(prompt)
         self.assertEqual(meta, payload["new_msgs"][0]["image_meta"])
 
+    def test_related_profiles_are_structured_arrays_not_json_strings(self):
+        related_profiles = [{"user_id": "1001", "emotion_tends_to_user": {"valence": 0.2}}]
+
+        feedback_prompt = self.tm.get_feedback_prompt(
+            bot_name="Nya", role="r", willingness=0.5, chat_state_value=1,
+            history_summary="", recent_msgs=[], new_msgs_formatted=[],
+            emotion={"valence": 0.0, "arousal": 0.0, "dominance": 0.0},
+            related_profiles_json=json.dumps(related_profiles, ensure_ascii=False),
+            search_result=[], last_summary="",
+        )
+        chat_prompt = self.tm.get_chat_prompt(
+            bot_name="Nya", role="r", chat_state_value=1,
+            history_summary="", recent_msgs=[], new_msgs_formatted=[],
+            emotion={"valence": 0.0, "arousal": 0.0, "dominance": 0.0},
+            related_profiles_json=json.dumps(related_profiles, ensure_ascii=False),
+            search_result=[], chat_summary="",
+        )
+
+        self.assertEqual(related_profiles, _extract_payload(feedback_prompt)["related_profiles"])
+        self.assertEqual(related_profiles, _extract_payload(chat_prompt)["related_profiles"])
+
     def test_feedback_prompt_mentions_image_meta_schema(self):
         prompt = self.tm.get_feedback_prompt(
             bot_name="Nya", role="r", willingness=0.5, chat_state_value=1,

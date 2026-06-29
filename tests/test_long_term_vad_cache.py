@@ -119,7 +119,9 @@ def _install_stub_modules(package_name: str):
 
     config = types.ModuleType(f"{package_name}.config")
     config.get_effective_chat_model = lambda: "chat-model"
+    config.get_effective_chat_provider = lambda: "openai_compatible"
     config.get_effective_feedback_model = lambda: "feedback-model"
+    config.get_effective_feedback_provider = lambda: "openai_compatible"
     config.get_runtime_settings = lambda: {"rag_final_k": 20, "rag_candidate_k": 40}
     config.get_chat_thinking_settings = lambda: {"enabled": False}
     config.get_chat_max_tokens = lambda: 1024

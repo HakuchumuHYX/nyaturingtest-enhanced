@@ -10,29 +10,39 @@ from ..utils import sanitize_text
 
 class MessageRepository:
     @staticmethod
+    def _message_final_id(msg: Message) -> str:
+        final_msg_id = str(msg.id or "")
+        if final_msg_id:
+            return final_msg_id
+        unique_str = "_".join([
+            sanitize_text(msg.content),
+            str(msg.time.timestamp()),
+            str(msg.user_id or ""),
+            sanitize_text(msg.user_name),
+        ])
+        return str(uuid.uuid5(uuid.NAMESPACE_DNS, unique_str))
+
+    @staticmethod
     async def sync_messages(session_id: str, recent_msgs: list[Message]):
         """增量同步消息到数据库"""
         try:
             session_db = await SessionModel.get_or_none(id=session_id)
             if not session_db:
-                return
+                raise RuntimeError(f"session not found: {session_id}")
 
-            msg_ids = [msg.id for msg in recent_msgs if msg.id]
+            final_msg_ids = [MessageRepository._message_final_id(msg) for msg in recent_msgs]
             existing_ids = set()
 
-            if msg_ids:
+            if final_msg_ids:
                 existing_msgs = await GlobalMessageModel.filter(
                     session=session_db,
-                    msg_id__in=msg_ids,
+                    msg_id__in=final_msg_ids,
                 ).values_list("msg_id", flat=True)
                 existing_ids = set(existing_msgs)
 
             bulk_msgs = []
             for msg in recent_msgs:
-                final_msg_id = msg.id
-                if not final_msg_id:
-                    unique_str = f"{sanitize_text(msg.content)}_{msg.time.timestamp()}"
-                    final_msg_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, unique_str))
+                final_msg_id = MessageRepository._message_final_id(msg)
 
                 if final_msg_id not in existing_ids:
                     bulk_msgs.append(
@@ -53,6 +63,7 @@ class MessageRepository:
 
         except Exception as e:
             logger.error(f"[Repo] 同步消息失败: {e}")
+            raise
 
     @staticmethod
     async def get_history_before(session_id: str, time_point: datetime, limit: int = 20) -> list[Message]:

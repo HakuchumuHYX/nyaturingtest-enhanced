@@ -12,6 +12,16 @@ class IngressLightweightTests(unittest.TestCase):
         self.assertNotIn("resolve_images=False", source)
         self.assertIn("resolve_images=plugin_config.get(\"vlm\", {}).get(\"enabled\", True)", source)
 
+    def test_queue_pressure_drops_low_priority_before_message_conversion(self):
+        source = (PLUGIN_DIR / "handlers" / "commands.py").read_text(encoding="utf-8")
+
+        self.assertIn("pre_queue_priority", source)
+        self.assertIn('decision="drop_pre_conversion"', source)
+        self.assertLess(
+            source.index("pre_queue_priority"),
+            source.index("message_content, image_meta = await message2BotMessage"),
+        )
+
     def test_image_sticker_sub_type_accepts_string_or_int(self):
         source = (PLUGIN_DIR / "core" / "logic.py").read_text(encoding="utf-8")
 

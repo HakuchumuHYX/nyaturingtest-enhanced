@@ -4,6 +4,7 @@ import hashlib
 import random
 import time
 import traceback
+from collections.abc import Collection
 
 from nonebot import logger
 from nonebot.adapters.onebot.v11 import Bot, Message, MessageSegment
@@ -52,6 +53,32 @@ def _should_resolve_image(resolve_images: bool) -> bool:
         and plugin_config.get("vlm", {}).get("enabled", True)
         and not is_shutting_down()
     )
+
+
+def _is_local_self_echo(msg: MMessage, bot_self_id: str, self_sent_ids: Collection[str]) -> bool:
+    msg_id = str(getattr(msg, "id", "") or "")
+    return bool(
+        msg_id
+        and str(getattr(msg, "user_id", "")) == str(bot_self_id)
+        and msg_id in self_sent_ids
+    )
+
+
+def _filter_local_self_echoes(
+        messages: list[MMessage],
+        bot_self_id: str,
+        self_sent_ids: Collection[str] | None = None,
+) -> tuple[list[MMessage], list[MMessage]]:
+    if self_sent_ids is None:
+        self_sent_ids = set(SELF_SENT_MSG_IDS)
+    filtered = []
+    local_echoes = []
+    for msg in messages:
+        if _is_local_self_echo(msg, bot_self_id, self_sent_ids):
+            local_echoes.append(msg)
+        else:
+            filtered.append(msg)
+    return filtered, local_echoes
 
 
 async def llm_response(client: LLMClient, message: str, model: str, temperature: float | None = None, json_mode: bool = False,
@@ -281,11 +308,25 @@ async def spawn_state(state: GroupState):
                     continue
                 
                 current_chunk = state.messages_chunk.copy()
+                chunk_bot = state.bot
+                chunk_event = state.event
                 state.messages_chunk.clear()
 
-            bot_self_id = str(state.bot.self_id)
-            # 过滤掉只有 Bot 自己发的消息的 chunk (通常是回显)
-            # 除非这些回显被某些逻辑标记为需要处理（目前没有）
+            if chunk_bot is None or chunk_event is None:
+                continue
+
+            bot_self_id = str(chunk_bot.self_id)
+            current_chunk, local_self_echoes = _filter_local_self_echoes(
+                current_chunk,
+                bot_self_id,
+                set(SELF_SENT_MSG_IDS),
+            )
+            if local_self_echoes:
+                logger.debug(f"过滤本机自身回显消息 {len(local_self_echoes)} 条")
+            if not current_chunk:
+                continue
+
+            # 非本机 bot-id 消息仍保留；整批都是 bot-id 时只写记忆，不触发 LLM。
             is_echo_only = all(str(msg.user_id) == bot_self_id for msg in current_chunk)
             
             # 如果全是回显，跳过生成回复，但需要更新记忆 (记录上下文)
@@ -308,6 +349,7 @@ async def spawn_state(state: GroupState):
             # 3. 加载 Session (加锁)
             async with state.session_lock:
                 await state.session.load_session()
+                turn_generation = getattr(state.session, "generation", 0)
 
             # 4. 组装 LLM 调用函数
 
@@ -414,13 +456,22 @@ async def spawn_state(state: GroupState):
                     messages_chunk=current_chunk,
                     chat_llm_func=chat_func,  # 传入 Chat 函数
                     feedback_llm_func=feedback_func,  # 传入 Feedback 函数
-                    publish=should_publish
+                    publish=should_publish,
+                    expected_generation=turn_generation,
                 )
 
                 # 6. 发送回复 (保持不变)
                 if responses:
+                    if state.session.is_generation_stale(turn_generation):
+                        state.session._log_stale_generation("pre_send", turn_generation)
+                        continue
                     total = len(responses)
+                    sent_count = 0
+                    runtime_settings = get_runtime_settings()
+                    max_turn_messages = max(0, int(runtime_settings["max_reply_messages"]))
                     for r_idx, response in enumerate(responses):
+                        if sent_count >= max_turn_messages:
+                            break
                         raw_content = ""
                         reply_id = None
                         if isinstance(response, str):
@@ -431,13 +482,18 @@ async def spawn_state(state: GroupState):
 
                         if not raw_content: continue
 
-                        runtime_settings = get_runtime_settings()
+                        remaining_messages = max_turn_messages - sent_count
                         msg_parts = build_send_parts(
                             raw_content,
-                            max_messages=runtime_settings["max_reply_messages"],
+                            max_messages=remaining_messages,
                             strategy=runtime_settings["send_strategy"],
                         )
                         for i, part in enumerate(msg_parts):
+                            if sent_count >= max_turn_messages:
+                                break
+                            if state.session.is_generation_stale(turn_generation):
+                                state.session._log_stale_generation("send_loop", turn_generation)
+                                break
                             part = part.strip()
 
                             if not part: continue
@@ -451,7 +507,8 @@ async def spawn_state(state: GroupState):
                                     logger.warning(f"引用ID无效: {reply_id}")
 
                             try:
-                                result = await state.bot.send(message=msg_to_send, event=state.event)
+                                result = await chunk_bot.send(message=msg_to_send, event=chunk_event)
+                                sent_count += 1
 
                                 sent_content = msg_to_send.extract_plain_text()
                                 if not sent_content and len(msg_to_send) > 0:
@@ -465,9 +522,16 @@ async def spawn_state(state: GroupState):
                                     msg_id = _build_self_message_id(sent_content)
                                     logger.debug(f"发送结果无 message_id，使用本地自身消息 ID: {msg_id}")
 
+                                if state.session.is_generation_stale(turn_generation):
+                                    state.session._log_stale_generation("append_self_message", turn_generation)
+                                    continue
+
                                 # 主动写入记忆，确保"知道自己上一句说了什么"
                                 async with state.session_lock:
-                                    await state.session.append_self_message(sent_content, msg_id, str(state.bot.self_id))
+                                    if state.session.is_generation_stale(turn_generation):
+                                        state.session._log_stale_generation("append_self_message_locked", turn_generation)
+                                        continue
+                                    await state.session.append_self_message(sent_content, msg_id, str(chunk_bot.self_id))
 
                             except ActionFailed as e:
                                 if getattr(e, "retcode", 0) == 1200 or "120" in str(e):

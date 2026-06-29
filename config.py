@@ -131,7 +131,6 @@ def get_default_config() -> dict:
             "send_strategy": "split_by_sentence",
             "max_reply_messages": 2,
             "humanized_delay_seconds": 1.0,
-            "low_willingness_observe_interval": 5,
             "role_max_chars": 4000,
             "examples_max_chars": 2000,
             "short_context_limit": 20,
@@ -142,6 +141,10 @@ def get_default_config() -> dict:
             "consolidation_max_messages": 60,
             "interaction_log_recent_days": 180,
             "history_recall_limit": 20,
+            "backup_retention_count": 7,
+            "raw_message_retention_days": 0,
+            "raw_interaction_retention_days": 0,
+            "token_usage_retention_days": 0,
             "speak_cooldown_seconds": 16.0,
             "willingness_idle_after_seconds": 300.0,
             "willingness_decay_rate_active": 0.03,
@@ -314,10 +317,13 @@ def load_plugin_config() -> dict:
         _set_config_load_status(ok=False, source="invalid", error=e)
         raise
     except Exception as e:
-        logger.error(f"加载配置文件失败: {e}，使用默认配置")
-        _plugin_config = get_default_config()
-        _set_config_load_status(ok=False, source="fallback", error=e)
-        return _plugin_config
+        if _plugin_config:
+            logger.error(f"加载配置文件失败: {e}，继续使用上一份有效配置")
+            _set_config_load_status(ok=False, source="last_known_good", error=e)
+            return _plugin_config
+        logger.error(f"加载配置文件失败: {e}，无上一份有效配置可用")
+        _set_config_load_status(ok=False, source="invalid", error=e)
+        raise
 
 
 def save_plugin_config(config: dict):
@@ -426,6 +432,8 @@ def get_token_stats_model_names() -> list[str]:
 
 def get_runtime_settings() -> dict[str, Any]:
     runtime = plugin_config.get("runtime", {}) or {}
+    # Deprecated legacy key accepted in local config but intentionally ignored:
+    # low_willingness_observe_interval. Passive observation is consolidation-driven.
 
     def number(name: str, default, cast, *, minimum=None, maximum=None):
         value = runtime.get(name, default)
@@ -456,7 +464,6 @@ def get_runtime_settings() -> dict[str, Any]:
         "send_strategy": str(runtime.get("send_strategy") or "split_by_sentence"),
         "max_reply_messages": number("max_reply_messages", 2, int, minimum=1),
         "humanized_delay_seconds": number("humanized_delay_seconds", 1.0, float, minimum=0.0),
-        "low_willingness_observe_interval": number("low_willingness_observe_interval", 5, int, minimum=0),
         "role_max_chars": number("role_max_chars", 4000, int, minimum=1),
         "examples_max_chars": number("examples_max_chars", 2000, int, minimum=0),
         "short_context_limit": number("short_context_limit", 20, int, minimum=1),
@@ -467,6 +474,10 @@ def get_runtime_settings() -> dict[str, Any]:
         "consolidation_max_messages": number("consolidation_max_messages", 60, int, minimum=1),
         "interaction_log_recent_days": number("interaction_log_recent_days", 180, int, minimum=1),
         "history_recall_limit": number("history_recall_limit", 20, int, minimum=1),
+        "backup_retention_count": number("backup_retention_count", 7, int, minimum=1),
+        "raw_message_retention_days": number("raw_message_retention_days", 0, int, minimum=0),
+        "raw_interaction_retention_days": number("raw_interaction_retention_days", 0, int, minimum=0),
+        "token_usage_retention_days": number("token_usage_retention_days", 0, int, minimum=0),
         "speak_cooldown_seconds": number("speak_cooldown_seconds", 16.0, float, minimum=0.0),
         "willingness_idle_after_seconds": number("willingness_idle_after_seconds", 300.0, float, minimum=0.0),
         "willingness_decay_rate_active": number("willingness_decay_rate_active", 0.03, float, minimum=0.0),

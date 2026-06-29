@@ -1,12 +1,28 @@
 # nyaturingtest/client.py
 import asyncio
 from dataclasses import dataclass, field
+import hashlib
 import time
 from typing import Callable, Any, Optional
 
 import httpx
 from openai import AsyncOpenAI, APIConnectionError, APITimeoutError
 from nonebot import logger
+
+try:
+    from .json_mode import is_json_mode_unsupported_error
+except ImportError:
+    def is_json_mode_unsupported_error(exc: Exception) -> bool:
+        text = str(exc).lower()
+        return (
+            "json mode is not supported" in text
+            or "response_format" in text and "not supported" in text
+        )
+
+
+PROVIDER_ADVISORY_BACKOFF_SECONDS = 5.0
+PROVIDER_ADVISORY_BACKOFF_MAX_SLEEP_SECONDS = 1.0
+_SHARED_PROVIDER_BACKOFF_UNTIL: dict[str, float] = {}
 
 
 @dataclass
@@ -43,11 +59,15 @@ class LLMClient:
         openai_client: Optional[AsyncOpenAI] = None,
         timeout: float = 60.0,
         proxy: Optional[str] = None,
+        base_url: str = "",
+        api_key: str = "",
     ):
         self.provider = self._normalize_provider(provider)
         self.openai_client = openai_client
         self.timeout = timeout
         self.proxy = proxy
+        self.base_url = (base_url or "").strip().rstrip("/")
+        self._api_key_hash = self._hash_secret(api_key)
         self.provider_status = ProviderStatus()
 
     @staticmethod
@@ -63,6 +83,48 @@ class LLMClient:
         if not self.openai_client:
             raise RuntimeError("openai_client is required for LLMClient")
         return self.openai_client
+
+    @staticmethod
+    def _hash_secret(value: str | None) -> str:
+        value = value or ""
+        if not value:
+            return ""
+        return hashlib.sha256(value.encode("utf-8", "ignore")).hexdigest()[:16]
+
+    def _client_base_url(self) -> str:
+        if self.base_url:
+            return self.base_url
+        return str(getattr(self.openai_client, "base_url", "") or "").strip().rstrip("/")
+
+    def _client_api_key_hash(self) -> str:
+        if self._api_key_hash:
+            return self._api_key_hash
+        return self._hash_secret(str(getattr(self.openai_client, "api_key", "") or ""))
+
+    def _provider_backoff_key(self, model: str) -> str:
+        return "|".join([
+            self.provider,
+            self._client_base_url(),
+            self._client_api_key_hash(),
+            str(model or ""),
+        ])
+
+    async def _sleep_for_shared_provider_backoff(self, model: str) -> None:
+        key = self._provider_backoff_key(model)
+        until = _SHARED_PROVIDER_BACKOFF_UNTIL.get(key, 0.0)
+        remaining = until - time.time()
+        if remaining <= 0:
+            return
+        delay = min(remaining, PROVIDER_ADVISORY_BACKOFF_MAX_SLEEP_SECONDS)
+        logger.warning(f"[LLM] provider advisory backoff {delay:.2f}s for {self.provider}/{model}")
+        await asyncio.sleep(delay)
+
+    def _record_shared_provider_backoff(self, model: str) -> None:
+        key = self._provider_backoff_key(model)
+        _SHARED_PROVIDER_BACKOFF_UNTIL[key] = max(
+            _SHARED_PROVIDER_BACKOFF_UNTIL.get(key, 0.0),
+            time.time() + PROVIDER_ADVISORY_BACKOFF_SECONDS,
+        )
 
     @staticmethod
     def _is_thinking_enabled(extra_body: dict[str, Any] | None) -> bool:
@@ -162,6 +224,7 @@ class LLMClient:
         system_content = system_prompt or "You are an intelligent agent. Output only valid JSON."
         max_retries = 3
         base_delay = 2
+        json_mode_fallback_used = False
 
         for attempt in range(max_retries):
             if self.provider_status.circuit_until > time.time():
@@ -175,6 +238,7 @@ class LLMClient:
                         "error_message": "provider circuit breaker is open",
                     },
                 )
+            await self._sleep_for_shared_provider_backoff(model)
 
             request_kwargs = dict(kwargs)
             request_timeout = request_kwargs.pop("timeout", self.timeout)
@@ -194,72 +258,86 @@ class LLMClient:
                 request_kwargs.pop("top_p", None)
                 request_kwargs.pop("presence_penalty", None)
                 request_kwargs.pop("frequency_penalty", None)
+            if json_mode_fallback_used:
+                request_kwargs.pop("response_format", None)
             request_kwargs = {key: value for key, value in request_kwargs.items() if value is not None}
 
-            try:
-                client = self._openai_client_required()
-                response = await client.chat.completions.create(
-                    model=model,
-                    messages=[
-                        {"role": "system", "content": system_content},
-                        {"role": "user", "content": prompt},
-                    ],
-                    timeout=request_timeout,
-                    **request_kwargs,
-                )
+            while True:
+                try:
+                    client = self._openai_client_required()
+                    response = await client.chat.completions.create(
+                        model=model,
+                        messages=[
+                            {"role": "system", "content": system_content},
+                            {"role": "user", "content": prompt},
+                        ],
+                        timeout=request_timeout,
+                        **request_kwargs,
+                    )
 
-                choice = response.choices[0]
-                message = choice.message
-                finish_reason = getattr(choice, "finish_reason", "") or ""
-                content = getattr(message, "content", "") or ""
-                reasoning_content = getattr(message, "reasoning_content", "") or ""
-                usage = self._usage_to_dict(getattr(response, "usage", None), finish_reason)
-                usage["provider"] = self.provider
+                    choice = response.choices[0]
+                    message = choice.message
+                    finish_reason = getattr(choice, "finish_reason", "") or ""
+                    content = getattr(message, "content", "") or ""
+                    reasoning_content = getattr(message, "reasoning_content", "") or ""
+                    usage = self._usage_to_dict(getattr(response, "usage", None), finish_reason)
+                    usage["provider"] = self.provider
 
-                result = LLMResponse(
-                    content=content,
-                    reasoning_content=reasoning_content,
-                    finish_reason=finish_reason,
-                    model=getattr(response, "model", "") or model,
-                    provider=self.provider,
-                    usage=usage,
-                )
+                    result = LLMResponse(
+                        content=content,
+                        reasoning_content=reasoning_content,
+                        finish_reason=finish_reason,
+                        model=getattr(response, "model", "") or model,
+                        provider=self.provider,
+                        usage=usage,
+                    )
 
-                if on_usage:
-                    try:
-                        on_usage(usage)
-                    except Exception as ex:
-                        logger.warning(f"Usage callback failed: {ex}")
+                    if on_usage:
+                        try:
+                            on_usage(usage)
+                        except Exception as ex:
+                            logger.warning(f"Usage callback failed: {ex}")
 
-                if finish_reason == "length":
-                    return self._error_response(model, "length", "finish_reason=length")
-                if not content.strip() and attempt < max_retries - 1:
-                    self.provider_status.last_error_type = "empty_content"
-                    self.provider_status.last_error_message = "empty content from provider"
-                    self.provider_status.last_error_time = time.time()
-                    await asyncio.sleep(0.2)
-                    continue
+                    if finish_reason == "length":
+                        return self._error_response(model, "length", "finish_reason=length")
+                    if not content.strip() and attempt < max_retries - 1:
+                        self.provider_status.last_error_type = "empty_content"
+                        self.provider_status.last_error_message = "empty content from provider"
+                        self.provider_status.last_error_time = time.time()
+                        await asyncio.sleep(0.2)
+                        break
 
-                return result
+                    return result
 
-            except (APIConnectionError, APITimeoutError, httpx.ConnectError, httpx.ReadTimeout) as e:
-                logger.warning(f"[LLM] 网络请求失败 (尝试 {attempt + 1}/{max_retries}): {type(e).__name__} - {e}")
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(base_delay * (attempt + 1))
-                else:
+                except (APIConnectionError, APITimeoutError, httpx.ConnectError, httpx.ReadTimeout) as e:
+                    logger.warning(f"[LLM] 网络请求失败 (尝试 {attempt + 1}/{max_retries}): {type(e).__name__} - {e}")
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(base_delay * (attempt + 1))
+                        break
                     logger.error(f"[LLM] 最终请求失败: {e}")
                     return self._error_response(model, "network_error", str(e))
 
-            except Exception as e:
-                error_type = self._classify_exception(e)
-                logger.error(f"[LLM] API 调用失败 [{error_type}]: {e}")
-                if error_type == "rate_limit":
-                    self.provider_status.circuit_until = time.time() + 30
+                except Exception as e:
+                    if (
+                        "response_format" in request_kwargs
+                        and not json_mode_fallback_used
+                        and is_json_mode_unsupported_error(e)
+                    ):
+                        logger.warning("LLM 模型不支持 JSON mode，已降级为普通文本 JSON 提示重试")
+                        request_kwargs.pop("response_format", None)
+                        json_mode_fallback_used = True
+                        continue
+
+                    error_type = self._classify_exception(e)
+                    logger.error(f"[LLM] API 调用失败 [{error_type}]: {e}")
+                    if error_type == "rate_limit":
+                        self._record_shared_provider_backoff(model)
+                        self.provider_status.circuit_until = time.time() + 30
+                        return self._error_response(model, error_type, str(e))
+                    if error_type in {"insufficient_system_resource", "server_error"} and attempt < max_retries - 1:
+                        await asyncio.sleep(base_delay * (attempt + 1))
+                        break
                     return self._error_response(model, error_type, str(e))
-                if error_type in {"insufficient_system_resource", "server_error"} and attempt < max_retries - 1:
-                    await asyncio.sleep(base_delay * (attempt + 1))
-                    continue
-                return self._error_response(model, error_type, str(e))
 
         return self._error_response(model, "retry_exhausted", "max retries exhausted")
 

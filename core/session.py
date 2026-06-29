@@ -19,6 +19,7 @@ from ..llm.client import LLMClient
 from ..config import get_chat_thinking_settings, get_runtime_settings
 from ..models.emotion import EmotionState, clamp_vad_value
 from ..memory.vector import VectorMemory, where_any
+from ..memory.validation import validate_memory_candidate
 from ..models.impression import Impression
 from ..memory.short_term import Memory, Message
 from ..prompts.presets import PRESETS
@@ -28,6 +29,7 @@ from ..prompts.templates import get_feedback_prompt, get_chat_prompt
 from ..database.message_repository import MessageRepository
 from ..database.profile_repository import ProfileRepository
 from ..database.session_repository import SessionStateRepository
+from ..database.backup_lock import BACKUP_IO_LOCK
 from .services import RagSearchService
 from .orchestrator import ConversationOrchestrator
 from .structured_log import log_event
@@ -123,6 +125,9 @@ class _FeedbackContext:
     existing_related_memories: list[dict]
     allow_memory_supersede: bool
     active_user_ids: set[str]
+
+
+_STALE_GENERATION_WRITE = object()
 
 
 def _score_stat_fields(stats: dict) -> dict:
@@ -244,6 +249,8 @@ class Session:
                 http_client=self._client_instance,
                 max_retries=0,
             ),
+            base_url="https://api.siliconflow.cn/v1",
+            api_key=self._siliconflow_api_key,
         )
 
         runtime_settings = get_runtime_settings()
@@ -273,15 +280,60 @@ class Session:
         self._last_decay_time = datetime.now()
         self._last_speak_time = datetime.min
         self._active_count = 0
-        self._passive_observe_skips = 0
         self._engaged = False
         self.last_consolidated_time = None
         self._messages_since_consolidation = 0
         self._last_consolidation_attempt = datetime.min
         self._loaded = False
         self._background_tasks = set()
+        self._save_lock = asyncio.Lock()
+        self.generation = 0
+
+    def bump_generation(self, reason: str = "") -> int:
+        self.generation += 1
+        log_event("session_generation_bumped",
+            session_id=self.id,
+            generation=self.generation,
+            reason=reason,
+        )
+        return self.generation
+
+    def is_generation_stale(self, expected_generation: int | None) -> bool:
+        return expected_generation is not None and self.generation != expected_generation
+
+    def _log_stale_generation(self, stage: str, expected_generation: int | None) -> None:
+        log_event("stale_turn_discarded",
+            session_id=self.id,
+            stage=stage,
+            expected_generation=expected_generation,
+            current_generation=self.generation,
+        )
+
+    async def _run_sync_if_generation_current(
+        self,
+        func,
+        *args,
+        expected_generation: int | None = None,
+        stage: str,
+        **kwargs,
+    ):
+        if self.is_generation_stale(expected_generation):
+            self._log_stale_generation(stage, expected_generation)
+            return _STALE_GENERATION_WRITE
+
+        def guarded():
+            with BACKUP_IO_LOCK:
+                if self.is_generation_stale(expected_generation):
+                    return _STALE_GENERATION_WRITE
+                return func(*args, **kwargs)
+
+        result = await run_sync(guarded)()
+        if result is _STALE_GENERATION_WRITE:
+            self._log_stale_generation(stage, expected_generation)
+        return result
 
     async def set_role(self, name: str, role: str):
+        self.bump_generation("set_role")
         self.__role = _limit_role_text(role, get_runtime_settings()["role_max_chars"])
         self.__name = name
         self.__aliases = []
@@ -298,6 +350,7 @@ class Session:
         return list(self.__aliases)
 
     async def reset(self):
+        self.bump_generation("reset")
         self.__name = "terminus"
         self.__aliases = []
         self.__role = "一个男性人类"
@@ -317,12 +370,15 @@ class Session:
         self.last_consolidated_time = None
         self._messages_since_consolidation = 0
         self._last_consolidation_attempt = datetime.min
-        # 清理数据库中的所有关联数据
-        await SessionStateRepository.delete_session_data(self.id)
-        await self.save_session()
+        # 清理数据库中的所有关联数据，并与后台持久化共用同一把锁：
+        # 旧 generation 的后台写入要么已在删除前完成，要么拿锁后被跳过。
+        async with self._save_lock:
+            await SessionStateRepository.delete_session_data(self.id)
+            await self._save_session_locked()
         logger.info(f"[Session {self.id}] 已完全重置（含数据库清理）")
 
     async def calm_down(self):
+        self.bump_generation("calm_down")
         self.global_emotion = EmotionState()
         self.profiles = {}
         self.__chatting_state = _ChattingState.IDLE
@@ -334,6 +390,7 @@ class Session:
 
     async def reset_emotion(self):
         """仅重置情绪状态（VAD），不影响意愿值、聊天状态、记忆等"""
+        self.bump_generation("reset_emotion")
         self.global_emotion = EmotionState()
         # 同时重置所有用户画像的情绪
         for profile in self.profiles.values():
@@ -350,6 +407,14 @@ class Session:
         task.add_done_callback(self._background_tasks.discard)
         return task
 
+    def _schedule_save_session(self, force_index: bool = False):
+        return self._create_safe_task(
+            self.save_session(
+                force_index=force_index,
+                expected_generation=self.generation,
+            )
+        )
+
     @staticmethod
     def _on_task_done(task: asyncio.Task):
         if task.cancelled():
@@ -358,7 +423,21 @@ class Session:
         if exc:
             logger.error(f"[Session] 后台任务异常: {exc}")
 
-    async def save_session(self, force_index: bool = False):
+    async def save_session(
+        self,
+        force_index: bool = False,
+        expected_generation: int | None = None,
+    ) -> bool:
+        if self.is_generation_stale(expected_generation):
+            self._log_stale_generation("save_session", expected_generation)
+            return False
+        async with self._save_lock:
+            if self.is_generation_stale(expected_generation):
+                self._log_stale_generation("save_session_locked", expected_generation)
+                return False
+            return await self._save_session_locked(force_index=force_index)
+
+    async def _save_session_locked(self, force_index: bool = False) -> bool:
         try:
             # 1. 保存基础状态
             await SessionStateRepository.save_session_state(
@@ -397,8 +476,10 @@ class Session:
                 await run_sync(self.long_term_memory.cleanup)(days_retention=90)
 
             logger.debug(f"[Session {self.id}] 数据库保存成功")
+            return True
         except Exception as e:
             logger.warning(f"[Session {self.id}] 数据库保存警告: {e}")
+            return False
 
     async def load_session(self):
         if self._loaded: return
@@ -480,6 +561,7 @@ class Session:
             filename = f"{filename}.json"
         if filename not in PRESETS.keys(): return False
 
+        self.bump_generation("load_preset")
         preset = PRESETS[filename]
         base_role = preset.role
         self.__name = preset.name
@@ -777,7 +859,12 @@ class Session:
             active_user_ids=active_user_ids,
         )
 
-    def _apply_sediment(self, ctx: _FeedbackContext, messages_chunk: list[Message]) -> None:
+    def _apply_sediment(
+        self,
+        ctx: _FeedbackContext,
+        messages_chunk: list[Message],
+        expected_generation: int | None = None,
+    ) -> None:
         """应用 Feedback 的沉淀结果：情绪、画像、摘要、长期记忆。"""
         response_dict = ctx.response_dict
 
@@ -817,7 +904,13 @@ class Session:
 
                     # 2. 异步写入数据库
                     # 启动一个后台任务去存库，不阻塞主流程
-                    self._create_safe_task(self._save_interaction_log(uid, delta))
+                    self._create_safe_task(
+                        self._save_interaction_log(
+                            uid,
+                            delta,
+                            expected_generation=expected_generation,
+                        )
+                    )
 
         for p in self.profiles.values():
             p.update_emotion_tends()
@@ -844,6 +937,7 @@ class Session:
                     analyze_result,
                     default_user_id=fallback_uid,
                     supersede_candidates=ctx.existing_related_memories,
+                    expected_generation=expected_generation,
                 )
             )
 
@@ -852,6 +946,7 @@ class Session:
             ctx: _FeedbackContext,
             messages_chunk: list[Message],
             is_relevant: bool,
+            expected_generation: int | None = None,
     ) -> list[str]:
         """应用 Feedback 的发言决策结果：历史溯源、意愿、状态。"""
         response_dict = ctx.response_dict
@@ -879,6 +974,10 @@ class Session:
 
                     recalled_history = formatted_history
                     logger.info(f"[Session {self.id}] 成功回溯了 {len(formatted_history)} 条历史消息")
+
+        if self.is_generation_stale(expected_generation):
+            self._log_stale_generation("feedback_decision", expected_generation)
+            return []
 
         # 7. 更新意愿值 (带强关联兜底)
         try:
@@ -909,7 +1008,8 @@ class Session:
 
     async def feedback_stage(self, messages_chunk: list[Message], llm_func: Callable,
                                is_relevant: bool = False,
-                               search_result: _SearchResult | None = None) -> list[str]:
+                               search_result: _SearchResult | None = None,
+                               expected_generation: int | None = None) -> list[str]:
         """
         反馈阶段：分析情绪、提取记忆、更新摘要
         返回：recalled_history (溯源到的历史消息列表)
@@ -918,12 +1018,20 @@ class Session:
         ctx = await self._run_feedback_llm(messages_chunk, llm_func, is_relevant, search_result)
         if ctx is None:
             return []
-        self._apply_sediment(ctx, messages_chunk)
-        recalled_history = await self._apply_decision(ctx, messages_chunk, is_relevant)
+        if self.is_generation_stale(expected_generation):
+            self._log_stale_generation("feedback_sediment", expected_generation)
+            return []
+        self._apply_sediment(ctx, messages_chunk, expected_generation=expected_generation)
+        recalled_history = await self._apply_decision(ctx, messages_chunk, is_relevant, expected_generation)
         logger.debug(f"<< 反馈结束: 意愿 {self.willingness:.2f}, 状态 {self.__chatting_state}")
         return recalled_history
 
-    async def consolidate_stage(self, messages_chunk: list[Message], feedback_llm_func: Callable) -> None:
+    async def consolidate_stage(
+        self,
+        messages_chunk: list[Message],
+        feedback_llm_func: Callable,
+        expected_generation: int | None = None,
+    ) -> None:
         """常驻记忆固化：分析+沉淀，但不改回复意愿、不做发言决策。"""
         if not messages_chunk:
             return
@@ -941,6 +1049,9 @@ class Session:
             use_rerank=False,
             force_retrieve=True,
         )
+        if self.is_generation_stale(expected_generation):
+            self._log_stale_generation("consolidation_search", expected_generation)
+            return
         ctx = await self._run_feedback_llm(
             messages_chunk,
             feedback_llm_func,
@@ -949,7 +1060,10 @@ class Session:
         )
         if ctx is None:
             return
-        self._apply_sediment(ctx, messages_chunk)
+        if self.is_generation_stale(expected_generation):
+            self._log_stale_generation("consolidation_sediment", expected_generation)
+            return
+        self._apply_sediment(ctx, messages_chunk, expected_generation=expected_generation)
         latest = max((m.time for m in messages_chunk), default=None)
         if latest is not None:
             if self.last_consolidated_time is None or latest > self.last_consolidated_time:
@@ -963,12 +1077,17 @@ class Session:
             analyze_result: list,
             default_user_id: str = "",
             supersede_candidates: list[dict] | None = None,
+            expected_generation: int | None = None,
     ):
         """
         后台任务：保存长期记忆到向量数据库
         优化：增加质量过滤和去重
         """
         try:
+            if self.is_generation_stale(expected_generation):
+                self._log_stale_generation("long_term_memory", expected_generation)
+                return
+
             today = int(datetime.now().strftime("%Y%m%d"))
             runtime_settings = get_runtime_settings()
             skipped_quality = 0
@@ -1011,7 +1130,7 @@ class Session:
                     speaker_user_name = str(item.get("speaker_user_name") or "").strip()
                     if not subject_user_id and default_user_id:
                         subject_user_id = default_user_id
-                    category = str(item.get("category") or "event").strip() or "event"
+                    category = str(item.get("category") or "event").strip().lower() or "event"
                     try:
                         confidence = max(0.0, min(1.0, float(item.get("confidence", 0.7))))
                     except (TypeError, ValueError):
@@ -1068,10 +1187,31 @@ class Session:
                         )
                         continue
 
-                # 质量过滤：使用 should_store_memory 函数
+                # 质量过滤：基础长度/噪声过滤 + 服务端事实边界验证。
                 if not should_store_memory(content):
                     skipped_quality += 1
                     logger.debug(f"[Memory] 跳过低质量记忆: {content[:30]}...")
+                    continue
+                validation_result = validate_memory_candidate(
+                    content=content,
+                    category=category,
+                    confidence=confidence,
+                    subject_user_id=subject_user_id,
+                    subject_user_name=subject_user_name,
+                    reason=str(item.get("reason") or "") if isinstance(item, dict) else "",
+                )
+                if not validation_result.valid:
+                    skipped_quality += 1
+                    log_event(
+                        "memory_candidate_rejected",
+                        session_id=self.id,
+                        action=action,
+                        category=category,
+                        reason=validation_result.reason,
+                    )
+                    logger.debug(
+                        f"[Memory] 跳过不可靠记忆({validation_result.reason}): {content[:30]}..."
+                    )
                     continue
 
                 metadata = {
@@ -1094,19 +1234,57 @@ class Session:
                 if action == "supersede":
                     target_ref = str(item.get("target_ref") or "").strip()
                     metadata["supersedes"] = target_ref
-                    await run_sync(self.long_term_memory.add_texts)([content], metadatas=[metadata])
+                    add_result = await self._run_sync_if_generation_current(
+                        self.long_term_memory.add_texts,
+                        [content],
+                        metadatas=[metadata],
+                        expected_generation=expected_generation,
+                        stage="long_term_memory_add",
+                    )
+                    if add_result is _STALE_GENERATION_WRITE:
+                        return
+                    confirmed_added = (
+                        isinstance(add_result, dict)
+                        and int(add_result.get("added") or 0) >= 1
+                    )
+                    if not confirmed_added:
+                        log_event(
+                            "rag_action_rejected",
+                            session_id=self.id,
+                            action=action,
+                            target_ref=target_ref,
+                            reason="replacement_not_confirmed_in_vector_store",
+                            queued_wal=add_result.get("queued_wal") if isinstance(add_result, dict) else None,
+                            failed=add_result.get("failed") if isinstance(add_result, dict) else None,
+                        )
+                        continue
                     updated_target_metadata = dict(target_metadata)
                     updated_target_metadata["status"] = "superseded"
                     updated_target_metadata["superseded_at"] = datetime.now().astimezone().isoformat()
                     updated_target_metadata["superseded_reason"] = str(item.get("reason") or "")[:200]
-                    await run_sync(self.long_term_memory.update_metadata_by_id)(target_ref, updated_target_metadata)
+                    update_result = await self._run_sync_if_generation_current(
+                        self.long_term_memory.update_metadata_by_id,
+                        target_ref,
+                        updated_target_metadata,
+                        expected_generation=expected_generation,
+                        stage="long_term_memory_supersede",
+                    )
+                    if update_result is _STALE_GENERATION_WRITE:
+                        return
                     superseded_count += 1
                 else:
                     pending_memories.append((content, metadata))
 
             store_result = {"added": 0, "skipped_dedup": 0}
             if pending_memories:
-                store_result = await run_sync(self.long_term_memory.add_memories_with_dedup)(pending_memories)
+                store_result = await self._run_sync_if_generation_current(
+                    self.long_term_memory.add_memories_with_dedup,
+                    pending_memories,
+                    expected_generation=expected_generation,
+                    stage="long_term_memory_bulk",
+                )
+                if store_result is _STALE_GENERATION_WRITE:
+                    return
 
             saved_count = store_result.get("added", 0)
             skipped_dedup = store_result.get("skipped_dedup", 0)
@@ -1119,7 +1297,8 @@ class Session:
 
     async def chat_stage(self, messages_chunk: list[Message], llm_func: Callable,
                            recalled_history: list[str],
-                           search_result: _SearchResult | None = None) -> list[dict]:
+                           search_result: _SearchResult | None = None,
+                           expected_generation: int | None = None) -> list[dict]:
         logger.debug(">> 对话阶段 (Chat) 开始")
         search_history = search_result.mem_history if search_result else []
         formatted_msgs = [
@@ -1197,6 +1376,10 @@ class Session:
             if not isinstance(replies, list):
                 return []
 
+            if self.is_generation_stale(expected_generation):
+                self._log_stale_generation("chat_reply", expected_generation)
+                return []
+
             if replies:
                 retain = get_runtime_settings()["speak_willingness_retain_factor"]
                 self.willingness = max(0.0, self.willingness * retain)
@@ -1223,7 +1406,7 @@ class Session:
         )
         
         await self.global_memory.update([msg])
-        self._create_safe_task(self.save_session())
+        self._schedule_save_session()
 
     async def update_without_trigger(self, messages_chunk: list[Message]):
         """
@@ -1232,7 +1415,7 @@ class Session:
         if not messages_chunk: return
         logger.debug(f"[Session {self.id}] 处理回显消息 (Count: {len(messages_chunk)})")
         await self.global_memory.update(messages_chunk)
-        self._create_safe_task(self.save_session())
+        self._schedule_save_session()
 
     async def drain_background_tasks(self, timeout: float | None = None):
         if timeout is None:
@@ -1263,13 +1446,27 @@ class Session:
     async def update(self, messages_chunk: list[Message],
                      chat_llm_func: Callable[[str, bool], Awaitable[str]],
                      feedback_llm_func: Callable[[str, bool], Awaitable[str]],
-                     publish: bool = True) -> list[dict] | None:
+                     publish: bool = True,
+                     expected_generation: int | None = None) -> list[dict] | None:
         return await ConversationOrchestrator(self).process_chunk(
             messages_chunk,
             chat_llm_func,
             feedback_llm_func,
             publish=publish,
+            expected_generation=expected_generation,
         )
 
-    async def _save_interaction_log(self, user_id: str, delta: dict):
-        await ProfileRepository.log_interaction(self.id, user_id, delta)
+    async def _save_interaction_log(
+        self,
+        user_id: str,
+        delta: dict,
+        expected_generation: int | None = None,
+    ):
+        if self.is_generation_stale(expected_generation):
+            self._log_stale_generation("interaction_log", expected_generation)
+            return
+        async with self._save_lock:
+            if self.is_generation_stale(expected_generation):
+                self._log_stale_generation("interaction_log_locked", expected_generation)
+                return
+            await ProfileRepository.log_interaction(self.id, user_id, delta)

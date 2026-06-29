@@ -40,13 +40,35 @@ class AddTextsWALTests(unittest.TestCase):
 
         mem.collection = BoomCollection()
 
-        mem.add_texts(["记住这件事"], metadatas=[{"source": "memory"}])
+        result = mem.add_texts(["记住这件事"], metadatas=[{"source": "memory"}])
 
         wal = os.path.join(tmp, "pending_memories.jsonl")
         self.assertTrue(os.path.exists(wal))
         with open(wal, encoding="utf-8") as handle:
             line = json.loads(handle.readline())
         self.assertEqual("记住这件事", line["content"])
+        self.assertEqual({"added": 0, "queued_wal": 1, "failed": 0}, result)
+
+    def test_successful_add_returns_confirmed_write_result(self):
+        import tempfile
+
+        from test_vector_batch import _load_vector_module
+
+        module = _load_vector_module()
+        mem = object.__new__(module.VectorMemory)
+        mem.persist_directory = tempfile.mkdtemp()
+        added = []
+
+        class OkCollection:
+            def add(self, **kwargs):
+                added.extend(kwargs["documents"])
+
+        mem.collection = OkCollection()
+
+        result = mem.add_texts(["确认写入的记忆"], metadatas=[{"source": "memory"}])
+
+        self.assertEqual(["确认写入的记忆"], added)
+        self.assertEqual({"added": 1, "queued_wal": 0, "failed": 0}, result)
 
 
 class WALReplayTests(unittest.TestCase):
@@ -105,6 +127,39 @@ class DedupWALTests(unittest.TestCase):
         ])
 
         self.assertEqual(1, result["dedup_errors"])
+        wal = os.path.join(tmp, "pending_memories.jsonl")
+        self.assertTrue(os.path.exists(wal))
+        with open(wal, encoding="utf-8") as handle:
+            line = json.loads(handle.readline())
+        self.assertEqual("Alice 讨厌香菜", line["content"])
+
+    def test_dedup_add_failure_does_not_count_wal_as_added(self):
+        import json
+        import os
+        import tempfile
+
+        from test_vector_batch import _load_vector_module
+
+        module = _load_vector_module()
+        mem = object.__new__(module.VectorMemory)
+        tmp = tempfile.mkdtemp()
+        mem.persist_directory = tmp
+
+        class FailingAddCollection:
+            def query(self, **kwargs):
+                return {"distances": [[]]}
+
+            def add(self, **kwargs):
+                raise RuntimeError("embedding add down")
+
+        mem.collection = FailingAddCollection()
+
+        result = mem.add_memories_with_dedup([
+            ("Alice 讨厌香菜", {"source": "memory", "type": "preference"}),
+        ])
+
+        self.assertEqual(0, result["added"])
+        self.assertEqual(0, result["dedup_errors"])
         wal = os.path.join(tmp, "pending_memories.jsonl")
         self.assertTrue(os.path.exists(wal))
         with open(wal, encoding="utf-8") as handle:

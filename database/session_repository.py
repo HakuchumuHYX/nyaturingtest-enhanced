@@ -36,6 +36,7 @@ class SessionStateRepository:
             logger.info(f"[Repo] 会话 {session_id} 数据已完全清除")
         except Exception as e:
             logger.error(f"[Repo] 删除会话数据失败: {e}")
+            raise
 
     @staticmethod
     async def save_session_state(session_id: str, data: dict):
@@ -58,6 +59,7 @@ class SessionStateRepository:
             )
         except Exception as e:
             logger.error(f"[Repo] 保存会话状态失败: {e}")
+            raise
 
     @staticmethod
     async def load_full_session_data(session_id: str):

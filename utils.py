@@ -336,6 +336,7 @@ async def render_token_stats_card(
     *,
     stats: dict,
     watermark: str | None = None,
+    scope_label: str = "当前模型",
     width: int = 750
 ) -> bytes:
     """渲染 Token 统计卡片
@@ -343,6 +344,7 @@ async def render_token_stats_card(
     Args:
         stats: 统计数据字典（包含 1d_local, 1d_global, 7d_local, 7d_global, all_global）
         watermark: 右下角水印文字（可选）
+        scope_label: 统计范围标签，例如“当前模型”或“全部历史模型”
         width: 图片宽度
     
     Returns:
@@ -393,7 +395,7 @@ async def render_token_stats_card(
     items = []
     
     # 标题
-    items.append(TextBox("Token 使用统计", style=title_style).set_w(content_w).set_padding(0))
+    items.append(TextBox(f"Token 使用统计（{scope_label}）", style=title_style).set_w(content_w).set_padding(0))
     items.append(Spacer(1, 16))
     
     # 辅助函数：格式化单个时间段的统计

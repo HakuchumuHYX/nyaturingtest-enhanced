@@ -20,7 +20,9 @@ from ..core.services import RagSearchService
 from ..memory.vector import where_any
 from ..config import (
     get_effective_chat_model,
+    get_effective_chat_provider,
     get_effective_feedback_model,
+    get_effective_feedback_provider,
     get_runtime_settings,
     get_chat_thinking_settings,
     get_chat_max_tokens,
@@ -190,13 +192,17 @@ async def _summarize_long_term_vad(
 - dominance: [-1.0, 1.0]，长期关系中的主动/被动与掌控感
 """
 
+    feedback_extra_body = None
+    if get_effective_feedback_provider() == "deepseek_official":
+        feedback_extra_body = {"thinking": {"type": "disabled"}}
+
     response = await llm_response(
         state.feedback_client,
         prompt,
         model=feedback_model,
         temperature=0.1,
         json_mode=True,
-        extra_body={"thinking": {"type": "disabled"}},
+        extra_body=feedback_extra_body,
         max_tokens=get_feedback_max_tokens(),
         timeout=get_feedback_timeout(),
         on_usage=make_usage_recorder(str(state.session.id), feedback_model)
@@ -296,6 +302,8 @@ async def handle_query_memory(bot: Bot, event: GroupMessageEvent, args: Message 
     bot_role = "AI助手"
     recent_user_msgs = []
     vector_records = []
+    target_vector_records = []
+    unscoped_vector_records = []
     long_term_vad = None
     long_term_memory = None
 
@@ -330,6 +338,7 @@ async def handle_query_memory(bot: Bot, event: GroupMessageEvent, args: Message 
 
     # --- 向量记忆检索 (RAG) ---
     try:
+        runtime_settings = get_runtime_settings()
         search_queries = [
             f"关于{target_name}的记忆",
             f"我对{target_name}的看法",
@@ -383,15 +392,23 @@ async def handle_query_memory(bot: Bot, event: GroupMessageEvent, args: Message 
 
             # 后过滤：去重 + 质量过滤
             if vector_records:
-                unique_recs = []
                 seen = set()
                 for rec in vector_records:
                     content = rec.get('content', '')
+                    metadata = rec.get("metadata") or {}
+                    subject_id = str(
+                        metadata.get("subject_user_id")
+                        or metadata.get("user_id")
+                        or ""
+                    )
                     # 质量过滤：排除低质量内容
                     if content and content not in seen and should_store_memory(content):
                         seen.add(content)
-                        unique_recs.append(content)
-                vector_records = unique_recs
+                        if subject_id == target_id:
+                            target_vector_records.append(content)
+                        else:
+                            unscoped_vector_records.append(content)
+                vector_records = target_vector_records + unscoped_vector_records
 
                 logger.debug(
                     f"查询记忆: 交互={interaction_count}, 记忆量={memory_count}, "
@@ -418,7 +435,7 @@ async def handle_query_memory(bot: Bot, event: GroupMessageEvent, args: Message 
                 bot_role=bot_role,
                 target_name=target_name,
                 target_id=target_id,
-                vector_records=vector_records
+                vector_records=target_vector_records or vector_records
             )
         except Exception as e:
             logger.error(f"长期记忆 VAD 汇总失败: {e}")
@@ -435,7 +452,8 @@ async def handle_query_memory(bot: Bot, event: GroupMessageEvent, args: Message 
         return
 
     # 5. 构建 Prompt
-    vector_memory_str = "\n".join([f"- {rec}" for rec in vector_records]) if vector_records else "(暂无深层记忆)"
+    target_memory_str = "\n".join([f"- {rec}" for rec in target_vector_records]) if target_vector_records else "(暂无主体匹配记忆)"
+    unscoped_memory_str = "\n".join([f"- {rec}" for rec in unscoped_vector_records]) if unscoped_vector_records else "(暂无全局/未标记记忆)"
 
     # Prompt 增加甄别指令，防止张冠李戴
     prompt = f"""
@@ -448,12 +466,14 @@ async def handle_query_memory(bot: Bot, event: GroupMessageEvent, args: Message 
 [用户数据]
 - 情感定位(VAD模型):
   - 愉悦度(Valence, -1讨厌~1喜欢): {profile_data['valence']:.2f}
-  - 关注度(Arousal, 0无感~1兴奋): {profile_data['arousal']:.2f}
-  - 支配度(Dominance, -1你畏惧他~1你掌控他): {profile_data['dominance']:.2f}
+	  - 关注度(Arousal, 0无感~1兴奋): {profile_data['arousal']:.2f}
+	  - 支配度(Dominance, -1你畏惧他~1你掌控他): {profile_data['dominance']:.2f}
 - 交互深度: {profile_data['interactions']} 次
-- 长期记忆碎片(重要参考):
-{vector_memory_str}
-**(注意: 记忆碎片可能包含群聊中其他人的信息。请仔细甄别，只提取主语是"{target_name}"或明显关于他的事件，忽略无关人员的记忆。)**
+- 目标用户长期记忆碎片(高优先级):
+{target_memory_str}
+- 全局/未标记记忆碎片(低优先级，仅作背景参考):
+{unscoped_memory_str}
+**(注意: 全局/未标记记忆可能包含群聊中其他人的信息。请优先使用目标用户长期记忆碎片；只有内容明确关于"{target_name}"时，才引用低优先级背景记忆。)**
 
 - 他最近说过的话: {json.dumps(recent_user_msgs, ensure_ascii=False)}
 
@@ -467,11 +487,18 @@ async def handle_query_memory(bot: Bot, event: GroupMessageEvent, args: Message 
 
     # 6. 调用 LLM
     query_memory_chat_thinking = get_chat_thinking_settings()
-    query_memory_chat_extra_body = {
-        "thinking": {
-            "type": "enabled" if query_memory_chat_thinking.get("enabled") else "disabled"
+    query_memory_chat_provider = get_effective_chat_provider()
+    query_memory_use_deepseek_thinking = (
+        query_memory_chat_provider == "deepseek_official"
+        and bool(query_memory_chat_thinking.get("enabled"))
+    )
+    query_memory_chat_extra_body = None
+    if query_memory_chat_provider == "deepseek_official":
+        query_memory_chat_extra_body = {
+            "thinking": {
+                "type": "enabled" if query_memory_chat_thinking.get("enabled") else "disabled"
+            }
         }
-    }
 
     try:
         # 使用统一的 llm_response 封装；传输层重试由 LLMClient 统一负责。
@@ -479,10 +506,10 @@ async def handle_query_memory(bot: Bot, event: GroupMessageEvent, args: Message 
             state.client,
             prompt,
             model=get_effective_chat_model(),
-            temperature=None if query_memory_chat_thinking.get("enabled") else 0.8,
+            temperature=None if query_memory_use_deepseek_thinking else 0.8,
             json_mode=True,
             extra_body=query_memory_chat_extra_body,
-            reasoning_effort=query_memory_chat_thinking.get("reasoning_effort", "high") if query_memory_chat_thinking.get("enabled") else None,
+            reasoning_effort=query_memory_chat_thinking.get("reasoning_effort", "high") if query_memory_use_deepseek_thinking else None,
             max_tokens=min(get_chat_max_tokens(), 2048),
             timeout=get_chat_timeout(),
             on_usage=make_usage_recorder(session_id, get_effective_chat_model())

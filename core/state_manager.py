@@ -18,6 +18,7 @@ from ..config import (
 )
 from ..memory.short_term import Message as MMessage
 from .session import Session
+from .usage import drain_usage_tasks
 from ..utils import get_http_client, close_http_client
 from ..database.enabled_group_repository import EnabledGroupRepository
 
@@ -35,6 +36,8 @@ def _build_chat_llm_client() -> LLMClient:
         provider=provider,
         openai_client=openai_client,
         timeout=get_chat_timeout(),
+        base_url=get_effective_chat_base_url(),
+        api_key=get_effective_chat_api_key(),
     )
 
 
@@ -57,6 +60,8 @@ def _build_feedback_llm_client() -> LLMClient:
         provider=get_effective_feedback_provider(),
         openai_client=openai_client,
         timeout=get_feedback_timeout(),
+        base_url=get_effective_feedback_base_url(),
+        api_key=get_effective_feedback_api_key(),
     )
 
 SELF_SENT_MSG_IDS = deque(maxlen=50)
@@ -221,7 +226,9 @@ async def cleanup_global_resources():
     # 4. 关闭全局 HTTP 客户端
     await close_http_client()
 
-    # 4. 最后关闭数据库
+    await drain_usage_tasks(timeout=get_runtime_settings()["memory_drain_timeout_seconds"])
+
+    # 5. 最后关闭数据库
     logger.info("正在关闭数据库连接...")
     await Tortoise.close_connections()
     logger.info("数据库连接已关闭")

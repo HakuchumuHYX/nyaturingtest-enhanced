@@ -5,6 +5,11 @@ import httpx
 from openai import AsyncOpenAI
 from nonebot import logger
 
+try:
+    from .json_mode import is_json_mode_unsupported_error
+except ImportError:
+    from json_mode import is_json_mode_unsupported_error
+
 
 def _model_supports_response_format(model: str) -> bool:
     normalized = (model or "").strip().lower()
@@ -12,11 +17,33 @@ def _model_supports_response_format(model: str) -> bool:
 
 
 def _is_json_mode_unsupported_error(exc: Exception) -> bool:
-    text = str(exc).lower()
-    return (
-        "json mode is not supported" in text
-        or "response_format" in text and "not supported" in text
-    )
+    return is_json_mode_unsupported_error(exc)
+
+
+def _usage_to_dict(usage, *, provider: str, finish_reason: str) -> dict:
+    if not usage:
+        data = {}
+    elif hasattr(usage, "model_dump"):
+        data = usage.model_dump()
+    elif isinstance(usage, dict):
+        data = dict(usage)
+    else:
+        data = {
+            "prompt_tokens": getattr(usage, "prompt_tokens", 0) or 0,
+            "completion_tokens": getattr(usage, "completion_tokens", 0) or 0,
+            "total_tokens": getattr(usage, "total_tokens", 0) or 0,
+        }
+
+    prompt_tokens = int(data.get("prompt_tokens") or 0)
+    completion_tokens = int(data.get("completion_tokens") or 0)
+    normalized = {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": int(data.get("total_tokens") or prompt_tokens + completion_tokens),
+        "provider": provider,
+        "finish_reason": finish_reason or "",
+    }
+    return normalized
 
 
 class VLM:
@@ -103,13 +130,20 @@ class VLM:
                     **request_kwargs,
                 )
 
+                choice = response.choices[0]
+                finish_reason = getattr(choice, "finish_reason", "") or ""
+
                 if on_usage and response.usage:
                     try:
-                        on_usage(response.usage.model_dump())
+                        on_usage(_usage_to_dict(
+                            response.usage,
+                            provider=getattr(self, "provider", "openai_compatible"),
+                            finish_reason=finish_reason,
+                        ))
                     except Exception as ex:
                         logger.warning(f"VLM Usage callback failed: {ex}")
 
-                content = response.choices[0].message.content
+                content = choice.message.content
                 if content:
                     return content
                 logger.warning(f"VLM 返回内容为空 (尝试 {retries + 1}/{self.max_retries + 1})")

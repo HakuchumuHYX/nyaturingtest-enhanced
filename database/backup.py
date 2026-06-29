@@ -9,14 +9,15 @@ from pathlib import Path
 from nonebot import logger, require
 import nonebot_plugin_localstore as store
 
+from ..config import get_runtime_settings
 from .backup_lock import BACKUP_IO_LOCK
+from .retention import cleanup_raw_data_retention
 
 # 确保调度器插件已加载
 require("nonebot_plugin_apscheduler")
 from nonebot_plugin_apscheduler import scheduler
 
-# 保留最近多少天的备份
-MAX_BACKUP_DAYS = 7
+DEFAULT_BACKUP_RETENTION_COUNT = 7
 SQLITE_FILENAME = "nyabot.sqlite"
 
 
@@ -58,13 +59,21 @@ def _copy_data_to_staging(data_dir: Path, staging_dir: Path):
     _copy_sqlite_snapshot(sqlite_path, staging_dir / SQLITE_FILENAME)
 
 
-def _backup_data_sync():
+def _backup_retention_count() -> int:
+    try:
+        value = get_runtime_settings().get("backup_retention_count", DEFAULT_BACKUP_RETENTION_COUNT)
+        return max(1, int(value or DEFAULT_BACKUP_RETENTION_COUNT))
+    except (TypeError, ValueError):
+        return DEFAULT_BACKUP_RETENTION_COUNT
+
+
+def _backup_data_sync() -> bool:
     """同步的备份执行函数"""
     data_dir, backup_dir = get_backup_dirs()
     
     if not data_dir.exists():
         logger.warning(f"备份失败：数据目录 {data_dir} 不存在。")
-        return
+        return False
 
     # 确保备份目录存在
     backup_dir.mkdir(parents=True, exist_ok=True)
@@ -100,17 +109,23 @@ def _backup_data_sync():
                 backup_filepath.unlink()
             except:
                 pass
-        return
+        return False
 
     # 清理过期的备份文件
     _clean_old_backups_sync()
+    return True
 
 
-def _clean_old_backups_sync():
+def _clean_old_backups_sync(retention_count: int | None = None):
     """同步清理旧的备份文件"""
     _, backup_dir = get_backup_dirs()
     if not backup_dir.exists():
         return
+    keep_value = retention_count if retention_count is not None else _backup_retention_count()
+    try:
+        keep_count = max(1, int(keep_value or DEFAULT_BACKUP_RETENTION_COUNT))
+    except (TypeError, ValueError):
+        keep_count = DEFAULT_BACKUP_RETENTION_COUNT
 
     try:
         backups = []
@@ -123,9 +138,9 @@ def _clean_old_backups_sync():
         # 按时间从新到旧排序
         backups.sort(key=lambda x: x[0], reverse=True)
 
-        # 保留最近 MAX_BACKUP_DAYS 个备份，删除多余的
-        if len(backups) > MAX_BACKUP_DAYS:
-            for _, old_file in backups[MAX_BACKUP_DAYS:]:
+        # 保留最近 backup_retention_count 个备份，删除多余的。
+        if len(backups) > keep_count:
+            for _, old_file in backups[keep_count:]:
                 logger.info(f"删除过期的备份文件: {old_file}")
                 old_file.unlink()
 
@@ -137,7 +152,11 @@ async def backup_task():
     """异步包装器，用于被 APScheduler 调用"""
     logger.info("触发自动备份任务...")
     # 由于文件压缩可能比较耗时且是阻塞的 I/O 操作，将其放入 asyncio 线程池中运行
-    await asyncio.to_thread(_backup_data_sync)
+    if await asyncio.to_thread(_backup_data_sync):
+        try:
+            await cleanup_raw_data_retention()
+        except Exception as e:
+            logger.error(f"备份后清理原始数据库行失败: {e}")
 
 
 def setup_backup_job():
