@@ -88,7 +88,7 @@ def get_default_config() -> dict:
                 # off | deepseek_v4_roleplay | gemini_3_flash_roleplay
                 "rp_style": "off",
             },
-            "max_tokens": 4096,
+            "max_tokens": 65536,
             "timeout": 180,
         },
         "vlm": {
@@ -107,7 +107,7 @@ def get_default_config() -> dict:
             "thinking": {
                 "enabled": False,
             },
-            "max_tokens": 2048,
+            "max_tokens": 65536,
             "timeout": 60,
         },
         "siliconflow_api_key": "",
@@ -273,8 +273,8 @@ def build_settings(config: dict[str, Any], *, require_api_keys: bool = False) ->
         )
 
     return PluginSettings(
-        chat=endpoint("chat", require_key=require_api_keys, max_tokens_default=4096),
-        feedback=endpoint("feedback", require_key=require_api_keys, max_tokens_default=2048),
+        chat=endpoint("chat", require_key=require_api_keys, max_tokens_default=65536),
+        feedback=endpoint("feedback", require_key=require_api_keys, max_tokens_default=65536),
         vlm=endpoint("vlm", require_key=require_api_keys and bool(cfg.get("vlm", {}).get("enabled", True))),
         rerank_model=str(cfg.get("rerank", {}).get("model") or ""),
         rerank_threshold=float(cfg.get("rerank", {}).get("threshold") or 0.0),
@@ -369,7 +369,7 @@ def get_chat_timeout() -> float:
 
 
 def get_chat_max_tokens() -> int:
-    return int(plugin_config.get("chat", {}).get("max_tokens") or 1536)
+    return int(plugin_config.get("chat", {}).get("max_tokens") or 65536)
 
 
 def get_effective_feedback_api_key() -> str:
@@ -398,7 +398,7 @@ def get_feedback_timeout() -> float:
 
 
 def get_feedback_max_tokens() -> int:
-    return int(plugin_config.get("feedback", {}).get("max_tokens") or 2048)
+    return int(plugin_config.get("feedback", {}).get("max_tokens") or 65536)
 
 
 def get_effective_vlm_api_key() -> str:

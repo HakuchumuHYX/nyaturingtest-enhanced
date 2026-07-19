@@ -48,10 +48,20 @@ class RagPromptSafetyStaticTests(unittest.TestCase):
         source = (PLUGIN_DIR / "handlers" / "memory.py").read_text(encoding="utf-8")
         query_call_area = source.index("query_memory_chat_extra_body")
         call_start = source.index("response = await llm_response", query_call_area)
-        call_end = source.index("max_tokens=min", call_start)
+        call_end = source.index("on_usage=", call_start)
         call_source = source[call_start:call_end]
 
         self.assertNotIn("system_prompt", call_source)
+
+    def test_query_memory_uses_full_chat_output_budget(self):
+        source = (PLUGIN_DIR / "handlers" / "memory.py").read_text(encoding="utf-8")
+        query_call_area = source.index("query_memory_chat_extra_body")
+        call_start = source.index("response = await llm_response", query_call_area)
+        call_end = source.index("on_usage=", call_start)
+        call_source = source[call_start:call_end]
+
+        self.assertIn("max_tokens=get_chat_max_tokens()", call_source)
+        self.assertNotIn("min(get_chat_max_tokens(), 2048)", call_source)
 
 
 if __name__ == "__main__":

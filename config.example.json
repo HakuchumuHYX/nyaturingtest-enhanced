@@ -9,7 +9,7 @@
       "reasoning_effort": "high",
       "rp_style": "off"
     },
-    "max_tokens": 4096,
+    "max_tokens": 65536,
     "timeout": 180
   },
   "feedback": {
@@ -20,7 +20,7 @@
     "thinking": {
       "enabled": false
     },
-    "max_tokens": 2048,
+    "max_tokens": 65536,
     "timeout": 60
   },
   "vlm": {

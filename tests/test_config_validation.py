@@ -65,6 +65,29 @@ class ConfigValidationTests(unittest.TestCase):
         self.assertNotIn("sk-", text)
         self.assertNotIn("google" + "_api_key", text)
 
+    def test_llm_output_budgets_default_to_65536(self):
+        module = _load_config_module()
+        cfg = module.get_default_config()
+
+        self.assertEqual(65536, cfg["chat"]["max_tokens"])
+        self.assertEqual(65536, cfg["feedback"]["max_tokens"])
+
+        settings = module.build_settings(cfg)
+        self.assertEqual(65536, settings.chat.max_tokens)
+        self.assertEqual(65536, settings.feedback.max_tokens)
+
+        module.plugin_config = {"chat": {}, "feedback": {}}
+        self.assertEqual(65536, module.get_chat_max_tokens())
+        self.assertEqual(65536, module.get_feedback_max_tokens())
+
+    def test_config_example_uses_65536_llm_output_budgets(self):
+        example = json.loads(
+            (PLUGIN_DIR / "config.example.json").read_text(encoding="utf-8")
+        )
+
+        self.assertEqual(65536, example["chat"]["max_tokens"])
+        self.assertEqual(65536, example["feedback"]["max_tokens"])
+
     def test_readme_documents_restart_required_config_fields(self):
         readme = (PLUGIN_DIR / "README.md").read_text(encoding="utf-8")
 

@@ -510,7 +510,7 @@ async def handle_query_memory(bot: Bot, event: GroupMessageEvent, args: Message 
             json_mode=True,
             extra_body=query_memory_chat_extra_body,
             reasoning_effort=query_memory_chat_thinking.get("reasoning_effort", "high") if query_memory_use_deepseek_thinking else None,
-            max_tokens=min(get_chat_max_tokens(), 2048),
+            max_tokens=get_chat_max_tokens(),
             timeout=get_chat_timeout(),
             on_usage=make_usage_recorder(session_id, get_effective_chat_model())
         )
