@@ -20,6 +20,10 @@ from ..config import (
     get_runtime_settings,
     get_token_stats_model_names,
     get_config_load_status,
+    get_effective_vlm_mode,
+    get_vision_settings,
+    native_vision_enabled,
+    should_use_standalone_vlm,
 )
 from ..core.state_manager import (
     ensure_group_state,
@@ -374,6 +378,8 @@ async def do_status(matcher: type[Matcher], group_id: int):
         status_msg = state.session.status()
     chat_thinking = get_chat_thinking_settings()
     feedback_thinking = get_feedback_thinking_settings()
+    chat_vision = get_vision_settings("chat")
+    feedback_vision = get_vision_settings("feedback")
     chat_provider_status = getattr(state.client, "provider_status", None)
     feedback_provider_status = getattr(state.feedback_client, "provider_status", None)
     provider_lines = [
@@ -381,6 +387,12 @@ async def do_status(matcher: type[Matcher], group_id: int):
         "Provider:",
         f"- Chat thinking: {'on' if chat_thinking.get('enabled') else 'off'} {chat_thinking.get('reasoning_effort', '')}".strip(),
         f"- Feedback thinking: {'on' if feedback_thinking.get('enabled') else 'off'}",
+        (
+            f"- Vision: chat={'native' if chat_vision['enabled'] else 'text'}, "
+            f"feedback={'native' if feedback_vision['enabled'] else 'text'}, "
+            f"vlm_mode={get_effective_vlm_mode()}, "
+            f"standalone={'on' if should_use_standalone_vlm() else 'off'}"
+        ),
         f"- Queue length: {len(state.messages_chunk)}",
         f"- Metrics: llm={metrics.llm_success}/{metrics.llm_failure}, vlm={metrics.vlm_success}/{metrics.vlm_failure}, db_write_failure={metrics.db_write_failure}",
     ]
@@ -433,6 +445,11 @@ async def handle_auto_chat(bot: Bot, event: GroupMessageEvent):
     async with state.session_lock:
         await state.session.load_session()
         bot_name = state.session.name()
+        recent_context_messages = state.session.global_memory.access_context(limit=4).messages
+        conversation_context = "\n".join(
+            f"{msg.user_name}: {msg.content}"
+            for msg in recent_context_messages
+        )[-600:]
 
     # Shutdown 检查：避免在关机时进入耗时的 VLM 处理
     if is_shutting_down():
@@ -457,7 +474,7 @@ async def handle_auto_chat(bot: Bot, event: GroupMessageEvent):
             )
             return
 
-    _resolve_images = plugin_config.get("vlm", {}).get("enabled", True)
+    _resolve_images = should_use_standalone_vlm()
     if _resolve_images:
         _has_image = any(seg.type == "image" for seg in event.original_message)
         if _has_image and not pre_queue_priority:
@@ -465,12 +482,17 @@ async def handle_auto_chat(bot: Bot, event: GroupMessageEvent):
             if state.session.willingness < _skip_threshold:
                 _resolve_images = False
 
+    image_inputs = []
     message_content, image_meta = await message2BotMessage(
         bot_name=bot_name,
         group_id=group_id,
         message=event.original_message,
         bot=bot,
-        resolve_images=plugin_config.get("vlm", {}).get("enabled", True) and _resolve_images,
+        resolve_images=_resolve_images,
+        attach_native_images=native_vision_enabled(),
+        image_inputs_out=image_inputs,
+        conversation_context=conversation_context,
+        message_scope=str(event.message_id),
     )
     if not message_content:
         return
@@ -521,7 +543,8 @@ async def handle_auto_chat(bot: Bot, event: GroupMessageEvent):
                 content=message_content,
                 id=msg_id,
                 user_id=user_id,
-                image_meta=image_meta
+                image_meta=image_meta,
+                image_inputs=image_inputs,
             )
         )
         state.new_message_signal.set()

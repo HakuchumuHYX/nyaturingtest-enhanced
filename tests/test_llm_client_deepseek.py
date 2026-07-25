@@ -119,6 +119,39 @@ class _StatusError(Exception):
 
 
 class DeepSeekLLMClientTests(unittest.TestCase):
+    def test_generate_builds_native_multimodal_user_content(self):
+        module = _load_client_module()
+        fake = _FakeOpenAIClient()
+        client = module.LLMClient(provider="openai_compatible", openai_client=fake)
+        image = types.SimpleNamespace(
+            to_openai_content=lambda: [
+                {"type": "text", "text": "[当前消息图片 image_ref=primary:0:x]"},
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": "data:image/png;base64,abc",
+                        "detail": "high",
+                    },
+                },
+            ]
+        )
+
+        asyncio.run(
+            client.generate(
+                prompt="dynamic",
+                model="vision-model",
+                system_prompt="stable",
+                images=[image],
+            )
+        )
+
+        user_content = fake.last_kwargs["messages"][1]["content"]
+        self.assertIsInstance(user_content, list)
+        self.assertEqual({"type": "text", "text": "dynamic"}, user_content[0])
+        self.assertEqual("primary:0:x", user_content[1]["text"].split("image_ref=")[1][:-1])
+        self.assertEqual("image_url", user_content[2]["type"])
+        self.assertEqual("high", user_content[2]["image_url"]["detail"])
+
     def test_generate_filters_sampling_when_thinking_is_enabled(self):
         module = _load_client_module()
         fake = _FakeOpenAIClient()

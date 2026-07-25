@@ -88,6 +88,57 @@ class ConfigValidationTests(unittest.TestCase):
         self.assertEqual(65536, example["chat"]["max_tokens"])
         self.assertEqual(65536, example["feedback"]["max_tokens"])
 
+    def test_vision_defaults_preserve_standalone_vlm_behavior(self):
+        module = _load_config_module()
+        cfg = module.get_default_config()
+
+        self.assertFalse(cfg["chat"]["vision"]["enabled"])
+        self.assertFalse(cfg["feedback"]["vision"]["enabled"])
+        self.assertEqual("fallback", cfg["vlm"]["mode"])
+        self.assertTrue(module._should_use_standalone_vlm(cfg))
+
+    def test_fallback_vlm_is_skipped_only_when_both_consumers_are_native(self):
+        module = _load_config_module()
+        cfg = module.get_default_config()
+        cfg["chat"]["vision"]["enabled"] = True
+        self.assertTrue(module._should_use_standalone_vlm(cfg))
+
+        cfg["feedback"]["vision"]["enabled"] = True
+        self.assertFalse(module._should_use_standalone_vlm(cfg))
+
+        cfg["vlm"]["mode"] = "always"
+        self.assertTrue(module._should_use_standalone_vlm(cfg))
+
+        cfg["vlm"]["enabled"] = False
+        self.assertFalse(module._should_use_standalone_vlm(cfg))
+
+    def test_native_only_settings_do_not_require_vlm_api_key(self):
+        module = _load_config_module()
+        cfg = module.get_default_config()
+        cfg["chat"]["api_key"] = "chat-key"
+        cfg["feedback"]["api_key"] = "feedback-key"
+        cfg["vlm"]["api_key"] = ""
+        cfg["chat"]["vision"]["enabled"] = True
+        cfg["feedback"]["vision"]["enabled"] = True
+
+        settings = module.build_settings(cfg, require_api_keys=True)
+
+        self.assertTrue(settings.chat.vision_enabled)
+        self.assertTrue(settings.feedback.vision_enabled)
+        self.assertEqual("fallback", settings.vlm_mode)
+
+    def test_invalid_vision_detail_and_vlm_mode_fail_fast(self):
+        module = _load_config_module()
+        cfg = module.get_default_config()
+        cfg["chat"]["vision"]["detail"] = "ultra"
+        with self.assertRaises(RuntimeError):
+            module.normalize_config(cfg)
+
+        cfg = module.get_default_config()
+        cfg["vlm"]["mode"] = "sometimes"
+        with self.assertRaises(RuntimeError):
+            module.normalize_config(cfg)
+
     def test_readme_documents_restart_required_config_fields(self):
         readme = (PLUGIN_DIR / "README.md").read_text(encoding="utf-8")
 

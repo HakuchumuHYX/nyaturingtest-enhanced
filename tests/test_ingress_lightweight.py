@@ -6,11 +6,13 @@ PLUGIN_DIR = Path(__file__).resolve().parents[1]
 
 
 class IngressLightweightTests(unittest.TestCase):
-    def test_auto_chat_uses_vlm_enabled_for_image_resolution(self):
+    def test_auto_chat_uses_effective_image_routes(self):
         source = (PLUGIN_DIR / "handlers" / "commands.py").read_text(encoding="utf-8")
 
         self.assertNotIn("resolve_images=False", source)
-        self.assertIn("resolve_images=plugin_config.get(\"vlm\", {}).get(\"enabled\", True)", source)
+        self.assertIn("_resolve_images = should_use_standalone_vlm()", source)
+        self.assertIn("attach_native_images=native_vision_enabled()", source)
+        self.assertIn("image_inputs_out=image_inputs", source)
 
     def test_queue_pressure_drops_low_priority_before_message_conversion(self):
         source = (PLUGIN_DIR / "handlers" / "commands.py").read_text(encoding="utf-8")

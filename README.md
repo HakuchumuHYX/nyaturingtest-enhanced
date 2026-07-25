@@ -14,7 +14,7 @@
 - **双阶段 LLM 链路**：Feedback 阶段负责情绪、摘要、画像、记忆提取；Chat 阶段负责生成最终回复。
 - **长期记忆**：使用 ChromaDB 持久化向量记忆，通过 SiliconFlow Embedding 召回，并可使用 Rerank 二次排序。
 - **短时记忆**：保存最近消息和摘要，摘要由 Feedback 阶段更新，不再由短时记忆模块自行调用小模型压缩。
-- **多模态图片理解**：`vlm.enabled=true` 时，会下载并压缩图片/表情包，调用 OpenAI-compatible VLM 生成中文描述后写入上下文。
+- **多模态图片理解**：Chat/Feedback 可分别启用原生视觉输入；纯文本模型继续由 OpenAI-compatible VLM 生成可持久化的中文图片观察。
 - **Token 统计**：记录 Chat、Feedback、VLM 的 prompt/completion/reasoning tokens，以及 DeepSeek prompt cache hit/miss。
 - **SQLite 持久化**：会话状态、消息、用户画像、启用群组和 Token 使用量存入 SQLite，并带基础迁移与索引。
 - **自动备份**：每天 04:00 自动打包插件数据；`reset confirm` 前也会先触发一次备份。
@@ -60,7 +60,11 @@
       "rp_style": "off"
     },
     "max_tokens": 4096,
-    "timeout": 180
+    "timeout": 180,
+    "vision": {
+      "enabled": false,
+      "detail": "auto"
+    }
   },
   "feedback": {
     "provider": "deepseek_official",
@@ -71,10 +75,15 @@
       "enabled": false
     },
     "max_tokens": 2048,
-    "timeout": 60
+    "timeout": 60,
+    "vision": {
+      "enabled": false,
+      "detail": "low"
+    }
   },
   "vlm": {
     "enabled": true,
+    "mode": "fallback",
     "provider": "openai_compatible",
     "api_key": "YOUR_VLM_API_KEY",
     "base_url": "https://api.siliconflow.cn/v1",
@@ -137,6 +146,8 @@
 - DeepSeek 官方接口默认使用 `https://api.deepseek.com`。
 - 通过 CLI Proxy API 中转 Vertex AI Gemini 时，保持 `chat.provider` 为 `openai_compatible`，`chat.base_url` 填代理暴露的 `/v1` OpenAI-compatible 地址，`chat.model` 填代理中的 Gemini 模型别名；建议关闭 `chat.thinking.enabled` 并设置 `chat.thinking.rp_style` 为 `gemini_3_flash_roleplay`。
 - `feedback` 也可以使用同一个 OpenAI-compatible Gemini 代理；建议保持 `feedback.thinking.enabled` 为 `false`，它只做结构化状态分析，不需要 RP preset。
+- `chat.vision.enabled` 与 `feedback.vision.enabled` 分别声明对应模型是否接受 OpenAI `image_url` 输入；默认均为 `false`，兼容纯文本模型。
+- `vlm.mode=fallback` 只在 Chat/Feedback 至少一个不支持原生图片时调用独立 VLM；`always` 会同时提供原图和 VLM 观察；`off` 完全禁用独立 VLM。
 - `vlm.provider` 只支持 `openai_compatible`；换成 Gemini 时需要代理支持 OpenAI `image_url` 多模态输入，若代理不支持图片 JSON mode，VLM 会降级为普通文本 JSON 提示重试。
 - 旧版非 OpenAI-compatible provider 已被移除，配置为已移除 provider 会直接报错。
 - `siliconflow_api_key` 用于长期记忆的 Embedding 和 Rerank。
@@ -165,6 +176,7 @@
 
 - `chat.provider` / `chat.base_url` / `chat.api_key`
 - `feedback.provider` / `feedback.base_url` / `feedback.api_key`
+- `chat.vision` / `feedback.vision` / `vlm.mode`
 - `vlm.provider` / `vlm.base_url` / `vlm.api_key`
 - `embedding.base_url` / `embedding.model` / `siliconflow_api_key`
 - `rerank.base_url` / `rerank.model`
@@ -334,9 +346,9 @@ plugins/nyaturingtest/
 ## 运维建议
 
 - 先只在低流量群执行 `/autochat enable`，观察 `/status` 和 `/token统计`。
-- `/status` 会显示 Chat/Feedback thinking 状态、消息队列长度、LLM/VLM 成功失败计数和最近 provider 错误。
+- `/status` 会显示 Chat/Feedback thinking、有效图片路由、消息队列长度、LLM/VLM 成功失败计数和最近 provider 错误。
 - DeepSeek thinking 会增加 reasoning tokens；上线后应重点关注 `/token统计` 中的 reasoning token 和 cache hit ratio。
-- 图片理解会额外消耗 VLM tokens；不需要看图时可设置 `vlm.enabled=false`。
+- 独立图片理解会额外消耗 VLM tokens；两个下游模型都支持图片且 `vlm.mode=fallback` 时不会调用独立 VLM。
 - `reset confirm` 是不可逆操作，虽然会先备份，但仍应确认备份文件存在且可恢复。
 - 如果 provider 返回 429，`LLMClient` 会短暂打开 circuit breaker，避免持续打满上游。
 

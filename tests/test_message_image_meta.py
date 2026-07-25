@@ -59,6 +59,24 @@ class MessageImageMetaTests(unittest.TestCase):
         self.assertIsNone(restored.image_meta)
         self.assertEqual("hi", restored.content)
 
+    def test_native_image_inputs_are_ephemeral(self):
+        module = _load_short_term()
+        image_input = types.SimpleNamespace(ref_id="primary:0:abc")
+        msg = module.Message(
+            time=datetime.now(),
+            user_name="u",
+            content="[图片]",
+            id="1",
+            user_id="100",
+            image_inputs=[image_input],
+        )
+
+        self.assertEqual(["primary:0:abc"], msg.image_refs())
+        self.assertNotIn("image_inputs", msg.to_json())
+        restored = module.Message.from_json(msg.to_json())
+        self.assertEqual([], restored.image_inputs)
+        self.assertEqual("[图片]", restored.content)
+
 
 if __name__ == "__main__":
     unittest.main()

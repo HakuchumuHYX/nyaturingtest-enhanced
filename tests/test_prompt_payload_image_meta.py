@@ -37,7 +37,13 @@ class PromptPayloadImageMetaTests(unittest.TestCase):
         }
         new_msgs = [
             {"id": "100", "name": "Alice", "content": "你看这个", "image_meta": None},
-            {"id": "101", "name": "Bob", "content": "[表情包|实体:初音未来(0.85)|...]", "image_meta": meta},
+            {
+                "id": "101",
+                "name": "Bob",
+                "content": "[表情包|实体:初音未来(0.85)|...]",
+                "image_meta": meta,
+                "image_refs": ["primary:0:abc"],
+            },
         ]
         prompt = self.tm.get_feedback_prompt(
             bot_name="Nya", role="r", willingness=0.5, chat_state_value=1,
@@ -50,6 +56,7 @@ class PromptPayloadImageMetaTests(unittest.TestCase):
         self.assertEqual(2, len(payload["new_msgs"]))
         self.assertIsNone(payload["new_msgs"][0]["image_meta"])
         self.assertEqual(meta, payload["new_msgs"][1]["image_meta"])
+        self.assertEqual(["primary:0:abc"], payload["new_msgs"][1]["image_refs"])
 
     def test_feedback_payload_image_meta_none_does_not_break(self):
         new_msgs = [{"id": "1", "name": "A", "content": "hi", "image_meta": None}]
@@ -107,6 +114,24 @@ class PromptPayloadImageMetaTests(unittest.TestCase):
         )
         self.assertIn("image_meta", prompt)
         self.assertIn("affect", prompt)
+        self.assertNotIn('"image_observations" (Array)', prompt)
+
+    def test_feedback_requests_observations_only_for_native_image_refs(self):
+        prompt = self.tm.get_feedback_prompt(
+            bot_name="Nya", role="r", willingness=0.5, chat_state_value=1,
+            history_summary="", recent_msgs=[],
+            new_msgs_formatted=[{
+                "id": "1",
+                "name": "A",
+                "content": "[图片]",
+                "image_meta": None,
+                "image_refs": ["scope:primary:0:abc"],
+            }],
+            emotion={"valence": 0.0, "arousal": 0.0, "dominance": 0.0},
+            related_profiles_json="[]", search_result=[], last_summary="",
+        )
+        self.assertIn('"image_observations" (Array)', prompt)
+        self.assertIn("scope:primary:0:abc", prompt)
 
     def test_chat_prompt_mentions_image_meta(self):
         prompt = self.tm.get_chat_prompt(

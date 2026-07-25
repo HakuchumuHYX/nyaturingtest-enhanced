@@ -208,6 +208,20 @@ class LLMClient:
             },
         )
 
+    @staticmethod
+    def _build_user_content(prompt: str, images: list[Any] | None) -> str | list[dict]:
+        if not images:
+            return prompt
+        content: list[dict] = [{"type": "text", "text": prompt}]
+        for image in images:
+            builder = getattr(image, "to_openai_content", None)
+            if not callable(builder):
+                continue
+            blocks = builder()
+            if isinstance(blocks, list):
+                content.extend(block for block in blocks if isinstance(block, dict))
+        return content if len(content) > 1 else prompt
+
     async def generate(
         self,
         prompt: str,
@@ -215,6 +229,7 @@ class LLMClient:
         temperature: float | None = None,
         system_prompt: str | None = None,
         on_usage: Callable[[dict], None] | None = None,
+        images: list[Any] | None = None,
         **kwargs,
     ) -> LLMResponse:
         """
@@ -269,7 +284,7 @@ class LLMClient:
                         model=model,
                         messages=[
                             {"role": "system", "content": system_content},
-                            {"role": "user", "content": prompt},
+                            {"role": "user", "content": self._build_user_content(prompt, images)},
                         ],
                         timeout=request_timeout,
                         **request_kwargs,

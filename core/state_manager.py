@@ -218,8 +218,9 @@ async def cleanup_global_resources():
     # 3. 关闭 VLM 的私有 HTTP 客户端（强制中断正在进行的 VLM 请求）
     try:
         from ..memory.image import image_manager
-        await image_manager._vlm.close()
-        logger.info("VLM HTTP 客户端已关闭")
+        if image_manager._vlm is not None:
+            await image_manager._vlm.close()
+            logger.info("VLM HTTP 客户端已关闭")
     except Exception as e:
         logger.warning(f"关闭 VLM 客户端失败: {e}")
 

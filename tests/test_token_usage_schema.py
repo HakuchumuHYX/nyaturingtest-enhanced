@@ -70,7 +70,7 @@ class TokenUsageSchemaTests(unittest.TestCase):
         self.assertIn("get_effective_chat_model()", source)
         self.assertIn("get_effective_feedback_model()", source)
         self.assertIn("get_effective_vlm_model()", source)
-        self.assertIn('plugin_config.get("vlm", {}).get("enabled", True)', source)
+        self.assertIn("should_use_standalone_vlm()", source)
 
 
 if __name__ == "__main__":

@@ -31,6 +31,8 @@ class EndpointSettings:
     thinking_enabled: bool = False
     reasoning_effort: str = ""
     rp_style: str = "off"
+    vision_enabled: bool = False
+    vision_detail: str = "auto"
 
 
 @dataclass(frozen=True)
@@ -38,6 +40,7 @@ class PluginSettings:
     chat: EndpointSettings
     feedback: EndpointSettings
     vlm: EndpointSettings
+    vlm_mode: str
     rerank_model: str
     rerank_threshold: float
 
@@ -90,14 +93,24 @@ def get_default_config() -> dict:
             },
             "max_tokens": 65536,
             "timeout": 180,
+            "vision": {
+                "enabled": False,
+                "detail": "auto",
+            },
         },
         "vlm": {
             "enabled": True,
+            # fallback: 仅在 Chat/Feedback 至少一个不支持原生图片时调用
+            # always: 始终生成文字观察；off: 完全不调用独立 VLM
+            "mode": "fallback",
             "provider": OPENAI_COMPATIBLE,
             "api_key": "",
             "base_url": "https://api.siliconflow.cn/v1",
             "model": "zai-org/GLM-4.6V",
             "timeout": 60,
+            "max_image_side": 1280,
+            "high_detail_for_sticker": True,
+            "high_detail_for_png": True,
         },
         "feedback": {
             "provider": DEEPSEEK_OFFICIAL,
@@ -109,6 +122,10 @@ def get_default_config() -> dict:
             },
             "max_tokens": 65536,
             "timeout": 60,
+            "vision": {
+                "enabled": False,
+                "detail": "low",
+            },
         },
         "siliconflow_api_key": "",
         "embedding": {
@@ -228,6 +245,27 @@ def _normalize_endpoint(section_name: str, section: dict[str, Any]) -> None:
     _drop_removed_fields(section)
 
 
+def _normalize_vision(section_name: str, section: dict[str, Any]) -> None:
+    vision = section.get("vision")
+    if not isinstance(vision, dict):
+        vision = {}
+        section["vision"] = vision
+    vision["enabled"] = bool(vision.get("enabled", False))
+    detail = str(vision.get("detail") or ("low" if section_name == "feedback" else "auto")).strip().lower()
+    if detail not in {"low", "high", "auto"}:
+        raise RuntimeError(f"{section_name}.vision.detail must be low, high, or auto.")
+    vision["detail"] = detail
+
+
+def _normalize_vlm_mode(vlm: dict[str, Any]) -> None:
+    mode = str(vlm.get("mode") or "fallback").strip().lower()
+    if mode not in {"fallback", "always", "off"}:
+        raise RuntimeError("vlm.mode must be fallback, always, or off.")
+    if not bool(vlm.get("enabled", True)):
+        mode = "off"
+    vlm["mode"] = mode
+
+
 def normalize_config(config: dict[str, Any]) -> dict[str, Any]:
     merged = _deep_merge(get_default_config(), _migrate_legacy_config(config))
 
@@ -238,8 +276,37 @@ def normalize_config(config: dict[str, Any]) -> dict[str, Any]:
     _normalize_endpoint("chat", merged["chat"])
     _normalize_endpoint("feedback", merged["feedback"])
     _normalize_endpoint("vlm", merged["vlm"])
+    _normalize_vision("chat", merged["chat"])
+    _normalize_vision("feedback", merged["feedback"])
+    _normalize_vlm_mode(merged["vlm"])
 
     return merged
+
+
+def _endpoint_vision_enabled(config: dict[str, Any], endpoint_name: str) -> bool:
+    section = config.get(endpoint_name, {}) or {}
+    vision = section.get("vision") or {}
+    return bool(vision.get("enabled", False))
+
+
+def _get_vlm_mode(config: dict[str, Any]) -> str:
+    vlm = config.get("vlm", {}) or {}
+    if not bool(vlm.get("enabled", True)):
+        return "off"
+    mode = str(vlm.get("mode") or "fallback").strip().lower()
+    return mode if mode in {"fallback", "always", "off"} else "fallback"
+
+
+def _should_use_standalone_vlm(config: dict[str, Any]) -> bool:
+    mode = _get_vlm_mode(config)
+    if mode == "off":
+        return False
+    if mode == "always":
+        return True
+    return not (
+        _endpoint_vision_enabled(config, "chat")
+        and _endpoint_vision_enabled(config, "feedback")
+    )
 
 
 def _require(value: str, field_name: str) -> str:
@@ -260,6 +327,7 @@ def build_settings(config: dict[str, Any], *, require_api_keys: bool = False) ->
         base_url = _require(section.get("base_url", ""), f"{name}.base_url")
         model = _require(section.get("model", ""), f"{name}.model")
         thinking = section.get("thinking") or {}
+        vision = section.get("vision") or {}
         return EndpointSettings(
             provider=section.get("provider", ""),
             api_key=api_key,
@@ -270,12 +338,16 @@ def build_settings(config: dict[str, Any], *, require_api_keys: bool = False) ->
             thinking_enabled=bool(thinking.get("enabled", False)),
             reasoning_effort=str(thinking.get("reasoning_effort") or ""),
             rp_style=str(thinking.get("rp_style") or "off"),
+            vision_enabled=bool(vision.get("enabled", False)),
+            vision_detail=str(vision.get("detail") or ("low" if name == "feedback" else "auto")),
         )
 
+    needs_standalone_vlm = _should_use_standalone_vlm(cfg)
     return PluginSettings(
         chat=endpoint("chat", require_key=require_api_keys, max_tokens_default=65536),
         feedback=endpoint("feedback", require_key=require_api_keys, max_tokens_default=65536),
-        vlm=endpoint("vlm", require_key=require_api_keys and bool(cfg.get("vlm", {}).get("enabled", True))),
+        vlm=endpoint("vlm", require_key=require_api_keys and needs_standalone_vlm),
+        vlm_mode=_get_vlm_mode(cfg),
         rerank_model=str(cfg.get("rerank", {}).get("model") or ""),
         rerank_threshold=float(cfg.get("rerank", {}).get("threshold") or 0.0),
     )
@@ -290,6 +362,7 @@ def describe_settings(settings: PluginSettings) -> str:
         endpoint("chat", settings.chat),
         endpoint("feedback", settings.feedback),
         endpoint("vlm", settings.vlm),
+        f"vision: chat={settings.chat.vision_enabled}, feedback={settings.feedback.vision_enabled}, vlm_mode={settings.vlm_mode}",
     ])
 
 
@@ -401,6 +474,35 @@ def get_feedback_max_tokens() -> int:
     return int(plugin_config.get("feedback", {}).get("max_tokens") or 65536)
 
 
+def get_vision_settings(endpoint_name: str) -> dict[str, Any]:
+    if endpoint_name not in {"chat", "feedback"}:
+        raise ValueError(f"Unsupported vision endpoint: {endpoint_name}")
+    default_detail = "low" if endpoint_name == "feedback" else "auto"
+    vision = (plugin_config.get(endpoint_name, {}) or {}).get("vision") or {}
+    detail = str(vision.get("detail") or default_detail).strip().lower()
+    if detail not in {"low", "high", "auto"}:
+        detail = default_detail
+    return {
+        "enabled": bool(vision.get("enabled", False)),
+        "detail": detail,
+    }
+
+
+def get_effective_vlm_mode() -> str:
+    return _get_vlm_mode(plugin_config)
+
+
+def should_use_standalone_vlm() -> bool:
+    return _should_use_standalone_vlm(plugin_config)
+
+
+def native_vision_enabled() -> bool:
+    return (
+        get_vision_settings("chat")["enabled"]
+        or get_vision_settings("feedback")["enabled"]
+    )
+
+
 def get_effective_vlm_api_key() -> str:
     return plugin_config.get("vlm", {}).get("api_key", "").strip()
 
@@ -418,7 +520,7 @@ def get_token_stats_model_names() -> list[str]:
         get_effective_chat_model(),
         get_effective_feedback_model(),
     ]
-    if plugin_config.get("vlm", {}).get("enabled", True):
+    if should_use_standalone_vlm():
         models.append(get_effective_vlm_model())
 
     result = []

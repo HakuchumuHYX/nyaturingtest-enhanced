@@ -10,7 +10,11 @@
       "rp_style": "off"
     },
     "max_tokens": 65536,
-    "timeout": 180
+    "timeout": 180,
+    "vision": {
+      "enabled": false,
+      "detail": "auto"
+    }
   },
   "feedback": {
     "provider": "deepseek_official",
@@ -21,15 +25,23 @@
       "enabled": false
     },
     "max_tokens": 65536,
-    "timeout": 60
+    "timeout": 60,
+    "vision": {
+      "enabled": false,
+      "detail": "low"
+    }
   },
   "vlm": {
     "enabled": true,
+    "mode": "fallback",
     "provider": "openai_compatible",
     "api_key": "YOUR_VLM_API_KEY",
     "base_url": "https://api.siliconflow.cn/v1",
     "model": "zai-org/GLM-4.6V",
-    "timeout": 60
+    "timeout": 60,
+    "max_image_side": 1280,
+    "high_detail_for_sticker": true,
+    "high_detail_for_png": true
   },
   "siliconflow_api_key": "YOUR_SILICONFLOW_API_KEY",
   "embedding": {

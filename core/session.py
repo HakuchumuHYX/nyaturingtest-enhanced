@@ -17,6 +17,7 @@ from openai import AsyncOpenAI
 
 from ..llm.client import LLMClient
 from ..config import get_chat_thinking_settings, get_runtime_settings
+from .. import config as config_module
 from ..models.emotion import EmotionState, clamp_vad_value
 from ..memory.vector import VectorMemory, where_any
 from ..memory.validation import validate_memory_candidate
@@ -52,6 +53,24 @@ def _history_without_current_chunk(all_messages: list[Message], messages_chunk: 
             or any(m is chunk_msg for chunk_msg in messages_chunk)
         )
     ]
+
+
+def _message_image_refs(message: Message) -> list[str]:
+    getter = getattr(message, "image_refs", None)
+    if callable(getter):
+        return getter()
+    return [
+        str(getattr(item, "ref_id", "") or "")
+        for item in (getattr(message, "image_inputs", []) or [])
+        if getattr(item, "ref_id", "")
+    ]
+
+
+def _endpoint_uses_native_vision(endpoint_name: str) -> bool:
+    getter = getattr(config_module, "get_vision_settings", None)
+    if not callable(getter):
+        return False
+    return bool(getter(endpoint_name).get("enabled", False))
 
 
 def _dedupe_preserve_order(items: list[str]) -> list[str]:
@@ -779,6 +798,11 @@ class Session:
                 "name": msg.user_name,
                 "content": escape_for_prompt(msg.content),
                 "image_meta": msg.image_meta,
+                "image_refs": (
+                    _message_image_refs(msg)
+                    if _endpoint_uses_native_vision("feedback")
+                    else []
+                ),
             }
             for msg in messages_chunk
         ]
@@ -802,6 +826,7 @@ class Session:
                 "name": m.user_name,
                 "content": escape_for_prompt(m.content),
                 "image_meta": m.image_meta,
+                "image_refs": [],
             }
             for m in history_msgs
         ]
@@ -858,6 +883,64 @@ class Session:
             allow_memory_supersede=allow_memory_supersede,
             active_user_ids=active_user_ids,
         )
+
+    def _apply_native_image_observations(
+        self,
+        response_dict: dict,
+        messages_chunk: list[Message],
+    ) -> None:
+        from ..memory.image_schema import (
+            merge_segment_metas,
+            parse_vlm_response,
+            render_image_text,
+        )
+
+        raw_observations = response_dict.get("image_observations", [])
+        if not isinstance(raw_observations, list):
+            return
+        observations_by_ref = {
+            str(item.get("image_ref") or ""): item
+            for item in raw_observations
+            if isinstance(item, dict) and str(item.get("image_ref") or "")
+        }
+        if not observations_by_ref:
+            return
+
+        for msg in messages_chunk:
+            if msg.image_meta or not msg.image_inputs:
+                continue
+            segment_metas = []
+            rendered_labels = []
+            observed_inputs = []
+            for image_input in msg.image_inputs:
+                image_ref = str(getattr(image_input, "ref_id", "") or "")
+                observation = observations_by_ref.get(image_ref)
+                if not observation:
+                    continue
+                description = parse_vlm_response(
+                    json.dumps(observation, ensure_ascii=False),
+                    is_sticker=bool(getattr(image_input, "is_sticker", False)),
+                )
+                meta = description.to_meta()
+                meta["image_ref"] = image_ref
+                if getattr(image_input, "source", "primary") == "referenced":
+                    segment_metas.append({"referenced": [meta]})
+                else:
+                    segment_metas.append(meta)
+                rendered_labels.append(
+                    render_image_text(description, description.is_sticker)
+                )
+                observed_inputs.append(image_input)
+
+            merged_meta = merge_segment_metas(segment_metas)
+            if not merged_meta:
+                continue
+            msg.image_meta = merged_meta
+            enriched_content = msg.content
+            for image_input in observed_inputs:
+                placeholder = "[表情包]" if getattr(image_input, "is_sticker", False) else "[图片]"
+                enriched_content = enriched_content.replace(placeholder, "", 1)
+            msg.content = f"{enriched_content.strip()}{''.join(rendered_labels)}".strip()
 
     def _apply_sediment(
         self,
@@ -1021,6 +1104,7 @@ class Session:
         if self.is_generation_stale(expected_generation):
             self._log_stale_generation("feedback_sediment", expected_generation)
             return []
+        self._apply_native_image_observations(ctx.response_dict, messages_chunk)
         self._apply_sediment(ctx, messages_chunk, expected_generation=expected_generation)
         recalled_history = await self._apply_decision(ctx, messages_chunk, is_relevant, expected_generation)
         logger.debug(f"<< 反馈结束: 意愿 {self.willingness:.2f}, 状态 {self.__chatting_state}")
@@ -1063,6 +1147,7 @@ class Session:
         if self.is_generation_stale(expected_generation):
             self._log_stale_generation("consolidation_sediment", expected_generation)
             return
+        self._apply_native_image_observations(ctx.response_dict, messages_chunk)
         self._apply_sediment(ctx, messages_chunk, expected_generation=expected_generation)
         latest = max((m.time for m in messages_chunk), default=None)
         if latest is not None:
@@ -1307,6 +1392,11 @@ class Session:
                 "name": msg.user_name,
                 "content": escape_for_prompt(msg.content),
                 "image_meta": msg.image_meta,
+                "image_refs": (
+                    _message_image_refs(msg)
+                    if _endpoint_uses_native_vision("chat")
+                    else []
+                ),
             }
             for msg in messages_chunk
         ]
@@ -1324,6 +1414,7 @@ class Session:
                 "name": m.user_name,
                 "content": escape_for_prompt(m.content),
                 "image_meta": m.image_meta,
+                "image_refs": [],
             }
             for m in history_msgs
         ]

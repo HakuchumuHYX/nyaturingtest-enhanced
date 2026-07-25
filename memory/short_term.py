@@ -1,7 +1,8 @@
 # nyaturingtest/mem.py
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
+from typing import Any
 
 from nonebot import logger
 
@@ -14,6 +15,8 @@ class Message:
     id: str = ""
     user_id: str = ""
     image_meta: dict | None = None     # 图片结构化观测，纯内存，不持久化
+    # 原生多模态输入，仅当前进程短期持有；不序列化、不写数据库。
+    image_inputs: list[Any] = field(default_factory=list, repr=False, compare=False)
 
     def to_json(self) -> dict:
         return {
@@ -35,6 +38,13 @@ class Message:
             user_id=data.get("user_id", ""),
             image_meta=data.get("image_meta"),
         )
+
+    def image_refs(self) -> list[str]:
+        return [
+            str(getattr(item, "ref_id", "") or "")
+            for item in self.image_inputs
+            if getattr(item, "ref_id", "")
+        ]
 
 
 @dataclass

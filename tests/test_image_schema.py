@@ -1,6 +1,7 @@
 import unittest
 from pathlib import Path
 import sys
+import json
 
 PLUGIN_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PLUGIN_DIR))
@@ -52,7 +53,7 @@ class ImageWithDescriptionSchemaTests(unittest.TestCase):
         self.assertEqual("无", restored.pragmatic_intent)
         self.assertEqual({"valence": 0.0, "arousal": 0.0, "dominance": 0.0}, restored.affect)
 
-    def test_to_meta_excludes_free_text(self):
+    def test_to_meta_includes_persistable_visual_description(self):
         desc = ImageWithDescription(
             visual_description="画面描述",
             ocr_text="配字",
@@ -69,8 +70,7 @@ class ImageWithDescriptionSchemaTests(unittest.TestCase):
         self.assertEqual({"valence": -0.3, "arousal": 0.6, "dominance": 0.1}, meta["affect"])
         self.assertEqual([{"frame": 2, "action": "转头"}], meta["temporal"])
         self.assertTrue(meta["is_sticker"])
-        # 不含自由文本
-        self.assertNotIn("visual_description", meta)
+        self.assertEqual("画面描述", meta["visual_description"])
         self.assertNotIn("description", meta)
 
     def test_to_meta_isolation(self):
@@ -120,6 +120,25 @@ class ParseVlmResponseTests(unittest.TestCase):
         desc = parse_vlm_response("", is_sticker=True)
         self.assertEqual("", desc.visual_description)
         self.assertTrue(desc.is_sticker)
+
+    def test_untrusted_free_text_and_arrays_are_bounded(self):
+        resp = json.dumps({
+            "visual_description": "图" * 500,
+            "ocr_text": "字" * 5000,
+            "entities": [
+                {"name": f"E{i}", "type": "object", "confidence": 0.5}
+                for i in range(50)
+            ],
+            "temporal": [
+                {"frame": i, "action": "动作"}
+                for i in range(80)
+            ],
+        }, ensure_ascii=False)
+        desc = parse_vlm_response(resp)
+        self.assertEqual(160, len(desc.visual_description))
+        self.assertEqual(2000, len(desc.ocr_text))
+        self.assertEqual(20, len(desc.entities))
+        self.assertEqual(32, len(desc.temporal))
 
     def test_parse_legacy_fields(self):
         """模型用旧字段 description/emotion 也能解析。"""
@@ -263,10 +282,11 @@ class MergeSegmentMetasTests(unittest.TestCase):
         out = merge_segment_metas([None, m, None])
         self.assertEqual({"primary": m}, out)
 
-    def test_multiple_primary_takes_first(self):
+    def test_multiple_primary_keeps_compat_primary_and_all_images(self):
         a, b = self._meta("A"), self._meta("B")
         out = merge_segment_metas([a, b])
-        self.assertEqual({"primary": a}, out)
+        self.assertEqual(a, out["primary"])
+        self.assertEqual([a, b], out["primary_images"])
 
     def test_referenced_only(self):
         ref1, ref2 = self._meta("R1"), self._meta("R2")

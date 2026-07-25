@@ -24,6 +24,10 @@ PRAGMATIC_INTENTS = (
 
 # 实体类型封闭集
 ENTITY_TYPES = ("character", "real_person", "meme", "brand", "object")
+MAX_VISUAL_DESCRIPTION_CHARS = 160
+MAX_OCR_TEXT_CHARS = 2000
+MAX_ENTITIES = 20
+MAX_TEMPORAL_STEPS = 32
 
 
 def gif_target_count(total_frames: int) -> int:
@@ -99,7 +103,7 @@ def _normalize_entities(raw) -> list[dict]:
             etype = "object"
         confidence = _clamp(e.get("confidence"), 0.0, 1.0, 0.0)
         out.append({"name": name, "type": etype, "confidence": round(confidence, 3)})
-    return out
+    return out[:MAX_ENTITIES]
 
 
 def _normalize_affect(raw) -> dict:
@@ -129,13 +133,13 @@ def _normalize_temporal(raw) -> list[dict]:
         except (TypeError, ValueError):
             frame = 0
         out.append({"frame": frame, "action": action})
-    return out
+    return out[:MAX_TEMPORAL_STEPS]
 
 
 @dataclass
 class ImageWithDescription:
     # 新正交槽
-    visual_description: str = ""        # 纯视觉描述（原 description 本职，≤60字）
+    visual_description: str = ""        # 纯视觉描述（原 description 本职，≤160字）
     ocr_text: str = ""                  # 图内文字，单列
     entities: list = field(default_factory=list)
         # [{name, type∈ENTITY_TYPES, confidence∈[0,1]}]；模型自身知识识别；不认识=空
@@ -148,8 +152,9 @@ class ImageWithDescription:
     emotion: str = ""                   # 旧三段式，仅 from_json 读旧缓存用
 
     def to_meta(self) -> dict:
-        """返回纯结构化元数据（供 Message.image_meta），不含自由文本。"""
+        """返回供 Message.image_meta 使用的结构化图片观察。"""
         return {
+            "visual_description": self.visual_description,
             "entities": list(self.entities),
             "ocr_text": self.ocr_text,
             "pragmatic_intent": self.pragmatic_intent,
@@ -186,8 +191,10 @@ class ImageWithDescription:
             raise ValueError("JSON解析失败")
 
         # 新字段优先；缺省时从旧字段回填或用默认
-        visual = str(data.get("visual_description") or data.get("description") or "")
-        ocr_text = str(data.get("ocr_text") or "")
+        visual = str(
+            data.get("visual_description") or data.get("description") or ""
+        )[:MAX_VISUAL_DESCRIPTION_CHARS]
+        ocr_text = str(data.get("ocr_text") or "")[:MAX_OCR_TEXT_CHARS]
         entities = _normalize_entities(data.get("entities"))
         pragmatic_intent = str(data.get("pragmatic_intent") or "无")
         if pragmatic_intent not in PRAGMATIC_INTENTS:
@@ -218,12 +225,14 @@ def parse_vlm_response(response: str, is_sticker: bool = False) -> ImageWithDesc
     """
     data = _extract_json(response) or {}
 
-    visual = str(data.get("visual_description") or data.get("description") or "").strip()
+    visual = str(
+        data.get("visual_description") or data.get("description") or ""
+    ).strip()[:MAX_VISUAL_DESCRIPTION_CHARS]
     if not visual:
-        # 解析失败兜底：截取原始响应前 60 字
-        visual = (response or "")[:60].strip()
+        # 解析失败兜底：保留足够的视觉信息，同时限制异常响应长度。
+        visual = (response or "")[:MAX_VISUAL_DESCRIPTION_CHARS].strip()
 
-    ocr_text = str(data.get("ocr_text") or "")
+    ocr_text = str(data.get("ocr_text") or "")[:MAX_OCR_TEXT_CHARS]
 
     entities = _normalize_entities(data.get("entities"))
 
@@ -274,7 +283,8 @@ def merge_segment_metas(segment_metas: list) -> dict | None:
     引用消息段返回 {"referenced": [...]}。
     输出：
       - 无任何图片 meta -> None
-      - 有主图 -> {"primary": <首张非空裸 meta>, "referenced": [...]}（referenced 可缺省）
+      - 有主图 -> {"primary": <首张非空裸 meta>, "primary_images": [全部主图], ...}
+        单图时省略 primary_images，兼容既有消费者。
       - 仅引用图 -> {"referenced": [...]}
     """
     primary_metas = []
@@ -295,6 +305,8 @@ def merge_segment_metas(segment_metas: list) -> dict | None:
     out: dict = {}
     if primary_metas:
         out["primary"] = primary_metas[0]
+        if len(primary_metas) > 1:
+            out["primary_images"] = primary_metas
     if referenced:
         out["referenced"] = referenced
     return out

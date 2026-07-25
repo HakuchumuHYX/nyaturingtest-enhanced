@@ -27,8 +27,10 @@ from ..config import (
     get_effective_vlm_api_key,
     get_effective_vlm_base_url,
     get_effective_vlm_model,
+    should_use_standalone_vlm,
 )
 from ..llm.vlm import VLM
+from ..llm.vision import VisionInput
 from ..core.metrics import metrics
 from ..utils import get_http_client
 from .image_policy import (
@@ -48,6 +50,7 @@ from .image_schema import (
 
 IMAGE_CACHE_DIR = Path(f"{store.get_plugin_cache_dir()}/image_cache")
 _IMG_SEMAPHORE = asyncio.Semaphore(3)
+IMAGE_OBSERVATION_SCHEMA_VERSION = "3"
 
 
 class ImageManager:
@@ -62,8 +65,16 @@ class ImageManager:
 
     def __init__(self):
         if not self._initialized:
-            vlm_provider = plugin_config.get("vlm", {}).get("provider", "openai_compatible").strip().lower()
+            self._vlm: VLM | None = None
+            IMAGE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            self._initialized = True
+            self._mem_cache: OrderedDict[str, tuple[float, ImageWithDescription]] = OrderedDict()
 
+    def _get_vlm(self) -> VLM:
+        if self._vlm is None:
+            if not should_use_standalone_vlm():
+                raise RuntimeError("Standalone VLM is disabled by the effective image route.")
+            vlm_provider = plugin_config.get("vlm", {}).get("provider", "openai_compatible").strip().lower()
             self._vlm = VLM(
                 api_key=get_effective_vlm_api_key(),
                 endpoint=get_effective_vlm_base_url(),
@@ -71,9 +82,7 @@ class ImageManager:
                 provider=vlm_provider,
                 timeout=int(plugin_config.get("vlm", {}).get("timeout") or 60),
             )
-            IMAGE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-            self._initialized = True
-            self._mem_cache: OrderedDict[str, tuple[float, ImageWithDescription]] = OrderedDict()
+        return self._vlm
 
     def get_from_cache(self, key: str) -> ImageWithDescription | None:
         safe_key = sanitize_image_cache_key(key)
@@ -94,22 +103,47 @@ class ImageManager:
             while len(self._mem_cache) > MEM_CACHE_MAX_ITEMS:
                 self._mem_cache.popitem(last=False)
 
+    def _description_cache_key(
+        self,
+        identifier: str,
+        *,
+        is_sticker: bool,
+        context_text: str,
+    ) -> str:
+        material = "|".join([
+            IMAGE_OBSERVATION_SCHEMA_VERSION,
+            get_effective_vlm_model(),
+            str(identifier or ""),
+            "sticker" if is_sticker else "image",
+            str(context_text or ""),
+        ])
+        return hashlib.sha256(material.encode("utf-8", "ignore")).hexdigest()
+
     async def resolve_image_from_url(self, url: str, file_unique: str, is_sticker: bool, context_text: str = "",
-                                     on_usage: Callable[[dict], None] | None = None) -> tuple[str, dict | None]:
+                                     on_usage: Callable[[dict], None] | None = None,
+                                     *,
+                                     describe: bool = True,
+                                     include_native: bool = False,
+                                     ref_id: str = "",
+                                     source: str = "primary",
+                                     ) -> tuple[str, dict | None, VisionInput | None]:
         """
-        高层接口：下载并分析图片，返回 (格式化描述文本, 结构化元数据)。
+        高层接口：下载图片，并按路由选择独立 VLM 描述和/或原生图片输入。
         元数据为 None 表示无结构化观测（占位/失败/未识别）。
         """
         if not url:
-            return ("[无效图片]", None)
+            return ("[无效图片]", None, None)
 
         async with _IMG_SEMAPHORE:
             try:
-                # 1. 尝试从内存缓存获取
-                if file_unique:
-                    cached_desc = self.get_from_cache(file_unique)
-                    if cached_desc:
-                        return (render_image_text(cached_desc, is_sticker), cached_desc.to_meta())
+                description_cache_key = self._description_cache_key(
+                    file_unique or url,
+                    is_sticker=is_sticker,
+                    context_text=context_text,
+                )
+                cached_desc = self.get_from_cache(description_cache_key) if describe else None
+                if cached_desc and not include_native:
+                    return (render_image_text(cached_desc, is_sticker), cached_desc.to_meta(), None)
 
                 # 2. 准备文件缓存路径
                 cache_path = IMAGE_CACHE_DIR.joinpath("raw")
@@ -143,10 +177,10 @@ class ImageManager:
                             content_type = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
                             if content_type and content_type not in SAFE_IMAGE_CONTENT_TYPES:
                                 logger.warning(f"拒绝非图片响应: {content_type}")
-                                return ("\n[图片类型不支持]\n", None)
+                                return ("\n[图片类型不支持]\n", None, None)
                             if len(resp.content) > MAX_IMAGE_BYTES:
                                 logger.warning(f"拒绝过大图片: {len(resp.content)} bytes")
-                                return ("\n[图片过大]\n", None)
+                                return ("\n[图片过大]\n", None, None)
                             image_bytes = resp.content
                             break
                         except Exception:
@@ -161,22 +195,70 @@ class ImageManager:
                             logger.warning(f"写入图片缓存失败: {e}")
 
                 if not image_bytes:
-                    return ("\n[图片下载失败]\n", None)
+                    return ("\n[图片下载失败]\n", None, None)
+
+                vision_input = None
+                if include_native:
+                    vision_input = await self._build_native_vision_input(
+                        image_bytes,
+                        is_sticker=is_sticker,
+                        ref_id=ref_id,
+                        source=source,
+                    )
+
+                if not describe:
+                    placeholder = "\n[表情包]\n" if is_sticker else "\n[图片]\n"
+                    return (placeholder, None, vision_input)
+
+                if cached_desc:
+                    return (
+                        render_image_text(cached_desc, is_sticker),
+                        cached_desc.to_meta(),
+                        vision_input,
+                    )
 
                 # 5. 调用 VLM 进行识别
                 image_base64 = base64.b64encode(image_bytes).decode("utf-8")
                 description = await self.get_image_description(
-                    image_base64=image_base64, is_sticker=is_sticker, cache_key=file_unique,
+                    image_base64=image_base64, is_sticker=is_sticker,
+                    cache_key=description_cache_key,
                     context_text=context_text, on_usage=on_usage
                 )
 
                 if description:
-                    return (render_image_text(description, is_sticker), description.to_meta())
-                return ("\n[图片识别无结果]\n", None)
+                    return (
+                        render_image_text(description, is_sticker),
+                        description.to_meta(),
+                        vision_input,
+                    )
+                return ("\n[图片识别无结果]\n", None, vision_input)
 
             except Exception as e:
                 logger.error(f"Image resolve error: {e}")
-                return ("\n[图片处理出错]\n", None)
+                return ("\n[图片处理出错]\n", None, None)
+
+    async def _build_native_vision_input(
+        self,
+        image_bytes: bytes,
+        *,
+        is_sticker: bool,
+        ref_id: str,
+        source: str,
+    ) -> VisionInput | None:
+        normalized = await _prepare_native_image_payload(
+            image_bytes,
+            max_side=_configured_max_image_side(),
+        )
+        if not normalized:
+            return None
+        payload_bytes, image_format = normalized
+        encoded = base64.b64encode(payload_bytes).decode("utf-8")
+        return VisionInput(
+            ref_id=ref_id,
+            data_url=f"data:image/{image_format};base64,{encoded}",
+            is_sticker=is_sticker,
+            source=source,
+        )
 
     async def get_image_description(self, image_base64: str, is_sticker: bool,
                                     cache_key: str | None = None,
@@ -193,15 +275,22 @@ class ImageManager:
             return None
         image_hash = await _calculate_image_hash(image_bytes)
 
-        cache = IMAGE_CACHE_DIR.joinpath(f"{image_hash}.json")
+        disk_cache_material = "|".join([
+            IMAGE_OBSERVATION_SCHEMA_VERSION,
+            get_effective_vlm_model(),
+            image_hash,
+            str(cache_key or ""),
+            "sticker" if is_sticker else "image",
+            str(context_text or ""),
+        ])
+        disk_cache_key = hashlib.sha256(
+            disk_cache_material.encode("utf-8", "ignore")
+        ).hexdigest()
+        cache = IMAGE_CACHE_DIR.joinpath(f"{disk_cache_key}.json")
         if cache.exists():
             try:
                 async with await anyio.open_file(cache, encoding="utf-8") as f:
                     image_with_desc = ImageWithDescription.from_json(await f.read())
-                    if image_with_desc.is_sticker != is_sticker:
-                        image_with_desc.is_sticker = is_sticker
-                        async with await anyio.open_file(cache, "w", encoding="utf-8") as f:
-                            await f.write(image_with_desc.to_json())
                     if cache_key:
                         self.save_to_cache(cache_key, image_with_desc)
                     return image_with_desc
@@ -233,8 +322,8 @@ class ImageManager:
             )
 
         base_prompt += f"""请输出以下字段：
-1. visual_description：用中文描述图片画面内容，最多60字。
-2. ocr_text：原样提取图片里出现的文字（表情包配字、截图文字等），没有文字就留空字符串。
+1. visual_description：用中文完整描述与群聊理解有关的画面、动作、空间关系和显著细节，最多160字。
+2. ocr_text：按自然阅读顺序原样提取图片里的文字；截图、表格、聊天记录需尽量保留换行和区块关系，没有文字就留空字符串。
 3. entities：凭你已有的知识判断图中出现的角色/IP/真人/品牌/meme 名称，给出数组，每项含 name(名称)、type(取值: character/real_person/meme/brand/object)、confidence(0~1)。不认识就返回空数组 []，禁止编造不存在的名字。
 4. pragmatic_intent：这张图在对话里的语用功能，从以下封闭标签里选一个：嘲讽/自嘲/附和/破冰/卖萌/终结话题/否认/求助/感叹/无。
 5. affect：图片表达的情感，用 VAD 三元组：{{"valence":-1~1(愉悦度),"arousal":0~1(兴奋度),"dominance":-1~1(支配度)}}。
@@ -279,17 +368,24 @@ class ImageManager:
         # === 4. 格式最终清洗 + 静态图压缩 ===
         try:
             img = Image.open(io.BytesIO(base64.b64decode(target_image_base64)))
-            max_side = 512
+            max_side = _configured_max_image_side()
             w, h = img.size
             if max(w, h) > max_side:
                 ratio = max_side / max(w, h)
                 img = img.resize((int(w * ratio), int(h * ratio)), Image.Resampling.LANCZOS)
-            if img.mode != "RGB":
-                img = img.convert("RGB")
             buffer = io.BytesIO()
-            img.save(buffer, format="JPEG", quality=85)
+            preserve_png = target_format == "png"
+            if preserve_png:
+                if img.mode not in {"RGB", "RGBA", "L", "LA"}:
+                    img = img.convert("RGBA")
+                img.save(buffer, format="PNG", optimize=True)
+                target_format = "png"
+            else:
+                if img.mode != "RGB":
+                    img = img.convert("RGB")
+                img.save(buffer, format="JPEG", quality=90)
+                target_format = "jpeg"
             target_image_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
-            target_format = "jpeg"
         except Exception as e:
             logger.error(f"图片压缩/格式转换失败: {e}")
             if target_format not in ["jpeg", "png", "webp"]:
@@ -299,8 +395,14 @@ class ImageManager:
         high_detail_for_sticker = bool(
             plugin_config.get("vlm", {}).get("high_detail_for_sticker", True)
         )
-        detail = "high" if (is_sticker and high_detail_for_sticker) else "low"
-        response = await self._vlm.request(
+        high_detail_for_png = bool(
+            plugin_config.get("vlm", {}).get("high_detail_for_png", True)
+        )
+        detail = "high" if (
+            (is_sticker and high_detail_for_sticker)
+            or (target_format == "png" and high_detail_for_png)
+        ) else "low"
+        response = await self._get_vlm().request(
             prompt=prompt,
             image_base64=target_image_base64,
             image_format=target_format,
@@ -440,10 +542,62 @@ def _process_gif_to_grid(gif_base64: str) -> tuple[str, int] | None:
         return None
 
 
+def _configured_max_image_side() -> int:
+    raw_value = plugin_config.get("vlm", {}).get("max_image_side", 1280)
+    try:
+        value = int(raw_value)
+    except (TypeError, ValueError):
+        value = 1280
+    return max(512, min(value, 4096))
+
+
+@run_sync
+def _prepare_native_image_payload(
+    image_bytes: bytes,
+    *,
+    max_side: int,
+) -> tuple[bytes, str] | None:
+    """Validate and resize a native multimodal payload without semantic analysis."""
+    try:
+        image = Image.open(io.BytesIO(image_bytes))
+        if image.width * image.height > MAX_IMAGE_PIXELS:
+            logger.warning(f"拒绝像素过大的原生视觉图片: {image.width}x{image.height}")
+            return None
+        raw_format = (image.format or "JPEG").lower()
+        if raw_format == "jpg":
+            raw_format = "jpeg"
+        if getattr(image, "is_animated", False) and getattr(image, "n_frames", 1) > 1:
+            if raw_format == "gif":
+                return image_bytes, "gif"
+            image.seek(0)
+
+        w, h = image.size
+        if max(w, h) > max_side:
+            ratio = max_side / max(w, h)
+            image = image.resize(
+                (max(1, int(w * ratio)), max(1, int(h * ratio))),
+                Image.Resampling.LANCZOS,
+            )
+
+        output = io.BytesIO()
+        if raw_format == "png":
+            if image.mode not in {"RGB", "RGBA", "L", "LA"}:
+                image = image.convert("RGBA")
+            image.save(output, format="PNG", optimize=True)
+            return output.getvalue(), "png"
+
+        if image.mode != "RGB":
+            image = image.convert("RGB")
+        image.save(output, format="JPEG", quality=90)
+        return output.getvalue(), "jpeg"
+    except Exception as exc:
+        logger.warning(f"原生视觉图片预处理失败: {exc}")
+        return None
+
+
 @run_sync
 def _calculate_image_hash(image: bytes) -> str:
-    sha256_hash = hashlib.md5(image).hexdigest()
-    return sha256_hash
+    return hashlib.sha256(image).hexdigest()
 
 
 image_manager = ImageManager()
