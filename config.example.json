@@ -9,7 +9,7 @@
       "reasoning_effort": "high",
       "rp_style": "off"
     },
-    "max_tokens": 65536,
+    "max_tokens": 4096,
     "timeout": 180,
     "vision": {
       "enabled": false,
@@ -21,10 +21,7 @@
     "api_key": "YOUR_DEEPSEEK_API_KEY",
     "base_url": "https://api.deepseek.com",
     "model": "deepseek-v4-flash",
-    "thinking": {
-      "enabled": false
-    },
-    "max_tokens": 65536,
+    "max_tokens": 2048,
     "timeout": 60,
     "vision": {
       "enabled": false,
@@ -76,8 +73,8 @@
     "history_recall_limit": 20,
     "backup_retention_count": 7,
     "raw_message_retention_days": 0,
-    "raw_interaction_retention_days": 0,
-    "token_usage_retention_days": 0,
+    "raw_interaction_retention_days": 180,
+    "token_usage_retention_days": 90,
     "speak_cooldown_seconds": 16.0,
     "willingness_idle_after_seconds": 300.0,
     "willingness_decay_rate_active": 0.03,
@@ -97,14 +94,21 @@
     "rerank_willingness_threshold": 0.68,
     "rag_debug_log": false,
     "rag_final_k": 20,
-    "rag_candidate_k": 40,
     "rag_per_query_recall_k": 40,
     "rag_merged_candidate_cap": 64,
     "rag_memory_char_budget": 1500,
+    "prompt_summary_chars": 1200,
+    "prompt_recent_message_chars": 1600,
+    "prompt_history_chars": 2400,
+    "prompt_rag_item_chars": 500,
+    "prompt_recalled_history_chars": 1200,
     "rag_default_event_ttl_days": 90,
     "memory_write_max_retries": 3,
     "memory_write_retry_base_delay": 0.5,
-    "memory_drain_timeout_seconds": 10.0
+    "memory_drain_timeout_seconds": 10.0,
+    "memory_query_user_cooldown_seconds": 30.0,
+    "memory_query_group_cooldown_seconds": 3.0,
+    "memory_query_cache_max_entries": 256
   },
   "enabled_groups": []
 }

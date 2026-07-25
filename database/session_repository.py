@@ -1,11 +1,9 @@
-from datetime import datetime, timedelta
-
 from nonebot import logger
 
 from ..memory.short_term import Message
 from ..models.database import GlobalMessageModel, InteractionLogModel, SessionModel, UserProfileModel
 from ..config import get_runtime_settings
-from ..utils import sanitize_text
+from ..core.text_utils import sanitize_text
 
 
 class SessionStateRepository:
@@ -69,36 +67,8 @@ class SessionStateRepository:
             return None
 
         users_db = await UserProfileModel.filter(session=session_db)
-        user_ids = [user.id for user in users_db]
-        recent_logs_by_user: dict[int, list[InteractionLogModel]] = {user.id: [] for user in users_db}
-        if user_ids:
-            recent_interaction_cutoff = datetime.now() - timedelta(
-                days=get_runtime_settings()["interaction_log_recent_days"]
-            )
-            all_logs = await InteractionLogModel.filter(
-                user_id__in=user_ids,
-                timestamp__gte=recent_interaction_cutoff,
-            ).order_by("user_id", "-timestamp")
-            for log in all_logs:
-                bucket = recent_logs_by_user.setdefault(log.user_id, [])
-                if len(bucket) < 20:
-                    bucket.append(log)
-
         users_data = []
         for user_db in users_db:
-            recent_logs = recent_logs_by_user.get(user_db.id, [])
-            logs_data = [
-                {
-                    "timestamp": log.timestamp,
-                    "delta": {
-                        "valence": log.delta_valence,
-                        "arousal": log.delta_arousal,
-                        "dominance": log.delta_dominance,
-                    },
-                }
-                for log in reversed(recent_logs)
-            ]
-
             users_data.append(
                 {
                     "user_id": user_db.user_id,
@@ -106,7 +76,9 @@ class SessionStateRepository:
                     "arousal": user_db.arousal,
                     "dominance": user_db.dominance,
                     "last_update_time": user_db.last_update_time,
-                    "recent_logs": logs_data,
+                    "interaction_count": user_db.interaction_count,
+                    "first_interaction_at": user_db.first_interaction_at,
+                    "last_interaction_at": user_db.last_interaction_at,
                 }
             )
 

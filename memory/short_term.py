@@ -17,6 +17,8 @@ class Message:
     image_meta: dict | None = None     # 图片结构化观测，纯内存，不持久化
     # 原生多模态输入，仅当前进程短期持有；不序列化、不写数据库。
     image_inputs: list[Any] = field(default_factory=list, repr=False, compare=False)
+    revision: int = field(default=0, repr=False, compare=False)
+    _persistence_id: str = field(default="", repr=False, compare=False)
 
     def to_json(self) -> dict:
         return {
@@ -46,6 +48,10 @@ class Message:
             if getattr(item, "ref_id", "")
         ]
 
+    def mark_dirty(self) -> int:
+        self.revision += 1
+        return self.revision
+
 
 @dataclass
 class MemoryRecord:
@@ -66,18 +72,14 @@ class Memory:
         maxlen = max(self.__context_limit, int(buffer_size or self.__context_limit * 10))
         # 上下文窗口：保留缓冲区，access 只返回最近 context_limit 条
         self.__messages = deque(messages, maxlen=maxlen) if messages else deque(maxlen=maxlen)
-
-    def related_users(self) -> list[str]:
-        """
-        获取相关用户列表 (返回 user_id 优先)
-        """
-        return list({msg.user_id if msg.user_id else msg.user_name for msg in self.__messages})
+        self.__dirty_messages: dict[int, Message] = {}
 
     async def clear(self) -> None:
         """
         清除所有记忆
         """
         self.__messages.clear()
+        self.__dirty_messages.clear()
         self.__compressed_message = ""
         logger.info("已清除所有记忆")
 
@@ -104,6 +106,38 @@ class Memory:
     def snapshot(self) -> list[Message]:
         return list(self.__messages)
 
+    def pending_messages(self) -> list[tuple[Message, int]]:
+        return [
+            (message, message.revision)
+            for message in self.__dirty_messages.values()
+        ]
+
+    def mark_persisted(self, persisted: list[tuple[Message, int]]) -> None:
+        for message, revision in persisted:
+            key = id(message)
+            if message.revision == revision:
+                self.__dirty_messages.pop(key, None)
+
+    def mark_dirty(self, message: Message) -> None:
+        message.mark_dirty()
+        self.__dirty_messages[id(message)] = message
+
+    def messages_after(
+        self,
+        watermark: datetime | None,
+        limit: int | None = None,
+    ) -> list[Message]:
+        """Return buffered messages newer than a consolidation watermark."""
+
+        messages = list(self.__messages)
+        if watermark is not None:
+            watermark_ts = watermark.timestamp()
+            messages = [message for message in messages if message.time.timestamp() > watermark_ts]
+        if limit is not None:
+            safe_limit = max(1, int(limit))
+            messages = messages[-safe_limit:]
+        return messages
+
     async def update(self, message_chunk: list[Message]):
         """
         仅更新上下文窗口，不再触发后台压缩任务
@@ -124,3 +158,5 @@ class Memory:
         if to_add:
             # 1. 更新上下文窗口 (Rolling Window)
             self.__messages.extend(to_add)
+            for message in to_add:
+                self.mark_dirty(message)

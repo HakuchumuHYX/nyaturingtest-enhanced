@@ -14,14 +14,9 @@ from nonebot.permission import SUPERUSER
 from nonebot.matcher import Matcher
 
 from ..config import (
-    plugin_config,
-    get_chat_thinking_settings,
-    get_feedback_thinking_settings,
     get_runtime_settings,
     get_token_stats_model_names,
-    get_config_load_status,
-    get_effective_vlm_mode,
-    get_vision_settings,
+    get_token_stats_watermark,
     native_vision_enabled,
     should_use_standalone_vlm,
 )
@@ -35,11 +30,14 @@ from ..core.state_manager import (
 )
 from ..core.logic import message2BotMessage
 from ..core.metrics import metrics
+from ..core.status_service import StatusService
 from ..core.structured_log import log_event
 from ..memory.short_term import Message as MMessage
 from ..database.enabled_group_repository import EnabledGroupRepository
 from ..database.token_repository import TokenUsageRepository
 from ..database.backup import backup_task
+from ..core.admin_service import reset_session_with_backup
+from ..core.ingress import sender_display_name
 from .command_meta import render_group_help, render_private_help
 
 
@@ -345,13 +343,10 @@ async def do_reset(matcher: type[Matcher], group_id: int):
     state = ensure_group_state(group_id)
     if not state:
         await matcher.finish("本群 Autochat 未启用，请先使用 autochat enable")
-    async with state.session_lock:
-        await state.session.load_session()
-        state.session.bump_generation("reset_requested")
     await matcher.send("即将重置，会先执行一次数据备份...")
-    await backup_task()
-    async with state.session_lock:
-        await state.session.reset()
+    if not await reset_session_with_backup(state, backup_task):
+        await matcher.finish("备份失败，已中止重置；会话、记忆和画像均未清除。")
+        return
     await matcher.finish("已重置会话")
 
 
@@ -373,41 +368,7 @@ async def do_status(matcher: type[Matcher], group_id: int):
     state = ensure_group_state(group_id)
     if not state:
         await matcher.finish("本群 Autochat 未启用，请先使用 autochat enable")
-    async with state.session_lock:
-        await state.session.load_session()
-        status_msg = state.session.status()
-    chat_thinking = get_chat_thinking_settings()
-    feedback_thinking = get_feedback_thinking_settings()
-    chat_vision = get_vision_settings("chat")
-    feedback_vision = get_vision_settings("feedback")
-    chat_provider_status = getattr(state.client, "provider_status", None)
-    feedback_provider_status = getattr(state.feedback_client, "provider_status", None)
-    provider_lines = [
-        "",
-        "Provider:",
-        f"- Chat thinking: {'on' if chat_thinking.get('enabled') else 'off'} {chat_thinking.get('reasoning_effort', '')}".strip(),
-        f"- Feedback thinking: {'on' if feedback_thinking.get('enabled') else 'off'}",
-        (
-            f"- Vision: chat={'native' if chat_vision['enabled'] else 'text'}, "
-            f"feedback={'native' if feedback_vision['enabled'] else 'text'}, "
-            f"vlm_mode={get_effective_vlm_mode()}, "
-            f"standalone={'on' if should_use_standalone_vlm() else 'off'}"
-        ),
-        f"- Queue length: {len(state.messages_chunk)}",
-        f"- Metrics: llm={metrics.llm_success}/{metrics.llm_failure}, vlm={metrics.vlm_success}/{metrics.vlm_failure}, db_write_failure={metrics.db_write_failure}",
-    ]
-    for name, provider_status in (("Chat", chat_provider_status), ("Feedback", feedback_provider_status)):
-        if provider_status and provider_status.last_error_type:
-            provider_lines.append(
-                f"- {name} last_error={provider_status.last_error_type} circuit_remaining={provider_status.circuit_remaining_seconds}s"
-            )
-    config_status = get_config_load_status()
-    if not config_status.ok or config_status.source != "file":
-        provider_lines.append(
-            f"- Config: source={config_status.source} ok={config_status.ok} error={config_status.error_type}"
-        )
-    status_msg += "\n".join(provider_lines)
-    await matcher.finish(status_msg)
+    await matcher.finish(await StatusService().describe(state))
 
 
 @list_groups_pm.handle()
@@ -424,15 +385,17 @@ async def handle_list_groups_pm():
 @manual_backup_cmd.handle()
 async def handle_manual_backup():
     await manual_backup_cmd.send("开始手动备份 NyaTuringTest 数据，请稍候...")
-    await backup_task()
-    await manual_backup_cmd.finish("备份完成！")
+    if await backup_task():
+        await manual_backup_cmd.finish("备份完成！")
+    await manual_backup_cmd.finish("备份失败，请检查日志和数据目录。")
 
 
 @manual_backup_pm.handle()
 async def handle_manual_backup_pm():
     await manual_backup_pm.send("开始手动备份 NyaTuringTest 数据，请稍候...")
-    await backup_task()
-    await manual_backup_pm.finish("备份完成！")
+    if await backup_task():
+        await manual_backup_pm.finish("备份完成！")
+    await manual_backup_pm.finish("备份失败，请检查日志和数据目录。")
 
 
 @auto_chat.handle()
@@ -511,13 +474,7 @@ async def handle_auto_chat(bot: Bot, event: GroupMessageEvent):
         nickname = bot_name
 
     if not nickname:
-        if is_shutting_down():
-            return
-        try:
-            user_info = await bot.get_group_member_info(group_id=group_id, user_id=int(user_id))
-            nickname = user_info.get("card") or user_info.get("nickname") or str(user_id)
-        except Exception:
-            nickname = str(user_id)
+        nickname = sender_display_name(event, user_id)
 
     async with state.data_lock:
         max_size = get_runtime_settings()["queue_max_size"]
@@ -586,8 +543,7 @@ async def handle_manage_autochat(event: GroupMessageEvent, args: Message = Comma
 
 @token_stats.handle()
 async def handle_token_stats(bot: Bot, event: GroupMessageEvent, args: Message = CommandArg()):
-    from ..config import plugin_config
-    from ..utils import render_token_stats_card
+    from ..presenters.token_stats_card import render_token_stats_card
     from nonebot.adapters.onebot.v11 import MessageSegment
     from nonebot.exception import FinishedException
     
@@ -604,7 +560,7 @@ async def handle_token_stats(bot: Bot, event: GroupMessageEvent, args: Message =
     scope_label = "全部历史模型" if token_stats_scope_all else "当前模型"
     
     # 获取水印配置
-    watermark = plugin_config.get("token_stats", {}).get("watermark", "Generated by HakuBot")
+    watermark = get_token_stats_watermark()
     
     # 渲染图片
     try:

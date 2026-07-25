@@ -30,6 +30,11 @@ def build_send_parts(text: str, *, max_messages: int = 2, strategy: str = "split
         raw_parts = _split_text(text)
     parts = [_normalize_send_part(part) for part in raw_parts]
     parts = [part for part in parts if part]
-    if max_messages > 0:
-        return parts[:max_messages]
+    if max_messages > 0 and len(parts) > max_messages:
+        if max_messages == 1:
+            return [" ".join(parts)]
+        return [
+            *parts[: max_messages - 1],
+            " ".join(parts[max_messages - 1 :]),
+        ]
     return parts

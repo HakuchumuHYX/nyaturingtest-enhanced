@@ -29,6 +29,9 @@ class PersonProfile:
     """
     上次更新情感的时间
     """
+    interaction_count: int = 0
+    first_interaction_at: datetime | None = None
+    last_interaction_at: datetime | None = None
     _dirty: bool = field(default=True, init=False, repr=False, compare=False)
 
     @property
@@ -77,6 +80,10 @@ class PersonProfile:
 
         # 将新的印象加入队列
         self.interactions.appendleft(impression)
+        self.interaction_count += 1
+        if self.first_interaction_at is None:
+            self.first_interaction_at = impression.timestamp
+        self.last_interaction_at = impression.timestamp
         self.mark_dirty()
 
     def merge_old_interactions(self):

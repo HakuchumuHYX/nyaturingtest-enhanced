@@ -23,16 +23,17 @@ except Exception:
     scheduler = None
 
 from ..config import (
-    plugin_config,
+    get_app_settings,
     get_effective_vlm_api_key,
     get_effective_vlm_base_url,
     get_effective_vlm_model,
+    get_vlm_image_settings,
     should_use_standalone_vlm,
 )
 from ..llm.vlm import VLM
 from ..llm.vision import VisionInput
 from ..core.metrics import metrics
-from ..utils import get_http_client
+from ..core.http_client import get_http_client
 from .image_policy import (
     MAX_IMAGE_BYTES,
     MAX_IMAGE_PIXELS,
@@ -66,7 +67,6 @@ class ImageManager:
     def __init__(self):
         if not self._initialized:
             self._vlm: VLM | None = None
-            IMAGE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
             self._initialized = True
             self._mem_cache: OrderedDict[str, tuple[float, ImageWithDescription]] = OrderedDict()
 
@@ -74,13 +74,13 @@ class ImageManager:
         if self._vlm is None:
             if not should_use_standalone_vlm():
                 raise RuntimeError("Standalone VLM is disabled by the effective image route.")
-            vlm_provider = plugin_config.get("vlm", {}).get("provider", "openai_compatible").strip().lower()
+            vlm = get_app_settings().vlm
             self._vlm = VLM(
                 api_key=get_effective_vlm_api_key(),
                 endpoint=get_effective_vlm_base_url(),
                 model=get_effective_vlm_model(),
-                provider=vlm_provider,
-                timeout=int(plugin_config.get("vlm", {}).get("timeout") or 60),
+                provider=vlm.provider,
+                timeout=int(vlm.timeout),
             )
         return self._vlm
 
@@ -392,12 +392,9 @@ class ImageManager:
                 return None
 
         # 5. 发送请求（分级 detail：表情包走 high 提升配字/角色细节识别率）
-        high_detail_for_sticker = bool(
-            plugin_config.get("vlm", {}).get("high_detail_for_sticker", True)
-        )
-        high_detail_for_png = bool(
-            plugin_config.get("vlm", {}).get("high_detail_for_png", True)
-        )
+        image_settings = get_vlm_image_settings()
+        high_detail_for_sticker = image_settings["high_detail_for_sticker"]
+        high_detail_for_png = image_settings["high_detail_for_png"]
         detail = "high" if (
             (is_sticker and high_detail_for_sticker)
             or (target_format == "png" and high_detail_for_png)
@@ -543,7 +540,7 @@ def _process_gif_to_grid(gif_base64: str) -> tuple[str, int] | None:
 
 
 def _configured_max_image_side() -> int:
-    raw_value = plugin_config.get("vlm", {}).get("max_image_side", 1280)
+    raw_value = get_vlm_image_settings()["max_image_side"]
     try:
         value = int(raw_value)
     except (TypeError, ValueError):

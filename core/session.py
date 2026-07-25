@@ -3,7 +3,6 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
-from enum import Enum
 import json
 import random
 import time
@@ -13,9 +12,6 @@ import httpx
 from nonebot import logger
 import nonebot_plugin_localstore as store
 from nonebot.utils import run_sync
-from openai import AsyncOpenAI
-
-from ..llm.client import LLMClient
 from ..config import get_chat_thinking_settings, get_runtime_settings
 from .. import config as config_module
 from ..models.emotion import EmotionState, clamp_vad_value
@@ -23,10 +19,16 @@ from ..memory.vector import VectorMemory, where_any
 from ..memory.validation import validate_memory_candidate
 from ..models.impression import Impression
 from ..memory.short_term import Memory, Message
-from ..prompts.presets import PRESETS
+from ..prompts.presets import PRESETS, reload_presets
 from ..models.profile import PersonProfile
-from ..utils import extract_and_parse_json, check_relevance, sanitize_text, escape_for_prompt, get_time_description, should_store_memory
-from ..prompts.templates import get_feedback_prompt, get_chat_prompt
+from .text_utils import (
+    check_relevance,
+    extract_and_parse_json,
+    sanitize_text,
+    should_store_memory,
+)
+from .time_context import get_time_description
+from ..prompts.templates import PromptBudget, get_feedback_prompt, get_chat_prompt
 from ..database.message_repository import MessageRepository
 from ..database.profile_repository import ProfileRepository
 from ..database.session_repository import SessionStateRepository
@@ -35,6 +37,13 @@ from .services import RagSearchService
 from .orchestrator import ConversationOrchestrator
 from .structured_log import log_event
 from .rag_query import build_chat_rag_queries
+from .turn_models import FeedbackOutcome
+from .persistence import PersistenceCoordinator
+from .session_state import ChattingState as _ChattingState, SessionState
+from .session_runtime import SessionRuntime
+from .feedback_processor import FeedbackProcessor
+from .chat_planner import ChatPlanner
+from .memory_writer import MemoryWriteService
 
 
 def _limit_role_text(text: str, max_chars: int) -> str:
@@ -73,53 +82,6 @@ def _endpoint_uses_native_vision(endpoint_name: str) -> bool:
     return bool(getter(endpoint_name).get("enabled", False))
 
 
-def _dedupe_preserve_order(items: list[str]) -> list[str]:
-    result = []
-    seen = set()
-    for item in items:
-        if item in seen:
-            continue
-        seen.add(item)
-        result.append(item)
-    return result
-
-
-def _active_user_query_names(
-    active_user_names: list[str] | None,
-    active_users: list[dict] | None,
-) -> list[str]:
-    result = []
-    seen = set()
-    seen_names = set()
-
-    for user in active_users or []:
-        if not isinstance(user, dict):
-            continue
-        user_id = str(user.get("user_id") or "").strip()
-        user_name = str(user.get("user_name") or "").strip()
-        if not user_name:
-            continue
-        key = f"id:{user_id}" if user_id else f"name:{user_name}"
-        if key in seen or user_name in seen_names:
-            continue
-        seen.add(key)
-        seen_names.add(user_name)
-        result.append(user_name)
-
-    for user_name in active_user_names or []:
-        user_name = str(user_name or "").strip()
-        if not user_name:
-            continue
-        key = f"name:{user_name}"
-        if key in seen or user_name in seen_names:
-            continue
-        seen.add(key)
-        seen_names.add(user_name)
-        result.append(user_name)
-
-    return result
-
-
 def _active_user_scope_ids(active_users: list[dict] | None) -> set[str]:
     result = set()
     for user in active_users or []:
@@ -147,6 +109,19 @@ class _FeedbackContext:
 
 
 _STALE_GENERATION_WRITE = object()
+
+
+def _normalize_feedback_response(
+    parsed: object,
+    current_emotion: EmotionState,
+) -> tuple[dict | None, str]:
+    """Compatibility facade for callers that already parsed Feedback JSON."""
+
+    result = FeedbackProcessor.parse(
+        json.dumps(parsed, ensure_ascii=False),
+        current_emotion,
+    )
+    return result.payload, result.failure_reason
 
 
 def _score_stat_fields(stats: dict) -> dict:
@@ -219,21 +194,6 @@ def _existing_related_memories(
     return related
 
 
-class _ChattingState(Enum):
-    IDLE = 0  # 潜水
-    BUBBLE = 1  # 冒泡
-    ACTIVE = 2  # 活跃
-
-    def __str__(self):
-        match self:
-            case _ChattingState.IDLE:
-                return "潜水状态"
-            case _ChattingState.BUBBLE:
-                return "冒泡状态"
-            case _ChattingState.ACTIVE:
-                return "对话状态"
-
-
 class Session:
     """
     群聊会话
@@ -258,55 +218,159 @@ class Session:
             )
             self._owns_http_client = True
 
-        # 保存基础 LLM Client，供 Memory 和其他组件使用
-        # NOTE: this client is for internal memory/analysis components, keep SiliconFlow OpenAI-compatible here.
-        self._base_llm_client = LLMClient(
-            provider="openai_compatible",
-            openai_client=AsyncOpenAI(
-                api_key=self._siliconflow_api_key,
-                base_url="https://api.siliconflow.cn/v1",
-                http_client=self._client_instance,
-                max_retries=0,
-            ),
-            base_url="https://api.siliconflow.cn/v1",
-            api_key=self._siliconflow_api_key,
-        )
-
         runtime_settings = get_runtime_settings()
-        self.global_memory: Memory = Memory(
+        short_term_memory = Memory(
             context_limit=runtime_settings["short_context_limit"],
             buffer_size=runtime_settings["short_term_buffer_size"],
         )
 
-        self.long_term_memory: VectorMemory = VectorMemory(
+        vector_memory = VectorMemory(
             api_key=self._siliconflow_api_key,
             persist_directory=f"{store.get_plugin_data_dir()}/vector_index_{id}",
         )
+        self._state = SessionState(name=name)
+        self._runtime = SessionRuntime(
+            short_term_memory=short_term_memory,
+            vector_memory=vector_memory,
+            http_client=self._client_instance,
+            owns_http_client=self._owns_http_client,
+            memory_writer=MemoryWriteService(vector_memory),
+        )
+        self._runtime.persistence = PersistenceCoordinator(
+            self._save_coordinated,
+            task_factory=self._create_safe_task,
+        )
 
-        self.__name = name
-        self.__aliases: list[str] = []
-        self.profiles: dict[str, PersonProfile] = {}
-        self.global_emotion: EmotionState = EmotionState()
-        self.chat_summary = ""
-        self.__role = "一个男性人类"
-        self.__examples_str = ""
+    def _domain_state(self) -> SessionState:
+        state = self.__dict__.get("_state")
+        if state is None:
+            state = SessionState()
+            self.__dict__["_state"] = state
+        return state
 
-        # 意愿值系统
-        self.willingness: float = 0.0
-        self.__chatting_state = _ChattingState.IDLE
+    def _runtime_state(self) -> SessionRuntime:
+        runtime = self.__dict__.get("_runtime")
+        if runtime is None:
+            runtime = SessionRuntime()
+            self.__dict__["_runtime"] = runtime
+        return runtime
 
-        self._last_activity_time = datetime.now()
-        self._last_decay_time = datetime.now()
-        self._last_speak_time = datetime.min
-        self._active_count = 0
-        self._engaged = False
-        self.last_consolidated_time = None
-        self._messages_since_consolidation = 0
-        self._last_consolidation_attempt = datetime.min
-        self._loaded = False
-        self._background_tasks = set()
-        self._save_lock = asyncio.Lock()
-        self.generation = 0
+    _Session__name = property(
+        lambda self: self._domain_state().name,
+        lambda self, value: setattr(self._domain_state(), "name", value),
+    )
+    _Session__role = property(
+        lambda self: self._domain_state().role,
+        lambda self, value: setattr(self._domain_state(), "role", value),
+    )
+    _Session__aliases = property(
+        lambda self: self._domain_state().aliases,
+        lambda self, value: setattr(self._domain_state(), "aliases", value),
+    )
+    _Session__examples_str = property(
+        lambda self: self._domain_state().examples,
+        lambda self, value: setattr(self._domain_state(), "examples", value),
+    )
+    _Session__chatting_state = property(
+        lambda self: self._domain_state().chatting_state,
+        lambda self, value: setattr(self._domain_state(), "chatting_state", value),
+    )
+    profiles = property(
+        lambda self: self._domain_state().profiles,
+        lambda self, value: setattr(self._domain_state(), "profiles", value),
+    )
+    global_emotion = property(
+        lambda self: self._domain_state().global_emotion,
+        lambda self, value: setattr(self._domain_state(), "global_emotion", value),
+    )
+    chat_summary = property(
+        lambda self: self._domain_state().chat_summary,
+        lambda self, value: setattr(self._domain_state(), "chat_summary", value),
+    )
+    willingness = property(
+        lambda self: self._domain_state().willingness,
+        lambda self, value: setattr(self._domain_state(), "willingness", value),
+    )
+    generation = property(
+        lambda self: self._domain_state().generation,
+        lambda self, value: setattr(self._domain_state(), "generation", value),
+    )
+    _last_activity_time = property(
+        lambda self: self._domain_state().last_activity_time,
+        lambda self, value: setattr(self._domain_state(), "last_activity_time", value),
+    )
+    _last_decay_time = property(
+        lambda self: self._domain_state().last_decay_time,
+        lambda self, value: setattr(self._domain_state(), "last_decay_time", value),
+    )
+    _last_speak_time = property(
+        lambda self: self._domain_state().last_speak_time,
+        lambda self, value: setattr(self._domain_state(), "last_speak_time", value),
+    )
+    _active_count = property(
+        lambda self: self._domain_state().active_count,
+        lambda self, value: setattr(self._domain_state(), "active_count", value),
+    )
+    _engaged = property(
+        lambda self: self._domain_state().engaged,
+        lambda self, value: setattr(self._domain_state(), "engaged", value),
+    )
+    last_consolidated_time = property(
+        lambda self: self._domain_state().last_consolidated_time,
+        lambda self, value: setattr(
+            self._domain_state(),
+            "last_consolidated_time",
+            value,
+        ),
+    )
+    _messages_since_consolidation = property(
+        lambda self: self._domain_state().messages_since_consolidation,
+        lambda self, value: setattr(
+            self._domain_state(),
+            "messages_since_consolidation",
+            value,
+        ),
+    )
+    _last_consolidation_attempt = property(
+        lambda self: self._domain_state().last_consolidation_attempt,
+        lambda self, value: setattr(
+            self._domain_state(),
+            "last_consolidation_attempt",
+            value,
+        ),
+    )
+    _loaded = property(
+        lambda self: self._domain_state().loaded,
+        lambda self, value: setattr(self._domain_state(), "loaded", value),
+    )
+    global_memory = property(
+        lambda self: self._runtime_state().short_term_memory,
+        lambda self, value: setattr(self._runtime_state(), "short_term_memory", value),
+    )
+    long_term_memory = property(
+        lambda self: self._runtime_state().vector_memory,
+        lambda self, value: setattr(self._runtime_state(), "vector_memory", value),
+    )
+    _background_tasks = property(
+        lambda self: self._runtime_state().background_tasks,
+        lambda self, value: setattr(self._runtime_state(), "background_tasks", value),
+    )
+    _save_lock = property(
+        lambda self: self._runtime_state().save_lock,
+        lambda self, value: setattr(self._runtime_state(), "save_lock", value),
+    )
+    _persistence = property(
+        lambda self: self._runtime_state().persistence,
+        lambda self, value: setattr(self._runtime_state(), "persistence", value),
+    )
+
+    @property
+    def memory_writer(self) -> MemoryWriteService:
+        writer = self._runtime_state().memory_writer
+        if writer is None or writer.vector_memory is not self.long_term_memory:
+            writer = MemoryWriteService(self.long_term_memory)
+            self._runtime_state().memory_writer = writer
+        return writer
 
     def bump_generation(self, reason: str = "") -> int:
         self.generation += 1
@@ -427,12 +491,32 @@ class Session:
         return task
 
     def _schedule_save_session(self, force_index: bool = False):
-        return self._create_safe_task(
-            self.save_session(
-                force_index=force_index,
-                expected_generation=self.generation,
+        coordinator = self._get_persistence_coordinator()
+        coordinator.request(force_index=force_index)
+        return coordinator
+
+    def _get_persistence_coordinator(self) -> PersistenceCoordinator:
+        coordinator = getattr(self, "_persistence", None)
+        if coordinator is None:
+            coordinator = PersistenceCoordinator(
+                self._save_coordinated,
+                task_factory=self._create_safe_task,
             )
-        )
+            self._persistence = coordinator
+        return coordinator
+
+    def begin_persistence_batch(self) -> None:
+        self._get_persistence_coordinator().begin_batch()
+
+    async def end_persistence_batch(self, *, flush: bool = False) -> bool:
+        return await self._get_persistence_coordinator().end_batch(flush=flush)
+
+    async def flush_persistence(self) -> bool:
+        return await self._get_persistence_coordinator().flush()
+
+    async def _save_coordinated(self, force_index: bool = False) -> bool:
+        async with self._save_lock:
+            return await self._save_session_locked(force_index=force_index)
 
     @staticmethod
     def _on_task_done(task: asyncio.Task):
@@ -454,7 +538,10 @@ class Session:
             if self.is_generation_stale(expected_generation):
                 self._log_stale_generation("save_session_locked", expected_generation)
                 return False
-            return await self._save_session_locked(force_index=force_index)
+            result = await self._save_session_locked(force_index=force_index)
+            if result and getattr(self, "_persistence", None) is not None:
+                self._persistence.mark_current_persisted()
+            return result
 
     async def _save_session_locked(self, force_index: bool = False) -> bool:
         try:
@@ -486,13 +573,14 @@ class Session:
                 for profile in dirty_profiles.values():
                     profile.mark_clean()
 
-            # 3. 同步消息（持久化整个缓冲区快照，避免只存最近 N 条导致丢消息）
-            recent_msgs = self.global_memory.snapshot()
-            if recent_msgs:
-                await MessageRepository.sync_messages(self.id, recent_msgs)
-
-            if force_index or random.random() < 0.01:
-                await run_sync(self.long_term_memory.cleanup)(days_retention=90)
+            # 3. 只同步新增或内容被图片观察丰富过的消息。
+            pending_messages = self.global_memory.pending_messages()
+            if pending_messages:
+                await MessageRepository.sync_messages(
+                    self.id,
+                    [message for message, _ in pending_messages],
+                )
+                self.global_memory.mark_persisted(pending_messages)
 
             logger.debug(f"[Session {self.id}] 数据库保存成功")
             return True
@@ -549,13 +637,10 @@ class Session:
             profile.emotion.arousal = user_data["arousal"]
             profile.emotion.dominance = user_data["dominance"]
             profile.last_update_time = user_data["last_update_time"]
-            
-            for log_data in user_data["recent_logs"]:
-                imp = Impression(
-                    timestamp=log_data["timestamp"],
-                    delta=log_data["delta"]
-                )
-                profile.interactions.append(imp)
+            profile.interaction_count = int(user_data.get("interaction_count") or 0)
+            profile.first_interaction_at = user_data.get("first_interaction_at")
+            profile.last_interaction_at = user_data.get("last_interaction_at")
+
             profile.mark_clean()
             self.profiles[user_id] = profile
 
@@ -573,12 +658,19 @@ class Session:
         logger.info(f"[Session {self.id}] 加载完成")
 
     def presets(self) -> list[str]:
-        return [f"{filename}: {preset.name} {preset.role}" for filename, preset in PRESETS.items() if not preset.hidden]
+        reload_presets()
+        return [
+            f"{filename}: {preset.name} {preset.role}"
+            for filename, preset in PRESETS.items()
+            if not preset.hidden
+        ]
 
     async def load_preset(self, filename: str) -> bool:
+        reload_presets()
         if not filename.endswith(".json") and f"{filename}.json" in PRESETS.keys():
             filename = f"{filename}.json"
-        if filename not in PRESETS.keys(): return False
+        if filename not in PRESETS:
+            return False
 
         self.bump_generation("load_preset")
         preset = PRESETS[filename]
@@ -699,7 +791,7 @@ class Session:
 
                 where_filter = where_any("source", ["preset", "memory"])
 
-                raw_results = await RagSearchService(self.long_term_memory).search_for_chat(
+                retrieval_result = await RagSearchService(self.long_term_memory).search_for_chat(
                     queries,
                     k=runtime_settings["rag_final_k"],
                     where=where_filter,
@@ -708,7 +800,8 @@ class Session:
                     merged_candidate_cap=runtime_settings["rag_merged_candidate_cap"],
                     active_user_ids=active_scope_user_ids,
                 )
-                retrieval_stats = getattr(self.long_term_memory, "last_retrieval_stats", {}) or {}
+                raw_results = retrieval_result.records
+                retrieval_stats = retrieval_result.stats
                 rag_stats.update({
                     "candidate_count": int(retrieval_stats.get("candidate_count") or 0),
                     "returned_count": int(retrieval_stats.get("returned_count") or len(raw_results)),
@@ -737,7 +830,12 @@ class Session:
                             prefix = f"【记忆/d:{date_str}】"
                         line = f"{prefix} {content}"
 
-                        if formatted_results and total_len + len(line) > max_len:
+                        remaining = max_len - total_len
+                        if remaining <= 0:
+                            break
+                        if len(line) > remaining:
+                            line = line[:remaining].rstrip()
+                        if not line:
                             break
                         formatted_results.append(line)
                         total_len += len(line)
@@ -764,7 +862,7 @@ class Session:
             llm_func: Callable,
             is_relevant: bool = False,
             search_result: _SearchResult | None = None,
-    ) -> _FeedbackContext | None:
+    ) -> tuple[_FeedbackContext | None, str]:
         """运行 Feedback LLM 并返回可复用的分析上下文。"""
         reaction_users = list({msg.user_id if msg.user_id else msg.user_name for msg in messages_chunk})
         related_profiles = [self.profiles.get(uid, PersonProfile(user_id=uid)) for uid in reaction_users]
@@ -772,10 +870,10 @@ class Session:
             if p.user_id not in self.profiles:
                 self.profiles[p.user_id] = p
 
-        related_profiles_json = json.dumps(
-            [{"user_id": p.user_id, "emotion_tends_to_user": asdict(p.emotion)} for p in related_profiles],
-            ensure_ascii=False, sort_keys=True, separators=(",", ":")
-        )
+        related_profiles_data = [
+            {"user_id": p.user_id, "emotion_tends_to_user": asdict(p.emotion)}
+            for p in related_profiles
+        ]
         search_history = search_result.mem_history if search_result else []
         active_user_ids = {
             str(msg.user_id)
@@ -796,7 +894,7 @@ class Session:
             {
                 "id": str(msg.user_id or ""),
                 "name": msg.user_name,
-                "content": escape_for_prompt(msg.content),
+                "content": msg.content,
                 "image_meta": msg.image_meta,
                 "image_refs": (
                     _message_image_refs(msg)
@@ -824,7 +922,7 @@ class Session:
             {
                 "time": m.time.strftime('%H:%M'),
                 "name": m.user_name,
-                "content": escape_for_prompt(m.content),
+                "content": m.content,
                 "image_meta": m.image_meta,
                 "image_refs": [],
             }
@@ -840,23 +938,30 @@ class Session:
             history_msgs_formatted, # 传入格式化后的历史
             formatted_msgs,
             asdict(self.global_emotion),
-            related_profiles_json, search_history, self.chat_summary,
+            related_profiles_data, search_history, self.chat_summary,
             is_relevant=is_relevant,
             time_info=time_str,
             existing_related_memories=existing_related_memories,
             allow_memory_supersede=allow_memory_supersede,
             new_msg_speakers=new_msg_speakers,
+            budget=PromptBudget.from_runtime(get_runtime_settings()),
         )
 
-        response_dict = {}
         try:
             response = await llm_func(prompt, json_mode=True)
-            parsed = extract_and_parse_json(response)
-            if parsed and isinstance(parsed, dict):
-                response_dict = parsed
         except Exception as e:
             logger.error(f"反馈阶段 LLM 错误，跳过本次处理: {e}")
-            return None
+            return None, "llm_error"
+
+        parsed_feedback = FeedbackProcessor.parse(response, self.global_emotion)
+        response_dict = parsed_feedback.payload
+        if response_dict is None:
+            log_event(
+                "feedback_rejected",
+                session_id=self.id,
+                failure_reason=parsed_feedback.failure_reason,
+            )
+            return None, parsed_feedback.failure_reason
 
         expected_feedback_fields = [
             "analyze_result",
@@ -877,11 +982,14 @@ class Session:
                 response_keys=sorted(str(key) for key in response_dict.keys()),
             )
 
-        return _FeedbackContext(
-            response_dict=response_dict,
-            existing_related_memories=existing_related_memories,
-            allow_memory_supersede=allow_memory_supersede,
-            active_user_ids=active_user_ids,
+        return (
+            _FeedbackContext(
+                response_dict=response_dict,
+                existing_related_memories=existing_related_memories,
+                allow_memory_supersede=allow_memory_supersede,
+                active_user_ids=active_user_ids,
+            ),
+            "",
         )
 
     def _apply_native_image_observations(
@@ -941,6 +1049,9 @@ class Session:
                 placeholder = "[表情包]" if getattr(image_input, "is_sticker", False) else "[图片]"
                 enriched_content = enriched_content.replace(placeholder, "", 1)
             msg.content = f"{enriched_content.strip()}{''.join(rendered_labels)}".strip()
+            mark_dirty = getattr(self.global_memory, "mark_dirty", None)
+            if mark_dirty is not None:
+                mark_dirty(msg)
 
     def _apply_sediment(
         self,
@@ -963,6 +1074,7 @@ class Session:
 
         # 4. 更新用户印象
         emo_tends = response_dict.get("emotion_tends", [])
+        interaction_updates: list[tuple[str, dict]] = []
         if isinstance(emo_tends, list):
             for i, msg in enumerate(messages_chunk):
                 if i >= len(emo_tends): break
@@ -980,20 +1092,18 @@ class Session:
                     delta = raw_delta
 
                 if uid in self.profiles and delta:
-                    # 1. 更新内存
                     self.profiles[uid].push_interaction(
                         Impression(timestamp=datetime.now().astimezone(), delta=delta)
                     )
+                    interaction_updates.append((uid, delta))
 
-                    # 2. 异步写入数据库
-                    # 启动一个后台任务去存库，不阻塞主流程
-                    self._create_safe_task(
-                        self._save_interaction_log(
-                            uid,
-                            delta,
-                            expected_generation=expected_generation,
-                        )
-                    )
+        if interaction_updates:
+            self._create_safe_task(
+                self._save_interaction_logs(
+                    interaction_updates,
+                    expected_generation=expected_generation,
+                )
+            )
 
         for p in self.profiles.values():
             p.update_emotion_tends()
@@ -1002,7 +1112,8 @@ class Session:
         # 5. 更新摘要
         summary = response_dict.get("summary")
         if summary is not None:
-            self.chat_summary = str(summary)
+            prompt_budget = PromptBudget.from_runtime(get_runtime_settings())
+            self.chat_summary = str(summary)[:prompt_budget.summary_chars]
         # 同步更新到 Memory，确保下一次 Prompt 使用最新摘要
         self.global_memory.update_summary(self.chat_summary)
 
@@ -1092,35 +1203,47 @@ class Session:
     async def feedback_stage(self, messages_chunk: list[Message], llm_func: Callable,
                                is_relevant: bool = False,
                                search_result: _SearchResult | None = None,
-                               expected_generation: int | None = None) -> list[str]:
+                               expected_generation: int | None = None) -> FeedbackOutcome:
         """
         反馈阶段：分析情绪、提取记忆、更新摘要
         返回：recalled_history (溯源到的历史消息列表)
         """
         logger.debug(">> 反馈阶段 (Feedback) 开始")
-        ctx = await self._run_feedback_llm(messages_chunk, llm_func, is_relevant, search_result)
+        ctx, failure_reason = await self._run_feedback_llm(
+            messages_chunk,
+            llm_func,
+            is_relevant,
+            search_result,
+        )
         if ctx is None:
-            return []
+            return FeedbackOutcome.rejected(failure_reason)
         if self.is_generation_stale(expected_generation):
             self._log_stale_generation("feedback_sediment", expected_generation)
-            return []
+            return FeedbackOutcome.rejected("stale_generation")
         self._apply_native_image_observations(ctx.response_dict, messages_chunk)
         self._apply_sediment(ctx, messages_chunk, expected_generation=expected_generation)
         recalled_history = await self._apply_decision(ctx, messages_chunk, is_relevant, expected_generation)
+        if self.is_generation_stale(expected_generation):
+            return FeedbackOutcome.rejected("stale_generation")
         logger.debug(f"<< 反馈结束: 意愿 {self.willingness:.2f}, 状态 {self.__chatting_state}")
-        return recalled_history
+        return FeedbackOutcome(
+            accepted=True,
+            recalled_history=recalled_history,
+            state_changed=True,
+        )
 
     async def consolidate_stage(
         self,
         messages_chunk: list[Message],
         feedback_llm_func: Callable,
         expected_generation: int | None = None,
-    ) -> None:
+    ) -> FeedbackOutcome:
         """常驻记忆固化：分析+沉淀，但不改回复意愿、不做发言决策。"""
         if not messages_chunk:
-            return
+            return FeedbackOutcome.rejected("no_messages")
+        self._last_consolidation_attempt = datetime.now()
         logger.debug(f"[Session {self.id}] >> 记忆固化 (Consolidate) {len(messages_chunk)} 条")
-        queries = [m.content for m in messages_chunk[-2:]]
+        queries = [m.content for m in reversed(messages_chunk[-3:])]
         active_user_names = [m.user_name for m in messages_chunk if m.user_name]
         active_users = [
             {"user_id": str(m.user_id or ""), "user_name": m.user_name}
@@ -1135,18 +1258,19 @@ class Session:
         )
         if self.is_generation_stale(expected_generation):
             self._log_stale_generation("consolidation_search", expected_generation)
-            return
-        ctx = await self._run_feedback_llm(
+            return FeedbackOutcome.rejected("stale_generation")
+        ctx, failure_reason = await self._run_feedback_llm(
             messages_chunk,
             feedback_llm_func,
             is_relevant=False,
             search_result=search_result,
         )
         if ctx is None:
-            return
+            self._schedule_save_session()
+            return FeedbackOutcome.rejected(failure_reason)
         if self.is_generation_stale(expected_generation):
             self._log_stale_generation("consolidation_sediment", expected_generation)
-            return
+            return FeedbackOutcome.rejected("stale_generation")
         self._apply_native_image_observations(ctx.response_dict, messages_chunk)
         self._apply_sediment(ctx, messages_chunk, expected_generation=expected_generation)
         latest = max((m.time for m in messages_chunk), default=None)
@@ -1154,8 +1278,8 @@ class Session:
             if self.last_consolidated_time is None or latest > self.last_consolidated_time:
                 self.last_consolidated_time = latest
         self._messages_since_consolidation = 0
-        self._last_consolidation_attempt = datetime.now()
-        await self.save_session()
+        self._schedule_save_session()
+        return FeedbackOutcome(accepted=True, state_changed=True)
 
     async def save_long_term_memory(
             self,
@@ -1318,44 +1442,34 @@ class Session:
 
                 if action == "supersede":
                     target_ref = str(item.get("target_ref") or "").strip()
-                    metadata["supersedes"] = target_ref
-                    add_result = await self._run_sync_if_generation_current(
-                        self.long_term_memory.add_texts,
-                        [content],
-                        metadatas=[metadata],
+                    operation_result = await self._run_sync_if_generation_current(
+                        self.memory_writer.supersede,
+                        content,
+                        metadata,
+                        target_ref,
+                        reason=str(item.get("reason") or ""),
                         expected_generation=expected_generation,
-                        stage="long_term_memory_add",
+                        stage="long_term_memory_supersede",
                     )
-                    if add_result is _STALE_GENERATION_WRITE:
+                    if operation_result is _STALE_GENERATION_WRITE:
                         return
-                    confirmed_added = (
-                        isinstance(add_result, dict)
-                        and int(add_result.get("added") or 0) >= 1
-                    )
-                    if not confirmed_added:
+                    if not (
+                        isinstance(operation_result, dict)
+                        and operation_result.get("completed")
+                    ):
                         log_event(
                             "rag_action_rejected",
                             session_id=self.id,
                             action=action,
                             target_ref=target_ref,
-                            reason="replacement_not_confirmed_in_vector_store",
-                            queued_wal=add_result.get("queued_wal") if isinstance(add_result, dict) else None,
-                            failed=add_result.get("failed") if isinstance(add_result, dict) else None,
+                            reason="supersede_queued_for_repair",
+                            queued_repair=(
+                                operation_result.get("queued_repair")
+                                if isinstance(operation_result, dict)
+                                else 0
+                            ),
                         )
                         continue
-                    updated_target_metadata = dict(target_metadata)
-                    updated_target_metadata["status"] = "superseded"
-                    updated_target_metadata["superseded_at"] = datetime.now().astimezone().isoformat()
-                    updated_target_metadata["superseded_reason"] = str(item.get("reason") or "")[:200]
-                    update_result = await self._run_sync_if_generation_current(
-                        self.long_term_memory.update_metadata_by_id,
-                        target_ref,
-                        updated_target_metadata,
-                        expected_generation=expected_generation,
-                        stage="long_term_memory_supersede",
-                    )
-                    if update_result is _STALE_GENERATION_WRITE:
-                        return
                     superseded_count += 1
                 else:
                     pending_memories.append((content, metadata))
@@ -1363,7 +1477,7 @@ class Session:
             store_result = {"added": 0, "skipped_dedup": 0}
             if pending_memories:
                 store_result = await self._run_sync_if_generation_current(
-                    self.long_term_memory.add_memories_with_dedup,
+                    self.memory_writer.add_candidates,
                     pending_memories,
                     expected_generation=expected_generation,
                     stage="long_term_memory_bulk",
@@ -1390,7 +1504,7 @@ class Session:
             {
                 "id": str(msg.id or ""),
                 "name": msg.user_name,
-                "content": escape_for_prompt(msg.content),
+                "content": msg.content,
                 "image_meta": msg.image_meta,
                 "image_refs": (
                     _message_image_refs(msg)
@@ -1412,7 +1526,7 @@ class Session:
             {
                 "time": m.time.strftime('%H:%M'),
                 "name": m.user_name,
-                "content": escape_for_prompt(m.content),
+                "content": m.content,
                 "image_meta": m.image_meta,
                 "image_refs": [],
             }
@@ -1424,22 +1538,23 @@ class Session:
         chat_role = self.__role.split("[对话样本]")[0].strip() if "[对话样本]" in self.__role else self.__role
         reaction_users = list({msg.user_id if msg.user_id else msg.user_name for msg in messages_chunk})
         related_profiles = [self.profiles.get(uid, PersonProfile(user_id=uid)) for uid in reaction_users]
-        related_profiles_json = json.dumps(
-            [{"user_id": p.user_id, "emotion_tends_to_user": asdict(p.emotion)} for p in related_profiles],
-            ensure_ascii=False, sort_keys=True, separators=(",", ":")
-        )
+        related_profiles_data = [
+            {"user_id": p.user_id, "emotion_tends_to_user": asdict(p.emotion)}
+            for p in related_profiles
+        ]
         prompt = get_chat_prompt(
             self.__name, chat_role, self.__chatting_state.value,
             context_record.compressed_history,
             history_msgs_formatted, # 传入格式化后的历史
             formatted_msgs,
             asdict(self.global_emotion),
-            related_profiles_json,
+            related_profiles_data,
             search_history, self.chat_summary,
             examples_text=self.__examples_str,
             recalled_history=recalled_str,
             time_info=time_str,
             rp_style=get_chat_thinking_settings().get("rp_style", "off"),
+            budget=PromptBudget.from_runtime(get_runtime_settings()),
         )
         log_event("rag_prompt_budget",
             session_id=self.id,
@@ -1455,17 +1570,7 @@ class Session:
         try:
             # 使用传入的 chat_llm_func
             response = await llm_func(prompt, json_mode=True)
-            response_data = extract_and_parse_json(response)
-
-            replies = []
-            if isinstance(response_data, dict):
-                replies = response_data.get("reply", [])
-            elif isinstance(response_data, list):
-                replies = response_data
-                logger.warning("LLM 返回了 List 而非 Object，已自动兼容")
-
-            if not isinstance(replies, list):
-                return []
+            replies = ChatPlanner.parse(response).replies
 
             if self.is_generation_stale(expected_generation):
                 self._log_stale_generation("chat_reply", expected_generation)
@@ -1497,7 +1602,6 @@ class Session:
         )
         
         await self.global_memory.update([msg])
-        self._schedule_save_session()
 
     async def update_without_trigger(self, messages_chunk: list[Message]):
         """
@@ -1553,6 +1657,16 @@ class Session:
         delta: dict,
         expected_generation: int | None = None,
     ):
+        await self._save_interaction_logs(
+            [(user_id, delta)],
+            expected_generation=expected_generation,
+        )
+
+    async def _save_interaction_logs(
+        self,
+        interactions: list[tuple[str, dict]],
+        expected_generation: int | None = None,
+    ):
         if self.is_generation_stale(expected_generation):
             self._log_stale_generation("interaction_log", expected_generation)
             return
@@ -1560,4 +1674,4 @@ class Session:
             if self.is_generation_stale(expected_generation):
                 self._log_stale_generation("interaction_log_locked", expected_generation)
                 return
-            await ProfileRepository.log_interaction(self.id, user_id, delta)
+            await ProfileRepository.log_interactions(self.id, interactions)

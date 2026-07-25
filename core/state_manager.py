@@ -9,7 +9,8 @@ from tortoise import Tortoise
 
 from ..llm.client import LLMClient
 from ..config import (
-    plugin_config,
+    get_enabled_groups,
+    get_siliconflow_api_key,
     get_effective_chat_api_key,
     get_effective_chat_base_url,
     get_effective_chat_provider,
@@ -19,7 +20,7 @@ from ..config import (
 from ..memory.short_term import Message as MMessage
 from .session import Session
 from .usage import drain_usage_tasks
-from ..utils import get_http_client, close_http_client
+from .http_client import close_http_client, get_http_client
 from ..database.enabled_group_repository import EnabledGroupRepository
 
 
@@ -72,7 +73,7 @@ class GroupState:
     bot: Bot | None = None
     session: Session = field(
         default_factory=lambda: Session(
-            siliconflow_api_key=plugin_config.get("siliconflow_api_key", ""),
+            siliconflow_api_key=get_siliconflow_api_key(),
             http_client=get_http_client()
         )
     )
@@ -103,7 +104,9 @@ def is_shutting_down() -> bool:
 
 
 async def init_enabled_groups():
-    db_ids = await EnabledGroupRepository.load_enabled_group_ids(set(plugin_config.get("enabled_groups", [])))
+    db_ids = await EnabledGroupRepository.load_enabled_group_ids(
+        set(get_enabled_groups())
+    )
 
     runtime_enabled_groups.clear()
     runtime_enabled_groups.update(db_ids)
@@ -121,7 +124,7 @@ def ensure_group_state(group_id: int):
         new_state = GroupState(
             session=Session(
                 id=f"{group_id}",
-                siliconflow_api_key=plugin_config.get("siliconflow_api_key", ""),
+                siliconflow_api_key=get_siliconflow_api_key(),
                 http_client=get_http_client()
             )
         )
@@ -175,35 +178,32 @@ async def remove_group_state(group_id: int):
         del group_states[group_id]
 
 
+async def maintain_vector_memories() -> None:
+    """Run vector lifecycle cleanup outside the per-turn persistence path."""
+
+    for group_id, state in list(group_states.items()):
+        if not state.session._loaded:
+            continue
+        try:
+            await asyncio.to_thread(
+                state.session.long_term_memory.backfill_active_status,
+                dry_run=False,
+            )
+            await asyncio.to_thread(
+                state.session.long_term_memory.cleanup,
+                days_retention=90,
+            )
+        except Exception as e:
+            logger.warning(f"群 {group_id} 向量记忆定时维护失败: {e}")
+
+
 async def cleanup_global_resources():
     """统一的资源清理逻辑 (关机时调用)"""
     global _shutting_down
     _shutting_down = True
     logger.info("正在执行资源清理（已设置 shutdown 标志）...")
 
-    # 1. 强制保存会话 (需要数据库连接)
-    save_tasks = []
-    for group_id, state in group_states.items():
-        if state.session._loaded:
-            logger.info(f"正在保存群 {group_id} 的会话状态...")
-            save_tasks.append(state.session.save_session(force_index=True))
-
-    if save_tasks:
-        try:
-            # 增加超时时间，防止数据较多时保存中断
-            await asyncio.wait_for(asyncio.gather(*save_tasks, return_exceptions=True), timeout=60.0)
-            logger.info(f"会话保存完毕")
-        except Exception as e:
-            logger.error(f"关机保存错误: {e}")
-
-    for state in group_states.values():
-        try:
-            await state.session.drain_background_tasks(timeout=get_runtime_settings()["memory_drain_timeout_seconds"])
-            await state.session.close()
-        except Exception as e:
-            logger.warning(f"关闭群会话资源失败: {e}")
-
-    # 2. 取消后台任务
+    # 1. 先停止所有可能继续使用 Session/Vector/Provider 的群 worker。
     for gid in list(_group_tasks.keys()):
         task = _group_tasks.pop(gid)
         if not task.done():
@@ -215,7 +215,38 @@ async def cleanup_global_resources():
             except Exception as e:
                 logger.error(f"清理任务 {gid} 异常: {e}")
 
-    # 3. 关闭 VLM 的私有 HTTP 客户端（强制中断正在进行的 VLM 请求）
+    # 2. worker 停止后再排空后台写入，并在数据库仍可用时做最终保存。
+    drain_timeout = get_runtime_settings()["memory_drain_timeout_seconds"]
+    for state in group_states.values():
+        try:
+            await state.session.drain_background_tasks(timeout=drain_timeout)
+        except Exception as e:
+            logger.warning(f"排空群会话后台任务失败: {e}")
+
+    save_tasks = []
+    for group_id, state in group_states.items():
+        if state.session._loaded:
+            logger.info(f"正在保存群 {group_id} 的会话状态...")
+            save_tasks.append(state.session.save_session(force_index=True))
+
+    if save_tasks:
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*save_tasks, return_exceptions=True),
+                timeout=60.0,
+            )
+            logger.info("会话保存完毕")
+        except Exception as e:
+            logger.error(f"关机保存错误: {e}")
+
+    # 3. 所有 worker 和写任务都停止后，才关闭 Session 持有的资源。
+    for state in group_states.values():
+        try:
+            await state.session.close()
+        except Exception as e:
+            logger.warning(f"关闭群会话资源失败: {e}")
+
+    # 4. 关闭 VLM 的私有 HTTP 客户端。
     try:
         from ..memory.image import image_manager
         if image_manager._vlm is not None:
@@ -224,12 +255,11 @@ async def cleanup_global_resources():
     except Exception as e:
         logger.warning(f"关闭 VLM 客户端失败: {e}")
 
-    # 4. 关闭全局 HTTP 客户端
-    await close_http_client()
-
     await drain_usage_tasks(timeout=get_runtime_settings()["memory_drain_timeout_seconds"])
 
-    # 5. 最后关闭数据库
+    # 5. Provider/usage 都已停止后关闭共享 HTTP，最后关闭数据库。
+    await close_http_client()
+
     logger.info("正在关闭数据库连接...")
     await Tortoise.close_connections()
     logger.info("数据库连接已关闭")

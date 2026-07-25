@@ -3,16 +3,23 @@ import os
 import uuid
 import math
 import json
-import httpx
 import time
+from collections.abc import Iterator, Sequence
+from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import List, Dict, Any
+from typing import Any, List
 import chromadb
-from chromadb.api.types import Documents, EmbeddingFunction, Embeddings
 from nonebot import logger
-from openai import OpenAI
-from ..config import plugin_config, get_memory_endpoint_settings
+from ..config import (
+    get_app_settings,
+    get_memory_endpoint_settings,
+    get_runtime_settings,
+)
 from ..database.backup_lock import BACKUP_IO_LOCK
+from .vector_clients import (
+    SiliconFlowEmbeddingFunction,
+    SiliconFlowReranker,
+)
 
 
 MEMORY_COLLECTION_NAME = "nyabot_memory"
@@ -37,16 +44,29 @@ MEMORY_TYPE_DECAY_RATE = {
     "relationship": 0.003,
 }
 SCOPE_WEIGHT = {
-    "active_user": 1.10,
     "active_subject": 1.10,
     "mentioned_subject": 1.08,
     "active_speaker": 1.04,
     "global": 1.0,
     "legacy_subject": 0.75,
-    "other_user": 0.5,
     "other_subject": 0.5,
 }
 _metric_check_done: set[str] = set()
+
+
+@dataclass(frozen=True)
+class RetrievalResult(Sequence[dict[str, Any]]):
+    records: list[dict[str, Any]]
+    stats: dict[str, Any]
+
+    def __iter__(self) -> Iterator[dict[str, Any]]:
+        return iter(self.records)
+
+    def __len__(self) -> int:
+        return len(self.records)
+
+    def __getitem__(self, index):
+        return self.records[index]
 
 
 def _score_from_distance(distance: float | int | None) -> float:
@@ -106,6 +126,26 @@ def _dedupe_preserve_order(items: list[str]) -> list[str]:
         seen.add(item)
         result.append(item)
     return result
+
+
+def _memory_operation_id(
+    operation: str,
+    content: str,
+    metadata: dict,
+    target_ref: str = "",
+) -> str:
+    payload = json.dumps(
+        {
+            "operation": operation,
+            "content": content,
+            "metadata": metadata,
+            "target_ref": target_ref,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, payload))
 
 
 def where_any(field: str, values: list[Any]) -> dict:
@@ -179,6 +219,42 @@ def _normalized_metadata(meta: dict | None) -> dict[str, Any]:
     data["speaker_user_name"] = _clean_metadata_string(data.get("speaker_user_name"))
     data["user_id"] = subject_user_id
     return data
+
+
+def _dedup_scope_key(meta: dict | None) -> tuple[str, str, str]:
+    metadata = _normalized_metadata(meta)
+    source_class = "preset" if metadata["source"] == "preset" else "memory"
+    subject_user_id = "" if source_class == "preset" else metadata["subject_user_id"]
+    category = _clean_metadata_string(metadata.get("category") or metadata.get("type"))
+    return source_class, subject_user_id, category
+
+
+def _same_dedup_scope(candidate: dict | None, existing: dict | None) -> bool:
+    existing_metadata = _normalized_metadata(existing)
+    if existing_metadata["source"] == "memory" and _metadata_status(existing_metadata) != "active":
+        return False
+    return _dedup_scope_key(candidate) == _dedup_scope_key(existing_metadata)
+
+
+def _dedup_where(metadata: dict) -> dict:
+    source_class, subject_user_id, category = _dedup_scope_key(metadata)
+    conditions = [
+        {"source": {"$eq": source_class}},
+        {
+            "$or": [
+                {"category": {"$eq": category}},
+                {"type": {"$eq": category}},
+            ]
+        },
+    ]
+    if source_class == "memory" and subject_user_id:
+        conditions.append({
+            "$or": [
+                {"subject_user_id": {"$eq": subject_user_id}},
+                {"user_id": {"$eq": subject_user_id}},
+            ]
+        })
+    return where_all(*conditions)
 
 
 def _source_type_weight(meta: dict) -> float:
@@ -262,87 +338,6 @@ def _date_days_ago(meta: dict, *, now: datetime) -> int | None:
     return max(0, (now - memory_dt).days)
 
 
-class SiliconFlowReranker:
-    def __init__(self, api_key: str, model: str, api_url: str | None = None, timeout: float | None = None):
-        settings = get_memory_endpoint_settings()
-        self.api_key = api_key
-        self.model = model
-        self.api_url = api_url or str(settings["rerank_base_url"])
-        self._client = httpx.Client(timeout=timeout or float(settings["rerank_timeout"]), trust_env=False)
-
-    def rerank(self, query: str, documents: List[str], top_n: int = 5) -> List[Dict[str, Any]]:
-        """
-        返回格式: [{"index": int, "relevance_score": float}, ...] 
-        注意: SiliconFlow API 返回的结果中 document 索引对应传入 documents 的顺序
-        """
-        if not documents:
-            return []
-        
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json"
-        }
-        payload = {
-            "model": self.model,
-            "query": query,
-            "documents": documents,
-            "top_n": top_n,
-            "return_documents": False  # 不需要返回文档内容，只要索引和分数，省流
-        }
-        
-        try:
-            response = self._client.post(self.api_url, headers=headers, json=payload)
-            response.raise_for_status()
-            data = response.json()
-
-            # 兼容不同厂商的返回格式，通常 SiliconFlow (BGE) 返回 results 列表
-            return data.get("results", [])
-        except Exception as e:
-            logger.error(f"Rerank API Error: {e}")
-            return []
-
-    def close(self):
-        self._client.close()
-
-
-class SiliconFlowEmbeddingFunction(EmbeddingFunction):
-    def __init__(
-        self,
-        api_key: str,
-        session_id: str,
-        model: str | None = None,
-        base_url: str | None = None,
-        timeout: float | None = None,
-    ):
-        settings = get_memory_endpoint_settings()
-        self.api_key = api_key
-        self.session_id = session_id
-        self.model = model or str(settings["model"])
-        self._client = OpenAI(
-            api_key=api_key,
-            base_url=base_url or str(settings["base_url"]),
-            timeout=timeout or float(settings["timeout"]),
-            max_retries=0,
-        )
-
-    def __call__(self, input: Documents) -> Embeddings:
-        if not input: return []
-        cleaned_input = [text.replace("\n", " ") for text in input]
-        try:
-            response = self._client.embeddings.create(
-                model=self.model,
-                input=cleaned_input,
-                encoding_format="float",
-            )
-            return [item.embedding for item in response.data]
-        except Exception as e:
-            logger.error(f"Embedding API Error: {e}")
-            raise e
-
-    def close(self):
-        self._client.close()
-
-
 class VectorMemory:
     """
     Synchronous vector store wrapper.
@@ -353,6 +348,7 @@ class VectorMemory:
 
     def __init__(self, api_key: str, persist_directory: str, session_id: str = "global"):
         self.persist_directory = persist_directory
+        self._version = 0
         os.makedirs(self.persist_directory, exist_ok=True)
         memory_settings = get_memory_endpoint_settings()
         self.emb_fn = SiliconFlowEmbeddingFunction(
@@ -365,10 +361,11 @@ class VectorMemory:
         
         # 初始化 Reranker
         self.reranker = None
-        if plugin_config.get("rerank", {}).get("model"):
+        app_settings = get_app_settings()
+        if app_settings.rerank_model:
             self.reranker = SiliconFlowReranker(
                 api_key=api_key, 
-                model=plugin_config.get("rerank", {}).get("model", ""),
+                model=app_settings.rerank_model,
                 api_url=str(memory_settings["rerank_base_url"]),
                 timeout=float(memory_settings["rerank_timeout"]),
             )
@@ -379,17 +376,16 @@ class VectorMemory:
             embedding_function=self.emb_fn,
             metadata=MEMORY_COLLECTION_METADATA
         )
-        self._last_retrieval_stats = _empty_retrieval_stats()
         self._check_collection_metric_once()
         self._ids_supported = self._probe_ids_support()
         self.replay_pending()
 
     @property
-    def last_retrieval_stats(self) -> dict[str, Any]:
-        return dict(getattr(self, "_last_retrieval_stats", _empty_retrieval_stats()))
+    def version(self) -> int:
+        return int(getattr(self, "_version", 0) or 0)
 
-    def _set_retrieval_stats(self, stats: dict[str, Any]) -> None:
-        self._last_retrieval_stats = dict(stats)
+    def _bump_version(self) -> None:
+        self._version = self.version + 1
 
     def _check_collection_metric_once(self) -> str:
         state = _collection_metric_state(self.collection)
@@ -422,14 +418,30 @@ class VectorMemory:
         return os.path.join(self.persist_directory, "pending_memories.jsonl")
 
     def _append_wal(self, items: list[tuple[str, dict]]) -> bool:
+        operations = []
+        for content, metadata in items:
+            operation_id = str(metadata.get("operation_id") or "") or _memory_operation_id(
+                "add",
+                content,
+                metadata,
+            )
+            normalized_metadata = dict(metadata)
+            normalized_metadata["operation_id"] = operation_id
+            operations.append({
+                "operation_id": operation_id,
+                "operation": "add",
+                "content": content,
+                "metadata": normalized_metadata,
+                "target_ref": "",
+            })
+        return self._append_wal_operations(operations)
+
+    def _append_wal_operations(self, operations: list[dict]) -> bool:
         try:
             os.makedirs(self.persist_directory, exist_ok=True)
             with open(self._wal_path(), "a", encoding="utf-8") as handle:
-                for content, metadata in items:
-                    handle.write(json.dumps(
-                        {"content": content, "metadata": metadata},
-                        ensure_ascii=False,
-                    ) + "\n")
+                for operation in operations:
+                    handle.write(json.dumps(operation, ensure_ascii=False) + "\n")
             return True
         except Exception as e:
             logger.error(f"WAL append failed: {e}")
@@ -446,7 +458,7 @@ class VectorMemory:
             logger.error(f"WAL read failed: {e}")
             return 0
 
-        items: list[tuple[str, dict]] = []
+        operations: list[dict] = []
         for line in lines:
             try:
                 obj = json.loads(line)
@@ -456,31 +468,88 @@ class VectorMemory:
             if not content:
                 continue
             metadata = obj.get("metadata") if isinstance(obj.get("metadata"), dict) else {}
-            items.append((content, metadata))
+            operation = str(obj.get("operation") or "add")
+            operation_id = str(obj.get("operation_id") or metadata.get("operation_id") or "")
+            if not operation_id:
+                operation_id = _memory_operation_id(
+                    operation,
+                    content,
+                    metadata,
+                    str(obj.get("target_ref") or ""),
+                )
+            operations.append({
+                **obj,
+                "operation": operation,
+                "operation_id": operation_id,
+                "content": content,
+                "metadata": metadata,
+            })
 
-        if not items:
+        if not operations:
             try:
                 os.remove(path)
             except OSError:
                 pass
             return 0
 
-        try:
-            with BACKUP_IO_LOCK:
-                self.collection.add(
-                    documents=[content for content, _ in items],
-                    metadatas=[metadata for _, metadata in items],
-                    ids=[str(uuid.uuid4()) for _ in items],
-                )
-            os.remove(path)
-            logger.info(f"Replayed {len(items)} pending memories from WAL")
-            return len(items)
-        except Exception as e:
-            logger.error(f"WAL replay failed, keeping file: {e}")
-            return 0
+        completed = 0
+        remaining = []
+        for operation in operations:
+            try:
+                if operation["operation"] == "supersede":
+                    result = self.supersede_memory(
+                        operation["content"],
+                        operation["metadata"],
+                        str(operation.get("target_ref") or ""),
+                        reason=str(operation.get("reason") or ""),
+                        operation_id=operation["operation_id"],
+                        queue_on_failure=False,
+                    )
+                    success = bool(result.get("completed"))
+                else:
+                    result = self.add_texts(
+                        [operation["content"]],
+                        metadatas=[{
+                            **operation["metadata"],
+                            "operation_id": operation["operation_id"],
+                        }],
+                        queue_on_failure=False,
+                    )
+                    success = int(result.get("confirmed") or result.get("added") or 0) >= 1
+                if success:
+                    completed += 1
+                else:
+                    remaining.append(operation)
+            except Exception:
+                remaining.append(operation)
 
-    def add_texts(self, texts: List[str], metadatas: List[dict] | None = None) -> dict[str, int]:
-        empty_result = {"added": 0, "queued_wal": 0, "failed": 0}
+        try:
+            if remaining:
+                with open(path, "w", encoding="utf-8") as handle:
+                    for operation in remaining:
+                        handle.write(json.dumps(operation, ensure_ascii=False) + "\n")
+            else:
+                os.remove(path)
+        except OSError as e:
+            logger.error(f"WAL rewrite failed: {e}")
+            return 0
+        logger.info(f"Replayed {completed} pending memory operations from WAL")
+        return completed
+
+    def add_texts(
+        self,
+        texts: List[str],
+        metadatas: List[dict] | None = None,
+        *,
+        queue_on_failure: bool = True,
+    ) -> dict[str, Any]:
+        empty_result = {
+            "added": 0,
+            "confirmed": 0,
+            "queued_wal": 0,
+            "failed": 0,
+            "memory_refs": [],
+        }
         if not texts:
             return empty_result
         valid_data = [(t, metadatas[i] if metadatas and i < len(metadatas) else {})
@@ -488,29 +557,73 @@ class VectorMemory:
         if not valid_data:
             return empty_result
 
-        runtime = plugin_config.get("runtime", {}) or {}
+        runtime = get_runtime_settings()
         max_retries = int(runtime.get("memory_write_max_retries", 0) or 0)
         base_delay = float(runtime.get("memory_write_retry_base_delay", 0.5) or 0.0)
-        ids = [str(uuid.uuid4()) for _ in valid_data]
+        prepared_data = []
+        ids = []
+        for content, metadata in valid_data:
+            prepared_metadata = dict(metadata or {})
+            operation_id = str(prepared_metadata.get("operation_id") or "")
+            if not operation_id:
+                operation_id = _memory_operation_id("add", content, prepared_metadata)
+            prepared_metadata["operation_id"] = operation_id
+            prepared_data.append((content, prepared_metadata))
+            ids.append(str(uuid.uuid5(uuid.NAMESPACE_URL, operation_id)))
         for attempt in range(max_retries + 1):
             try:
+                existing_ids = set()
+                try:
+                    with BACKUP_IO_LOCK:
+                        existing = self.collection.get(ids=ids, include=[])
+                    existing_ids = set(existing.get("ids") or []) if isinstance(existing, dict) else set()
+                except Exception:
+                    existing_ids = set()
+                missing = [
+                    (item_id, data)
+                    for item_id, data in zip(ids, prepared_data)
+                    if item_id not in existing_ids
+                ]
+                if not missing:
+                    return {
+                        "added": 0,
+                        "confirmed": len(prepared_data),
+                        "queued_wal": 0,
+                        "failed": 0,
+                        "memory_refs": ids,
+                    }
                 with BACKUP_IO_LOCK:
                     self.collection.add(
-                        documents=[d[0] for d in valid_data],
-                        metadatas=[d[1] for d in valid_data],
-                        ids=ids
+                        documents=[data[0] for _, data in missing],
+                        metadatas=[data[1] for _, data in missing],
+                        ids=[item_id for item_id, _ in missing],
                     )
-                return {"added": len(valid_data), "queued_wal": 0, "failed": 0}
+                self._bump_version()
+                return {
+                    "added": len(missing),
+                    "confirmed": len(prepared_data),
+                    "queued_wal": 0,
+                    "failed": 0,
+                    "memory_refs": ids,
+                }
             except Exception as e:
                 logger.error(f"Vector add failed (attempt {attempt + 1}/{max_retries + 1}): {e}")
                 if attempt < max_retries and base_delay > 0:
                     time.sleep(base_delay * (2 ** attempt))
 
-        if self._append_wal(valid_data):
-            logger.warning(f"Vector add exhausted retries, wrote {len(valid_data)} memories to WAL")
-            return {"added": 0, "queued_wal": len(valid_data), "failed": 0}
-        logger.error(f"Vector add exhausted retries and WAL append failed for {len(valid_data)} memories")
-        return {"added": 0, "queued_wal": 0, "failed": len(valid_data)}
+        if queue_on_failure and self._append_wal(prepared_data):
+            logger.warning(f"Vector add exhausted retries, wrote {len(prepared_data)} memories to WAL")
+            return {
+                **empty_result,
+                "queued_wal": len(prepared_data),
+                "memory_refs": ids,
+            }
+        logger.error(f"Vector add exhausted retries and WAL append failed for {len(prepared_data)} memories")
+        return {
+            **empty_result,
+            "failed": len(prepared_data),
+            "memory_refs": ids,
+        }
 
     def retrieve(
         self,
@@ -519,19 +632,17 @@ class VectorMemory:
         where: dict | None = None,
         use_rerank: bool = True,
         merged_candidate_cap: int | None = None,
-    ) -> List[Dict[str, Any]]:
+    ) -> RetrievalResult:
         """
         检索逻辑：
         1. k 表示每条 query 的召回数量
         2. 如果未启用，直接召回 Top K
         """
         if not queries:
-            self._set_retrieval_stats(_empty_retrieval_stats(use_rerank=use_rerank))
-            return []
+            return RetrievalResult([], _empty_retrieval_stats(use_rerank=use_rerank))
         unique_queries = _dedupe_preserve_order([q for q in queries if q.strip()])
         if not unique_queries:
-            self._set_retrieval_stats(_empty_retrieval_stats(use_rerank=use_rerank))
-            return []
+            return RetrievalResult([], _empty_retrieval_stats(use_rerank=use_rerank))
         
         initial_k = max(1, int(k or 1))
         
@@ -580,18 +691,17 @@ class VectorMemory:
             
             # 如果没有结果，直接返回
             if not flattened_candidates:
-                self._set_retrieval_stats(_empty_retrieval_stats(use_rerank=use_rerank))
-                return []
+                return RetrievalResult([], _empty_retrieval_stats(use_rerank=use_rerank))
 
             # 如果不使用 Rerank 或 Reranker 未初始化，直接截断返回
             if not use_rerank or not self.reranker:
                 results = flattened_candidates[:k]
-                self._set_retrieval_stats({
+                stats = {
                     **_empty_retrieval_stats(use_rerank=use_rerank, fallback_reason="rerank_disabled"),
                     "candidate_count": len(flattened_candidates),
                     "returned_count": len(results),
-                })
-                return results
+                }
+                return RetrievalResult(results, stats)
 
             # 第二步：Rerank
             # search_stage 已把最新有效消息排在第一位；summary/name query 只做补充召回。
@@ -607,15 +717,15 @@ class VectorMemory:
             if not rerank_results:
                 logger.debug("Rerank无结果，回退到初筛候选")
                 results = flattened_candidates[:k]
-                self._set_retrieval_stats({
+                stats = {
                     **_empty_retrieval_stats(use_rerank=use_rerank, fallback_reason="rerank_api_empty"),
                     "candidate_count": len(flattened_candidates),
                     "returned_count": len(results),
-                })
-                return results
+                }
+                return RetrievalResult(results, stats)
             
             final_results = []
-            threshold = plugin_config.get("rerank", {}).get("threshold", 0.05)
+            threshold = get_app_settings().rerank_threshold
             
             for res in rerank_results:
                 idx = res.get("index")
@@ -637,23 +747,28 @@ class VectorMemory:
             if not final_results:
                 logger.debug("Rerank结果全部被过滤，回退到初筛候选")
                 results = flattened_candidates[:k]
-                self._set_retrieval_stats({
+                stats = {
                     **_empty_retrieval_stats(use_rerank=use_rerank, fallback_reason="rerank_all_filtered"),
                     "candidate_count": len(flattened_candidates),
                     "returned_count": len(results),
-                })
-                return results
-            self._set_retrieval_stats({
+                }
+                return RetrievalResult(results, stats)
+            stats = {
                 **_empty_retrieval_stats(use_rerank=use_rerank),
                 "candidate_count": len(flattened_candidates),
                 "returned_count": len(final_results),
-            })
-            return final_results
+            }
+            return RetrievalResult(final_results, stats)
 
         except Exception as e:
             logger.error(f"Vector retrieve failed: {e}")
-            self._set_retrieval_stats(_empty_retrieval_stats(use_rerank=use_rerank, fallback_reason="retrieve_error"))
-            return []
+            return RetrievalResult(
+                [],
+                _empty_retrieval_stats(
+                    use_rerank=use_rerank,
+                    fallback_reason="retrieve_error",
+                ),
+            )
 
     def _retrieve_active_subject_records(
         self,
@@ -708,6 +823,7 @@ class VectorMemory:
         try:
             with BACKUP_IO_LOCK:
                 self.collection.delete(where=where)
+            self._bump_version()
             logger.info(f"Deleted vectors where {where}")
         except Exception as e:
             logger.error(f"Vector delete failed: {e}")
@@ -739,6 +855,8 @@ class VectorMemory:
             for batch in _batched(delete_ids, 200):
                 with BACKUP_IO_LOCK:
                     self.collection.delete(ids=batch)
+            if delete_ids:
+                self._bump_version()
             logger.info(f"Cleaned up {len(delete_ids)} expired vector memories")
         except Exception as e:
             logger.error(f"Cleanup failed: {e}")
@@ -767,9 +885,105 @@ class VectorMemory:
             return
         with BACKUP_IO_LOCK:
             self.collection.update(ids=[memory_ref], metadatas=[dict(metadata or {})])
+        self._bump_version()
+
+    def supersede_memory(
+        self,
+        content: str,
+        metadata: dict,
+        target_ref: str,
+        *,
+        reason: str = "",
+        operation_id: str = "",
+        queue_on_failure: bool = True,
+    ) -> dict[str, Any]:
+        """Apply an idempotent, repairable supersede operation."""
+
+        target_metadata = self.get_metadata_by_id(target_ref)
+        if not target_metadata:
+            return {"completed": False, "queued_repair": 0, "reason": "target_missing"}
+        normalized_target = _normalized_metadata(target_metadata)
+        if (
+            normalized_target.get("source") != "memory"
+            or normalized_target.get("subtype") == "bot_self"
+        ):
+            return {"completed": False, "queued_repair": 0, "reason": "target_not_supersedable"}
+
+        operation_id = operation_id or _memory_operation_id(
+            "supersede",
+            content,
+            metadata,
+            target_ref,
+        )
+        replacement_metadata = _normalized_metadata(metadata)
+        replacement_metadata.update({
+            "operation_id": operation_id,
+            "supersede_operation_id": operation_id,
+            "supersedes": target_ref,
+            "status": "pending_supersede",
+        })
+        replacement_ref = str(uuid.uuid5(uuid.NAMESPACE_URL, operation_id))
+        operation = {
+            "operation_id": operation_id,
+            "operation": "supersede",
+            "content": content,
+            "metadata": replacement_metadata,
+            "target_ref": target_ref,
+            "reason": str(reason or "")[:200],
+        }
+
+        try:
+            add_result = self.add_texts(
+                [content],
+                metadatas=[replacement_metadata],
+                queue_on_failure=False,
+            )
+            if int(add_result.get("confirmed") or 0) < 1:
+                raise RuntimeError("replacement_not_confirmed")
+
+            updated_target = dict(normalized_target)
+            updated_target["status"] = "superseded"
+            updated_target["superseded_at"] = datetime.now().astimezone().isoformat()
+            updated_target["superseded_reason"] = operation["reason"]
+            updated_target["supersede_operation_id"] = operation_id
+            self.update_metadata_by_id(target_ref, updated_target)
+
+            active_replacement = dict(replacement_metadata)
+            active_replacement["status"] = "active"
+            self.update_metadata_by_id(replacement_ref, active_replacement)
+            return {
+                "completed": True,
+                "queued_repair": 0,
+                "operation_id": operation_id,
+                "memory_ref": replacement_ref,
+            }
+        except Exception as e:
+            queued = int(queue_on_failure and self._append_wal_operations([operation]))
+            logger.error(f"Supersede operation failed ({operation_id}): {e}")
+            return {
+                "completed": False,
+                "queued_repair": queued,
+                "operation_id": operation_id,
+                "memory_ref": replacement_ref,
+                "reason": type(e).__name__,
+            }
 
     def backfill_active_status(self, *, dry_run: bool = True, batch_size: int = 200, max_rounds: int = 5) -> dict[str, Any]:
         """Backfill missing status metadata without re-embedding records."""
+        marker_path = os.path.join(
+            self.persist_directory,
+            ".rag_status_backfill_complete.json",
+        )
+        if not dry_run and os.path.exists(marker_path):
+            return {
+                "dry_run": False,
+                "total_count": 0,
+                "missing_status_count": 0,
+                "backfilled_count": 0,
+                "verify_rounds": 0,
+                "complete": True,
+                "already_complete": True,
+            }
         report = {
             "dry_run": dry_run,
             "total_count": 0,
@@ -810,6 +1024,7 @@ class VectorMemory:
                 with BACKUP_IO_LOCK:
                     self.collection.update(ids=batch_ids, metadatas=batch_metadatas)
                 report["backfilled_count"] += len(batch)
+                self._bump_version()
         return report
 
     def _write_status_backfill_marker(self, report: dict[str, Any]) -> None:
@@ -833,6 +1048,7 @@ class VectorMemory:
                     embedding_function=self.emb_fn,
                     metadata=MEMORY_COLLECTION_METADATA,
                 )
+            self._bump_version()
         except Exception as e:
             logger.error(f"Clear failed: {e}")
 
@@ -885,6 +1101,8 @@ class VectorMemory:
             return False
         if metadata.get("subtype") == "bot_self":
             return False
+        if not _same_dedup_scope(new_metadata, metadata):
+            return False
 
         old_confidence = _clamp_float(metadata.get("confidence"), 1.0, 0.0, 1.0)
         metadata["confidence"] = min(1.0, old_confidence + (1.0 - old_confidence) * 0.2)
@@ -915,50 +1133,69 @@ class VectorMemory:
             if not normalized:
                 result["skipped_empty"] += 1
                 continue
-            if normalized in seen_batch:
+            normalized_metadata = _normalized_metadata(metadata)
+            batch_key = (normalized, _dedup_scope_key(normalized_metadata))
+            if batch_key in seen_batch:
                 result["skipped_dedup"] += 1
                 continue
-            seen_batch.add(normalized)
-            valid.append((normalized, metadata or {}))
+            seen_batch.add(batch_key)
+            valid.append((normalized, normalized_metadata))
 
         if not valid:
             return result
 
         try:
-            existing = self.collection.query(
-                query_texts=[content for content, _ in valid],
-                n_results=1,
-                where={
-                    "$or": [
-                        {"source": {"$eq": "memory"}},
-                        {"source": {"$eq": "preset"}},
-                    ]
-                },
-            )
-
             to_add: list[tuple[str, dict]] = []
-            distances = existing.get("distances") or []
-            ids = existing.get("ids") or []
-            metadatas = existing.get("metadatas") or []
-            for idx, (content, metadata) in enumerate(valid):
-                row = distances[idx] if idx < len(distances) else []
-                distance = row[0] if row else None
-                if distance is None:
-                    to_add.append((content, metadata))
-                    continue
+            grouped: dict[tuple[str, str, str], list[tuple[str, dict]]] = {}
+            for item in valid:
+                grouped.setdefault(_dedup_scope_key(item[1]), []).append(item)
 
-                similarity = 1 - distance
-                if similarity > threshold:
-                    logger.debug(f"[Memory] 跳过重复记忆 (相似度 {similarity:.2f}): {content[:30]}...")
-                    result["skipped_dedup"] += 1
+            for group in grouped.values():
+                existing = self.collection.query(
+                    query_texts=[content for content, _ in group],
+                    n_results=5,
+                    where=_dedup_where(group[0][1]),
+                )
+                distances = existing.get("distances") or []
+                ids = existing.get("ids") or []
+                metadatas = existing.get("metadatas") or []
+                for idx, (content, metadata) in enumerate(group):
+                    row_distances = distances[idx] if idx < len(distances) else []
                     row_ids = ids[idx] if idx < len(ids) else []
                     row_metadatas = metadatas[idx] if idx < len(metadatas) else []
-                    memory_ref = str(row_ids[0] or "").strip() if row_ids else ""
-                    existing_metadata = row_metadatas[0] if row_metadatas else {}
+                    duplicate = None
+                    for candidate_index, distance in enumerate(row_distances):
+                        if distance is None:
+                            continue
+                        existing_metadata = (
+                            row_metadatas[candidate_index]
+                            if candidate_index < len(row_metadatas)
+                            else {}
+                        )
+                        if not _same_dedup_scope(metadata, existing_metadata):
+                            continue
+                        similarity = 1 - distance
+                        if similarity > threshold:
+                            memory_ref = (
+                                str(row_ids[candidate_index] or "").strip()
+                                if candidate_index < len(row_ids)
+                                else ""
+                            )
+                            duplicate = (similarity, memory_ref, existing_metadata)
+                            break
+
+                    if duplicate is None:
+                        to_add.append((content, metadata))
+                        continue
+
+                    similarity, memory_ref, existing_metadata = duplicate
+                    logger.debug(
+                        f"[Memory] 跳过同 scope 重复记忆 "
+                        f"(相似度 {similarity:.2f}): {content[:30]}..."
+                    )
+                    result["skipped_dedup"] += 1
                     if self._reinforce_duplicate_memory(memory_ref, existing_metadata, metadata):
                         result["reinforced"] += 1
-                else:
-                    to_add.append((content, metadata))
 
             if to_add:
                 write_result = self.add_texts(
@@ -989,7 +1226,7 @@ class VectorMemory:
         candidate_k: int | None = None,
         merged_candidate_cap: int | None = None,
         active_user_ids: set[str] | list[str] | tuple[str, ...] | None = None,
-    ) -> List[Dict[str, Any]]:
+    ) -> RetrievalResult:
         """
         带时间衰减的检索
         
@@ -1013,14 +1250,27 @@ class VectorMemory:
         }
         # 1. 调用原有语义检索方法，再补充当前主体的结构化 metadata 召回。
         effective_candidate_k = candidate_k if candidate_k is not None else k
-        raw_results = self.retrieve(
+        retrieval_result = self.retrieve(
             queries,
             k=effective_candidate_k,
             where=where,
             use_rerank=use_rerank,
             merged_candidate_cap=merged_candidate_cap,
         )
-        stats = self.last_retrieval_stats
+        if isinstance(retrieval_result, RetrievalResult):
+            raw_results = list(retrieval_result.records)
+            stats = dict(retrieval_result.stats)
+        else:
+            # Compatibility for injected/fake stores during gradual migration.
+            raw_results = list(retrieval_result or [])
+            stats = {
+                **_empty_retrieval_stats(
+                    use_rerank=use_rerank,
+                    fallback_reason="legacy_result",
+                ),
+                "candidate_count": len(raw_results),
+                "returned_count": len(raw_results),
+            }
         subject_results = self._retrieve_active_subject_records(active_scope_ids, limit=min(5, max(1, k)))
         if subject_results:
             merged_results = []
@@ -1040,13 +1290,11 @@ class VectorMemory:
             stats["candidate_count"] = int(stats.get("candidate_count") or len(raw_results)) + subject_added_count
 
         if not raw_results:
-            self._set_retrieval_stats(stats)
-            return []
+            return RetrievalResult([], stats)
 
         # 2. 应用生命周期过滤和时间衰减
         today_dt = datetime.now()
         active_results = []
-        other_user_filtered_count = 0
         other_subject_downweighted_count = 0
         legacy_subject_count = 0
         scope_counts: dict[str, int] = {}
@@ -1119,9 +1367,7 @@ class VectorMemory:
         ]
         stats.update(_score_distribution(adjusted_scores))
         stats["returned_count"] = len(final_results)
-        stats["other_user_filtered_count"] = other_user_filtered_count
         stats["other_subject_downweighted_count"] = other_subject_downweighted_count
         stats["legacy_subject_count"] = legacy_subject_count
         stats["scope_counts"] = dict(scope_counts)
-        self._set_retrieval_stats(stats)
-        return final_results
+        return RetrievalResult(final_results, stats)

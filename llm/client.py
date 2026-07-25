@@ -58,14 +58,12 @@ class LLMClient:
         provider: str = "deepseek_official",
         openai_client: Optional[AsyncOpenAI] = None,
         timeout: float = 60.0,
-        proxy: Optional[str] = None,
         base_url: str = "",
         api_key: str = "",
     ):
         self.provider = self._normalize_provider(provider)
         self.openai_client = openai_client
         self.timeout = timeout
-        self.proxy = proxy
         self.base_url = (base_url or "").strip().rstrip("/")
         self._api_key_hash = self._hash_secret(api_key)
         self.provider_status = ProviderStatus()

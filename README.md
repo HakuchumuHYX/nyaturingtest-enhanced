@@ -43,7 +43,7 @@
 - 私有配置：`plugins/nyaturingtest/config.json`
 - 提交模板：`plugins/nyaturingtest/config.example.json`
 
-`config.json` 不应提交到仓库。首次启动时如果文件不存在，插件会创建默认配置，但 API Key 仍需要手动填写。
+`config.json` 不应提交到仓库。文件不存在时插件只在内存中使用默认值，不会在导入期写文件；请从 `config.example.json` 复制并填写 API Key。测试或独立部署需要隔离配置时，可用 `NYATURINGTEST_CONFIG_FILE` 指向其他配置路径。
 
 ### 最小可用配置
 
@@ -71,9 +71,6 @@
     "api_key": "YOUR_DEEPSEEK_API_KEY",
     "base_url": "https://api.deepseek.com",
     "model": "deepseek-v4-flash",
-    "thinking": {
-      "enabled": false
-    },
     "max_tokens": 2048,
     "timeout": 60,
     "vision": {
@@ -123,18 +120,37 @@
     "history_recall_limit": 20,
     "backup_retention_count": 7,
     "raw_message_retention_days": 0,
-    "raw_interaction_retention_days": 0,
-    "token_usage_retention_days": 0,
-    "speak_cooldown_seconds": 10.0,
+    "raw_interaction_retention_days": 180,
+    "token_usage_retention_days": 90,
+    "speak_cooldown_seconds": 16.0,
     "willingness_idle_after_seconds": 300.0,
     "willingness_decay_rate_active": 0.03,
     "willingness_decay_rate_idle": 0.06,
-    "relevance_willingness_floor": 0.95,
-    "passive_willingness_growth_limit": 0.7,
-    "passive_willingness_growth_per_message": 0.03,
-    "low_willingness_skip_threshold": 0.35,
-    "post_feedback_skip_threshold": 0.4,
-    "rerank_willingness_threshold": 0.6
+    "relevance_willingness_floor": 0.7,
+    "willingness_reply_threshold": 0.4,
+    "interest_topic_willingness_floor": 0.45,
+    "speak_willingness_retain_factor": 0.55,
+    "willingness_load_value": 0.1,
+    "passive_growth_min_factor": 0.3,
+    "passive_growth_max_factor": 2.0,
+    "passive_willingness_growth_limit": 0.72,
+    "passive_willingness_growth_per_message": 0.045,
+    "low_willingness_skip_threshold": 0.3,
+    "post_feedback_skip_threshold": 0.34,
+    "active_to_bubble_threshold": 0.5,
+    "rerank_willingness_threshold": 0.68,
+    "rag_final_k": 20,
+    "rag_per_query_recall_k": 40,
+    "rag_merged_candidate_cap": 64,
+    "rag_memory_char_budget": 1500,
+    "prompt_summary_chars": 1200,
+    "prompt_recent_message_chars": 1600,
+    "prompt_history_chars": 2400,
+    "prompt_rag_item_chars": 500,
+    "prompt_recalled_history_chars": 1200,
+    "memory_query_user_cooldown_seconds": 30.0,
+    "memory_query_group_cooldown_seconds": 3.0,
+    "memory_query_cache_max_entries": 256
   },
   "enabled_groups": []
 }
@@ -145,13 +161,13 @@
 - `chat.provider` 和 `feedback.provider` 支持 `deepseek_official` 与 `openai_compatible`。
 - DeepSeek 官方接口默认使用 `https://api.deepseek.com`。
 - 通过 CLI Proxy API 中转 Vertex AI Gemini 时，保持 `chat.provider` 为 `openai_compatible`，`chat.base_url` 填代理暴露的 `/v1` OpenAI-compatible 地址，`chat.model` 填代理中的 Gemini 模型别名；建议关闭 `chat.thinking.enabled` 并设置 `chat.thinking.rp_style` 为 `gemini_3_flash_roleplay`。
-- `feedback` 也可以使用同一个 OpenAI-compatible Gemini 代理；建议保持 `feedback.thinking.enabled` 为 `false`，它只做结构化状态分析，不需要 RP preset。
+- `feedback` 也可以使用同一个 OpenAI-compatible Gemini 代理；Feedback 的 thinking 固定关闭，它只做确定性的结构化状态分析。
 - `chat.vision.enabled` 与 `feedback.vision.enabled` 分别声明对应模型是否接受 OpenAI `image_url` 输入；默认均为 `false`，兼容纯文本模型。
 - `vlm.mode=fallback` 只在 Chat/Feedback 至少一个不支持原生图片时调用独立 VLM；`always` 会同时提供原图和 VLM 观察；`off` 完全禁用独立 VLM。
 - `vlm.provider` 只支持 `openai_compatible`；换成 Gemini 时需要代理支持 OpenAI `image_url` 多模态输入，若代理不支持图片 JSON mode，VLM 会降级为普通文本 JSON 提示重试。
 - 旧版非 OpenAI-compatible provider 已被移除，配置为已移除 provider 会直接报错。
 - `siliconflow_api_key` 用于长期记忆的 Embedding 和 Rerank。
-- Chat 默认开启 DeepSeek thinking；Feedback 默认关闭 thinking，以保证结构化状态更新稳定。
+- Chat 默认开启 DeepSeek thinking；Feedback 没有公开 thinking 开关并固定关闭，以保证结构化状态更新稳定。
 
 ### Runtime 说明
 
@@ -166,7 +182,7 @@
 - `consolidation_enabled` / `consolidation_message_threshold` / `consolidation_interval_seconds` / `consolidation_max_messages`：控制低意愿潜水时的被动记忆固化；该路径只沉淀记忆，不触发回复决策。
 - `rerank_willingness_threshold`：意愿值达到阈值或强关联时启用 Rerank 检索。
 - `backup_retention_count`：按数量保留最近多少个备份文件。
-- `raw_message_retention_days` / `raw_interaction_retention_days` / `token_usage_retention_days`：原始消息、画像交互日志和 Token 使用量的保留天数；默认 `0` 表示不清理，不影响长期向量记忆。
+- `raw_message_retention_days` / `raw_interaction_retention_days` / `token_usage_retention_days`：原始消息、画像交互日志和 Token 明细的保留天数；默认分别为 `0`、`180`、`90`。画像计数和 Token 历史统计由聚合表保留，不影响长期向量记忆。
 
 ### 配置加载与重启语义
 
@@ -260,7 +276,7 @@
 
 ## 角色预设
 
-预设文件从 localstore 的插件配置目录加载，在本项目中通常是：
+预设文件统一从项目配置目录加载：
 
 ```text
 config/nyaturingtest/nya_presets/
@@ -275,7 +291,7 @@ config/nyaturingtest/nya_presets/
 - `examples`：对话样本，会拼入角色提示词。
 - `hidden`：是否从 `/presets` 输出中隐藏。
 
-新增或修改预设后，使用 `/set_preset <文件名>` 重新加载到对应群。
+新增或修改预设后，使用 `/set_preset <文件名>` 重新加载到对应群；命令会先重新扫描目录，无需重启。独立部署需要使用其他目录时，可通过 `NYATURINGTEST_PRESET_DIR` 覆盖。
 
 ## 数据与备份
 
@@ -306,7 +322,7 @@ nyabot_backup_YYYYMMDD_HHMMSS.zip
 
 备份逻辑会使用 SQLite backup API 复制数据库快照，并打包向量库等插件数据。备份包含聊天内容、用户 ID、Token 使用量、用户画像和长期向量记忆，属于敏感数据；建议加密保存，定期复制到外部存储，并在测试环境做恢复演练。
 
-`backup_retention_count` 按数量保留最近的备份文件，默认保留 7 个。原始数据库表的自动清理由 `raw_message_retention_days`、`raw_interaction_retention_days` 和 `token_usage_retention_days` 控制，默认关闭；启用后每次成功的自动、手动或重置前备份都会先生成备份快照，再清理 SQLite 中的原始行，不删除 ChromaDB 长期向量记忆。
+`backup_retention_count` 按数量保留最近的备份文件，默认保留 7 个。Schema 升级前会先创建快照；自动、手动或重置前备份成功后才会执行明细 retention。原始消息默认不清理，画像交互与 Token 明细默认保留 180/90 天；聚合统计与 ChromaDB 长期向量记忆不会被删除。
 
 ## 模块结构
 
@@ -320,11 +336,15 @@ plugins/nyaturingtest/
 │   └── command_meta.py      # help 文本的命令元数据
 ├── core/
 │   ├── state_manager.py     # 每群 GroupState、后台任务和资源清理
-│   ├── logic.py             # OneBot 消息转换、LLM 调用包装、spawn_state 主循环
-│   ├── session.py           # 会话状态、记忆、情绪、角色和阶段逻辑
-│   ├── orchestrator.py      # 短时记忆、检索、Feedback、Chat 的编排
-│   ├── services.py          # 面向 orchestrator 的轻量服务封装
-│   └── message_sender.py    # 回复拆分策略
+│   ├── logic.py             # OneBot 消息转换和精简 GroupWorker
+│   ├── session.py           # 兼容门面和阶段协调
+│   ├── session_state.py     # 纯领域状态
+│   ├── session_runtime.py   # I/O 资源和后台任务
+│   ├── orchestrator.py      # Turn Pipeline 编排
+│   ├── engagement.py        # 意愿、参与态和冷却策略
+│   ├── feedback_processor.py / chat_planner.py
+│   ├── debounced_inbox.py / turn_call_factory.py / reply_dispatcher.py
+│   └── persistence.py       # 合并保存与 flush
 ├── database/
 │   ├── migrations.py        # SQLite schema 迁移
 │   ├── *_repository.py      # 会话、消息、画像、Token、启用群组等窄 repository
@@ -335,10 +355,12 @@ plugins/nyaturingtest/
 │   └── vlm.py               # OpenAI-compatible VLM 适配器
 ├── memory/
 │   ├── short_term.py        # 短时消息窗口和摘要载体
-│   ├── vector.py            # ChromaDB + SiliconFlow Embedding/Rerank
+│   ├── vector.py            # ChromaDB、WAL 和记忆生命周期
+│   ├── vector_clients.py    # Embedding/Rerank HTTP 适配器
 │   ├── image.py             # 图片下载、缓存、压缩、GIF 处理和 VLM 描述
 │   └── image_policy.py      # 图片安全限制
 ├── models/                  # ORM、情绪、画像、印象模型
+├── presenters/              # Token 统计卡片等展示层
 ├── prompts/                 # Chat/Feedback prompt 模板与角色预设加载
 └── tests/                   # 单元测试和静态约束测试
 ```
@@ -346,7 +368,7 @@ plugins/nyaturingtest/
 ## 运维建议
 
 - 先只在低流量群执行 `/autochat enable`，观察 `/status` 和 `/token统计`。
-- `/status` 会显示 Chat/Feedback thinking、有效图片路由、消息队列长度、LLM/VLM 成功失败计数和最近 provider 错误。
+- `/status` 会显示 Chat thinking、Feedback 固定策略、有效图片路由、消息队列长度、LLM/VLM 成功失败计数和最近 provider 错误。
 - DeepSeek thinking 会增加 reasoning tokens；上线后应重点关注 `/token统计` 中的 reasoning token 和 cache hit ratio。
 - 独立图片理解会额外消耗 VLM tokens；两个下游模型都支持图片且 `vlm.mode=fallback` 时不会调用独立 VLM。
 - `reset confirm` 是不可逆操作，虽然会先备份，但仍应确认备份文件存在且可恢复。

@@ -1,13 +1,15 @@
 # __init__.py
+import asyncio
+
 from nonebot import get_driver, logger
 from tortoise import Tortoise
 from pathlib import Path
 
 from .core.state_manager import cleanup_global_resources, init_enabled_groups
-from .database.migrations import ensure_schema_version
+from .database.migrations import SCHEMA_VERSION, ensure_schema_version
 from .handlers import commands
 from .handlers import memory
-from .database.backup import setup_backup_job
+from .database.backup import backup_before_schema_upgrade, setup_backup_job
 
 driver = get_driver()
 
@@ -17,9 +19,14 @@ PLUGIN_DATA_DIR = Path(__file__).parent.parent.parent / "data" / "nyaturingtest"
 
 @driver.on_startup
 async def init_db():
-    import os
     PLUGIN_DATA_DIR.mkdir(parents=True, exist_ok=True)
     db_path = PLUGIN_DATA_DIR / "nyabot.sqlite"
+    if not await asyncio.to_thread(
+        backup_before_schema_upgrade,
+        db_path,
+        SCHEMA_VERSION,
+    ):
+        raise RuntimeError("数据库升级前备份失败，已中止启动以保护现有数据")
 
     await Tortoise.init(
         db_url=f'sqlite://{db_path}',

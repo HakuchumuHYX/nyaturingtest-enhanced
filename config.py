@@ -1,14 +1,19 @@
 # nyaturingtest/config.py
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
+from collections.abc import Mapping
 
 from nonebot import logger
 
 
 PLUGIN_DIR = Path(__file__).parent
-CONFIG_FILE = PLUGIN_DIR / "config.json"
+CONFIG_FILE = Path(
+    os.environ.get("NYATURINGTEST_CONFIG_FILE", str(PLUGIN_DIR / "config.json"))
+).expanduser()
 
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 DEEPSEEK_COMPAT_BASE_URL = "https://api.deepseek.com/v1"
@@ -33,16 +38,46 @@ class EndpointSettings:
     rp_style: str = "off"
     vision_enabled: bool = False
     vision_detail: str = "auto"
+    max_image_side: int = 1280
+    high_detail_for_sticker: bool = True
+    high_detail_for_png: bool = True
 
 
 @dataclass(frozen=True)
-class PluginSettings:
+class MemoryEndpointSettings:
+    model: str
+    base_url: str
+    timeout: float
+    rerank_base_url: str
+    rerank_timeout: float
+
+
+@dataclass(frozen=True)
+class RetentionSettings:
+    backup_count: int
+    raw_message_days: int
+    raw_interaction_days: int
+    token_usage_days: int
+
+
+@dataclass(frozen=True)
+class AppSettings:
     chat: EndpointSettings
     feedback: EndpointSettings
     vlm: EndpointSettings
     vlm_mode: str
     rerank_model: str
     rerank_threshold: float
+    runtime: Mapping[str, Any]
+    memory: MemoryEndpointSettings
+    retention: RetentionSettings
+    siliconflow_api_key: str
+    enabled_groups: tuple[int, ...]
+    token_stats_watermark: str
+
+
+# Transitional public name for callers that imported the earlier validation model.
+PluginSettings = AppSettings
 
 
 @dataclass(frozen=True)
@@ -91,7 +126,7 @@ def get_default_config() -> dict:
                 # off | deepseek_v4_roleplay | gemini_3_flash_roleplay
                 "rp_style": "off",
             },
-            "max_tokens": 65536,
+            "max_tokens": 4096,
             "timeout": 180,
             "vision": {
                 "enabled": False,
@@ -117,10 +152,7 @@ def get_default_config() -> dict:
             "api_key": "",
             "base_url": DEEPSEEK_BASE_URL,
             "model": DEEPSEEK_CHAT_MODEL,
-            "thinking": {
-                "enabled": False,
-            },
-            "max_tokens": 65536,
+            "max_tokens": 2048,
             "timeout": 60,
             "vision": {
                 "enabled": False,
@@ -160,8 +192,8 @@ def get_default_config() -> dict:
             "history_recall_limit": 20,
             "backup_retention_count": 7,
             "raw_message_retention_days": 0,
-            "raw_interaction_retention_days": 0,
-            "token_usage_retention_days": 0,
+            "raw_interaction_retention_days": 180,
+            "token_usage_retention_days": 90,
             "speak_cooldown_seconds": 16.0,
             "willingness_idle_after_seconds": 300.0,
             "willingness_decay_rate_active": 0.03,
@@ -181,14 +213,21 @@ def get_default_config() -> dict:
             "rerank_willingness_threshold": 0.68,
             "rag_debug_log": False,
             "rag_final_k": 20,
-            "rag_candidate_k": 40,
             "rag_per_query_recall_k": 40,
             "rag_merged_candidate_cap": 64,
             "rag_memory_char_budget": 1500,
+            "prompt_summary_chars": 1200,
+            "prompt_recent_message_chars": 1600,
+            "prompt_history_chars": 2400,
+            "prompt_rag_item_chars": 500,
+            "prompt_recalled_history_chars": 1200,
             "rag_default_event_ttl_days": 90,
             "memory_write_max_retries": 3,
             "memory_write_retry_base_delay": 0.5,
             "memory_drain_timeout_seconds": 10.0,
+            "memory_query_user_cooldown_seconds": 30.0,
+            "memory_query_group_cooldown_seconds": 3.0,
+            "memory_query_cache_max_entries": 256,
         },
         "enabled_groups": [],
     }
@@ -279,6 +318,9 @@ def normalize_config(config: dict[str, Any]) -> dict[str, Any]:
     _normalize_vision("chat", merged["chat"])
     _normalize_vision("feedback", merged["feedback"])
     _normalize_vlm_mode(merged["vlm"])
+    # Removed no-op compatibility fields are accepted but never exposed.
+    merged["feedback"].pop("thinking", None)
+    merged["runtime"].pop("rag_candidate_k", None)
 
     return merged
 
@@ -316,7 +358,7 @@ def _require(value: str, field_name: str) -> str:
     return value
 
 
-def build_settings(config: dict[str, Any], *, require_api_keys: bool = False) -> PluginSettings:
+def build_settings(config: dict[str, Any], *, require_api_keys: bool = False) -> AppSettings:
     cfg = normalize_config(config)
 
     def endpoint(name: str, *, require_key: bool, max_tokens_default: int = 0) -> EndpointSettings:
@@ -340,20 +382,44 @@ def build_settings(config: dict[str, Any], *, require_api_keys: bool = False) ->
             rp_style=str(thinking.get("rp_style") or "off"),
             vision_enabled=bool(vision.get("enabled", False)),
             vision_detail=str(vision.get("detail") or ("low" if name == "feedback" else "auto")),
+            max_image_side=max(256, int(section.get("max_image_side") or 1280)),
+            high_detail_for_sticker=bool(
+                section.get("high_detail_for_sticker", True)
+            ),
+            high_detail_for_png=bool(section.get("high_detail_for_png", True)),
         )
 
     needs_standalone_vlm = _should_use_standalone_vlm(cfg)
-    return PluginSettings(
-        chat=endpoint("chat", require_key=require_api_keys, max_tokens_default=65536),
-        feedback=endpoint("feedback", require_key=require_api_keys, max_tokens_default=65536),
+    runtime = _build_runtime_settings(cfg)
+    memory = _build_memory_endpoint_settings(cfg)
+    return AppSettings(
+        chat=endpoint("chat", require_key=require_api_keys, max_tokens_default=4096),
+        feedback=endpoint("feedback", require_key=require_api_keys, max_tokens_default=2048),
         vlm=endpoint("vlm", require_key=require_api_keys and needs_standalone_vlm),
         vlm_mode=_get_vlm_mode(cfg),
         rerank_model=str(cfg.get("rerank", {}).get("model") or ""),
         rerank_threshold=float(cfg.get("rerank", {}).get("threshold") or 0.0),
+        runtime=MappingProxyType(runtime),
+        memory=memory,
+        retention=RetentionSettings(
+            backup_count=runtime["backup_retention_count"],
+            raw_message_days=runtime["raw_message_retention_days"],
+            raw_interaction_days=runtime["raw_interaction_retention_days"],
+            token_usage_days=runtime["token_usage_retention_days"],
+        ),
+        siliconflow_api_key=str(cfg.get("siliconflow_api_key") or ""),
+        enabled_groups=tuple(
+            int(group_id)
+            for group_id in cfg.get("enabled_groups", [])
+        ),
+        token_stats_watermark=str(
+            cfg.get("token_stats", {}).get("watermark")
+            or "Generated by HakuBot"
+        ),
     )
 
 
-def describe_settings(settings: PluginSettings) -> str:
+def describe_settings(settings: AppSettings) -> str:
     def endpoint(name: str, value: EndpointSettings) -> str:
         key_state = "set" if value.api_key else "missing"
         return f"{name}: provider={value.provider}, model={value.model}, base_url={value.base_url}, api_key={key_state}"
@@ -371,10 +437,9 @@ def load_plugin_config() -> dict:
     global _plugin_config
 
     if not CONFIG_FILE.exists():
-        logger.warning(f"配置文件不存在，将创建默认配置: {CONFIG_FILE}")
+        logger.warning(f"配置文件不存在，使用内置默认配置: {CONFIG_FILE}")
         _plugin_config = get_default_config()
-        save_plugin_config(_plugin_config)
-        _set_config_load_status(ok=True, source="default_created")
+        _set_config_load_status(ok=True, source="default")
         return _plugin_config
 
     try:
@@ -399,101 +464,126 @@ def load_plugin_config() -> dict:
         raise
 
 
-def save_plugin_config(config: dict):
+def save_plugin_config(config: dict) -> bool:
     """保存配置到 config.json"""
+    global plugin_config, _app_settings, _app_settings_source_id
     try:
+        normalized = normalize_config(config)
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(config, f, indent=2, ensure_ascii=False)
+            json.dump(normalized, f, indent=2, ensure_ascii=False)
+        plugin_config = normalized
+        _plugin_config.clear()
+        _plugin_config.update(normalized)
+        _app_settings = build_settings(normalized, require_api_keys=False)
+        _app_settings_source_id = id(plugin_config)
         logger.info(f"配置已保存: {CONFIG_FILE}")
+        return True
     except Exception as e:
         logger.error(f"保存配置文件失败: {e}")
+        return False
 
 
-plugin_config = load_plugin_config()
+plugin_config: dict[str, Any]
+_app_settings: AppSettings | None = None
+_app_settings_source_id = 0
+
+
+def get_app_settings() -> AppSettings:
+    """Return the normalized immutable settings snapshot.
+
+    Production replaces ``plugin_config`` only through the loader. The identity
+    check also keeps tests and compatibility callers that replace the mapping
+    working without rebuilding settings on every hot-path read.
+    """
+
+    global _app_settings, _app_settings_source_id
+    source_id = id(plugin_config)
+    if _app_settings is None or _app_settings_source_id != source_id:
+        _app_settings = build_settings(plugin_config, require_api_keys=False)
+        _app_settings_source_id = source_id
+    return _app_settings
 
 
 def get_effective_chat_api_key() -> str:
-    return plugin_config.get("chat", {}).get("api_key", "").strip()
+    return get_app_settings().chat.api_key.strip()
 
 
 def get_effective_chat_model() -> str:
-    return (plugin_config.get("chat", {}).get("model") or DEEPSEEK_CHAT_MODEL).strip()
+    return get_app_settings().chat.model.strip()
 
 
 def get_effective_chat_base_url() -> str:
-    return (plugin_config.get("chat", {}).get("base_url") or DEEPSEEK_BASE_URL).strip()
+    return get_app_settings().chat.base_url.strip()
 
 
 def get_effective_chat_provider() -> str:
-    return (plugin_config.get("chat", {}).get("provider") or DEEPSEEK_OFFICIAL).strip().lower()
+    return get_app_settings().chat.provider.strip().lower()
 
 
 def get_chat_thinking_settings() -> dict[str, Any]:
-    thinking = plugin_config.get("chat", {}).get("thinking") or {}
+    endpoint = get_app_settings().chat
     return {
-        "enabled": bool(thinking.get("enabled", True)),
-        "reasoning_effort": str(thinking.get("reasoning_effort") or "low"),
-        "rp_style": str(thinking.get("rp_style") or "off"),
+        "enabled": endpoint.thinking_enabled,
+        "reasoning_effort": endpoint.reasoning_effort or "low",
+        "rp_style": endpoint.rp_style,
     }
 
 
 def get_chat_timeout() -> float:
-    return float(plugin_config.get("chat", {}).get("timeout") or 180)
+    return get_app_settings().chat.timeout
 
 
 def get_chat_max_tokens() -> int:
-    return int(plugin_config.get("chat", {}).get("max_tokens") or 65536)
+    return get_app_settings().chat.max_tokens
 
 
 def get_effective_feedback_api_key() -> str:
-    return plugin_config.get("feedback", {}).get("api_key", "").strip()
+    return get_app_settings().feedback.api_key.strip()
 
 
 def get_effective_feedback_model() -> str:
-    return (plugin_config.get("feedback", {}).get("model") or DEEPSEEK_CHAT_MODEL).strip()
+    return get_app_settings().feedback.model.strip()
 
 
 def get_effective_feedback_base_url() -> str:
-    return (plugin_config.get("feedback", {}).get("base_url") or DEEPSEEK_BASE_URL).strip()
+    return get_app_settings().feedback.base_url.strip()
 
 
 def get_effective_feedback_provider() -> str:
-    return (plugin_config.get("feedback", {}).get("provider") or DEEPSEEK_OFFICIAL).strip().lower()
-
-
-def get_feedback_thinking_settings() -> dict[str, Any]:
-    thinking = plugin_config.get("feedback", {}).get("thinking") or {}
-    return {"enabled": bool(thinking.get("enabled", False))}
+    return get_app_settings().feedback.provider.strip().lower()
 
 
 def get_feedback_timeout() -> float:
-    return float(plugin_config.get("feedback", {}).get("timeout") or 60)
+    return get_app_settings().feedback.timeout
 
 
 def get_feedback_max_tokens() -> int:
-    return int(plugin_config.get("feedback", {}).get("max_tokens") or 65536)
+    return get_app_settings().feedback.max_tokens
 
 
 def get_vision_settings(endpoint_name: str) -> dict[str, Any]:
     if endpoint_name not in {"chat", "feedback"}:
         raise ValueError(f"Unsupported vision endpoint: {endpoint_name}")
-    default_detail = "low" if endpoint_name == "feedback" else "auto"
-    vision = (plugin_config.get(endpoint_name, {}) or {}).get("vision") or {}
-    detail = str(vision.get("detail") or default_detail).strip().lower()
-    if detail not in {"low", "high", "auto"}:
-        detail = default_detail
+    endpoint = getattr(get_app_settings(), endpoint_name)
     return {
-        "enabled": bool(vision.get("enabled", False)),
-        "detail": detail,
+        "enabled": endpoint.vision_enabled,
+        "detail": endpoint.vision_detail,
     }
 
 
 def get_effective_vlm_mode() -> str:
-    return _get_vlm_mode(plugin_config)
+    return get_app_settings().vlm_mode
 
 
 def should_use_standalone_vlm() -> bool:
-    return _should_use_standalone_vlm(plugin_config)
+    settings = get_app_settings()
+    if settings.vlm_mode == "off":
+        return False
+    if settings.vlm_mode == "always":
+        return True
+    return not (
+        settings.chat.vision_enabled and settings.feedback.vision_enabled
+    )
 
 
 def native_vision_enabled() -> bool:
@@ -504,15 +594,36 @@ def native_vision_enabled() -> bool:
 
 
 def get_effective_vlm_api_key() -> str:
-    return plugin_config.get("vlm", {}).get("api_key", "").strip()
+    return get_app_settings().vlm.api_key.strip()
 
 
 def get_effective_vlm_base_url() -> str:
-    return plugin_config.get("vlm", {}).get("base_url", "").strip()
+    return get_app_settings().vlm.base_url.strip()
 
 
 def get_effective_vlm_model() -> str:
-    return plugin_config.get("vlm", {}).get("model", "").strip()
+    return get_app_settings().vlm.model.strip()
+
+
+def get_vlm_image_settings() -> dict[str, int | bool]:
+    value = get_app_settings().vlm
+    return {
+        "max_image_side": value.max_image_side,
+        "high_detail_for_sticker": value.high_detail_for_sticker,
+        "high_detail_for_png": value.high_detail_for_png,
+    }
+
+
+def get_siliconflow_api_key() -> str:
+    return get_app_settings().siliconflow_api_key
+
+
+def get_enabled_groups() -> tuple[int, ...]:
+    return get_app_settings().enabled_groups
+
+
+def get_token_stats_watermark() -> str:
+    return get_app_settings().token_stats_watermark
 
 
 def get_token_stats_model_names() -> list[str]:
@@ -532,8 +643,8 @@ def get_token_stats_model_names() -> list[str]:
     return result
 
 
-def get_runtime_settings() -> dict[str, Any]:
-    runtime = plugin_config.get("runtime", {}) or {}
+def _build_runtime_settings(config: Mapping[str, Any]) -> dict[str, Any]:
+    runtime = config.get("runtime", {}) or {}
     # Deprecated legacy key accepted in local config but intentionally ignored:
     # low_willingness_observe_interval. Passive observation is consolidation-driven.
 
@@ -560,7 +671,7 @@ def get_runtime_settings() -> dict[str, Any]:
             return value.strip().lower() in {"1", "true", "yes", "on"}
         return bool(value)
 
-    return {
+    settings = {
         "debounce_seconds": number("debounce_seconds", 2.0, float, minimum=0.0),
         "queue_max_size": number("queue_max_size", 200, int, minimum=1),
         "send_strategy": str(runtime.get("send_strategy") or "split_by_sentence"),
@@ -578,8 +689,8 @@ def get_runtime_settings() -> dict[str, Any]:
         "history_recall_limit": number("history_recall_limit", 20, int, minimum=1),
         "backup_retention_count": number("backup_retention_count", 7, int, minimum=1),
         "raw_message_retention_days": number("raw_message_retention_days", 0, int, minimum=0),
-        "raw_interaction_retention_days": number("raw_interaction_retention_days", 0, int, minimum=0),
-        "token_usage_retention_days": number("token_usage_retention_days", 0, int, minimum=0),
+        "raw_interaction_retention_days": number("raw_interaction_retention_days", 180, int, minimum=0),
+        "token_usage_retention_days": number("token_usage_retention_days", 90, int, minimum=0),
         "speak_cooldown_seconds": number("speak_cooldown_seconds", 16.0, float, minimum=0.0),
         "willingness_idle_after_seconds": number("willingness_idle_after_seconds", 300.0, float, minimum=0.0),
         "willingness_decay_rate_active": number("willingness_decay_rate_active", 0.03, float, minimum=0.0),
@@ -599,24 +710,80 @@ def get_runtime_settings() -> dict[str, Any]:
         "rerank_willingness_threshold": ratio("rerank_willingness_threshold", 0.68),
         "rag_debug_log": flag("rag_debug_log", False),
         "rag_final_k": number("rag_final_k", 20, int, minimum=1),
-        "rag_candidate_k": number("rag_candidate_k", 40, int, minimum=1),
-        "rag_per_query_recall_k": number("rag_per_query_recall_k", runtime.get("rag_candidate_k", 40), int, minimum=1),
+        "rag_per_query_recall_k": number("rag_per_query_recall_k", 40, int, minimum=1),
         "rag_merged_candidate_cap": number("rag_merged_candidate_cap", 64, int, minimum=1),
         "rag_memory_char_budget": number("rag_memory_char_budget", 1500, int, minimum=1),
+        "prompt_summary_chars": number("prompt_summary_chars", 1200, int, minimum=100),
+        "prompt_recent_message_chars": number("prompt_recent_message_chars", 1600, int, minimum=100),
+        "prompt_history_chars": number("prompt_history_chars", 2400, int, minimum=100),
+        "prompt_rag_item_chars": number("prompt_rag_item_chars", 500, int, minimum=50),
+        "prompt_recalled_history_chars": number("prompt_recalled_history_chars", 1200, int, minimum=100),
         "rag_default_event_ttl_days": number("rag_default_event_ttl_days", 90, int, minimum=1),
         "memory_write_max_retries": number("memory_write_max_retries", 3, int, minimum=0),
         "memory_write_retry_base_delay": number("memory_write_retry_base_delay", 0.5, float, minimum=0.0),
         "memory_drain_timeout_seconds": number("memory_drain_timeout_seconds", 10.0, float, minimum=0.0),
+        "memory_query_user_cooldown_seconds": number("memory_query_user_cooldown_seconds", 30.0, float, minimum=0.0),
+        "memory_query_group_cooldown_seconds": number("memory_query_group_cooldown_seconds", 3.0, float, minimum=0.0),
+        "memory_query_cache_max_entries": number("memory_query_cache_max_entries", 256, int, minimum=1),
     }
+    settings["passive_growth_max_factor"] = max(
+        settings["passive_growth_min_factor"],
+        settings["passive_growth_max_factor"],
+    )
+    settings["short_context_limit"] = min(
+        settings["short_context_limit"],
+        settings["short_term_buffer_size"],
+    )
+    settings["rag_per_query_recall_k"] = max(
+        settings["rag_final_k"],
+        settings["rag_per_query_recall_k"],
+    )
+    settings["rag_merged_candidate_cap"] = max(
+        settings["rag_final_k"],
+        settings["rag_merged_candidate_cap"],
+    )
+    settings["prompt_rag_item_chars"] = min(
+        settings["prompt_rag_item_chars"],
+        settings["rag_memory_char_budget"],
+    )
+    return settings
+
+
+def get_runtime_settings() -> Mapping[str, Any]:
+    return get_app_settings().runtime
+
+
+def _build_memory_endpoint_settings(
+    config: Mapping[str, Any],
+) -> MemoryEndpointSettings:
+    embedding = config.get("embedding", {}) or {}
+    rerank = config.get("rerank", {}) or {}
+    return MemoryEndpointSettings(
+        model=str(embedding.get("model") or "BAAI/bge-m3"),
+        base_url=str(
+            embedding.get("base_url") or "https://api.siliconflow.cn/v1"
+        ).rstrip("/"),
+        timeout=float(embedding.get("timeout") or 30),
+        rerank_base_url=str(
+            rerank.get("base_url")
+            or "https://api.siliconflow.cn/v1/rerank"
+        ).rstrip("/"),
+        rerank_timeout=float(rerank.get("timeout") or 10),
+    )
 
 
 def get_memory_endpoint_settings() -> dict[str, str | float]:
-    embedding = plugin_config.get("embedding", {}) or {}
-    rerank = plugin_config.get("rerank", {}) or {}
+    value = get_app_settings().memory
     return {
-        "model": str(embedding.get("model") or "BAAI/bge-m3"),
-        "base_url": str(embedding.get("base_url") or "https://api.siliconflow.cn/v1").rstrip("/"),
-        "timeout": float(embedding.get("timeout") or 30),
-        "rerank_base_url": str(rerank.get("base_url") or "https://api.siliconflow.cn/v1/rerank").rstrip("/"),
-        "rerank_timeout": float(rerank.get("timeout") or 10),
+        "model": value.model,
+        "base_url": value.base_url,
+        "timeout": value.timeout,
+        "rerank_base_url": value.rerank_base_url,
+        "rerank_timeout": value.rerank_timeout,
     }
+
+
+# Load after definitions so validation can construct the entire settings graph.
+plugin_config = load_plugin_config()
+_app_settings = build_settings(plugin_config, require_api_keys=False)
+_app_settings_source_id = id(plugin_config)

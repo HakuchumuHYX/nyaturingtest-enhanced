@@ -1,5 +1,6 @@
 # nyaturingtest/models.py
 from tortoise import fields
+from tortoise.indexes import Index
 from tortoise.models import Model
 
 
@@ -32,6 +33,9 @@ class UserProfileModel(Model):
     dominance = fields.FloatField(default=0.0)
 
     last_update_time = fields.DatetimeField(auto_now=True)
+    interaction_count = fields.IntField(default=0)
+    first_interaction_at = fields.DatetimeField(null=True)
+    last_interaction_at = fields.DatetimeField(null=True)
 
     class Meta:
         table = "nyabot_user_profiles"
@@ -48,7 +52,7 @@ class InteractionLogModel(Model):
 
     class Meta:
         table = "nyabot_interactions"
-        indexes = (("timestamp",),)
+        indexes = (Index(fields=("timestamp",), name="idx_interactions_timestamp"),)
 
 
 class GlobalMessageModel(Model):
@@ -57,13 +61,20 @@ class GlobalMessageModel(Model):
     user_name = fields.CharField(max_length=255)
     user_id = fields.CharField(max_length=255, default="")
     content = fields.TextField()
-    time = fields.DatetimeField(index=True)
+    time = fields.DatetimeField()
     msg_id = fields.CharField(max_length=255, default="")
 
     class Meta:
         table = "nyabot_global_messages"
         unique_together = (("session", "msg_id"),)
-        indexes = (("session", "time"), ("session", "user_id", "time"))
+        indexes = (
+            Index(fields=("time",), name="idx_messages_time"),
+            Index(fields=("session_id", "time"), name="idx_messages_session_time"),
+            Index(
+                fields=("session_id", "user_id", "time"),
+                name="idx_messages_session_user_time",
+            ),
+        )
 
 
 class EnabledGroupModel(Model):
@@ -90,4 +101,40 @@ class TokenUsageModel(Model):
 
     class Meta:
         table = "nyabot_token_usage"
-        indexes = (("session_id", "timestamp"), ("model_name", "timestamp"))  # 联合索引加速查询
+        indexes = (
+            Index(
+                fields=("session_id", "timestamp"),
+                name="idx_token_usage_session_time",
+            ),
+            Index(
+                fields=("model_name", "timestamp"),
+                name="idx_token_usage_model_time",
+            ),
+        )
+
+
+class DailyTokenUsageModel(Model):
+    """按自然日汇总的 Token 消耗，用于长期统计和安全清理明细。"""
+
+    id = fields.IntField(pk=True)
+    day = fields.DateField()
+    session_id = fields.CharField(max_length=255)
+    model_name = fields.CharField(max_length=255)
+    provider = fields.CharField(max_length=64, default="")
+    prompt_tokens = fields.BigIntField(default=0)
+    completion_tokens = fields.BigIntField(default=0)
+    prompt_cache_hit_tokens = fields.BigIntField(default=0)
+    prompt_cache_miss_tokens = fields.BigIntField(default=0)
+    reasoning_tokens = fields.BigIntField(default=0)
+    request_count = fields.IntField(default=0)
+
+    class Meta:
+        table = "nyabot_daily_token_usage"
+        unique_together = (("day", "session_id", "model_name", "provider"),)
+        indexes = (
+            Index(
+                fields=("session_id", "day"),
+                name="idx_daily_token_session_day",
+            ),
+            Index(fields=("model_name", "day"), name="idx_daily_token_model_day"),
+        )

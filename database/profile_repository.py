@@ -1,6 +1,7 @@
 from datetime import datetime
 
 from nonebot import logger
+from tortoise import Tortoise
 
 from ..models.database import InteractionLogModel, SessionModel, UserProfileModel
 
@@ -56,10 +57,12 @@ class ProfileRepository:
 
             now = datetime.now()
             rows = []
+            increments: dict[int, int] = {}
             for user_id, delta in interactions:
                 user_db = user_map.get(str(user_id))
                 if not user_db:
                     continue
+                increments[user_db.id] = increments.get(user_db.id, 0) + 1
                 rows.append(
                     InteractionLogModel(
                         user=user_db,
@@ -71,6 +74,20 @@ class ProfileRepository:
                 )
             if rows:
                 await InteractionLogModel.bulk_create(rows)
+                conn = Tortoise.get_connection("default")
+                await conn.execute_many(
+                    """
+                    UPDATE nyabot_user_profiles
+                    SET interaction_count = interaction_count + ?,
+                        first_interaction_at = COALESCE(first_interaction_at, ?),
+                        last_interaction_at = ?
+                    WHERE id = ?
+                    """,
+                    [
+                        [count, now, now, user_pk]
+                        for user_pk, count in increments.items()
+                    ],
+                )
         except Exception as e:
             logger.error(f"[Repo] 记录交互日志失败: {e}")
 
@@ -86,9 +103,7 @@ class ProfileRepository:
                 session=session_db,
                 user_id=str(user_id),
             )
-            if user_db:
-                return await InteractionLogModel.filter(user=user_db).count()
-            return 0
+            return int(user_db.interaction_count or 0) if user_db else 0
         except Exception as e:
             logger.error(f"[Repo] 获取交互统计失败: {e}")
             return 0
@@ -108,8 +123,7 @@ class ProfileRepository:
             if not user_db:
                 return None
 
-            first_log = await InteractionLogModel.filter(user=user_db).order_by("timestamp").first()
-            return first_log.timestamp if first_log else None
+            return user_db.first_interaction_at
         except Exception as e:
             logger.error(f"[Repo] 获取首次交互时间失败: {e}")
             return None

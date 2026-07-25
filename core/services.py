@@ -4,6 +4,8 @@ from typing import Any
 from nonebot.utils import run_sync
 
 from ..memory.short_term import Message
+from ..memory.vector import RetrievalResult
+from .turn_models import FeedbackOutcome
 
 
 class RagSearchService:
@@ -27,17 +29,22 @@ class RagSearchService:
             "preview": content[:80],
         }
 
-    async def _retrieve(self, queries: list[str], **kwargs: Any) -> list[dict]:
-        records = await run_sync(self.long_term_memory.retrieve_with_decay)(queries, **kwargs)
-        return [self.normalize_record(record) for record in records]
+    async def _retrieve(self, queries: list[str], **kwargs: Any) -> RetrievalResult:
+        result = await run_sync(self.long_term_memory.retrieve_with_decay)(queries, **kwargs)
+        records = result.records if isinstance(result, RetrievalResult) else list(result or [])
+        stats = result.stats if isinstance(result, RetrievalResult) else {}
+        return RetrievalResult(
+            records=[self.normalize_record(record) for record in records],
+            stats=dict(stats),
+        )
 
-    async def search_for_chat(self, queries: list[str], **kwargs: Any) -> list[dict]:
+    async def search_for_chat(self, queries: list[str], **kwargs: Any) -> RetrievalResult:
         return await self._retrieve(queries, **kwargs)
 
-    async def search_for_user_profile(self, queries: list[str], **kwargs: Any) -> list[dict]:
+    async def search_for_user_profile(self, queries: list[str], **kwargs: Any) -> RetrievalResult:
         return await self._retrieve(queries, **kwargs)
 
-    async def search_for_debug(self, queries: list[str], **kwargs: Any) -> list[dict]:
+    async def search_for_debug(self, queries: list[str], **kwargs: Any) -> RetrievalResult:
         return await self._retrieve(queries, **kwargs)
 
 
@@ -78,10 +85,16 @@ class MemoryService:
         await self.session.save_long_term_memory(analyze_result, default_user_id=default_user_id)
 
     async def consolidate(self, messages_chunk, feedback_llm_func, *, expected_generation: int | None = None):
-        await self.session.consolidate_stage(
+        return await self.session.consolidate_stage(
             messages_chunk,
             feedback_llm_func,
             expected_generation=expected_generation,
+        )
+
+    def unconsolidated_messages(self, limit: int) -> list[Message]:
+        return self.session.global_memory.messages_after(
+            self.session.last_consolidated_time,
+            limit=limit,
         )
 
 
@@ -97,7 +110,7 @@ class FeedbackService:
         is_relevant: bool = False,
         search_result=None,
         expected_generation: int | None = None,
-    ) -> list[str]:
+    ) -> FeedbackOutcome:
         try:
             return await self.session.feedback_stage(
                 messages_chunk,
@@ -107,7 +120,11 @@ class FeedbackService:
                 expected_generation=expected_generation,
             )
         finally:
-            await self.session.save_session(expected_generation=expected_generation)
+            schedule_save = getattr(self.session, "_schedule_save_session", None)
+            if schedule_save is not None:
+                schedule_save()
+            else:
+                await self.session.save_session(expected_generation=expected_generation)
 
 
 class ChatService:

@@ -1,10 +1,10 @@
 # nyaturingtest/presets.py
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 import json
 import os
+from pathlib import Path
 
 from nonebot import logger
-import nonebot_plugin_localstore as store
 
 
 @dataclass
@@ -72,25 +72,45 @@ _猫娘预设 = RolePreset(
     ]
 )
 
-PRESETS: dict[str, RolePreset] = {}
+_BUILTIN_PRESETS: dict[str, RolePreset] = {"喵喵.json": _猫娘预设}
+PRESETS: dict[str, RolePreset] = dict(_BUILTIN_PRESETS)
+DEFAULT_PRESET_DIR = (
+    Path(__file__).resolve().parents[3]
+    / "config"
+    / "nyaturingtest"
+    / "nya_presets"
+)
 
 
-def _load_presets_from_directory(directory: str = f"{store.get_plugin_config_dir()}/nya_presets"):
-    if not os.path.exists(directory):
-        os.makedirs(directory)
-        with open(os.path.join(directory, "喵喵.json"), "w", encoding="utf-8") as f:
-            json.dump(asdict(_猫娘预设), f, ensure_ascii=False, indent=4)
-    for filename in os.listdir(directory):
-        if filename.endswith(".json"):
-            path = os.path.join(directory, filename)
+def get_preset_directory() -> Path:
+    """Return the single external preset source used by docs and commands."""
+
+    override = os.environ.get("NYATURINGTEST_PRESET_DIR")
+    return Path(override).expanduser() if override else DEFAULT_PRESET_DIR
+
+
+def reload_presets(directory: str | Path | None = None) -> int:
+    """Reload external presets without creating files or retaining stale entries."""
+
+    preset_dir = Path(directory) if directory is not None else get_preset_directory()
+    loaded: dict[str, RolePreset] = {}
+    if preset_dir.is_dir():
+        paths = sorted(preset_dir.glob("*.json"), key=lambda path: path.name)
+    else:
+        paths = []
+    for path in paths:
+        if path.is_file():
             try:
                 with open(path, encoding="utf-8") as f:
                     data = json.load(f)
-                    preset = RolePreset(**data)
-                    PRESETS[filename] = preset
+                loaded[path.name] = RolePreset(**data)
             except Exception as e:
-                logger.warning(f"无法加载预设 {filename}: {e}")
+                logger.warning(f"无法加载预设 {path.name}: {e}")
+    PRESETS.clear()
+    PRESETS.update(_BUILTIN_PRESETS)
+    PRESETS.update(loaded)
+    return len(loaded)
 
 
-# 模块导入时自动加载外部预设
-_load_presets_from_directory()
+# 启动时加载一次，命令执行时还会刷新以支持新增和修改文件。
+reload_presets()

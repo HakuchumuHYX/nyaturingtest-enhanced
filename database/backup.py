@@ -116,6 +116,40 @@ def _backup_data_sync() -> bool:
     return True
 
 
+def backup_before_schema_upgrade(
+    database_path: Path,
+    target_version: int,
+) -> bool:
+    """Create a recoverable snapshot before applying an existing DB upgrade."""
+
+    database_path = Path(database_path)
+    if not database_path.exists() or database_path.stat().st_size == 0:
+        return True
+    current_version = 0
+    try:
+        with sqlite3.connect(str(database_path)) as connection:
+            has_version_table = connection.execute(
+                """
+                SELECT 1 FROM sqlite_master
+                WHERE type='table' AND name='nyabot_schema_version'
+                """
+            ).fetchone()
+            if has_version_table:
+                row = connection.execute(
+                    "SELECT version FROM nyabot_schema_version WHERE id=1"
+                ).fetchone()
+                current_version = int(row[0]) if row else 0
+    except sqlite3.Error as e:
+        logger.error(f"迁移前检查数据库版本失败: {e}")
+        return False
+    if current_version >= int(target_version):
+        return True
+    logger.info(
+        f"数据库将从 schema {current_version} 升级到 {target_version}，先创建快照"
+    )
+    return _backup_data_sync()
+
+
 def _clean_old_backups_sync(retention_count: int | None = None):
     """同步清理旧的备份文件"""
     _, backup_dir = get_backup_dirs()
@@ -148,15 +182,26 @@ def _clean_old_backups_sync(retention_count: int | None = None):
         logger.error(f"清理过期备份时发生异常: {e}")
 
 
-async def backup_task():
-    """异步包装器，用于被 APScheduler 调用"""
+async def backup_task() -> bool:
+    """执行一次数据备份；仅备份文件创建成功时返回 ``True``。"""
     logger.info("触发自动备份任务...")
     # 由于文件压缩可能比较耗时且是阻塞的 I/O 操作，将其放入 asyncio 线程池中运行
-    if await asyncio.to_thread(_backup_data_sync):
-        try:
-            await cleanup_raw_data_retention()
-        except Exception as e:
-            logger.error(f"备份后清理原始数据库行失败: {e}")
+    if not await asyncio.to_thread(_backup_data_sync):
+        return False
+
+    try:
+        await cleanup_raw_data_retention()
+    except Exception as e:
+        # 备份文件已经成功落盘。Retention 是独立的后置维护任务，失败不应
+        # 把一次有效备份重新标记为失败，也不应阻止管理员随后执行 reset。
+        logger.error(f"备份后清理原始数据库行失败: {e}")
+    return True
+
+
+async def vector_maintenance_task() -> None:
+    from ..core.state_manager import maintain_vector_memories
+
+    await maintain_vector_memories()
 
 
 def setup_backup_job():
@@ -170,5 +215,14 @@ def setup_backup_job():
         id="nyaturingtest_daily_backup",
         misfire_grace_time=3600, # 允许误差一小时（比如刚好四点时机器人没开机）
         replace_existing=True
+    )
+    scheduler.add_job(
+        vector_maintenance_task,
+        "cron",
+        hour=3,
+        minute=30,
+        id="nyaturingtest_vector_maintenance",
+        misfire_grace_time=3600,
+        replace_existing=True,
     )
     logger.info("已注册自动备份定时任务: 每天凌晨 04:00")
