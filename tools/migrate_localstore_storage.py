@@ -168,6 +168,10 @@ def merge_stores(
         target_client = chromadb.PersistentClient(path=str(target_path))
         target = target_client.create_collection(
             COLLECTION_NAME,
+            # Stored embeddings are copied explicitly.  Persisting Chroma's
+            # default embedding function here would conflict with the custom
+            # runtime embedding adapter when VectorMemory reopens the store.
+            embedding_function=None,
             metadata={"hnsw:space": "cosine"},
         )
         seen_ids: set[str] = set()
