@@ -15,7 +15,7 @@
 - **长期记忆**：使用 ChromaDB 持久化向量记忆，通过 SiliconFlow Embedding 召回，并可使用 Rerank 二次排序。
 - **短时记忆**：保存最近消息和摘要，摘要由 Feedback 阶段更新，不再由短时记忆模块自行调用小模型压缩。
 - **多模态图片理解**：Chat/Feedback 可分别启用原生视觉输入；纯文本模型继续由 OpenAI-compatible VLM 生成可持久化的中文图片观察。
-- **Token 统计**：记录 Chat、Feedback、VLM 的 prompt/completion/reasoning tokens，以及 DeepSeek prompt cache hit/miss。
+- **Token 统计**：记录 Chat、Feedback、VLM 的 prompt/completion/reasoning tokens，以及 DeepSeek prompt cache hit/miss；展示时按规范化模型名合并，原始 Provider 明细仍保留用于诊断。
 - **SQLite 持久化**：会话状态、消息、用户画像、启用群组和 Token 使用量存入 SQLite，并带基础迁移与索引。
 - **自动备份**：每天 04:00 自动打包插件数据；`reset confirm` 前也会先触发一次备份。
 
@@ -26,11 +26,11 @@
 - Python `>=3.10`
 - `nonebot2[fastapi]`
 - `nonebot-adapter-onebot`
-- `nonebot-plugin-localstore`
 - `nonebot-plugin-apscheduler`
 - `tortoise-orm`
 - `openai`
 - `httpx`
+- `json-repair`
 - `chromadb`
 - `pillow`
 
@@ -295,24 +295,31 @@ config/nyaturingtest/nya_presets/
 
 ## 数据与备份
 
-插件数据由 `nonebot-plugin-localstore` 管理。本项目中常见路径是：
+插件运行数据统一使用工作区路径，不依赖进程用户的 XDG/localstore
+目录。默认路径如下：
 
 ```text
 data/nyaturingtest/
+cache/nyaturingtest/image_cache/
+data/nyaturingtest_backups/
 ```
 
 主要内容：
 
 - `nyabot.sqlite`：SQLite 主数据库。
 - `vector_index_<群号>/`：每个群的 ChromaDB 向量库。
-- `image_cache/`：图片识别缓存，位于插件 cache 目录。
+- `cache/nyaturingtest/image_cache/`：图片识别缓存，不进入数据备份。
 - 字体文件：Token 统计卡片渲染使用。
 
-备份文件默认写入插件数据目录同级的：
+备份文件默认写入：
 
 ```text
-nyaturingtest_backups/
+data/nyaturingtest_backups/
 ```
+
+可分别通过 `NYATURINGTEST_DATA_DIR`、`NYATURINGTEST_CACHE_DIR`、
+`NYATURINGTEST_BACKUP_DIR` 和 `NYATURINGTEST_PRESET_DIR` 覆盖默认路径。
+相对路径以工作区根目录为基准。
 
 备份文件名格式：
 

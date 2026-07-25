@@ -3,24 +3,22 @@ import asyncio
 
 from nonebot import get_driver, logger
 from tortoise import Tortoise
-from pathlib import Path
 
 from .core.state_manager import cleanup_global_resources, init_enabled_groups
 from .database.migrations import SCHEMA_VERSION, ensure_schema_version
 from .handlers import commands
 from .handlers import memory
 from .database.backup import backup_before_schema_upgrade, setup_backup_job
+from .paths import get_data_dir
 
 driver = get_driver()
-
-# 使用项目根目录下的 data 目录
-PLUGIN_DATA_DIR = Path(__file__).parent.parent.parent / "data" / "nyaturingtest"
 
 
 @driver.on_startup
 async def init_db():
-    PLUGIN_DATA_DIR.mkdir(parents=True, exist_ok=True)
-    db_path = PLUGIN_DATA_DIR / "nyabot.sqlite"
+    data_dir = get_data_dir()
+    data_dir.mkdir(parents=True, exist_ok=True)
+    db_path = data_dir / "nyabot.sqlite"
     if not await asyncio.to_thread(
         backup_before_schema_upgrade,
         db_path,

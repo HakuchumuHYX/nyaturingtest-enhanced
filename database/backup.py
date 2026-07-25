@@ -7,9 +7,9 @@ import asyncio
 from datetime import datetime
 from pathlib import Path
 from nonebot import logger, require
-import nonebot_plugin_localstore as store
 
 from ..config import get_runtime_settings
+from ..paths import get_backup_dir, get_data_dir
 from .backup_lock import BACKUP_IO_LOCK
 from .retention import cleanup_raw_data_retention
 
@@ -22,11 +22,7 @@ SQLITE_FILENAME = "nyabot.sqlite"
 
 
 def get_backup_dirs() -> tuple[Path, Path]:
-    # 获取插件的数据目录（包含了 nyabot.sqlite, 字体文件，向量数据库索引等）
-    data_dir = Path(store.get_plugin_data_dir())
-    # 设置备份的存放目录（放在数据目录上一级，避免无限循环打包）
-    backup_dir = data_dir.parent / "nyaturingtest_backups"
-    return data_dir, backup_dir
+    return get_data_dir(), get_backup_dir()
 
 
 def _copy_sqlite_snapshot(source: Path, target: Path):

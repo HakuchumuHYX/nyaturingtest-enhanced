@@ -6,15 +6,7 @@ from tortoise.transactions import in_transaction
 
 from ..core.metrics import metrics
 from ..models.database import DailyTokenUsageModel, TokenUsageModel
-
-
-TOKEN_FIELDS = (
-    "prompt_tokens",
-    "completion_tokens",
-    "prompt_cache_hit_tokens",
-    "prompt_cache_miss_tokens",
-    "reasoning_tokens",
-)
+from .token_stats_aggregation import TOKEN_FIELDS, merge_token_stats_by_model
 
 
 def _empty_stats() -> dict[str, list[dict]]:
@@ -30,27 +22,7 @@ def _empty_stats() -> dict[str, list[dict]]:
 def _format_aggregate_rows(
     aggregate: dict[tuple[str, str], dict[str, int]],
 ) -> list[dict]:
-    rows = []
-    for (model, provider), totals in sorted(aggregate.items()):
-        prompt = totals["prompt_tokens"]
-        completion = totals["completion_tokens"]
-        cache_hit = totals["prompt_cache_hit_tokens"]
-        cache_miss = totals["prompt_cache_miss_tokens"]
-        cache_total = cache_hit + cache_miss
-        rows.append(
-            {
-                "model": model,
-                "provider": provider,
-                "prompt": prompt,
-                "completion": completion,
-                "reasoning": totals["reasoning_tokens"],
-                "cache_hit": cache_hit,
-                "cache_miss": cache_miss,
-                "cache_hit_ratio": cache_hit / cache_total if cache_total else 0.0,
-                "total": prompt + completion,
-            }
-        )
-    return rows
+    return merge_token_stats_by_model(aggregate)
 
 
 class TokenUsageRepository:

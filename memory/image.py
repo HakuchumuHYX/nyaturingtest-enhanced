@@ -11,7 +11,6 @@ import re
 from typing import Callable
 import anyio
 from nonebot import logger, require
-import nonebot_plugin_localstore as store
 from PIL import Image, ImageDraw, ImageFont
 from nonebot.utils import run_sync
 import time
@@ -34,6 +33,7 @@ from ..llm.vlm import VLM
 from ..llm.vision import VisionInput
 from ..core.metrics import metrics
 from ..core.http_client import get_http_client
+from ..paths import get_image_cache_dir
 from .image_policy import (
     MAX_IMAGE_BYTES,
     MAX_IMAGE_PIXELS,
@@ -49,7 +49,7 @@ from .image_schema import (
     gif_target_count,
 )
 
-IMAGE_CACHE_DIR = Path(f"{store.get_plugin_cache_dir()}/image_cache")
+IMAGE_CACHE_DIR = get_image_cache_dir()
 _IMG_SEMAPHORE = asyncio.Semaphore(3)
 IMAGE_OBSERVATION_SCHEMA_VERSION = "3"
 

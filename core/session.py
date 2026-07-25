@@ -10,7 +10,6 @@ import traceback
 
 import httpx
 from nonebot import logger
-import nonebot_plugin_localstore as store
 from nonebot.utils import run_sync
 from ..config import get_chat_thinking_settings, get_runtime_settings
 from .. import config as config_module
@@ -44,6 +43,7 @@ from .session_runtime import SessionRuntime
 from .feedback_processor import FeedbackProcessor
 from .chat_planner import ChatPlanner
 from .memory_writer import MemoryWriteService
+from ..paths import get_vector_dir
 
 
 def _limit_role_text(text: str, max_chars: int) -> str:
@@ -226,7 +226,7 @@ class Session:
 
         vector_memory = VectorMemory(
             api_key=self._siliconflow_api_key,
-            persist_directory=f"{store.get_plugin_data_dir()}/vector_index_{id}",
+            persist_directory=str(get_vector_dir(id)),
         )
         self._state = SessionState(name=name)
         self._runtime = SessionRuntime(

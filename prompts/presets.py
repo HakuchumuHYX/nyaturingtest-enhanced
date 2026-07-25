@@ -1,10 +1,11 @@
 # nyaturingtest/presets.py
 from dataclasses import dataclass, field
 import json
-import os
 from pathlib import Path
 
 from nonebot import logger
+
+from ..paths import DEFAULT_PRESET_DIR, get_preset_dir
 
 
 @dataclass
@@ -74,19 +75,12 @@ _猫娘预设 = RolePreset(
 
 _BUILTIN_PRESETS: dict[str, RolePreset] = {"喵喵.json": _猫娘预设}
 PRESETS: dict[str, RolePreset] = dict(_BUILTIN_PRESETS)
-DEFAULT_PRESET_DIR = (
-    Path(__file__).resolve().parents[3]
-    / "config"
-    / "nyaturingtest"
-    / "nya_presets"
-)
 
 
 def get_preset_directory() -> Path:
     """Return the single external preset source used by docs and commands."""
 
-    override = os.environ.get("NYATURINGTEST_PRESET_DIR")
-    return Path(override).expanduser() if override else DEFAULT_PRESET_DIR
+    return get_preset_dir()
 
 
 def reload_presets(directory: str | Path | None = None) -> int:
