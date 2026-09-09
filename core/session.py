@@ -11,27 +11,74 @@ import httpx
 from nonebot import logger
 from nonebot.utils import run_sync
 from ..config import get_vector_dir
-from ..models.emotion import EmotionState
+from ..domain import EmotionState
 from ..memory.vector import VectorMemory
 from ..memory.short_term import Memory, Message
 from .engagement import (
     LOW_WILLINGNESS_SKIP_THRESHOLD,
     WILLINGNESS_LOAD_VALUE,
 )
-from ..prompts.presets import PRESETS, reload_presets
-from ..models.profile import PersonProfile
-from ..database.message_repository import MessageRepository
-from ..database.profile_repository import ProfileRepository
-from ..database.session_repository import SessionStateRepository
-from ..database.backup_lock import BACKUP_IO_LOCK
+from .prompts import PRESETS, reload_presets
+from ..domain import PersonProfile
+from .prompts import truncate_text
+from ..db import MessageRepository
+from ..db import ProfileRepository
+from ..db import SessionStateRepository
+from ..memory.vector import BACKUP_IO_LOCK
 from .metrics import log_event
-from .persistence import PersistenceCoordinator
 
 
 # 角色与摘要文本上限、后台任务排空超时
 ROLE_MAX_CHARS = 4000
 EXAMPLES_MAX_CHARS = 2000
 MEMORY_DRAIN_TIMEOUT_SECONDS = 10.0
+
+
+class PersistenceCoordinator:
+    """合并同一会话的重复保存请求：去抖 + 单飞 + 显式 flush。"""
+
+    def __init__(
+        self,
+        save_callback,
+        *,
+        task_factory=asyncio.create_task,
+        debounce_seconds: float = 0.05,
+    ):
+        self._save_callback = save_callback
+        self._task_factory = task_factory
+        self._debounce_seconds = max(0.0, float(debounce_seconds))
+        self._pending = False
+        self._force_index = False
+        self._task: asyncio.Task | None = None
+
+    def request(self, *, force_index: bool = False) -> None:
+        self._pending = True
+        self._force_index = self._force_index or force_index
+        self._ensure_task()
+
+    def _ensure_task(self) -> None:
+        if not self._pending:
+            return
+        if self._task is None or self._task.done():
+            self._task = self._task_factory(self._run())
+
+    async def _run(self) -> None:
+        try:
+            if self._debounce_seconds:
+                await asyncio.sleep(self._debounce_seconds)
+            while self._pending:
+                self._pending = False
+                force_index = self._force_index
+                self._force_index = False
+                await self._save_callback(force_index)
+        finally:
+            self._task = None
+
+    async def flush(self) -> bool:
+        task = self._task
+        if task is not None and not task.done():
+            await asyncio.shield(task)
+        return not self._pending
 
 
 class ChattingState(Enum):
@@ -97,13 +144,6 @@ class FeedbackOutcome:
     @classmethod
     def rejected(cls, reason: str) -> "FeedbackOutcome":
         return cls(accepted=False, failure_reason=reason)
-
-
-def _limit_role_text(text: str, max_chars: int) -> str:
-    text = text or ""
-    if max_chars > 0 and len(text) > max_chars:
-        return text[:max_chars].rstrip() + "\n[内容过长，已截断]"
-    return text
 
 
 STALE_GENERATION_WRITE = object()
@@ -191,7 +231,7 @@ class Session:
 
     async def set_role(self, name: str, role: str):
         self.bump_generation("set_role")
-        self.state.role = _limit_role_text(role, ROLE_MAX_CHARS)
+        self.state.role = truncate_text(role, ROLE_MAX_CHARS)
         self.state.name = name
         self.state.aliases = []
         self.state.examples = ""
@@ -265,28 +305,10 @@ class Session:
         return task
 
     def _schedule_save_session(self, force_index: bool = False):
-        coordinator = self._get_persistence_coordinator()
-        coordinator.request(force_index=force_index)
-        return coordinator
-
-    def _get_persistence_coordinator(self) -> PersistenceCoordinator:
-        coordinator = self.runtime.persistence
-        if coordinator is None:
-            coordinator = PersistenceCoordinator(
-                self._save_coordinated,
-                task_factory=self._create_safe_task,
-            )
-            self.runtime.persistence = coordinator
-        return coordinator
-
-    def begin_persistence_batch(self) -> None:
-        self._get_persistence_coordinator().begin_batch()
-
-    async def end_persistence_batch(self, *, flush: bool = False) -> bool:
-        return await self._get_persistence_coordinator().end_batch(flush=flush)
+        self.runtime.persistence.request(force_index=force_index)
 
     async def flush_persistence(self) -> bool:
-        return await self._get_persistence_coordinator().flush()
+        return await self.runtime.persistence.flush()
 
     async def _save_coordinated(self, force_index: bool = False) -> bool:
         async with self.runtime.save_lock:
@@ -312,10 +334,7 @@ class Session:
             if self.is_generation_stale(expected_generation):
                 self._log_stale_generation("save_session_locked", expected_generation)
                 return False
-            result = await self._save_session_locked(force_index=force_index)
-            if result:
-                self.runtime.persistence.mark_current_persisted()
-            return result
+            return await self._save_session_locked(force_index=force_index)
 
     async def _save_session_locked(self, force_index: bool = False) -> bool:
         try:
@@ -376,7 +395,7 @@ class Session:
         session_db = data["session"]
         
         self.state.name = session_db.name
-        self.state.role = _limit_role_text(session_db.role, ROLE_MAX_CHARS)
+        self.state.role = truncate_text(session_db.role, ROLE_MAX_CHARS)
         self.state.aliases = session_db.aliases if session_db.aliases else []
         self.state.chat_summary = session_db.chat_summary
         self.state.global_emotion.valence = session_db.valence
@@ -456,17 +475,17 @@ class Session:
                 b = ex.get("bot", "")
                 if u and b:
                     ex_lines.append(f"用户: {u}\n{preset.name}: {b}")
-            self.state.examples = _limit_role_text("\n".join(ex_lines), EXAMPLES_MAX_CHARS)
+            self.state.examples = truncate_text("\n".join(ex_lines), EXAMPLES_MAX_CHARS)
         else:
             self.state.examples = ""
 
         if self.state.examples:
-            self.state.role = _limit_role_text(
+            self.state.role = truncate_text(
                 f"{base_role}\n\n[对话样本]\n{self.state.examples}",
                 ROLE_MAX_CHARS,
             )
         else:
-            self.state.role = _limit_role_text(base_role, ROLE_MAX_CHARS)
+            self.state.role = truncate_text(base_role, ROLE_MAX_CHARS)
 
         await run_sync(self.runtime.vector_memory.delete_by_metadata)({"source": "preset"})
 
@@ -521,15 +540,6 @@ class Session:
 
         await self.runtime.short_term_memory.update(messages_chunk)
         self.state.messages_since_consolidation += len(messages_chunk)
-        self._schedule_save_session()
-
-    async def update_without_trigger(self, messages_chunk: list[Message]):
-        """
-        仅更新记忆，不触发 LLM 回复 (用于处理回显)
-        """
-        if not messages_chunk: return
-        logger.debug(f"[Session {self.id}] 处理回显消息 (Count: {len(messages_chunk)})")
-        await self.runtime.short_term_memory.update(messages_chunk)
         self._schedule_save_session()
 
     async def drain_background_tasks(self, timeout: float | None = None):

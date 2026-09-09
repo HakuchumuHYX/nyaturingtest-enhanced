@@ -18,18 +18,10 @@ class Message:
     content: str
     id: str = ""
     user_id: str = ""
-    image_meta: dict | None = None     # 图片结构化观测，纯内存，不持久化
     # 原生多模态输入，仅当前进程短期持有；不序列化、不写数据库。
     image_inputs: list[Any] = field(default_factory=list, repr=False, compare=False)
     revision: int = field(default=0, repr=False, compare=False)
     _persistence_id: str = field(default="", repr=False, compare=False)
-
-    def image_refs(self) -> list[str]:
-        return [
-            str(item.ref_id or "")
-            for item in self.image_inputs
-            if item.ref_id
-        ]
 
     def mark_dirty(self) -> int:
         self.revision += 1

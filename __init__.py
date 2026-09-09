@@ -1,14 +1,10 @@
 # __init__.py
-import asyncio
-
 from nonebot import get_driver, logger
 from tortoise import Tortoise
 
 from .core.state_manager import cleanup_global_resources, init_enabled_groups
-from .database.migrations import SCHEMA_VERSION, ensure_schema_version
-from .handlers import commands
-from .handlers import memory
-from .database.backup import backup_before_schema_upgrade, setup_backup_job
+from . import handlers  # 导入即注册所有 matcher
+from .backup import setup_backup_job
 from .config import get_data_dir
 
 driver = get_driver()
@@ -19,22 +15,14 @@ async def init_db():
     data_dir = get_data_dir()
     data_dir.mkdir(parents=True, exist_ok=True)
     db_path = data_dir / "nyabot.sqlite"
-    if not await asyncio.to_thread(
-        backup_before_schema_upgrade,
-        db_path,
-        SCHEMA_VERSION,
-    ):
-        raise RuntimeError("数据库升级前备份失败，已中止启动以保护现有数据")
-
     await Tortoise.init(
         db_url=f'sqlite://{db_path}',
-        modules={'models': [f'{__package__}.models.database']},
+        modules={'models': [f'{__package__}.models']},
         use_tz=False,
         _create_db=True,
         _enable_global_fallback=True
     )
     await Tortoise.generate_schemas()
-    await ensure_schema_version()
     logger.info(f"数据库已连接: {db_path}")
 
     # 初始化群组列表

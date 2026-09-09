@@ -1,33 +1,25 @@
-import json
+# 由多个模块合并而来：core/orchestrator.py, core/llm_output.py
+
 import random
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass
 from datetime import datetime
-
 from nonebot import logger
 from nonebot.utils import run_sync
-
-from ..config import get_vision_settings
-from ..database.message_repository import MessageRepository
+from ..db import MessageRepository
 from ..memory.short_term import SHORT_CONTEXT_LIMIT, Message
 from ..memory.validation import validate_memory_candidate
 from ..memory.vector import where_any
-from ..models.emotion import clamp_vad_value
-from ..models.impression import Impression
-from ..models.profile import PersonProfile
-from ..prompts.templates import PromptBudget, get_chat_prompt, get_feedback_prompt
+from ..domain import clamp_vad_value
+from ..domain import Impression
+from ..domain import PersonProfile
+from .prompts import PromptBudget, get_chat_prompt, get_feedback_prompt
 from .engagement import EngagementPolicy
-
-
-CONSOLIDATION_ENABLED = True
-CONSOLIDATION_MESSAGE_THRESHOLD = 8
-CONSOLIDATION_INTERVAL_SECONDS = 180.0
-CONSOLIDATION_MAX_MESSAGES = 60
-HISTORY_RECALL_LIMIT = 20
-from .llm_output import parse_feedback, parse_reply
 from .metrics import log_event
-from .rag_query import (
+from ..memory.vector import (
+    RetrievalResult,
+    search_memories,
     RAG_DEBUG_LOG,
     RAG_DEFAULT_EVENT_TTL_DAYS,
     RAG_FINAL_K,
@@ -44,10 +36,21 @@ from .engagement import (
     RERANK_WILLINGNESS_THRESHOLD,
     SPEAK_WILLINGNESS_RETAIN_FACTOR,
 )
-from .services import RagSearchService
 from .session import STALE_GENERATION_WRITE, ChattingState, FeedbackOutcome
-from .text_utils import should_store_memory
-from .time_context import get_time_description
+from ..memory.validation import should_store_memory
+from .prompts import get_time_description
+import math
+from dataclasses import dataclass
+from ..domain import EmotionState
+from .llm import extract_and_parse_json
+
+
+# ======== from core/orchestrator.py ========
+CONSOLIDATION_ENABLED = True
+CONSOLIDATION_MESSAGE_THRESHOLD = 8
+CONSOLIDATION_INTERVAL_SECONDS = 180.0
+CONSOLIDATION_MAX_MESSAGES = 60
+HISTORY_RECALL_LIMIT = 20
 
 
 def _history_without_current_chunk(all_messages: list[Message], messages_chunk: list[Message]) -> list[Message]:
@@ -61,14 +64,6 @@ def _history_without_current_chunk(all_messages: list[Message], messages_chunk: 
     ]
 
 
-def _message_image_refs(message: Message) -> list[str]:
-    return message.image_refs()
-
-
-def _endpoint_uses_native_vision(endpoint_name: str) -> bool:
-    return bool(get_vision_settings(endpoint_name).get("enabled", False))
-
-
 def _active_user_scope_ids(active_users: list[dict] | None) -> set[str]:
     result = set()
     for user in active_users or []:
@@ -78,13 +73,6 @@ def _active_user_scope_ids(active_users: list[dict] | None) -> set[str]:
         if user_id:
             result.add(user_id)
     return result
-
-
-@dataclass
-class _SearchResult:
-    mem_history: list[str]
-    raw_records: list[dict] | None = None
-    stats: dict | None = None
 
 
 @dataclass
@@ -138,7 +126,7 @@ def _existing_related_memories(
             continue
         if str(meta.get("status") or "active") != "active":
             continue
-        subject_user_id = str(meta.get("subject_user_id") or meta.get("user_id") or "").strip()
+        subject_user_id = str(meta.get("subject_user_id") or "").strip()
         if subject_user_id and subject_user_id not in active_user_ids:
             continue
 
@@ -180,7 +168,6 @@ class ConversationOrchestrator:
         publish: bool = True,
         expected_generation: int | None = None,
     ) -> list[dict] | None:
-        self.session.begin_persistence_batch()
         try:
             return await self._process_chunk(
                 messages_chunk,
@@ -190,7 +177,7 @@ class ConversationOrchestrator:
                 expected_generation=expected_generation,
             )
         finally:
-            await self.session.end_persistence_batch(flush=True)
+            await self.session.flush_persistence()
 
     async def _process_chunk(
         self,
@@ -367,7 +354,7 @@ class ConversationOrchestrator:
 
         long_term_memory = []
         raw_results = []
-        search_result = _SearchResult(mem_history=[], raw_records=[], stats=rag_stats)
+        search_result = RetrievalResult(records=[], stats=rag_stats)
         try:
             if not queries:
                 rag_stats["skip_reason"] = "no_queries"
@@ -378,7 +365,7 @@ class ConversationOrchestrator:
 
                 where_filter = where_any("source", ["preset", "memory"])
 
-                retrieval_result = await RagSearchService(self.session.runtime.vector_memory).search(
+                retrieval_result = await search_memories(self.session.runtime.vector_memory, 
                     queries,
                     k=RAG_FINAL_K,
                     where=where_filter,
@@ -436,10 +423,10 @@ class ConversationOrchestrator:
             if RAG_DEBUG_LOG:
                 rag_stats["result_debug"] = _rag_debug_records(raw_results)
             log_event("rag_search", **rag_stats)
-            search_result = _SearchResult(
-                mem_history=long_term_memory,
-                raw_records=raw_results,
+            search_result = RetrievalResult(
+                records=raw_results,
                 stats=rag_stats,
+                prompt_lines=long_term_memory,
             )
         return search_result
 
@@ -448,7 +435,7 @@ class ConversationOrchestrator:
             messages_chunk: list[Message],
             llm_func: Callable,
             is_relevant: bool = False,
-            search_result: _SearchResult | None = None,
+            search_result: RetrievalResult | None = None,
     ) -> tuple[_FeedbackContext | None, str]:
         """运行 Feedback LLM 并返回可复用的分析上下文。"""
         reaction_users = list({msg.user_id if msg.user_id else msg.user_name for msg in messages_chunk})
@@ -461,14 +448,14 @@ class ConversationOrchestrator:
             {"user_id": p.user_id, "emotion_tends_to_user": asdict(p.emotion)}
             for p in related_profiles
         ]
-        search_history = search_result.mem_history if search_result else []
+        search_history = search_result.prompt_lines if search_result else []
         active_user_ids = {
             str(msg.user_id)
             for msg in messages_chunk
             if msg.user_id and str(msg.user_id).strip()
         }
         existing_related_memories = _existing_related_memories(
-            search_result.raw_records if search_result else [],
+            search_result.records if search_result else [],
             active_user_ids,
         )
         allow_memory_supersede = any(
@@ -480,12 +467,6 @@ class ConversationOrchestrator:
                 "id": str(msg.user_id or ""),
                 "name": msg.user_name,
                 "content": msg.content,
-                "image_meta": msg.image_meta,
-                "image_refs": (
-                    _message_image_refs(msg)
-                    if _endpoint_uses_native_vision("feedback")
-                    else []
-                ),
             }
             for msg in messages_chunk
         ]
@@ -502,14 +483,12 @@ class ConversationOrchestrator:
         context_record = self.session.runtime.short_term_memory.access_context(limit=SHORT_CONTEXT_LIMIT)
         all_messages = context_record.messages
         history_msgs = _history_without_current_chunk(all_messages, messages_chunk)
-        # 历史消息格式化为结构化 dict（含 image_meta，重启后/过窗口的图多为 None）
+        # 历史消息格式化为结构化 dict
         history_msgs_formatted = [
             {
                 "time": m.time.strftime('%H:%M'),
                 "name": m.user_name,
                 "content": m.content,
-                "image_meta": m.image_meta,
-                "image_refs": [],
             }
             for m in history_msgs
         ]
@@ -530,6 +509,7 @@ class ConversationOrchestrator:
             allow_memory_supersede=allow_memory_supersede,
             new_msg_speakers=new_msg_speakers,
             budget=PromptBudget(),
+            has_images=any(message.image_inputs for message in messages_chunk),
         )
 
         try:
@@ -577,16 +557,12 @@ class ConversationOrchestrator:
             "",
         )
 
-    def _apply_native_image_observations(
+    def _apply_image_observations(
         self,
         response_dict: dict,
         messages_chunk: list[Message],
     ) -> None:
-        from ..memory.image_schema import (
-            merge_segment_metas,
-            parse_vlm_response,
-            render_image_text,
-        )
+        """把 Feedback 对图片的一句话观察写回消息文本，作为历史里的图片痕迹。"""
 
         raw_observations = response_dict.get("image_observations", [])
         if not isinstance(raw_observations, list):
@@ -600,40 +576,24 @@ class ConversationOrchestrator:
             return
 
         for msg in messages_chunk:
-            if msg.image_meta or not msg.image_inputs:
+            if not msg.image_inputs:
                 continue
-            segment_metas = []
-            rendered_labels = []
-            observed_inputs = []
+            labels = []
             for image_input in msg.image_inputs:
-                image_ref = str(image_input.ref_id or "")
-                observation = observations_by_ref.get(image_ref)
+                observation = observations_by_ref.get(str(image_input.ref_id or ""))
                 if not observation:
                     continue
-                description = parse_vlm_response(
-                    json.dumps(observation, ensure_ascii=False),
-                    is_sticker=bool(image_input.is_sticker),
-                )
-                meta = description.to_meta()
-                meta["image_ref"] = image_ref
-                if image_input.source == "referenced":
-                    segment_metas.append({"referenced": [meta]})
-                else:
-                    segment_metas.append(meta)
-                rendered_labels.append(
-                    render_image_text(description, description.is_sticker)
-                )
-                observed_inputs.append(image_input)
-
-            merged_meta = merge_segment_metas(segment_metas)
-            if not merged_meta:
+                summary = str(
+                    observation.get("summary") or observation.get("description") or ""
+                ).strip()
+                if not summary:
+                    continue
+                label = "表情包" if image_input.is_sticker else "图片"
+                labels.append(f"[{label}: {summary[:80]}]")
+            if not labels:
                 continue
-            msg.image_meta = merged_meta
-            enriched_content = msg.content
-            for image_input in observed_inputs:
-                placeholder = "[表情包]" if image_input.is_sticker else "[图片]"
-                enriched_content = enriched_content.replace(placeholder, "", 1)
-            msg.content = f"{enriched_content.strip()}{''.join(rendered_labels)}".strip()
+            content = msg.content.replace("[表情包]", "").replace("[图片]", "").strip()
+            msg.content = f"{content}{''.join(labels)}".strip()
             self.session.runtime.short_term_memory.mark_dirty(msg)
 
     def _apply_sediment(
@@ -784,7 +744,7 @@ class ConversationOrchestrator:
 
     async def feedback_stage(self, messages_chunk: list[Message], llm_func: Callable,
                                is_relevant: bool = False,
-                               search_result: _SearchResult | None = None,
+                               search_result: RetrievalResult | None = None,
                                expected_generation: int | None = None) -> FeedbackOutcome:
         """
         反馈阶段：分析情绪、提取记忆、更新摘要
@@ -802,7 +762,7 @@ class ConversationOrchestrator:
         if self.session.is_generation_stale(expected_generation):
             self.session._log_stale_generation("feedback_sediment", expected_generation)
             return FeedbackOutcome.rejected("stale_generation")
-        self._apply_native_image_observations(ctx.response_dict, messages_chunk)
+        self._apply_image_observations(ctx.response_dict, messages_chunk)
         self._apply_sediment(ctx, messages_chunk, expected_generation=expected_generation)
         recalled_history = await self._apply_decision(ctx, messages_chunk, is_relevant, expected_generation)
         if self.session.is_generation_stale(expected_generation):
@@ -853,7 +813,7 @@ class ConversationOrchestrator:
         if self.session.is_generation_stale(expected_generation):
             self.session._log_stale_generation("consolidation_sediment", expected_generation)
             return FeedbackOutcome.rejected("stale_generation")
-        self._apply_native_image_observations(ctx.response_dict, messages_chunk)
+        self._apply_image_observations(ctx.response_dict, messages_chunk)
         self._apply_sediment(ctx, messages_chunk, expected_generation=expected_generation)
         latest = max((m.time for m in messages_chunk), default=None)
         if latest is not None:
@@ -988,7 +948,6 @@ class ConversationOrchestrator:
                     confidence=confidence,
                     subject_user_id=subject_user_id,
                     subject_user_name=subject_user_name,
-                    reason=str(item.get("reason") or "") if isinstance(item, dict) else "",
                 )
                 if not validation_result.valid:
                     skipped_quality += 1
@@ -1009,7 +968,6 @@ class ConversationOrchestrator:
                     "source": "memory",
                     "type": category,
                     "date": today,
-                    "user_id": subject_user_id,
                     "subject_user_id": subject_user_id,
                     "subject_user_name": subject_user_name,
                     "speaker_user_id": speaker_user_id,
@@ -1077,21 +1035,15 @@ class ConversationOrchestrator:
 
     async def chat_stage(self, messages_chunk: list[Message], llm_func: Callable,
                            recalled_history: list[str],
-                           search_result: _SearchResult | None = None,
+                           search_result: RetrievalResult | None = None,
                            expected_generation: int | None = None) -> list[dict]:
         logger.debug(">> 对话阶段 (Chat) 开始")
-        search_history = search_result.mem_history if search_result else []
+        search_history = search_result.prompt_lines if search_result else []
         formatted_msgs = [
             {
                 "id": str(msg.id or ""),
                 "name": msg.user_name,
                 "content": msg.content,
-                "image_meta": msg.image_meta,
-                "image_refs": (
-                    _message_image_refs(msg)
-                    if _endpoint_uses_native_vision("chat")
-                    else []
-                ),
             }
             for msg in messages_chunk
         ]
@@ -1108,8 +1060,6 @@ class ConversationOrchestrator:
                 "time": m.time.strftime('%H:%M'),
                 "name": m.user_name,
                 "content": m.content,
-                "image_meta": m.image_meta,
-                "image_refs": [],
             }
             for m in history_msgs
         ]
@@ -1178,3 +1128,80 @@ class ConversationOrchestrator:
             and interval > 0
             and (datetime.now() - state.last_consolidation_attempt).total_seconds() >= interval
         )
+
+# ======== from core/llm_output.py ========
+"""LLM 输出的解析与校验边界。"""
+
+
+
+
+
+@dataclass(frozen=True)
+class ParsedFeedback:
+    payload: dict | None
+    failure_reason: str = ""
+
+
+def parse_feedback(response: str, current_emotion: EmotionState) -> ParsedFeedback:
+    """解析并校验 Feedback 的 new_emotion 边界。"""
+
+    try:
+        parsed = extract_and_parse_json(response)
+    except Exception:
+        return ParsedFeedback(None, "invalid_json")
+    if not isinstance(parsed, dict) or not parsed:
+        return ParsedFeedback(None, "invalid_payload")
+    raw_emotion = parsed.get("new_emotion")
+    if not isinstance(raw_emotion, dict):
+        return ParsedFeedback(None, "missing_new_emotion")
+
+    specs = {
+        "valence": (-1.0, 1.0, current_emotion.valence),
+        "arousal": (0.0, 1.0, current_emotion.arousal),
+        "dominance": (-1.0, 1.0, current_emotion.dominance),
+    }
+    normalized = {}
+    valid_fields = 0
+    for field_name, (minimum, maximum, default) in specs.items():
+        if field_name not in raw_emotion:
+            normalized[field_name] = default
+            continue
+        try:
+            value = float(raw_emotion[field_name])
+        except (TypeError, ValueError):
+            return ParsedFeedback(None, f"invalid_new_emotion_{field_name}")
+        if not math.isfinite(value):
+            return ParsedFeedback(None, f"invalid_new_emotion_{field_name}")
+        normalized[field_name] = max(minimum, min(maximum, value))
+        valid_fields += 1
+    if valid_fields == 0:
+        return ParsedFeedback(None, "empty_new_emotion")
+
+    payload = dict(parsed)
+    payload["new_emotion"] = normalized
+    return ParsedFeedback(payload)
+
+
+@dataclass(frozen=True)
+class ReplyPlan:
+    replies: list[dict | str]
+    failure_reason: str = ""
+
+
+def parse_reply(response: str) -> ReplyPlan:
+    """解析 Chat 回复列表；裸 list 是模型常见偏差，直接兼容。"""
+
+    try:
+        payload = extract_and_parse_json(response)
+    except Exception:
+        return ReplyPlan([], "invalid_json")
+    if isinstance(payload, dict):
+        replies = payload.get("reply", [])
+    elif isinstance(payload, list):
+        replies = payload
+        logger.warning("LLM 返回了 List 而非 Object，已自动兼容")
+    else:
+        return ReplyPlan([], "invalid_payload")
+    if not isinstance(replies, list):
+        return ReplyPlan([], "invalid_reply_list")
+    return ReplyPlan(replies)

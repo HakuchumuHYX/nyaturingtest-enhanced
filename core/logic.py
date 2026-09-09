@@ -1,33 +1,252 @@
-# nyaturingtest/logic.py
+# 由多个模块合并而来：core/logic.py, core/debounced_inbox.py, core/reply_dispatcher.py, core/message_sender.py
+
 import asyncio
 import hashlib
 import time
 import traceback
 from collections.abc import Collection
-
 from nonebot import logger
 from nonebot.adapters.onebot.v11 import Bot, Message, MessageSegment
-
-from ..llm.client import LLMClient
-from ..config import (
-    get_effective_chat_model,
-    get_effective_vlm_model,
-    get_vision_settings,
-    native_vision_enabled,
-    should_use_standalone_vlm,
-)
-from ..llm.vision import VisionInput
-from ..memory.image import image_manager
-from ..memory.image_schema import merge_segment_metas
+from .llm import LLMClient
+from .llm import VisionInput
+from ..memory.image import fetch_image_input
 from ..memory.short_term import Message as MMessage
 from .metrics import metrics
-from .debounced_inbox import DebouncedInbox
 from .orchestrator import ConversationOrchestrator
-from .reply_dispatcher import ReplyDispatcher
 from .metrics import log_event
 from .state_manager import GroupState, SELF_SENT_MSG_IDS, is_shutting_down
-from .turn_call_factory import TurnCallFactory
-from .usage import make_usage_recorder
+from .llm import TurnCallFactory
+from dataclasses import dataclass
+import random
+from nonebot.adapters.onebot.v11 import Message, MessageSegment
+from nonebot.adapters.onebot.v11.exception import ActionFailed
+import re
+# ======== from core/message_sender.py ========
+_SPLIT_PATTERN = re.compile(r"(?<=[。！？!?~\n])\s*|(?<!\.)\.(?!\.)(?=\s|$|[\u4e00-\u9fff])\s*")
+_SINGLE_TRAILING_PERIOD = re.compile(r"(?<!\.)\.$")
+
+
+def _normalize_send_part(text: str) -> str:
+    part = text.strip()
+    if not part:
+        return ""
+    part = part.rstrip("。")
+    part = _SINGLE_TRAILING_PERIOD.sub("", part)
+    return part.strip()
+
+
+def _split_text(text: str) -> list[str]:
+    text = text.strip()
+    if not text:
+        return []
+    parts = [part.strip() for part in _SPLIT_PATTERN.split(text) if part.strip()]
+    return parts or [text]
+
+
+def build_send_parts(text: str, *, max_messages: int = 2, strategy: str = "split_by_sentence") -> list[str]:
+    strategy = (strategy or "split_by_sentence").strip().lower()
+    if strategy == "single":
+        raw_parts = [text.strip()] if text and text.strip() else []
+    else:
+        raw_parts = _split_text(text)
+    parts = [_normalize_send_part(part) for part in raw_parts]
+    parts = [part for part in parts if part]
+    if max_messages > 0 and len(parts) > max_messages:
+        if max_messages == 1:
+            return [" ".join(parts)]
+        return [
+            *parts[: max_messages - 1],
+            " ".join(parts[max_messages - 1 :]),
+        ]
+    return parts
+# ======== from core/debounced_inbox.py ========
+@dataclass(frozen=True)
+class InboxBatch:
+    messages: list
+    bot: object
+    event: object
+
+
+class DebouncedInbox:
+    """Drain the existing priority-aware deque/list after a quiet window."""
+
+    def __init__(self, state, *, debounce_seconds: float, idle_timeout: float = 20.0):
+        self.state = state
+        self.debounce_seconds = max(0.0, float(debounce_seconds))
+        self.idle_timeout = max(0.1, float(idle_timeout))
+
+    async def next_batch(self) -> InboxBatch | None:
+        try:
+            await asyncio.wait_for(
+                self.state.new_message_signal.wait(),
+                timeout=self.idle_timeout,
+            )
+        except asyncio.TimeoutError:
+            return None
+
+        await asyncio.sleep(self.debounce_seconds)
+        self.state.new_message_signal.clear()
+        async with self.state.data_lock:
+            if (
+                self.state.bot is None
+                or self.state.event is None
+                or not self.state.messages_chunk
+            ):
+                return None
+            batch = InboxBatch(
+                messages=list(self.state.messages_chunk),
+                bot=self.state.bot,
+                event=self.state.event,
+            )
+            self.state.messages_chunk.clear()
+            return batch
+# ======== from core/reply_dispatcher.py ========
+# 发送策略参数
+SEND_STRATEGY = "split_by_sentence"
+MAX_REPLY_MESSAGES = 2
+HUMANIZED_DELAY_SECONDS = 1.0
+
+
+class ReplyDispatcher:
+    def __init__(self, self_sent_message_ids):
+        self._self_sent_message_ids = self_sent_message_ids
+
+    async def dispatch(
+        self,
+        *,
+        state,
+        responses: list,
+        bot,
+        event,
+        generation: int,
+    ) -> int:
+        if not responses:
+            return 0
+        if state.session.is_generation_stale(generation):
+            state.session._log_stale_generation("pre_send", generation)
+            return 0
+
+        total = len(responses)
+        sent_count = 0
+        max_messages = MAX_REPLY_MESSAGES
+        for response_index, response in enumerate(responses):
+            if sent_count >= max_messages:
+                break
+            raw_content, reply_id = self._response_content(response)
+            if not raw_content:
+                continue
+            parts = build_send_parts(
+                raw_content,
+                max_messages=max_messages - sent_count,
+                strategy=SEND_STRATEGY,
+            )
+            for part_index, part in enumerate(parts):
+                if sent_count >= max_messages:
+                    break
+                if state.session.is_generation_stale(generation):
+                    state.session._log_stale_generation("send_loop", generation)
+                    break
+                part = part.strip()
+                if not part:
+                    continue
+                message = Message(part)
+                if reply_id and response_index == 0 and part_index == 0:
+                    try:
+                        message.insert(0, MessageSegment.reply(int(reply_id)))
+                    except ValueError:
+                        logger.warning(f"引用ID无效: {reply_id}")
+
+                sent = await self._send_one(
+                    state=state,
+                    bot=bot,
+                    event=event,
+                    message=message,
+                    generation=generation,
+                )
+                if sent:
+                    sent_count += 1
+
+                has_more = (
+                    part_index < len(parts) - 1
+                    or response_index < total - 1
+                )
+                if has_more:
+                    await asyncio.sleep(self._delay_seconds(part))
+
+        if sent_count:
+            state.session._schedule_save_session()
+        return sent_count
+
+    @staticmethod
+    def _response_content(response) -> tuple[str, object | None]:
+        if isinstance(response, str):
+            return response, None
+        if isinstance(response, dict):
+            return (
+                str(response.get("content") or ""),
+                response.get("target_id") or response.get("reply_to"),
+            )
+        return "", None
+
+    async def _send_one(
+        self,
+        *,
+        state,
+        bot,
+        event,
+        message,
+        generation: int,
+    ) -> bool:
+        try:
+            result = await bot.send(message=message, event=event)
+            sent_content = message.extract_plain_text()
+            if not sent_content and len(message) > 0:
+                sent_content = str(message)
+            message_id = ""
+            if isinstance(result, dict) and "message_id" in result:
+                message_id = str(result["message_id"])
+                self._self_sent_message_ids.append(message_id)
+
+            if state.session.is_generation_stale(generation):
+                state.session._log_stale_generation(
+                    "append_self_message",
+                    generation,
+                )
+                return True
+            async with state.session_lock:
+                if state.session.is_generation_stale(generation):
+                    state.session._log_stale_generation(
+                        "append_self_message_locked",
+                        generation,
+                    )
+                    return True
+                await state.session.append_self_message(
+                    sent_content,
+                    message_id,
+                    str(bot.self_id),
+                )
+            return True
+        except ActionFailed as e:
+            if getattr(e, "retcode", 0) == 1200 or "120" in str(e):
+                logger.warning("风控拦截 (1200), 冷却中...")
+                await asyncio.sleep(random.uniform(5.0, 10.0))
+            else:
+                logger.error(f"发送失败: {e}")
+        except Exception as e:
+            logger.error(f"发送未知错误: {e}")
+        return False
+
+    @staticmethod
+    def _delay_seconds(part: str) -> float:
+        if SEND_STRATEGY == "humanized_delay":
+            delay = HUMANIZED_DELAY_SECONDS + len(part) * 0.08
+        else:
+            delay = 1.0 + len(part) * 0.1
+        return min(delay, 5.0)
+# ======== from core/logic.py ========
+# nyaturingtest/logic.py
+
+
 
 
 DEBOUNCE_SECONDS = 2.0
@@ -36,22 +255,6 @@ QUEUE_MAX_SIZE = 200
 
 def _is_sticker_segment_data(data: dict) -> bool:
     return str(data.get("sub_type", "")) == "1"
-
-
-def _image_placeholder(is_sticker: bool) -> str:
-    return "\n[表情包]\n" if is_sticker else "\n[图片]\n"
-
-
-def _should_resolve_image(resolve_images: bool) -> bool:
-    return (
-        resolve_images
-        and should_use_standalone_vlm()
-        and not is_shutting_down()
-    )
-
-
-def _should_attach_native_image(attach_native_images: bool) -> bool:
-    return attach_native_images and native_vision_enabled() and not is_shutting_down()
 
 
 def _build_image_ref(
@@ -155,209 +358,103 @@ async def llm_response(
         return "Error occurred."
 
 
-def _vision_inputs_for_endpoint(
-    messages: list[MMessage],
-    endpoint_name: str,
-) -> list[VisionInput]:
-    settings = get_vision_settings(endpoint_name)
-    if not settings["enabled"]:
-        return []
-    detail = settings["detail"]
-    result = []
-    seen_refs = set()
-    for message in messages:
-        for image_input in message.image_inputs:
-            if not isinstance(image_input, VisionInput):
-                continue
-            if image_input.ref_id in seen_refs:
-                continue
-            seen_refs.add(image_input.ref_id)
-            result.append(image_input.with_detail(detail))
-    return result
-
-
 async def message2BotMessage(
     bot_name: str,
     group_id: int,
     message: Message,
     bot: Bot,
-    resolve_images: bool = True,
     *,
-    attach_native_images: bool = False,
-    image_inputs_out: list[VisionInput] | None = None,
-    conversation_context: str = "",
     message_scope: str = "",
-) -> tuple[str, dict | None]:
-    """
-    将 OneBot 消息转换为 Bot 可读文本，并附带图片的结构化元数据。
-    返回 (text, image_meta)：
-      - text: 拼接后的可读文本（与历史行为一致，含图片管道标签）
-      - image_meta: 图片结构化观测，None 表示无图片/无结构信息。
-        多图时结构为 {"primary": <首张非空 meta>, "referenced": [<引用消息图片 meta 列表>]}。
-    支持解析引用消息(Reply)中的图片内容。
-    """
-
-    # === 0. 预提取当前消息中的纯文本上下文 ===
-    full_context_text = str(conversation_context or "").strip()
-    for seg in message:
-        if seg.type == "text":
-            text = seg.data.get("text", "")
-            full_context_text = f"{full_context_text}\n当前消息：{text}".strip()
-    if len(full_context_text) > 800:
-        full_context_text = full_context_text[-800:]
-
-    # === 消息段处理逻辑 ===
-    # 每段返回 (text, meta)；meta 为该段产出的图片结构化观测（None 表示无）
+) -> tuple[str, list[VisionInput]]:
+    """把 OneBot 消息转成可读文本，并收集原生图片输入。"""
 
     async def process_segment(
         seg: MessageSegment,
         segment_index: int,
-    ) -> tuple[str, dict | None, list[VisionInput]]:
+    ) -> tuple[str, list[VisionInput]]:
         if seg.type == "text":
-            return (f"{seg.data.get('text', '')}", None, [])
+            return (f"{seg.data.get('text', '')}", [])
 
-        elif seg.type == "image":
+        if seg.type == "image":
             url = seg.data.get("url", "")
             file_unique = seg.data.get("file_unique", "")
-            is_sticker = _is_sticker_segment_data(seg.data)
-            should_describe = _should_resolve_image(resolve_images)
-            should_attach = _should_attach_native_image(attach_native_images)
-
-            if not should_describe and not should_attach:
-                return (_image_placeholder(is_sticker), None, [])
-
-            # 获取 VLM 的真实模型名称以准确记录 token 消耗
-            # 兼容老配置，如果 vlm 未指定模型，则退而求其次使用 chat model
-            vlm_model_name = get_effective_vlm_model() or get_effective_chat_model()
-            vlm_recorder = make_usage_recorder(str(group_id), vlm_model_name)
-            image_ref = _build_image_ref(
-                message_scope,
-                "primary",
-                segment_index,
-                file_unique or url,
-            )
-
-            # 调用通用逻辑，传入提取到的上下文
-            text, meta, vision_input = await image_manager.resolve_image_from_url(
-                url, file_unique, is_sticker,
-                context_text=full_context_text,
-                on_usage=vlm_recorder,
-                describe=should_describe,
-                include_native=should_attach,
-                ref_id=image_ref,
+            text, vision_input = await fetch_image_input(
+                url,
+                file_unique,
+                is_sticker=_is_sticker_segment_data(seg.data),
+                ref_id=_build_image_ref(message_scope, "primary", segment_index, file_unique or url),
                 source="primary",
             )
-            if meta:
-                meta = dict(meta)
-                meta["image_ref"] = image_ref
-            return (text, meta, [vision_input] if vision_input else [])
+            return (text, [vision_input] if vision_input else [])
 
-        elif seg.type == "at":
-            id = seg.data.get("qq")
-            if not id: return ("", None, [])
-            if id == str(bot.self_id):
-                return (f" @{bot_name} ", None, [])
-            else:
-                try:
-                    user_info = await bot.get_group_member_info(group_id=group_id, user_id=int(id))
-                    nickname = user_info.get("card") or user_info.get("nickname") or str(id)
-                    return (f" @{nickname} ", None, [])
-                except Exception:
-                    return (f" @{id} ", None, [])
+        if seg.type == "at":
+            target = seg.data.get("qq")
+            if not target:
+                return ("", [])
+            if target == str(bot.self_id):
+                return (f" @{bot_name} ", [])
+            try:
+                user_info = await bot.get_group_member_info(group_id=group_id, user_id=int(target))
+                nickname = user_info.get("card") or user_info.get("nickname") or str(target)
+                return (f" @{nickname} ", [])
+            except Exception:
+                return (f" @{target} ", [])
 
-        elif seg.type == "reply":
+        if seg.type == "reply":
             reply_id = seg.data.get("id")
-            if reply_id:
-                try:
-                    source_msg = await bot.get_msg(message_id=int(reply_id))
-                    sender = source_msg.get("sender", {}).get("nickname", "未知")
+            if not reply_id:
+                return ("", [])
+            try:
+                source_msg = await bot.get_msg(message_id=int(reply_id))
+                sender = source_msg.get("sender", {}).get("nickname", "未知")
+                content_data = source_msg.get("message", [])
+                source_text = ""
+                image_inputs: list[VisionInput] = []
 
-                    content_data = source_msg.get("message", [])
-                    source_text = ""
-                    referenced_metas: list[dict] = []  # 引用消息里图片的结构化观测
-                    referenced_inputs: list[VisionInput] = []
-
-                    # 统一转为列表处理
-                    if isinstance(content_data, str):
-                        # 如果是纯文本(这种情况较少，通常是列表)，直接当文本
-                        source_text = content_data
-                    elif isinstance(content_data, list):
-                        for reply_segment_index, s in enumerate(content_data):
-                            msg_type = s.get("type")
-                            data = s.get("data", {})
-
-                            if msg_type == "text":
-                                source_text += data.get("text", "")
-
-                            elif msg_type == "image":
-                                # 对引用消息里的图片也进行分析
-                                img_url = data.get("url", "")
-                                img_file_unique = data.get("file_unique", "")
-                                # 引用里的图片通常不易判断是否为表情包，默认 False，或者尝试获取 sub_type
-                                is_sticker_ref = _is_sticker_segment_data(data)
-
-                                should_describe = _should_resolve_image(resolve_images)
-                                should_attach = _should_attach_native_image(attach_native_images)
-                                if not should_describe and not should_attach:
-                                    source_text += _image_placeholder(is_sticker_ref)
-                                    continue
-
-                                vlm_model_name_ref = get_effective_vlm_model() or get_effective_chat_model()
-                                vlm_recorder = make_usage_recorder(str(group_id), vlm_model_name_ref)
-
-                                # Await 分析结果
-                                image_ref = _build_image_ref(
+                if isinstance(content_data, str):
+                    source_text = content_data
+                elif isinstance(content_data, list):
+                    for reply_index, segment in enumerate(content_data):
+                        msg_type = segment.get("type")
+                        data = segment.get("data", {})
+                        if msg_type == "text":
+                            source_text += data.get("text", "")
+                        elif msg_type == "image":
+                            img_url = data.get("url", "")
+                            img_file_unique = data.get("file_unique", "")
+                            img_text, vision_input = await fetch_image_input(
+                                img_url,
+                                img_file_unique,
+                                is_sticker=_is_sticker_segment_data(data),
+                                ref_id=_build_image_ref(
                                     message_scope,
                                     "referenced",
-                                    reply_segment_index,
+                                    reply_index,
                                     img_file_unique or img_url,
-                                )
-                                img_text, img_meta, vision_input = await image_manager.resolve_image_from_url(
-                                    img_url, img_file_unique, is_sticker_ref,
-                                    context_text=full_context_text,
-                                    on_usage=vlm_recorder,
-                                    describe=should_describe,
-                                    include_native=should_attach,
-                                    ref_id=image_ref,
-                                    source="referenced",
-                                )
-                                source_text += img_text
-                                if img_meta:
-                                    img_meta = dict(img_meta)
-                                    img_meta["image_ref"] = image_ref
-                                    referenced_metas.append(img_meta)
-                                if vision_input:
-                                    referenced_inputs.append(vision_input)
+                                ),
+                                source="referenced",
+                            )
+                            source_text += img_text
+                            if vision_input:
+                                image_inputs.append(vision_input)
+                        elif msg_type == "face":
+                            source_text += "[表情]"
 
-                            elif msg_type == "face":
-                                # 简单处理 QQ 表情
-                                source_text += "[表情]"
+                if len(source_text) > 800:
+                    source_text = source_text[:800] + "..."
+                return (f" [回复 {sender}: \"{source_text}\"] ", image_inputs)
+            except Exception as e:
+                logger.warning(f"获取回复内容失败: {e}")
+                return (" [回复] ", [])
 
-                    # 截断过长文本 (图片描述通常比较长，这里稍微放宽一点限制，或者只截断纯文本部分)
-                    # 简单策略：如果总长度超过 200 字符，截断
-                    if len(source_text) > 800:
-                        source_text = source_text[:800] + "..."
-
-                    ref_meta: dict | None = {"referenced": referenced_metas} if referenced_metas else None
-                    return (f" [回复 {sender}: \"{source_text}\"] ", ref_meta, referenced_inputs)
-                except Exception as e:
-                    logger.warning(f"获取回复内容失败: {e}")
-                    return (" [回复] ", None, [])
-            return ("", None, [])
-
-        return ("", None, [])
+        return ("", [])
 
     tasks = [process_segment(seg, index) for index, seg in enumerate(message)]
     results = await asyncio.gather(*tasks)
 
-    # 聚合文本与元数据
-    content = "".join(r[0] for r in results).strip()
-    image_meta = merge_segment_metas([r[1] for r in results])
-    if image_inputs_out is not None:
-        for result in results:
-            image_inputs_out.extend(result[2])
-
-    return (content, image_meta)
+    content = "".join(result[0] for result in results).strip()
+    image_inputs = [item for result in results for item in result[1]]
+    return (content, image_inputs)
 
 
 async def _process_inbox_batch(
@@ -379,9 +476,7 @@ async def _process_inbox_batch(
         return
 
     if all(str(message.user_id) == bot_self_id for message in current_chunk):
-        async with state.session_lock:
-            await state.session.load_session()
-            await state.session.update_without_trigger(current_chunk)
+        # 自身账号发出的消息已由 append_self_message 写入记忆，这里直接丢弃
         return
     if is_shutting_down():
         return
@@ -391,11 +486,12 @@ async def _process_inbox_batch(
         generation = state.session.state.generation
         session_id = str(state.session.id)
 
+    images = [item for message in current_chunk for item in message.image_inputs]
     calls = call_factory.build(
         state=state,
         session_id=session_id,
-        chat_images=_vision_inputs_for_endpoint(current_chunk, "chat"),
-        feedback_images=_vision_inputs_for_endpoint(current_chunk, "feedback"),
+        chat_images=images,
+        feedback_images=images,
     )
     try:
         responses = await ConversationOrchestrator(state.session).process_chunk(

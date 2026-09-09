@@ -1,20 +1,105 @@
-# nyaturingtest/client.py
+# 由多个模块合并而来：llm/json_mode.py, llm/vision.py, core/http_client.py, llm/client.py, core/turn_call_factory.py
+
+from dataclasses import dataclass, field, replace
+import ssl
+import httpx
+from nonebot import logger
 import asyncio
 from dataclasses import dataclass, field
-import hashlib
 import time
 from typing import Callable, Any, Optional
-
-import httpx
 from openai import AsyncOpenAI, APIConnectionError, APITimeoutError
-from nonebot import logger
+import json
+import re
+from collections.abc import Callable
+from dataclasses import dataclass
+from ..config import (
+    get_app_settings,
+    get_reasoning_effort,
+)
+from .metrics import log_event
+from .metrics import make_usage_recorder
 
-from .json_mode import is_json_mode_unsupported_error
+
+# ======== from llm/json_mode.py ========
+def is_json_mode_unsupported_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return (
+        "json mode is not supported" in text
+        or "response_format" in text and "not supported" in text
+    )
+
+# ======== from llm/vision.py ========
+VISION_DETAILS = {"low", "high", "auto"}
 
 
-PROVIDER_ADVISORY_BACKOFF_SECONDS = 5.0
-PROVIDER_ADVISORY_BACKOFF_MAX_SLEEP_SECONDS = 1.0
-_SHARED_PROVIDER_BACKOFF_UNTIL: dict[str, float] = {}
+@dataclass(frozen=True)
+class VisionInput:
+    """Ephemeral image input for an OpenAI-compatible multimodal request."""
+
+    ref_id: str
+    data_url: str = field(repr=False)
+    is_sticker: bool = False
+    source: str = "primary"
+    detail: str = "auto"
+
+    def with_detail(self, detail: str) -> "VisionInput":
+        normalized = str(detail or "auto").strip().lower()
+        if normalized not in VISION_DETAILS:
+            normalized = "auto"
+        return replace(self, detail=normalized)
+
+    def to_openai_content(self) -> list[dict]:
+        source_label = "引用消息图片" if self.source == "referenced" else "当前消息图片"
+        return [
+            {
+                "type": "text",
+                "text": f"[{source_label} image_ref={self.ref_id}]",
+            },
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": self.data_url,
+                    "detail": self.detail,
+                },
+            },
+        ]
+
+# ======== from core/http_client.py ========
+_HTTP_CLIENT: httpx.AsyncClient | None = None
+
+
+def get_http_client() -> httpx.AsyncClient:
+    """Return the process-wide pooled HTTP client."""
+
+    global _HTTP_CLIENT
+    if _HTTP_CLIENT is None:
+        ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLSv1_2)
+        ssl_context.set_ciphers("ALL:@SECLEVEL=1")
+        _HTTP_CLIENT = httpx.AsyncClient(
+            verify=ssl_context,
+            timeout=30.0,
+            limits=httpx.Limits(
+                max_keepalive_connections=50,
+                max_connections=100,
+            ),
+        )
+    return _HTTP_CLIENT
+
+
+async def close_http_client() -> None:
+    global _HTTP_CLIENT
+    if _HTTP_CLIENT is not None:
+        await _HTTP_CLIENT.aclose()
+        _HTTP_CLIENT = None
+        logger.info("全局 HTTP 客户端已关闭")
+
+# ======== from llm/client.py ========
+# nyaturingtest/client.py
+
+
+
+
 
 
 @dataclass
@@ -57,7 +142,6 @@ class LLMClient:
         self.openai_client = openai_client
         self.timeout = timeout
         self.base_url = (base_url or "").strip().rstrip("/")
-        self._api_key_hash = self._hash_secret(api_key)
         self.provider_status = ProviderStatus()
 
     @staticmethod
@@ -73,48 +157,6 @@ class LLMClient:
         if not self.openai_client:
             raise RuntimeError("openai_client is required for LLMClient")
         return self.openai_client
-
-    @staticmethod
-    def _hash_secret(value: str | None) -> str:
-        value = value or ""
-        if not value:
-            return ""
-        return hashlib.sha256(value.encode("utf-8", "ignore")).hexdigest()[:16]
-
-    def _client_base_url(self) -> str:
-        if self.base_url:
-            return self.base_url
-        return str(getattr(self.openai_client, "base_url", "") or "").strip().rstrip("/")
-
-    def _client_api_key_hash(self) -> str:
-        if self._api_key_hash:
-            return self._api_key_hash
-        return self._hash_secret(str(getattr(self.openai_client, "api_key", "") or ""))
-
-    def _provider_backoff_key(self, model: str) -> str:
-        return "|".join([
-            self.provider,
-            self._client_base_url(),
-            self._client_api_key_hash(),
-            str(model or ""),
-        ])
-
-    async def _sleep_for_shared_provider_backoff(self, model: str) -> None:
-        key = self._provider_backoff_key(model)
-        until = _SHARED_PROVIDER_BACKOFF_UNTIL.get(key, 0.0)
-        remaining = until - time.time()
-        if remaining <= 0:
-            return
-        delay = min(remaining, PROVIDER_ADVISORY_BACKOFF_MAX_SLEEP_SECONDS)
-        logger.warning(f"[LLM] provider advisory backoff {delay:.2f}s for {self.provider}/{model}")
-        await asyncio.sleep(delay)
-
-    def _record_shared_provider_backoff(self, model: str) -> None:
-        key = self._provider_backoff_key(model)
-        _SHARED_PROVIDER_BACKOFF_UNTIL[key] = max(
-            _SHARED_PROVIDER_BACKOFF_UNTIL.get(key, 0.0),
-            time.time() + PROVIDER_ADVISORY_BACKOFF_SECONDS,
-        )
 
     @staticmethod
     def _usage_to_dict(usage: Any, finish_reason: str) -> dict[str, int | str]:
@@ -233,8 +275,6 @@ class LLMClient:
                         "error_message": "provider circuit breaker is open",
                     },
                 )
-            await self._sleep_for_shared_provider_backoff(model)
-
             request_kwargs = dict(kwargs)
             request_timeout = request_kwargs.pop("timeout", self.timeout)
 
@@ -313,7 +353,6 @@ class LLMClient:
                     error_type = self._classify_exception(e)
                     logger.error(f"[LLM] API 调用失败 [{error_type}]: {e}")
                     if error_type == "rate_limit":
-                        self._record_shared_provider_backoff(model)
                         self.provider_status.circuit_until = time.time() + 30
                         return self._error_response(model, error_type, str(e))
                     if error_type in {"insufficient_system_resource", "server_error"} and attempt < max_retries - 1:
@@ -322,3 +361,130 @@ class LLMClient:
                     return self._error_response(model, error_type, str(e))
 
         return self._error_response(model, "retry_exhausted", "max retries exhausted")
+
+# ======== from core/turn_call_factory.py ========
+@dataclass(frozen=True)
+class TurnCalls:
+    chat: Callable
+    feedback: Callable
+
+
+CHAT_SYSTEM_PROMPT = (
+    "你就是动态输入里的那个角色本人，正在群聊里用手机和人聊天。"
+    "role 是你的性格与经历，examples_text 是你的说话习惯，search_result 是你的记忆，"
+    "把它们当作自己的东西，不是别人给你的说明书。"
+    "不要以 AI、助手、模型或角色扮演引擎的身份说话，不要解释设定。"
+    "群聊回复要短、自然，像手机打字。"
+    "请在内部完成分析，但最终输出只包含一个合法 JSON 对象，不要输出 Markdown、解释或思考过程。"
+)
+
+FEEDBACK_SYSTEM_PROMPT = (
+    "你是一个对话分析引擎。你的输入是群聊消息日志和可选的群聊图片，"
+    "输出是结构化的情感分析 JSON。"
+    "这是一个纯数据处理任务：读取文本和图片 → 分析情感维度 → 输出 JSON。"
+    "你不需要参与对话，不需要扮演任何角色，只需要做文本情感分析。"
+    "你的输出必须包含 new_emotion 对象（含 valence、arousal、dominance 三个浮点数字段）。"
+    "请在内部完成分析，但最终输出只包含一个合法 JSON 对象，不要输出 Markdown、解释或思考过程。"
+)
+
+
+class TurnCallFactory:
+    def __init__(self, llm_response: Callable):
+        self._llm_response = llm_response
+
+    def build(
+        self,
+        *,
+        state,
+        session_id: str,
+        chat_images: list,
+        feedback_images: list,
+    ) -> TurnCalls:
+        def usage_recorder(model_name: str):
+            def log_usage(usage: dict):
+                log_event(
+                    "token_usage",
+                    session_id=session_id,
+                    provider=usage.get("provider", ""),
+                    model=model_name,
+                    tokens=usage.get("total_tokens", 0),
+                    decision=usage.get("finish_reason", ""),
+                )
+
+            return make_usage_recorder(
+                session_id,
+                model_name,
+                event_logger=log_usage,
+            )
+
+        chat_model = get_app_settings().chat.model
+        feedback_model = get_app_settings().feedback.model
+
+        async def chat(message: str, json_mode: bool = False):
+            return await self._llm_response(
+                state.client,
+                message,
+                model=chat_model,
+                temperature=0.7,
+                reasoning_effort=get_reasoning_effort("chat"),
+                json_mode=bool(json_mode),
+                max_tokens=get_app_settings().chat.max_tokens,
+                timeout=get_app_settings().chat.timeout,
+                system_prompt=CHAT_SYSTEM_PROMPT,
+                on_usage=usage_recorder(chat_model),
+                images=chat_images,
+            )
+
+        async def feedback(message: str, json_mode: bool = False):
+            return await self._llm_response(
+                state.feedback_client,
+                message,
+                model=feedback_model,
+                temperature=0.1,
+                json_mode=bool(json_mode),
+                reasoning_effort=get_reasoning_effort("feedback"),
+                max_tokens=get_app_settings().feedback.max_tokens,
+                timeout=get_app_settings().feedback.timeout,
+                on_usage=usage_recorder(feedback_model),
+                system_prompt=FEEDBACK_SYSTEM_PROMPT,
+                images=feedback_images,
+            )
+
+        return TurnCalls(chat=chat, feedback=feedback)
+
+
+def extract_and_parse_json(text: str) -> dict | list | None:
+    """Extract a JSON object/array from a bounded LLM response."""
+
+    if not text:
+        return None
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    match = re.search(r"```(?:json)?\s*(.*?)\s*```", text, flags=re.DOTALL)
+    if match:
+        text = match.group(1)
+    else:
+        text = re.sub(r"```json\s*|```\s*", "", text)
+    object_start = text.find("{")
+    array_start = text.find("[")
+    if object_start != -1 and (array_start == -1 or object_start < array_start):
+        end = text.rfind("}")
+        payload = text[object_start:end + 1] if end != -1 else ""
+    elif array_start != -1:
+        end = text.rfind("]")
+        payload = text[array_start:end + 1] if end != -1 else ""
+    else:
+        payload = ""
+    if not payload:
+        return None
+    try:
+        return json.loads(payload)
+    except json.JSONDecodeError:
+        pass
+    try:
+        from json_repair import repair_json
+
+        repaired = repair_json(payload, return_objects=True)
+        return repaired if isinstance(repaired, (dict, list)) else None
+    except Exception as e:
+        logger.warning(f"json_repair 失败: {e}")
+        return None

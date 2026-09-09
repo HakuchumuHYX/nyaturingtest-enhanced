@@ -1,7 +1,7 @@
 from dataclasses import dataclass
+from ..memory.short_term import Message
 from datetime import datetime
 
-from .text_utils import check_relevance, score_message_interest
 
 
 # 意愿与参与策略参数
@@ -97,3 +97,53 @@ class EngagementPolicy:
         if value.tzinfo is not None:
             return value.astimezone(None).replace(tzinfo=None)
         return value
+
+
+def check_relevance(
+    bot_name: str,
+    aliases: list[str],
+    messages: list[Message],
+) -> bool:
+    triggers = [bot_name, *(aliases or [])]
+    triggers = [
+        value.strip().lower()
+        for value in triggers
+        if value and len(value.strip()) >= 2
+    ]
+    return any(
+        trigger in message.content.lower()
+        for message in messages
+        for trigger in triggers
+    )
+
+def score_message_interest(
+    contents,
+    bot_name: str = "",
+    aliases=None,
+    *,
+    lo: float = 0.3,
+    hi: float = 2.0,
+) -> float:
+    aliases = aliases or []
+    text = " ".join(str(content or "") for content in (contents or []))
+    if not text.strip():
+        return lo
+    score = 1.0
+    if "?" in text or "？" in text:
+        score += 0.6
+    names = [str(bot_name or "").strip()]
+    names.extend(
+        str(alias).strip()
+        for alias in aliases
+        if alias and len(str(alias).strip()) >= 2
+    )
+    if any(name and name in text for name in names):
+        score += 0.7
+    stripped = text.strip()
+    if len(set(stripped)) <= 2 and len(stripped) >= 3:
+        score -= 0.6
+    if stripped in {"[图片]", "[表情包]"}:
+        score -= 0.5
+    if len(stripped) >= 15:
+        score += 0.2
+    return max(lo, min(hi, score))

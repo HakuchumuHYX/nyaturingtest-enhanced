@@ -1,8 +1,71 @@
+# 由多个模块合并而来：database/token_stats_aggregation.py, presenters/token_stats_card.py
+
+from collections.abc import Mapping
+import unicodedata
 from io import BytesIO
 from pathlib import Path
 import sys
 
 
+# ======== from database/token_stats_aggregation.py ========
+TOKEN_FIELDS = (
+    "prompt_tokens",
+    "completion_tokens",
+    "prompt_cache_hit_tokens",
+    "prompt_cache_miss_tokens",
+    "reasoning_tokens",
+)
+
+
+def _clean_model_name(value: object) -> str:
+    return unicodedata.normalize("NFKC", str(value or "")).strip()
+
+
+def _model_key(value: object) -> str:
+    return _clean_model_name(value).casefold()
+
+
+def _empty_totals() -> dict[str, int]:
+    return {field: 0 for field in TOKEN_FIELDS}
+
+
+def _format_totals(totals: Mapping[str, int]) -> dict[str, int | float]:
+    prompt = int(totals.get("prompt_tokens", 0) or 0)
+    completion = int(totals.get("completion_tokens", 0) or 0)
+    cache_hit = int(totals.get("prompt_cache_hit_tokens", 0) or 0)
+    cache_miss = int(totals.get("prompt_cache_miss_tokens", 0) or 0)
+    cache_total = cache_hit + cache_miss
+    return {
+        "prompt": prompt,
+        "completion": completion,
+        "reasoning": int(totals.get("reasoning_tokens", 0) or 0),
+        "cache_hit": cache_hit,
+        "cache_miss": cache_miss,
+        "cache_hit_ratio": cache_hit / cache_total if cache_total else 0.0,
+        "total": prompt + completion,
+    }
+
+
+def merge_token_stats_by_model(
+    aggregate: Mapping[tuple[str, str], Mapping[str, int]],
+) -> list[dict]:
+    """按规范化模型名合并（大小写不敏感），保留每个模型的汇总。"""
+
+    models: dict[str, dict] = {}
+    for (raw_model, _raw_provider), totals in aggregate.items():
+        model_name = _clean_model_name(raw_model)
+        key = _model_key(model_name)
+        entry = models.setdefault(key, {"model": model_name, "totals": _empty_totals()})
+        for field in TOKEN_FIELDS:
+            entry["totals"][field] += int(totals.get(field, 0) or 0)
+
+    return [
+        {"model": models[key]["model"], **_format_totals(models[key]["totals"])}
+        for key in sorted(models)
+    ]
+
+
+# ======== from presenters/token_stats_card.py ========
 async def render_token_stats_card(
     *,
     stats: dict,

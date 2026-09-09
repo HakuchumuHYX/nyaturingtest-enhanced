@@ -7,26 +7,22 @@ from nonebot.adapters.onebot.v11 import Bot, Event
 from openai import AsyncOpenAI
 from tortoise import Tortoise
 
-from ..llm.client import LLMClient
+from .llm import LLMClient
 from ..config import (
-    get_siliconflow_api_key,
-    get_effective_chat_api_key,
-    get_effective_chat_base_url,
-    get_effective_chat_provider,
-    get_chat_timeout,
+    get_app_settings,
 )
 from ..memory.short_term import Message as MMessage
 from .session import MEMORY_DRAIN_TIMEOUT_SECONDS, Session
-from .usage import drain_usage_tasks
-from .http_client import close_http_client, get_http_client
-from ..database.enabled_group_repository import EnabledGroupRepository
+from .metrics import drain_usage_tasks
+from .llm import close_http_client, get_http_client
+from ..db import EnabledGroupRepository
 
 
 def _build_chat_llm_client() -> LLMClient:
-    provider = get_effective_chat_provider()
+    provider = get_app_settings().chat.provider
     openai_client = AsyncOpenAI(
-        api_key=get_effective_chat_api_key(),
-        base_url=get_effective_chat_base_url(),
+        api_key=get_app_settings().chat.api_key,
+        base_url=get_app_settings().chat.base_url,
         http_client=get_http_client(),
         max_retries=0,
     )
@@ -34,9 +30,9 @@ def _build_chat_llm_client() -> LLMClient:
     return LLMClient(
         provider=provider,
         openai_client=openai_client,
-        timeout=get_chat_timeout(),
-        base_url=get_effective_chat_base_url(),
-        api_key=get_effective_chat_api_key(),
+        timeout=get_app_settings().chat.timeout,
+        base_url=get_app_settings().chat.base_url,
+        api_key=get_app_settings().chat.api_key,
     )
 
 
@@ -49,18 +45,18 @@ def _build_feedback_llm_client() -> LLMClient:
     )
 
     openai_client = AsyncOpenAI(
-        api_key=get_effective_feedback_api_key(),
-        base_url=get_effective_feedback_base_url(),
+        api_key=get_app_settings().feedback.api_key,
+        base_url=get_app_settings().feedback.base_url,
         http_client=get_http_client(),
         max_retries=0,
     )
 
     return LLMClient(
-        provider=get_effective_feedback_provider(),
+        provider=get_app_settings().feedback.provider,
         openai_client=openai_client,
-        timeout=get_feedback_timeout(),
-        base_url=get_effective_feedback_base_url(),
-        api_key=get_effective_feedback_api_key(),
+        timeout=get_app_settings().feedback.timeout,
+        base_url=get_app_settings().feedback.base_url,
+        api_key=get_app_settings().feedback.api_key,
     )
 
 SELF_SENT_MSG_IDS = deque(maxlen=50)
@@ -116,7 +112,7 @@ def ensure_group_state(group_id: int):
         new_state = GroupState(
             session=Session(
                 id=f"{group_id}",
-                siliconflow_api_key=get_siliconflow_api_key(),
+                siliconflow_api_key=get_app_settings().siliconflow_api_key,
                 http_client=get_http_client()
             )
         )
@@ -233,15 +229,6 @@ async def cleanup_global_resources():
             await state.session.close()
         except Exception as e:
             logger.warning(f"关闭群会话资源失败: {e}")
-
-    # 4. 关闭 VLM 的私有 HTTP 客户端。
-    try:
-        from ..memory.image import image_manager
-        if image_manager._vlm is not None:
-            await image_manager._vlm.close()
-            logger.info("VLM HTTP 客户端已关闭")
-    except Exception as e:
-        logger.warning(f"关闭 VLM 客户端失败: {e}")
 
     await drain_usage_tasks(timeout=MEMORY_DRAIN_TIMEOUT_SECONDS)
 

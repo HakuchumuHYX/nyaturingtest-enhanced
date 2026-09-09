@@ -1,24 +1,37 @@
-# nyaturingtest/vector_mem.py
+# 由多个模块合并而来：memory/vector.py, memory/vector_clients.py, core/rag_query.py
+
 import os
 import uuid
 import math
 import json
 import time
 from collections.abc import Iterator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, List
 import chromadb
 from nonebot import logger
+import threading
+
+from nonebot.utils import run_sync
 from ..config import get_app_settings, get_memory_endpoint_settings
-from ..database.backup_lock import BACKUP_IO_LOCK
-from .vector_clients import (
-    SiliconFlowEmbeddingFunction,
-    SiliconFlowReranker,
-)
+from typing import Any
+import httpx
+from chromadb.api.types import Documents, EmbeddingFunction, Embeddings
+from openai import OpenAI
+from ..config import get_memory_endpoint_settings
+import re
+
+
+# ======== from memory/vector.py ========
+# nyaturingtest/vector_mem.py
+
 
 
 MEMORY_COLLECTION_NAME = "nyabot_memory"
+# 备份打包整个向量目录，写入方用同一把进程级锁串行化
+BACKUP_IO_LOCK = threading.RLock()
+
 MEMORY_WRITE_MAX_RETRIES = 3
 MEMORY_WRITE_RETRY_BASE_DELAY = 0.5
 
@@ -56,6 +69,7 @@ _metric_check_done: set[str] = set()
 class RetrievalResult(Sequence[dict[str, Any]]):
     records: list[dict[str, Any]]
     stats: dict[str, Any]
+    prompt_lines: list[str] = field(default_factory=list)
 
     def __iter__(self) -> Iterator[dict[str, Any]]:
         return iter(self.records)
@@ -168,7 +182,7 @@ def _subject_user_where(user_ids: set[str]) -> dict:
     subject_conditions = []
     for user_id in sorted(user_ids):
         subject_conditions.append({"subject_user_id": {"$eq": user_id}})
-        subject_conditions.append({"user_id": {"$eq": user_id}})
+        subject_conditions.append({"subject_user_id": {"$eq": user_id}})
     return where_all(
         {"source": {"$eq": "memory"}},
         {"$or": subject_conditions},
@@ -207,7 +221,6 @@ def _normalized_metadata(meta: dict | None) -> dict[str, Any]:
     data["subject_user_name"] = _clean_metadata_string(data.get("subject_user_name"))
     data["speaker_user_id"] = _clean_metadata_string(data.get("speaker_user_id"))
     data["speaker_user_name"] = _clean_metadata_string(data.get("speaker_user_name"))
-    data["user_id"] = subject_user_id
     return data
 
 
@@ -241,7 +254,7 @@ def _dedup_where(metadata: dict) -> dict:
         conditions.append({
             "$or": [
                 {"subject_user_id": {"$eq": subject_user_id}},
-                {"user_id": {"$eq": subject_user_id}},
+                {"subject_user_id": {"$eq": subject_user_id}},
             ]
         })
     return where_all(*conditions)
@@ -982,7 +995,7 @@ class VectorMemory:
                 return 0
             
             results = self.collection.get(
-                where={"user_id": {"$eq": user_id}},
+                where={"subject_user_id": {"$eq": user_id}},
                 include=[]  # 不需要实际内容，只需要 ID
             )
             return len(results.get("ids", []))
@@ -1027,7 +1040,6 @@ class VectorMemory:
             reaffirm_count = 0
         metadata["reaffirm_count"] = reaffirm_count + 1
         metadata["last_reaffirmed_at"] = datetime.now().astimezone().isoformat()
-        metadata["user_id"] = metadata.get("subject_user_id") or metadata.get("user_id") or ""
         self.update_metadata_by_id(memory_ref, metadata)
         return True
 
@@ -1279,3 +1291,190 @@ class VectorMemory:
         stats["other_subject_downweighted_count"] = other_subject_downweighted_count
         stats["scope_counts"] = dict(scope_counts)
         return RetrievalResult(final_results, stats)
+
+# ======== from memory/vector_clients.py ========
+class SiliconFlowReranker:
+    """Small synchronous adapter for the configured rerank endpoint."""
+
+    def __init__(
+        self,
+        api_key: str,
+        model: str,
+        api_url: str | None = None,
+        timeout: float | None = None,
+    ):
+        settings = get_memory_endpoint_settings()
+        self.api_key = api_key
+        self.model = model
+        self.api_url = api_url or str(settings["rerank_base_url"])
+        self._client = httpx.Client(
+            timeout=timeout or float(settings["rerank_timeout"]),
+            trust_env=False,
+        )
+
+    def rerank(
+        self,
+        query: str,
+        documents: list[str],
+        top_n: int = 5,
+    ) -> list[dict[str, Any]]:
+        if not documents:
+            return []
+        try:
+            response = self._client.post(
+                self.api_url,
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": self.model,
+                    "query": query,
+                    "documents": documents,
+                    "top_n": top_n,
+                    "return_documents": False,
+                },
+            )
+            response.raise_for_status()
+            return response.json().get("results", [])
+        except Exception as e:
+            logger.error(f"Rerank API Error: {e}")
+            return []
+
+    def close(self) -> None:
+        self._client.close()
+
+
+class SiliconFlowEmbeddingFunction(EmbeddingFunction):
+    """Chroma embedding adapter with an owned OpenAI-compatible client."""
+
+    def __init__(
+        self,
+        api_key: str,
+        session_id: str,
+        model: str | None = None,
+        base_url: str | None = None,
+        timeout: float | None = None,
+    ):
+        settings = get_memory_endpoint_settings()
+        self.api_key = api_key
+        self.session_id = session_id
+        self.model = model or str(settings["model"])
+        self._client = OpenAI(
+            api_key=api_key,
+            base_url=base_url or str(settings["base_url"]),
+            timeout=timeout or float(settings["timeout"]),
+            max_retries=0,
+        )
+
+    def __call__(self, input: Documents) -> Embeddings:
+        if not input:
+            return []
+        try:
+            response = self._client.embeddings.create(
+                model=self.model,
+                input=[text.replace("\n", " ") for text in input],
+                encoding_format="float",
+            )
+            return [item.embedding for item in response.data]
+        except Exception as e:
+            logger.error(f"Embedding API Error: {e}")
+            raise
+
+    def close(self) -> None:
+        self._client.close()
+
+# ======== from core/rag_query.py ========
+# RAG 检索参数
+RAG_FINAL_K = 20
+RAG_PER_QUERY_RECALL_K = 40
+RAG_MERGED_CANDIDATE_CAP = 64
+RAG_MEMORY_CHAR_BUDGET = 1500
+RAG_DEBUG_LOG = False
+RAG_DEFAULT_EVENT_TTL_DAYS = 90
+
+
+_NOISE_QUERIES = {
+    "?", "？", "??", "？？", "???", "？？？",
+    "。", "！", "!", "...", "…",
+    "草", "艹", "笑死", "哈哈", "哈哈哈", "hhh", "www",
+    "233", "666", "ok", "OK", "嗯", "嗯嗯", "哦", "好", "好的",
+}
+_EMOJI_ONLY_RE = re.compile(r"^[\W_]+$", re.UNICODE)
+
+
+def _active_user_query_names(
+    active_user_names: list[str] | None,
+    active_users: list[dict] | None,
+) -> list[str]:
+    result = []
+    seen = set()
+    seen_names = set()
+
+    for user in active_users or []:
+        if not isinstance(user, dict):
+            continue
+        user_id = str(user.get("user_id") or "").strip()
+        user_name = str(user.get("user_name") or "").strip()
+        if not user_name:
+            continue
+        key = f"id:{user_id}" if user_id else f"name:{user_name}"
+        if key in seen or user_name in seen_names:
+            continue
+        seen.add(key)
+        seen_names.add(user_name)
+        result.append(user_name)
+
+    for user_name in active_user_names or []:
+        user_name = str(user_name or "").strip()
+        if not user_name:
+            continue
+        key = f"name:{user_name}"
+        if key in seen or user_name in seen_names:
+            continue
+        seen.add(key)
+        seen_names.add(user_name)
+        result.append(user_name)
+
+    return result
+
+
+def is_low_value_rag_query(text: str) -> bool:
+    query = str(text or "").strip()
+    if not query:
+        return True
+    if query in _NOISE_QUERIES or query.lower() in _NOISE_QUERIES:
+        return True
+    if query.startswith("[表情包]"):
+        return True
+    if len(query) < 4:
+        return True
+    return bool(_EMOJI_ONLY_RE.fullmatch(query))
+
+
+def build_chat_rag_queries(
+    raw_queries: list[str],
+    *,
+    chat_summary: str = "",
+    active_user_names: list[str] | None = None,
+    active_users: list[dict] | None = None,
+) -> list[str]:
+    effective_queries = [
+        str(query or "").strip()
+        for query in raw_queries or []
+        if not is_low_value_rag_query(str(query or ""))
+    ]
+
+    if chat_summary and str(chat_summary).strip():
+        effective_queries.append(str(chat_summary).strip())
+
+    active_query_names = _active_user_query_names(active_user_names, active_users)
+    effective_queries.extend([f"关于{name}" for name in active_query_names])
+
+    return _dedupe_preserve_order(effective_queries)
+
+
+async def search_memories(long_term_memory, queries: list[str], **kwargs) -> RetrievalResult:
+    """异步检索入口：把同步的向量检索放到线程里执行。"""
+
+    return await run_sync(long_term_memory.retrieve_with_decay)(queries, **kwargs)

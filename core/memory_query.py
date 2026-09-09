@@ -1,34 +1,141 @@
+# 由多个模块合并而来：core/memory_profile_query.py, core/memory_query_control.py
+
 import hashlib
 import json
 from dataclasses import dataclass
 from datetime import datetime
-
 from nonebot import logger
 from nonebot.utils import run_sync
-
 from ..config import (
-    get_chat_max_tokens,
+    get_app_settings,
     get_reasoning_effort,
-    get_chat_timeout,
-    get_effective_chat_model,
-    get_effective_feedback_model,
-    get_feedback_max_tokens,
-    get_feedback_timeout,
 )
-from ..database.message_repository import MessageRepository
-from ..prompts.templates import PromptBudget
-from .text_utils import (
-    calculate_dynamic_k,
-    extract_and_parse_json,
-    should_store_memory,
-)
-from .memory_query_control import BoundedTTLCache
-from .rag_query import RAG_MERGED_CANDIDATE_CAP
+from ..db import MessageRepository
+from .prompts import PromptBudget
+from .llm import extract_and_parse_json
+from ..memory.validation import should_store_memory
+from ..memory.vector import RAG_MERGED_CANDIDATE_CAP, search_memories
 from .metrics import metrics
-from .services import RagSearchService
-from .usage import make_usage_recorder
+from .metrics import make_usage_recorder
+import asyncio
+import time
+from collections import OrderedDict
+from collections.abc import Awaitable, Callable
+from typing import Generic, TypeVar
+# ======== from core/memory_query_control.py ========
+T = TypeVar("T")
 
 
+class MemoryQueryCooldownError(RuntimeError):
+    def __init__(self, retry_after: float):
+        super().__init__("memory query is cooling down")
+        self.retry_after = max(0.0, float(retry_after))
+
+
+class BoundedTTLCache(Generic[T]):
+    """Small deterministic LRU+TTL cache with no background cleanup task."""
+
+    def __init__(
+        self,
+        *,
+        max_entries: int,
+        ttl_seconds: float,
+        clock: Callable[[], float] = time.monotonic,
+    ):
+        self.max_entries = max(1, int(max_entries))
+        self.ttl_seconds = max(0.0, float(ttl_seconds))
+        self._clock = clock
+        self._items: OrderedDict[object, tuple[float, T]] = OrderedDict()
+
+    def get(self, key: object) -> T | None:
+        item = self._items.pop(key, None)
+        if item is None:
+            return None
+        created_at, value = item
+        if self._clock() - created_at >= self.ttl_seconds:
+            return None
+        self._items[key] = item
+        return value
+
+    def put(self, key: object, value: T) -> None:
+        self._items.pop(key, None)
+        self._items[key] = (self._clock(), value)
+        while len(self._items) > self.max_entries:
+            self._items.popitem(last=False)
+
+    def clear(self) -> None:
+        self._items.clear()
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+
+@dataclass
+class MemoryQueryControlStats:
+    started: int = 0
+    singleflight_reused: int = 0
+    cooldown_rejected: int = 0
+
+
+class MemoryQueryCoordinator(Generic[T]):
+    """Per-process cooldown and single-flight control for expensive queries."""
+
+    def __init__(
+        self,
+        *,
+        user_cooldown_seconds: float,
+        group_cooldown_seconds: float,
+        clock: Callable[[], float] = time.monotonic,
+    ):
+        self.user_cooldown_seconds = max(0.0, float(user_cooldown_seconds))
+        self.group_cooldown_seconds = max(0.0, float(group_cooldown_seconds))
+        self._clock = clock
+        self._lock = asyncio.Lock()
+        self._inflight: dict[object, asyncio.Task[T]] = {}
+        self._last_user: dict[tuple[str, str], float] = {}
+        self._last_group: dict[str, float] = {}
+        self.stats = MemoryQueryControlStats()
+
+    async def run(
+        self,
+        *,
+        key: object,
+        group_id: str,
+        user_id: str,
+        factory: Callable[[], Awaitable[T]],
+    ) -> T:
+        async with self._lock:
+            existing = self._inflight.get(key)
+            if existing is not None:
+                self.stats.singleflight_reused += 1
+                task = existing
+            else:
+                now = self._clock()
+                user_key = (str(group_id), str(user_id))
+                user_remaining = self.user_cooldown_seconds - (
+                    now - self._last_user.get(user_key, float("-inf"))
+                )
+                group_remaining = self.group_cooldown_seconds - (
+                    now - self._last_group.get(str(group_id), float("-inf"))
+                )
+                retry_after = max(user_remaining, group_remaining)
+                if retry_after > 0:
+                    self.stats.cooldown_rejected += 1
+                    raise MemoryQueryCooldownError(retry_after)
+                self._last_user[user_key] = now
+                self._last_group[str(group_id)] = now
+                task = asyncio.create_task(factory())
+                self._inflight[key] = task
+                self.stats.started += 1
+
+        try:
+            return await asyncio.shield(task)
+        finally:
+            if task.done():
+                async with self._lock:
+                    if self._inflight.get(key) is task:
+                        self._inflight.pop(key, None)
+# ======== from core/memory_profile_query.py ========
 MEMORY_QUERY_CACHE_MAX_ENTRIES = 256
 VAD_CACHE_TTL_SECONDS = 24 * 60 * 60
 _VAD_CACHE = BoundedTTLCache[dict](
@@ -164,8 +271,8 @@ class MemoryProfileQueryService:
             f"{request.target_name}做过的事",
             f"{request.target_name}的性格特点",
         ]
-        user_filter = [{"user_id": {"$eq": request.target_id}}]
-        user_filter.append({"user_id": {"$eq": ""}})
+        user_filter = [{"subject_user_id": {"$eq": request.target_id}}]
+        user_filter.append({"subject_user_id": {"$eq": ""}})
         where = {
             "$and": [
                 {"source": {"$eq": "memory"}},
@@ -173,7 +280,7 @@ class MemoryProfileQueryService:
             ]
         }
         metrics.memory_query_rag_calls += 1
-        result = await RagSearchService(memory).search(
+        result = await search_memories(memory, 
             queries,
             k=k,
             where=where,
@@ -196,11 +303,7 @@ class MemoryProfileQueryService:
             if not content:
                 break
             remaining -= len(content)
-            subject_id = str(
-                metadata.get("subject_user_id")
-                or metadata.get("user_id")
-                or ""
-            )
+            subject_id = str(metadata.get("subject_user_id") or "")
             grouped[
                 "target" if subject_id == request.target_id else "unscoped"
             ].append(content)
@@ -215,7 +318,7 @@ class MemoryProfileQueryService:
         snapshot: dict,
         records: list[str],
     ) -> dict | None:
-        model = get_effective_feedback_model()
+        model = get_app_settings().feedback.model
         key = _vad_cache_key(
             session_id=snapshot["session_id"],
             bot_name=snapshot["bot_name"],
@@ -245,8 +348,8 @@ class MemoryProfileQueryService:
             temperature=0.1,
             json_mode=True,
             reasoning_effort=get_reasoning_effort("feedback"),
-            max_tokens=get_feedback_max_tokens(),
-            timeout=get_feedback_timeout(),
+            max_tokens=get_app_settings().feedback.max_tokens,
+            timeout=get_app_settings().feedback.timeout,
             on_usage=make_usage_recorder(snapshot["session_id"], model),
         )
         data = extract_and_parse_json(response)
@@ -261,7 +364,7 @@ class MemoryProfileQueryService:
         return result
 
     async def _chat(self, session_id: str, prompt: str) -> str:
-        model = get_effective_chat_model()
+        model = get_app_settings().chat.model
         metrics.memory_query_chat_calls += 1
         return await self.llm_response(
             self.state.client,
@@ -270,8 +373,8 @@ class MemoryProfileQueryService:
             temperature=0.8,
             json_mode=True,
             reasoning_effort=get_reasoning_effort("chat"),
-            max_tokens=get_chat_max_tokens(),
-            timeout=get_chat_timeout(),
+            max_tokens=get_app_settings().chat.max_tokens,
+            timeout=get_app_settings().chat.timeout,
             on_usage=make_usage_recorder(session_id, model),
         )
 
@@ -304,3 +407,22 @@ class MemoryProfileQueryService:
 只输出 JSON：
 {{"description":"第一人称评价，100字以内","emotion":"3-5个关键词"}}
 """
+
+
+def calculate_dynamic_k(
+    interaction_count: int,
+    memory_count: int,
+    days_since_first: int,
+) -> int:
+    if memory_count <= 10:
+        max_limit = memory_count
+    elif memory_count <= 30:
+        max_limit = 20
+    elif memory_count <= 50:
+        max_limit = 30
+    else:
+        max_limit = 40
+    interaction_bonus = min(interaction_count // 50, 6)
+    memory_bonus = min(memory_count // 10, 8)
+    time_bonus = 4 if days_since_first > 90 else 3 if days_since_first > 30 else 2 if days_since_first > 7 else 0
+    return max(5, min(5 + interaction_bonus + memory_bonus + time_bonus, max_limit))
