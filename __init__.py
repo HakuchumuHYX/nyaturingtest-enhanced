@@ -9,7 +9,7 @@ from .database.migrations import SCHEMA_VERSION, ensure_schema_version
 from .handlers import commands
 from .handlers import memory
 from .database.backup import backup_before_schema_upgrade, setup_backup_job
-from .paths import get_data_dir
+from .config import get_data_dir
 
 driver = get_driver()
 

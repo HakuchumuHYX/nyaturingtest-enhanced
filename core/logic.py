@@ -12,39 +12,26 @@ from ..llm.client import LLMClient
 from ..config import (
     get_effective_chat_model,
     get_effective_vlm_model,
-    get_runtime_settings,
+    get_vision_settings,
+    native_vision_enabled,
+    should_use_standalone_vlm,
 )
-from .. import config as config_module
-try:
-    from ..llm.vision import VisionInput
-except ImportError:
-    VisionInput = object
+from ..llm.vision import VisionInput
 from ..memory.image import image_manager
 from ..memory.image_schema import merge_segment_metas
 from ..memory.short_term import Message as MMessage
 from .metrics import metrics
 from .debounced_inbox import DebouncedInbox
+from .orchestrator import ConversationOrchestrator
 from .reply_dispatcher import ReplyDispatcher
-from .structured_log import log_event
+from .metrics import log_event
 from .state_manager import GroupState, SELF_SENT_MSG_IDS, is_shutting_down
 from .turn_call_factory import TurnCallFactory
 from .usage import make_usage_recorder
 
 
-get_vision_settings = getattr(
-    config_module,
-    "get_vision_settings",
-    lambda endpoint_name: {
-        "enabled": False,
-        "detail": "low" if endpoint_name == "feedback" else "auto",
-    },
-)
-native_vision_enabled = getattr(config_module, "native_vision_enabled", lambda: False)
-should_use_standalone_vlm = getattr(
-    config_module,
-    "should_use_standalone_vlm",
-    lambda: True,
-)
+DEBOUNCE_SECONDS = 2.0
+QUEUE_MAX_SIZE = 200
 
 
 def _is_sticker_segment_data(data: dict) -> bool:
@@ -81,10 +68,10 @@ def _build_image_ref(
 
 
 def _is_local_self_echo(msg: MMessage, bot_self_id: str, self_sent_ids: Collection[str]) -> bool:
-    msg_id = str(getattr(msg, "id", "") or "")
+    msg_id = str(msg.id or "")
     return bool(
         msg_id
-        and str(getattr(msg, "user_id", "")) == str(bot_self_id)
+        and str(msg.user_id) == str(bot_self_id)
         and msg_id in self_sent_ids
     )
 
@@ -139,7 +126,7 @@ async def llm_response(
             metrics.llm_success += 1
             log_event(
                 "llm_success",
-                provider=getattr(client, "provider", ""),
+                provider=client.provider,
                 model=model,
                 latency_ms=int((time.perf_counter() - started_at) * 1000),
                 tokens="recorded_by_usage_callback",
@@ -149,7 +136,7 @@ async def llm_response(
         metrics.llm_failure += 1
         log_event(
             "llm_failure",
-            provider=getattr(client, "provider", ""),
+            provider=client.provider,
             model=model,
             latency_ms=int((time.perf_counter() - started_at) * 1000),
             decision="empty",
@@ -159,7 +146,7 @@ async def llm_response(
         metrics.llm_failure += 1
         log_event(
             "llm_error",
-            provider=getattr(client, "provider", ""),
+            provider=client.provider,
             model=model,
             latency_ms=int((time.perf_counter() - started_at) * 1000),
             decision="exception",
@@ -179,7 +166,7 @@ def _vision_inputs_for_endpoint(
     result = []
     seen_refs = set()
     for message in messages:
-        for image_input in getattr(message, "image_inputs", []) or []:
+        for image_input in message.image_inputs:
             if not isinstance(image_input, VisionInput):
                 continue
             if image_input.ref_id in seen_refs:
@@ -373,14 +360,12 @@ async def message2BotMessage(
     return (content, image_meta)
 
 
-
 async def _process_inbox_batch(
     state: GroupState,
     batch,
     *,
     call_factory: TurnCallFactory,
     dispatcher: ReplyDispatcher,
-    runtime_settings: dict,
 ) -> None:
     bot_self_id = str(batch.bot.self_id)
     current_chunk, local_echoes = _filter_local_self_echoes(
@@ -403,7 +388,7 @@ async def _process_inbox_batch(
 
     async with state.session_lock:
         await state.session.load_session()
-        generation = getattr(state.session, "generation", 0)
+        generation = state.session.state.generation
         session_id = str(state.session.id)
 
     calls = call_factory.build(
@@ -413,7 +398,7 @@ async def _process_inbox_batch(
         feedback_images=_vision_inputs_for_endpoint(current_chunk, "feedback"),
     )
     try:
-        responses = await state.session.update(
+        responses = await ConversationOrchestrator(state.session).process_chunk(
             messages_chunk=current_chunk,
             chat_llm_func=calls.chat,
             feedback_llm_func=calls.feedback,
@@ -422,9 +407,7 @@ async def _process_inbox_batch(
         )
     finally:
         for message in current_chunk:
-            image_inputs = getattr(message, "image_inputs", None)
-            if isinstance(image_inputs, list):
-                image_inputs.clear()
+            message.image_inputs.clear()
 
     await dispatcher.dispatch(
         state=state,
@@ -432,7 +415,6 @@ async def _process_inbox_batch(
         bot=batch.bot,
         event=batch.event,
         generation=generation,
-        runtime_settings=runtime_settings,
     )
 
 
@@ -445,10 +427,9 @@ async def spawn_state(state: GroupState):
 
     while True:
         try:
-            runtime_settings = get_runtime_settings()
             inbox = DebouncedInbox(
                 state,
-                debounce_seconds=runtime_settings["debounce_seconds"],
+                debounce_seconds=DEBOUNCE_SECONDS,
             )
             batch = await inbox.next_batch()
             if batch is None:
@@ -458,7 +439,6 @@ async def spawn_state(state: GroupState):
                 batch,
                 call_factory=call_factory,
                 dispatcher=dispatcher,
-                runtime_settings=runtime_settings,
             )
         except asyncio.CancelledError:
             logger.info(f"后台任务被取消: {id(state)}")

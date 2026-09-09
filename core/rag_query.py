@@ -1,6 +1,15 @@
 import re
 
 
+# RAG 检索参数
+RAG_FINAL_K = 20
+RAG_PER_QUERY_RECALL_K = 40
+RAG_MERGED_CANDIDATE_CAP = 64
+RAG_MEMORY_CHAR_BUDGET = 1500
+RAG_DEBUG_LOG = False
+RAG_DEFAULT_EVENT_TTL_DAYS = 90
+
+
 _NOISE_QUERIES = {
     "?", "？", "??", "？？", "???", "？？？",
     "。", "！", "!", "...", "…",

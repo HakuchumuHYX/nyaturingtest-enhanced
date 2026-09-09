@@ -5,7 +5,7 @@ from pathlib import Path
 
 from nonebot import logger
 
-from ..paths import DEFAULT_PRESET_DIR, get_preset_dir
+from ..config import get_preset_dir
 
 
 @dataclass

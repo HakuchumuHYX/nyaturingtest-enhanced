@@ -7,6 +7,10 @@ from typing import Any
 from nonebot import logger
 
 
+SHORT_CONTEXT_LIMIT = 20
+SHORT_TERM_BUFFER_SIZE = 200
+
+
 @dataclass
 class Message:
     time: datetime
@@ -20,32 +24,11 @@ class Message:
     revision: int = field(default=0, repr=False, compare=False)
     _persistence_id: str = field(default="", repr=False, compare=False)
 
-    def to_json(self) -> dict:
-        return {
-            "time": self.time.isoformat(),
-            "user_name": self.user_name,
-            "content": self.content,
-            "id": self.id,
-            "user_id": self.user_id,
-            "image_meta": self.image_meta,
-        }
-
-    @staticmethod
-    def from_json(data: dict) -> "Message":
-        return Message(
-            time=datetime.fromisoformat(data["time"]),
-            user_name=data["user_name"],
-            content=data["content"],
-            id=data.get("id", ""),
-            user_id=data.get("user_id", ""),
-            image_meta=data.get("image_meta"),
-        )
-
     def image_refs(self) -> list[str]:
         return [
-            str(getattr(item, "ref_id", "") or "")
+            str(item.ref_id or "")
             for item in self.image_inputs
-            if getattr(item, "ref_id", "")
+            if item.ref_id
         ]
 
     def mark_dirty(self) -> int:
@@ -64,8 +47,8 @@ class Memory:
             self,
             compressed_message: str | None = None,
             messages: list[Message] | None = None,
-            context_limit: int = 20,
-            buffer_size: int | None = None,
+            context_limit: int = SHORT_CONTEXT_LIMIT,
+            buffer_size: int | None = SHORT_TERM_BUFFER_SIZE,
     ):
         self.__context_limit = max(1, int(context_limit))
         self.__compressed_message = compressed_message or ""

@@ -8,8 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from nonebot import logger, require
 
-from ..config import get_runtime_settings
-from ..paths import get_backup_dir, get_data_dir
+from ..config import get_backup_dir, get_data_dir
 from .backup_lock import BACKUP_IO_LOCK
 from .retention import cleanup_raw_data_retention
 
@@ -49,6 +48,9 @@ def _copy_data_to_staging(data_dir: Path, staging_dir: Path):
             file_path = root_path / file
             if file_path == sqlite_path or file_path.name in {f"{SQLITE_FILENAME}-wal", f"{SQLITE_FILENAME}-shm"}:
                 continue
+            # 字体是静态资源，每个备份包重复约 24MB，没必要打包
+            if file_path.suffix.lower() in {".ttf", ".otf", ".ttc"}:
+                continue
             target_path = target_root / file
             shutil.copy2(file_path, target_path)
 
@@ -57,7 +59,7 @@ def _copy_data_to_staging(data_dir: Path, staging_dir: Path):
 
 def _backup_retention_count() -> int:
     try:
-        value = get_runtime_settings().get("backup_retention_count", DEFAULT_BACKUP_RETENTION_COUNT)
+        value = DEFAULT_BACKUP_RETENTION_COUNT
         return max(1, int(value or DEFAULT_BACKUP_RETENTION_COUNT))
     except (TypeError, ValueError):
         return DEFAULT_BACKUP_RETENTION_COUNT

@@ -5,10 +5,7 @@ import httpx
 from openai import AsyncOpenAI
 from nonebot import logger
 
-try:
-    from .json_mode import is_json_mode_unsupported_error
-except ImportError:
-    from json_mode import is_json_mode_unsupported_error
+from .json_mode import is_json_mode_unsupported_error
 
 
 def _model_supports_response_format(model: str) -> bool:

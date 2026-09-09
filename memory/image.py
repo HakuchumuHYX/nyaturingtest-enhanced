@@ -5,7 +5,6 @@ from collections import OrderedDict
 import hashlib
 import io
 import math
-from pathlib import Path
 import re
 
 from typing import Callable
@@ -26,14 +25,18 @@ from ..config import (
     get_effective_vlm_api_key,
     get_effective_vlm_base_url,
     get_effective_vlm_model,
-    get_vlm_image_settings,
     should_use_standalone_vlm,
 )
 from ..llm.vlm import VLM
 from ..llm.vision import VisionInput
 from ..core.metrics import metrics
+
+
+VLM_MAX_IMAGE_SIDE = 1280
+VLM_HIGH_DETAIL_FOR_STICKER = True
+VLM_HIGH_DETAIL_FOR_PNG = True
 from ..core.http_client import get_http_client
-from ..paths import get_image_cache_dir
+from ..config import get_image_cache_dir
 from .image_policy import (
     MAX_IMAGE_BYTES,
     MAX_IMAGE_PIXELS,
@@ -342,7 +345,7 @@ class ImageManager:
 
         # === 3. 核心逻辑：GIF 专门处理 ===
         # 判定条件：是动图 且 帧数 > 1 (避免单帧 GIF 误判)
-        if getattr(image, "is_animated", False) and image.n_frames > 1:
+        if image.is_animated and image.n_frames > 1:
             if image.n_frames > 80:
                 logger.warning(f"GIF 帧数过多，降级首帧处理: {image.n_frames}")
                 target_format = "jpeg"
@@ -392,9 +395,8 @@ class ImageManager:
                 return None
 
         # 5. 发送请求（分级 detail：表情包走 high 提升配字/角色细节识别率）
-        image_settings = get_vlm_image_settings()
-        high_detail_for_sticker = image_settings["high_detail_for_sticker"]
-        high_detail_for_png = image_settings["high_detail_for_png"]
+        high_detail_for_sticker = VLM_HIGH_DETAIL_FOR_STICKER
+        high_detail_for_png = VLM_HIGH_DETAIL_FOR_PNG
         detail = "high" if (
             (is_sticker and high_detail_for_sticker)
             or (target_format == "png" and high_detail_for_png)
@@ -540,12 +542,7 @@ def _process_gif_to_grid(gif_base64: str) -> tuple[str, int] | None:
 
 
 def _configured_max_image_side() -> int:
-    raw_value = get_vlm_image_settings()["max_image_side"]
-    try:
-        value = int(raw_value)
-    except (TypeError, ValueError):
-        value = 1280
-    return max(512, min(value, 4096))
+    return max(512, min(VLM_MAX_IMAGE_SIDE, 4096))
 
 
 @run_sync
@@ -563,7 +560,7 @@ def _prepare_native_image_payload(
         raw_format = (image.format or "JPEG").lower()
         if raw_format == "jpg":
             raw_format = "jpeg"
-        if getattr(image, "is_animated", False) and getattr(image, "n_frames", 1) > 1:
+        if image.is_animated and image.n_frames > 1:
             if raw_format == "gif":
                 return image_bytes, "gif"
             image.seek(0)

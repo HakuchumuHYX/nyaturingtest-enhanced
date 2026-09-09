@@ -1,4 +1,15 @@
+import json
 from dataclasses import dataclass
+
+from nonebot import logger
+
+
+def log_event(event: str, **fields):
+    """输出一行结构化 JSON 事件日志。"""
+
+    payload = {"event": event}
+    payload.update({key: value for key, value in fields.items() if value is not None})
+    logger.info(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
 
 
 @dataclass

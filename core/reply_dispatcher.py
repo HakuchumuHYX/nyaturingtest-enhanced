@@ -10,6 +10,12 @@ from nonebot.adapters.onebot.v11.exception import ActionFailed
 from .message_sender import build_send_parts
 
 
+# 发送策略参数
+SEND_STRATEGY = "split_by_sentence"
+MAX_REPLY_MESSAGES = 2
+HUMANIZED_DELAY_SECONDS = 1.0
+
+
 def build_self_message_id(content: str) -> str:
     digest = hashlib.sha1((content or "").encode("utf-8", "ignore")).hexdigest()[:12]
     return f"self:{time.time_ns()}:{digest}"
@@ -27,7 +33,6 @@ class ReplyDispatcher:
         bot,
         event,
         generation: int,
-        runtime_settings: dict,
     ) -> int:
         if not responses:
             return 0
@@ -37,7 +42,7 @@ class ReplyDispatcher:
 
         total = len(responses)
         sent_count = 0
-        max_messages = max(0, int(runtime_settings["max_reply_messages"]))
+        max_messages = MAX_REPLY_MESSAGES
         for response_index, response in enumerate(responses):
             if sent_count >= max_messages:
                 break
@@ -47,7 +52,7 @@ class ReplyDispatcher:
             parts = build_send_parts(
                 raw_content,
                 max_messages=max_messages - sent_count,
-                strategy=runtime_settings["send_strategy"],
+                strategy=SEND_STRATEGY,
             )
             for part_index, part in enumerate(parts):
                 if sent_count >= max_messages:
@@ -80,14 +85,10 @@ class ReplyDispatcher:
                     or response_index < total - 1
                 )
                 if has_more:
-                    await asyncio.sleep(
-                        self._delay_seconds(part, runtime_settings)
-                    )
+                    await asyncio.sleep(self._delay_seconds(part))
 
         if sent_count:
-            schedule_save = getattr(state.session, "_schedule_save_session", None)
-            if schedule_save is not None:
-                schedule_save()
+            state.session._schedule_save_session()
         return sent_count
 
     @staticmethod
@@ -151,9 +152,9 @@ class ReplyDispatcher:
         return False
 
     @staticmethod
-    def _delay_seconds(part: str, runtime_settings: dict) -> float:
-        if runtime_settings["send_strategy"] == "humanized_delay":
-            delay = runtime_settings["humanized_delay_seconds"] + len(part) * 0.08
+    def _delay_seconds(part: str) -> float:
+        if SEND_STRATEGY == "humanized_delay":
+            delay = HUMANIZED_DELAY_SECONDS + len(part) * 0.08
         else:
             delay = 1.0 + len(part) * 0.1
         return min(delay, 5.0)

@@ -8,15 +8,12 @@ from nonebot.utils import run_sync
 
 from ..config import (
     get_chat_max_tokens,
-    get_chat_thinking_settings,
+    get_reasoning_effort,
     get_chat_timeout,
     get_effective_chat_model,
-    get_effective_chat_provider,
     get_effective_feedback_model,
-    get_effective_feedback_provider,
     get_feedback_max_tokens,
     get_feedback_timeout,
-    get_runtime_settings,
 )
 from ..database.message_repository import MessageRepository
 from ..prompts.templates import PromptBudget
@@ -26,14 +23,16 @@ from .text_utils import (
     should_store_memory,
 )
 from .memory_query_control import BoundedTTLCache
+from .rag_query import RAG_MERGED_CANDIDATE_CAP
 from .metrics import metrics
 from .services import RagSearchService
 from .usage import make_usage_recorder
 
 
+MEMORY_QUERY_CACHE_MAX_ENTRIES = 256
 VAD_CACHE_TTL_SECONDS = 24 * 60 * 60
 _VAD_CACHE = BoundedTTLCache[dict](
-    max_entries=get_runtime_settings().get("memory_query_cache_max_entries", 256),
+    max_entries=MEMORY_QUERY_CACHE_MAX_ENTRIES,
     ttl_seconds=VAD_CACHE_TTL_SECONDS,
 )
 
@@ -133,7 +132,7 @@ class MemoryProfileQueryService:
     async def _snapshot(self, target_id: str) -> dict:
         async with self.state.session_lock:
             await self.state.session.load_session()
-            profile = self.state.session.profiles.get(target_id)
+            profile = self.state.session.state.profiles.get(target_id)
             return {
                 "session_id": str(self.state.session.id),
                 "bot_name": self.state.session.name(),
@@ -145,11 +144,7 @@ class MemoryProfileQueryService:
                 "first_interaction_at": (
                     profile.first_interaction_at if profile else None
                 ),
-                "long_term_memory": getattr(
-                    self.state.session,
-                    "long_term_memory",
-                    None,
-                ),
+                "long_term_memory": self.state.session.runtime.vector_memory,
             }
 
     async def _retrieve(self, request: MemoryProfileQuery, snapshot: dict) -> dict:
@@ -177,20 +172,19 @@ class MemoryProfileQueryService:
                 {"$or": user_filter},
             ]
         }
-        runtime = get_runtime_settings()
         metrics.memory_query_rag_calls += 1
-        result = await RagSearchService(memory).search_for_user_profile(
+        result = await RagSearchService(memory).search(
             queries,
             k=k,
             where=where,
             use_rerank=True,
-            merged_candidate_cap=runtime["rag_merged_candidate_cap"],
+            merged_candidate_cap=RAG_MERGED_CANDIDATE_CAP,
             decay_rate=0.02,
             active_user_ids={request.target_id},
         )
         seen = set()
         grouped = {"target": [], "unscoped": []}
-        budget = PromptBudget.from_runtime(runtime)
+        budget = PromptBudget()
         remaining = budget.rag_total_chars
         for record in result.records:
             content = str(record.get("content") or "")
@@ -243,9 +237,6 @@ class MemoryProfileQueryService:
             f"碎片: {json.dumps(records, ensure_ascii=False)}\n"
             '格式: {"valence":float,"arousal":float,"dominance":float}'
         )
-        extra_body = None
-        if get_effective_feedback_provider() == "deepseek_official":
-            extra_body = {"thinking": {"type": "disabled"}}
         metrics.memory_query_feedback_calls += 1
         response = await self.llm_response(
             self.state.feedback_client,
@@ -253,7 +244,7 @@ class MemoryProfileQueryService:
             model=model,
             temperature=0.1,
             json_mode=True,
-            extra_body=extra_body,
+            reasoning_effort=get_reasoning_effort("feedback"),
             max_tokens=get_feedback_max_tokens(),
             timeout=get_feedback_timeout(),
             on_usage=make_usage_recorder(snapshot["session_id"], model),
@@ -270,33 +261,15 @@ class MemoryProfileQueryService:
         return result
 
     async def _chat(self, session_id: str, prompt: str) -> str:
-        thinking = get_chat_thinking_settings()
-        provider = get_effective_chat_provider()
-        use_thinking = (
-            provider == "deepseek_official"
-            and bool(thinking.get("enabled"))
-        )
-        extra_body = None
-        if provider == "deepseek_official":
-            extra_body = {
-                "thinking": {
-                    "type": "enabled" if thinking.get("enabled") else "disabled"
-                }
-            }
         model = get_effective_chat_model()
         metrics.memory_query_chat_calls += 1
         return await self.llm_response(
             self.state.client,
             prompt,
             model=model,
-            temperature=None if use_thinking else 0.8,
+            temperature=0.8,
             json_mode=True,
-            extra_body=extra_body,
-            reasoning_effort=(
-                thinking.get("reasoning_effort", "high")
-                if use_thinking
-                else None
-            ),
+            reasoning_effort=get_reasoning_effort("chat"),
             max_tokens=get_chat_max_tokens(),
             timeout=get_chat_timeout(),
             on_usage=make_usage_recorder(session_id, model),

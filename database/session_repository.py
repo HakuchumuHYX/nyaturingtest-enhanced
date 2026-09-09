@@ -1,8 +1,7 @@
 from nonebot import logger
 
-from ..memory.short_term import Message
+from ..memory.short_term import SHORT_TERM_BUFFER_SIZE, Message
 from ..models.database import GlobalMessageModel, InteractionLogModel, SessionModel, UserProfileModel
-from ..config import get_runtime_settings
 from ..core.text_utils import sanitize_text
 
 
@@ -82,7 +81,7 @@ class SessionStateRepository:
                 }
             )
 
-        buffer_limit = get_runtime_settings()["short_term_buffer_size"]
+        buffer_limit = SHORT_TERM_BUFFER_SIZE
         msgs_db = await GlobalMessageModel.filter(session=session_db).order_by("-time").limit(buffer_limit)
         history_msgs = []
         for msg_db in reversed(msgs_db):

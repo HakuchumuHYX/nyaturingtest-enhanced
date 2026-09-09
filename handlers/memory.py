@@ -6,7 +6,6 @@ from nonebot.adapters.onebot.v11 import Bot, Event, GroupMessageEvent, Message
 from nonebot.params import CommandArg
 from nonebot.permission import SUPERUSER
 
-from ..config import get_runtime_settings
 from ..core.logic import llm_response
 from ..core.memory_profile_query import (
     MemoryProfileQuery,
@@ -17,6 +16,7 @@ from ..core.memory_query_control import (
     MemoryQueryCooldownError,
 )
 from ..core.metrics import metrics
+from ..core.rag_query import RAG_FINAL_K, RAG_MERGED_CANDIDATE_CAP, RAG_PER_QUERY_RECALL_K
 from ..core.services import RagSearchService
 from ..core.state_manager import ensure_group_state
 from ..memory.vector import where_any
@@ -42,16 +42,12 @@ rag_debug = on_command(
     block=True,
 )
 
-_runtime = get_runtime_settings()
+MEMORY_QUERY_USER_COOLDOWN_SECONDS = 30.0
+MEMORY_QUERY_GROUP_COOLDOWN_SECONDS = 3.0
+
 _MEMORY_QUERY_COORDINATOR = MemoryQueryCoordinator[str](
-    user_cooldown_seconds=_runtime.get(
-        "memory_query_user_cooldown_seconds",
-        30.0,
-    ),
-    group_cooldown_seconds=_runtime.get(
-        "memory_query_group_cooldown_seconds",
-        3.0,
-    ),
+    user_cooldown_seconds=MEMORY_QUERY_USER_COOLDOWN_SECONDS,
+    group_cooldown_seconds=MEMORY_QUERY_GROUP_COOLDOWN_SECONDS,
 )
 
 
@@ -99,22 +95,21 @@ async def handle_rag_debug(
         await rag_debug.finish("本群尚未启用 AI 功能。")
         return
 
-    runtime = get_runtime_settings()
     where_filter = where_any("source", ["preset", "memory"])
     async with state.session_lock:
         await state.session.load_session()
-        memory = getattr(state.session, "long_term_memory", None)
+        memory = state.session.runtime.vector_memory
     if memory is None:
         await rag_debug.finish("长期记忆库不可用。")
         return
 
-    result = await RagSearchService(memory).search_for_debug(
+    result = await RagSearchService(memory).search(
         [query],
-        k=runtime["rag_final_k"],
+        k=RAG_FINAL_K,
         where=where_filter,
         use_rerank=True,
-        candidate_k=runtime["rag_per_query_recall_k"],
-        merged_candidate_cap=runtime["rag_merged_candidate_cap"],
+        candidate_k=RAG_PER_QUERY_RECALL_K,
+        merged_candidate_cap=RAG_MERGED_CANDIDATE_CAP,
     )
     lines = [
         "RAG debug",
@@ -177,9 +172,9 @@ async def handle_query_memory(
         await query_memory.finish("本群尚未启用 AI 功能。")
         return
 
-    memory = getattr(state.session, "long_term_memory", None)
-    vector_version = int(getattr(memory, "version", 0) or 0)
-    generation = int(getattr(state.session, "generation", 0) or 0)
+    memory = state.session.runtime.vector_memory
+    vector_version = int(memory.version or 0)
+    generation = int(state.session.state.generation or 0)
     key = (str(event.group_id), target_id, vector_version, generation)
     started_at = time.perf_counter()
     metrics.memory_query_count += 1

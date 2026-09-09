@@ -20,7 +20,7 @@ class MessageRepository:
 
     @staticmethod
     def _message_final_id(msg: Message) -> str:
-        cached_id = str(getattr(msg, "_persistence_id", "") or "")
+        cached_id = str(msg._persistence_id or "")
         if cached_id:
             return cached_id
         final_msg_id = str(msg.id or "")

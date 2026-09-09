@@ -147,9 +147,6 @@ class ImageWithDescription:
     affect: dict = field(default_factory=lambda: {"valence": 0.0, "arousal": 0.0, "dominance": 0.0})
     is_sticker: bool = False
     temporal: list = field(default_factory=list)   # 仅 GIF：[{frame, action}]
-    # 旧字段别名（兼容旧磁盘缓存 JSON）
-    description: str = ""               # = visual_description
-    emotion: str = ""                   # 旧三段式，仅 from_json 读旧缓存用
 
     def to_meta(self) -> dict:
         """返回供 Message.image_meta 使用的结构化图片观察。"""
@@ -173,16 +170,13 @@ class ImageWithDescription:
                 "affect": self.affect,
                 "is_sticker": self.is_sticker,
                 "temporal": self.temporal,
-                # 旧字段别名，保证旧消费方/旧缓存可读
-                "description": self.visual_description,
-                "emotion": self.emotion,
             },
             ensure_ascii=False,
         )
 
     @staticmethod
     def from_json(json_str: str) -> "ImageWithDescription":
-        """从 JSON 反序列化，兼容旧缓存（只有 description/emotion/is_sticker）。"""
+        """从 JSON 反序列化。"""
         try:
             data = json.loads(json_str)
             if not isinstance(data, dict):
@@ -190,9 +184,8 @@ class ImageWithDescription:
         except Exception:
             raise ValueError("JSON解析失败")
 
-        # 新字段优先；缺省时从旧字段回填或用默认
         visual = str(
-            data.get("visual_description") or data.get("description") or ""
+            data.get("visual_description") or ""
         )[:MAX_VISUAL_DESCRIPTION_CHARS]
         ocr_text = str(data.get("ocr_text") or "")[:MAX_OCR_TEXT_CHARS]
         entities = _normalize_entities(data.get("entities"))
@@ -202,8 +195,6 @@ class ImageWithDescription:
         affect = _normalize_affect(data.get("affect"))
         temporal = _normalize_temporal(data.get("temporal"))
         is_sticker = bool(data.get("is_sticker", False))
-        # 旧 emotion 字段（仅保留用于读旧缓存，新数据不再写入）
-        emotion = str(data.get("emotion") or "")
 
         return ImageWithDescription(
             visual_description=visual,
@@ -213,8 +204,6 @@ class ImageWithDescription:
             affect=affect,
             is_sticker=is_sticker,
             temporal=temporal,
-            description=visual,
-            emotion=emotion,
         )
 
 
@@ -251,7 +240,6 @@ def parse_vlm_response(response: str, is_sticker: bool = False) -> ImageWithDesc
         affect=affect,
         is_sticker=is_sticker,
         temporal=temporal,
-        description=visual,
     )
 
 

@@ -9,15 +9,7 @@ import httpx
 from openai import AsyncOpenAI, APIConnectionError, APITimeoutError
 from nonebot import logger
 
-try:
-    from .json_mode import is_json_mode_unsupported_error
-except ImportError:
-    def is_json_mode_unsupported_error(exc: Exception) -> bool:
-        text = str(exc).lower()
-        return (
-            "json mode is not supported" in text
-            or "response_format" in text and "not supported" in text
-        )
+from .json_mode import is_json_mode_unsupported_error
 
 
 PROVIDER_ADVISORY_BACKOFF_SECONDS = 5.0
@@ -125,13 +117,6 @@ class LLMClient:
         )
 
     @staticmethod
-    def _is_thinking_enabled(extra_body: dict[str, Any] | None) -> bool:
-        thinking = (extra_body or {}).get("thinking")
-        if isinstance(thinking, dict):
-            return str(thinking.get("type", "")).lower() == "enabled"
-        return False
-
-    @staticmethod
     def _usage_to_dict(usage: Any, finish_reason: str) -> dict[str, int | str]:
         if not usage:
             data: dict[str, Any] = {}
@@ -230,10 +215,7 @@ class LLMClient:
         images: list[Any] | None = None,
         **kwargs,
     ) -> LLMResponse:
-        """
-        Generate a structured response. DeepSeek thinking mode is configured via
-        extra_body={"thinking": {"type": "enabled"|"disabled"}, ...}.
-        """
+        """Generate a structured response using common OpenAI SDK parameters."""
         system_content = system_prompt or "You are an intelligent agent. Output only valid JSON."
         max_retries = 3
         base_delay = 2
@@ -255,22 +237,9 @@ class LLMClient:
 
             request_kwargs = dict(kwargs)
             request_timeout = request_kwargs.pop("timeout", self.timeout)
-            extra_body = request_kwargs.get("extra_body")
-            if isinstance(extra_body, dict):
-                extra_body = dict(extra_body)
-                request_kwargs["extra_body"] = extra_body
-            thinking_enabled = self.provider == "deepseek_official" and self._is_thinking_enabled(extra_body)
 
-            if isinstance(extra_body, dict) and "reasoning_effort" in extra_body:
-                request_kwargs["reasoning_effort"] = extra_body.pop("reasoning_effort")
-
-            if temperature is not None and not thinking_enabled:
+            if temperature is not None:
                 request_kwargs["temperature"] = temperature
-            if thinking_enabled:
-                request_kwargs.pop("temperature", None)
-                request_kwargs.pop("top_p", None)
-                request_kwargs.pop("presence_penalty", None)
-                request_kwargs.pop("frequency_penalty", None)
             if json_mode_fallback_used:
                 request_kwargs.pop("response_format", None)
             request_kwargs = {key: value for key, value in request_kwargs.items() if value is not None}
@@ -353,25 +322,3 @@ class LLMClient:
                     return self._error_response(model, error_type, str(e))
 
         return self._error_response(model, "retry_exhausted", "max retries exhausted")
-
-    async def generate_response(
-        self,
-        prompt: str,
-        model: str,
-        temperature: float = 0.7,
-        system_prompt: str | None = None,
-        on_usage: Callable[[dict], None] | None = None,
-        **kwargs,
-    ) -> str | None:
-        """
-        Backward-compatible string API. New call sites should use generate().
-        """
-        response = await self.generate(
-            prompt=prompt,
-            model=model,
-            temperature=temperature,
-            system_prompt=system_prompt,
-            on_usage=on_usage,
-            **kwargs,
-        )
-        return response.content

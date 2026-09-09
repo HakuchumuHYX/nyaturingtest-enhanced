@@ -2,19 +2,15 @@ from datetime import datetime, timedelta
 
 from nonebot import logger
 
-from ..config import get_runtime_settings
 from ..models.database import GlobalMessageModel, InteractionLogModel, TokenUsageModel
 
 
 RETENTION_DISABLED_DAYS = 0
 
-
-def _retention_days(settings: dict, key: str) -> int:
-    try:
-        days = int(settings.get(key, RETENTION_DISABLED_DAYS) or RETENTION_DISABLED_DAYS)
-    except (TypeError, ValueError):
-        return RETENTION_DISABLED_DAYS
-    return max(RETENTION_DISABLED_DAYS, days)
+# 原始明细保留天数；0 表示永不清理
+RAW_MESSAGE_RETENTION_DAYS = 180
+RAW_INTERACTION_RETENTION_DAYS = 180
+TOKEN_USAGE_RETENTION_DAYS = 90
 
 
 async def _delete_older_than(model, field_name: str, days: int) -> int:
@@ -24,13 +20,12 @@ async def _delete_older_than(model, field_name: str, days: int) -> int:
     return await model.filter(**{f"{field_name}__lt": cutoff}).delete()
 
 
-async def cleanup_raw_data_retention(settings: dict | None = None) -> dict[str, int]:
-    """Delete old raw database rows according to opt-in retention settings.
+async def cleanup_raw_data_retention() -> dict[str, int]:
+    """按保留期清理原始数据库行。
 
-    This deliberately does not touch long-term vector memory. Semantic memory
-    lifecycle remains owned by the vector store cleanup path.
+    刻意不触碰长期向量记忆：语义记忆的生命周期由向量库清理路径负责。
     """
-    runtime = get_runtime_settings() if settings is None else settings
+
     result = {
         "messages": 0,
         "interactions": 0,
@@ -41,17 +36,17 @@ async def cleanup_raw_data_retention(settings: dict | None = None) -> dict[str, 
         result["messages"] = await _delete_older_than(
             GlobalMessageModel,
             "time",
-            _retention_days(runtime, "raw_message_retention_days"),
+            RAW_MESSAGE_RETENTION_DAYS,
         )
         result["interactions"] = await _delete_older_than(
             InteractionLogModel,
             "timestamp",
-            _retention_days(runtime, "raw_interaction_retention_days"),
+            RAW_INTERACTION_RETENTION_DAYS,
         )
         result["token_usage"] = await _delete_older_than(
             TokenUsageModel,
             "timestamp",
-            _retention_days(runtime, "token_usage_retention_days"),
+            TOKEN_USAGE_RETENTION_DAYS,
         )
     except Exception as e:
         logger.error(f"[Retention] 原始数据库行清理失败: {e}")

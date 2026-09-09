@@ -14,9 +14,11 @@ from nonebot.permission import SUPERUSER
 from nonebot.matcher import Matcher
 
 from ..config import (
-    get_runtime_settings,
+    get_config_load_status,
+    get_effective_vlm_mode,
+    get_reasoning_effort,
     get_token_stats_model_names,
-    get_token_stats_watermark,
+    get_vision_settings,
     native_vision_enabled,
     should_use_standalone_vlm,
 )
@@ -28,16 +30,13 @@ from ..core.state_manager import (
     group_states,
     is_shutting_down
 )
-from ..core.logic import message2BotMessage
-from ..core.metrics import metrics
-from ..core.status_service import StatusService
-from ..core.structured_log import log_event
+from ..core.engagement import LOW_WILLINGNESS_SKIP_THRESHOLD
+from ..core.logic import QUEUE_MAX_SIZE, message2BotMessage
+from ..core.metrics import log_event, metrics
 from ..memory.short_term import Message as MMessage
 from ..database.enabled_group_repository import EnabledGroupRepository
 from ..database.token_repository import TokenUsageRepository
 from ..database.backup import backup_task
-from ..core.admin_service import reset_session_with_backup
-from ..core.ingress import sender_display_name
 from .command_meta import render_group_help, render_private_help
 
 
@@ -68,6 +67,76 @@ async def _parse_group_id_or_finish(matcher: type[Matcher], raw: str) -> int:
     except ValueError:
         await matcher.finish("群号必须是数字")
         raise
+
+
+def sender_display_name(event, user_id: str) -> str:
+    card = str(event.sender.card or "").strip()
+    nickname = str(event.sender.nickname or "").strip()
+    return card or nickname or str(user_id)
+
+
+async def reset_session_with_backup(state, backup) -> bool:
+    """作废进行中的 turn，备份运行数据，然后重置该群会话。
+
+    备份刻意放在 session_lock 之外：它可能长时间打包整个数据目录。
+    """
+
+    async with state.session_lock:
+        await state.session.load_session()
+        state.session.bump_generation("reset_requested")
+
+    if not await backup():
+        return False
+
+    async with state.session_lock:
+        await state.session.reset()
+    return True
+
+
+async def describe_status(state) -> str:
+    """拼装会话与运行时诊断视图。"""
+
+    async with state.session_lock:
+        await state.session.load_session()
+        status = state.session.status()
+    chat_vision = get_vision_settings("chat")
+    feedback_vision = get_vision_settings("feedback")
+    lines = [
+        "",
+        "Provider:",
+        f"- Chat reasoning_effort: {get_reasoning_effort('chat') or '未指定（由上游决定）'}",
+        f"- Feedback reasoning_effort: {get_reasoning_effort('feedback') or '未指定（由上游决定）'}",
+        (
+            f"- Vision: chat={'native' if chat_vision['enabled'] else 'text'}, "
+            f"feedback={'native' if feedback_vision['enabled'] else 'text'}, "
+            f"vlm_mode={get_effective_vlm_mode()}, "
+            f"standalone={'on' if should_use_standalone_vlm() else 'off'}"
+        ),
+        f"- Queue length: {len(state.messages_chunk)}",
+        (
+            f"- Metrics: llm={metrics.llm_success}/{metrics.llm_failure}, "
+            f"vlm={metrics.vlm_success}/{metrics.vlm_failure}, "
+            f"db_write_failure={metrics.db_write_failure}"
+        ),
+    ]
+    for name, client in (
+        ("Chat", state.client),
+        ("Feedback", state.feedback_client),
+    ):
+        provider_status = client.provider_status
+        if provider_status.last_error_type:
+            lines.append(
+                f"- {name} last_error={provider_status.last_error_type} "
+                "circuit_remaining="
+                f"{provider_status.circuit_remaining_seconds}s"
+            )
+    config_status = get_config_load_status()
+    if not config_status.ok or config_status.source != "file":
+        lines.append(
+            f"- Config: source={config_status.source} "
+            f"ok={config_status.ok} error={config_status.error_type}"
+        )
+    return status + "\n".join(lines)
 
 
 # ==================== 命令定义 ====================
@@ -368,7 +437,7 @@ async def do_status(matcher: type[Matcher], group_id: int):
     state = ensure_group_state(group_id)
     if not state:
         await matcher.finish("本群 Autochat 未启用，请先使用 autochat enable")
-    await matcher.finish(await StatusService().describe(state))
+    await matcher.finish(await describe_status(state))
 
 
 @list_groups_pm.handle()
@@ -408,7 +477,7 @@ async def handle_auto_chat(bot: Bot, event: GroupMessageEvent):
     async with state.session_lock:
         await state.session.load_session()
         bot_name = state.session.name()
-        recent_context_messages = state.session.global_memory.access_context(limit=4).messages
+        recent_context_messages = state.session.runtime.short_term_memory.access_context(limit=4).messages
         conversation_context = "\n".join(
             f"{msg.user_name}: {msg.content}"
             for msg in recent_context_messages
@@ -426,7 +495,7 @@ async def handle_auto_chat(bot: Bot, event: GroupMessageEvent):
         raw_message_text,
     )
     async with state.data_lock:
-        max_size = get_runtime_settings()["queue_max_size"]
+        max_size = QUEUE_MAX_SIZE
         if len(state.messages_chunk) >= max_size and not pre_queue_priority:
             logger.warning(f"群 {group_id} 消息队列已满，转换前丢弃低优先级消息")
             log_event(
@@ -441,8 +510,8 @@ async def handle_auto_chat(bot: Bot, event: GroupMessageEvent):
     if _resolve_images:
         _has_image = any(seg.type == "image" for seg in event.original_message)
         if _has_image and not pre_queue_priority:
-            _skip_threshold = get_runtime_settings()["low_willingness_skip_threshold"]
-            if state.session.willingness < _skip_threshold:
+            _skip_threshold = LOW_WILLINGNESS_SKIP_THRESHOLD
+            if state.session.state.willingness < _skip_threshold:
                 _resolve_images = False
 
     image_inputs = []
@@ -477,7 +546,7 @@ async def handle_auto_chat(bot: Bot, event: GroupMessageEvent):
         nickname = sender_display_name(event, user_id)
 
     async with state.data_lock:
-        max_size = get_runtime_settings()["queue_max_size"]
+        max_size = QUEUE_MAX_SIZE
         if len(state.messages_chunk) >= max_size:
             is_priority = pre_queue_priority or _is_priority_message(
                 event.original_message,
@@ -559,14 +628,9 @@ async def handle_token_stats(bot: Bot, event: GroupMessageEvent, args: Message =
     )
     scope_label = "全部历史模型" if token_stats_scope_all else "当前模型"
     
-    # 获取水印配置
-    watermark = get_token_stats_watermark()
-    
-    # 渲染图片
     try:
         img_bytes = await render_token_stats_card(
             stats=stats,
-            watermark=watermark,
             scope_label=scope_label,
         )
         

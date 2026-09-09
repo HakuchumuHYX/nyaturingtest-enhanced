@@ -6,15 +6,11 @@ import json
 import time
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any, List
 import chromadb
 from nonebot import logger
-from ..config import (
-    get_app_settings,
-    get_memory_endpoint_settings,
-    get_runtime_settings,
-)
+from ..config import get_app_settings, get_memory_endpoint_settings
 from ..database.backup_lock import BACKUP_IO_LOCK
 from .vector_clients import (
     SiliconFlowEmbeddingFunction,
@@ -23,6 +19,9 @@ from .vector_clients import (
 
 
 MEMORY_COLLECTION_NAME = "nyabot_memory"
+MEMORY_WRITE_MAX_RETRIES = 3
+MEMORY_WRITE_RETRY_BASE_DELAY = 0.5
+
 MEMORY_COLLECTION_METADATA = {"hnsw:space": "cosine"}
 PRESET_TYPE_WEIGHT = {
     "bot_self": 0.95,
@@ -48,7 +47,6 @@ SCOPE_WEIGHT = {
     "mentioned_subject": 1.08,
     "active_speaker": 1.04,
     "global": 1.0,
-    "legacy_subject": 0.75,
     "other_subject": 0.5,
 }
 _metric_check_done: set[str] = set()
@@ -191,20 +189,12 @@ def _clean_metadata_string(value: Any) -> str:
     return str(value or "").strip()
 
 
-def _metadata_schema_version(value: Any) -> int:
-    try:
-        version = int(value)
-    except (TypeError, ValueError):
-        return 1
-    return version if version > 0 else 1
-
-
 def _normalized_metadata(meta: dict | None) -> dict[str, Any]:
     data = dict(meta or {})
     source = str(data.get("source") or "memory")
     memory_type = str(data.get("type") or "event")
     subtype = str(data.get("subtype") or ("legacy_rule" if source == "preset" else memory_type))
-    subject_user_id = _clean_metadata_string(data.get("subject_user_id") or data.get("user_id"))
+    subject_user_id = _clean_metadata_string(data.get("subject_user_id"))
     data["source"] = source
     data["type"] = memory_type
     data["subtype"] = subtype
@@ -212,7 +202,7 @@ def _normalized_metadata(meta: dict | None) -> dict[str, Any]:
     data["category"] = str(data.get("category") or memory_type)
     data["confidence"] = _clamp_float(data.get("confidence"), 1.0, 0.0, 1.0)
     data["importance"] = _clamp_float(data.get("importance"), 0.0, 0.0, 1.0)
-    data["schema_version"] = _metadata_schema_version(data.get("schema_version"))
+    data["schema_version"] = int(data.get("schema_version") or 2)
     data["subject_user_id"] = subject_user_id
     data["subject_user_name"] = _clean_metadata_string(data.get("subject_user_name"))
     data["speaker_user_id"] = _clean_metadata_string(data.get("speaker_user_id"))
@@ -291,7 +281,7 @@ def _memory_scope(meta: dict, active_scope_ids: set[str], queries: list[str]) ->
     if meta.get("source") == "preset":
         return "global", SCOPE_WEIGHT["global"]
 
-    subject_user_id = _clean_metadata_string(meta.get("subject_user_id") or meta.get("user_id"))
+    subject_user_id = _clean_metadata_string(meta.get("subject_user_id"))
     subject_user_name = _clean_metadata_string(meta.get("subject_user_name"))
     speaker_user_id = _clean_metadata_string(meta.get("speaker_user_id"))
 
@@ -302,14 +292,12 @@ def _memory_scope(meta: dict, active_scope_ids: set[str], queries: list[str]) ->
     if active_scope_ids and speaker_user_id and speaker_user_id in active_scope_ids:
         return "active_speaker", SCOPE_WEIGHT["active_speaker"]
     if subject_user_id:
-        if int(meta.get("schema_version") or 1) < 2 and not subject_user_name:
-            return "legacy_subject", SCOPE_WEIGHT["legacy_subject"]
         return "other_subject", SCOPE_WEIGHT["other_subject"]
     return "global", SCOPE_WEIGHT["global"]
 
 
 def _collection_metric_state(collection) -> str:
-    metadata = getattr(collection, "metadata", None)
+    metadata = collection.metadata
     if not isinstance(metadata, dict):
         return "unknown"
     space = metadata.get("hnsw:space")
@@ -377,12 +365,11 @@ class VectorMemory:
             metadata=MEMORY_COLLECTION_METADATA
         )
         self._check_collection_metric_once()
-        self._ids_supported = self._probe_ids_support()
         self.replay_pending()
 
     @property
     def version(self) -> int:
-        return int(getattr(self, "_version", 0) or 0)
+        return int(self._version or 0)
 
     def _bump_version(self) -> None:
         self._version = self.version + 1
@@ -395,24 +382,9 @@ class VectorMemory:
         if state == "unknown":
             logger.warning(f"Vector collection metric metadata unknown: {self.persist_directory}")
         elif state == "mismatch":
-            metadata = getattr(self.collection, "metadata", None)
+            metadata = self.collection.metadata
             logger.error(f"Vector collection metric mismatch: {self.persist_directory} metadata={metadata}")
         return state
-
-    @property
-    def ids_supported(self) -> bool:
-        return bool(getattr(self, "_ids_supported", False))
-
-    def _probe_ids_support(self) -> bool:
-        try:
-            with BACKUP_IO_LOCK:
-                probe = self.collection.get(limit=1, include=[])
-            supported = isinstance(probe, dict) and "ids" in probe
-            logger.info(f"Vector collection capability: ids_supported={supported} path={self.persist_directory}")
-            return supported
-        except Exception as e:
-            logger.warning(f"Vector collection ids probe failed: {e}")
-            return False
 
     def _wal_path(self) -> str:
         return os.path.join(self.persist_directory, "pending_memories.jsonl")
@@ -557,9 +529,8 @@ class VectorMemory:
         if not valid_data:
             return empty_result
 
-        runtime = get_runtime_settings()
-        max_retries = int(runtime.get("memory_write_max_retries", 0) or 0)
-        base_delay = float(runtime.get("memory_write_retry_base_delay", 0.5) or 0.0)
+        max_retries = MEMORY_WRITE_MAX_RETRIES
+        base_delay = MEMORY_WRITE_RETRY_BASE_DELAY
         prepared_data = []
         ids = []
         for content, metadata in valid_data:
@@ -798,7 +769,7 @@ class VectorMemory:
             metadata = _normalized_metadata(metadatas[index] if index < len(metadatas) else {})
             if metadata.get("source") != "memory" or _metadata_status(metadata) != "active":
                 continue
-            subject_user_id = _clean_metadata_string(metadata.get("subject_user_id") or metadata.get("user_id"))
+            subject_user_id = _clean_metadata_string(metadata.get("subject_user_id"))
             if subject_user_id not in active_user_ids:
                 continue
             if index < len(ids):
@@ -967,65 +938,6 @@ class VectorMemory:
                 "memory_ref": replacement_ref,
                 "reason": type(e).__name__,
             }
-
-    def backfill_active_status(self, *, dry_run: bool = True, batch_size: int = 200, max_rounds: int = 5) -> dict[str, Any]:
-        """Backfill missing status metadata without re-embedding records."""
-        marker_path = os.path.join(
-            self.persist_directory,
-            ".rag_status_backfill_complete.json",
-        )
-        if not dry_run and os.path.exists(marker_path):
-            return {
-                "dry_run": False,
-                "total_count": 0,
-                "missing_status_count": 0,
-                "backfilled_count": 0,
-                "verify_rounds": 0,
-                "complete": True,
-                "already_complete": True,
-            }
-        report = {
-            "dry_run": dry_run,
-            "total_count": 0,
-            "missing_status_count": 0,
-            "backfilled_count": 0,
-            "verify_rounds": 0,
-            "complete": False,
-        }
-        zero_rounds = 0
-        for _ in range(max(1, max_rounds)):
-            ids, metadatas = self._get_all_ids_metadatas()
-            missing = [
-                (item_id, metadata)
-                for item_id, metadata in zip(ids, metadatas)
-                if not metadata.get("status")
-            ]
-            report["total_count"] = len(ids)
-            report["missing_status_count"] = len(missing)
-            if dry_run:
-                report["complete"] = not missing
-                return report
-            if not missing:
-                zero_rounds += 1
-                report["verify_rounds"] = zero_rounds
-                if zero_rounds >= 2:
-                    report["complete"] = True
-                    self._write_status_backfill_marker(report)
-                    return report
-                continue
-            zero_rounds = 0
-            for batch in _batched(missing, batch_size):
-                batch_ids = [item_id for item_id, _ in batch]
-                batch_metadatas = []
-                for _, metadata in batch:
-                    updated = dict(metadata or {})
-                    updated["status"] = "active"
-                    batch_metadatas.append(updated)
-                with BACKUP_IO_LOCK:
-                    self.collection.update(ids=batch_ids, metadatas=batch_metadatas)
-                report["backfilled_count"] += len(batch)
-                self._bump_version()
-        return report
 
     def _write_status_backfill_marker(self, report: dict[str, Any]) -> None:
         marker_path = os.path.join(self.persist_directory, ".rag_status_backfill_complete.json")
@@ -1296,7 +1208,6 @@ class VectorMemory:
         today_dt = datetime.now()
         active_results = []
         other_subject_downweighted_count = 0
-        legacy_subject_count = 0
         scope_counts: dict[str, int] = {}
         
         for item in raw_results:
@@ -1308,8 +1219,6 @@ class VectorMemory:
             scope_counts[scope] = scope_counts.get(scope, 0) + 1
             if scope == "other_subject":
                 other_subject_downweighted_count += 1
-            elif scope == "legacy_subject":
-                legacy_subject_count += 1
             active_results.append(item)
             date = meta.get("date", 0)
 
@@ -1368,6 +1277,5 @@ class VectorMemory:
         stats.update(_score_distribution(adjusted_scores))
         stats["returned_count"] = len(final_results)
         stats["other_subject_downweighted_count"] = other_subject_downweighted_count
-        stats["legacy_subject_count"] = legacy_subject_count
         stats["scope_counts"] = dict(scope_counts)
         return RetrievalResult(final_results, stats)
