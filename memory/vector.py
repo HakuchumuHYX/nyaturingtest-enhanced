@@ -1,31 +1,23 @@
-# 由多个模块合并而来：memory/vector.py, memory/vector_clients.py, core/rag_query.py
-
-import os
-import uuid
-import math
 import json
+import math
+import os
+import re
+import threading
 import time
+import uuid
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, List
-import chromadb
-from nonebot import logger
-import threading
 
-from nonebot.utils import run_sync
-from ..config import get_app_settings, get_memory_endpoint_settings
-from typing import Any
+import chromadb
 import httpx
 from chromadb.api.types import Documents, EmbeddingFunction, Embeddings
+from nonebot import logger
+from nonebot.utils import run_sync
 from openai import OpenAI
-from ..config import get_memory_endpoint_settings
-import re
 
-
-# ======== from memory/vector.py ========
-# nyaturingtest/vector_mem.py
-
+from ..config import get_app_settings
 
 
 MEMORY_COLLECTION_NAME = "nyabot_memory"
@@ -104,16 +96,9 @@ def _empty_retrieval_stats(*, use_rerank: bool = False, fallback_reason: str = "
     }
 
 
-def _percentile(values: list[float], ratio: float) -> float | None:
-    if not values:
-        return None
-    ordered = sorted(values)
-    index = int((len(ordered) - 1) * ratio + 0.5)
-    index = max(0, min(len(ordered) - 1, index))
-    return ordered[index]
-
-
 def _score_distribution(values: list[float]) -> dict[str, float | None]:
+    """调整后分数的 min/p50/p90/max（最近秩法）。"""
+
     if not values:
         return {
             "adjusted_score_min": None,
@@ -121,11 +106,17 @@ def _score_distribution(values: list[float]) -> dict[str, float | None]:
             "adjusted_score_p90": None,
             "adjusted_score_max": None,
         }
+    ordered = sorted(values)
+    last = len(ordered) - 1
+
+    def nearest_rank(ratio: float) -> float:
+        return ordered[max(0, min(last, int(last * ratio + 0.5)))]
+
     return {
-        "adjusted_score_min": min(values),
-        "adjusted_score_p50": _percentile(values, 0.50),
-        "adjusted_score_p90": _percentile(values, 0.90),
-        "adjusted_score_max": max(values),
+        "adjusted_score_min": ordered[0],
+        "adjusted_score_p50": nearest_rank(0.50),
+        "adjusted_score_p90": nearest_rank(0.90),
+        "adjusted_score_max": ordered[last],
     }
 
 
@@ -179,10 +170,9 @@ def where_all(*conditions: dict) -> dict:
 
 
 def _subject_user_where(user_ids: set[str]) -> dict:
-    subject_conditions = []
-    for user_id in sorted(user_ids):
-        subject_conditions.append({"subject_user_id": {"$eq": user_id}})
-        subject_conditions.append({"subject_user_id": {"$eq": user_id}})
+    subject_conditions = [
+        {"subject_user_id": {"$eq": user_id}} for user_id in sorted(user_ids)
+    ]
     return where_all(
         {"source": {"$eq": "memory"}},
         {"$or": subject_conditions},
@@ -251,12 +241,7 @@ def _dedup_where(metadata: dict) -> dict:
         },
     ]
     if source_class == "memory" and subject_user_id:
-        conditions.append({
-            "$or": [
-                {"subject_user_id": {"$eq": subject_user_id}},
-                {"subject_user_id": {"$eq": subject_user_id}},
-            ]
-        })
+        conditions.append({"subject_user_id": {"$eq": subject_user_id}})
     return where_all(*conditions)
 
 
@@ -319,11 +304,6 @@ def _collection_metric_state(collection) -> str:
     return "cosine" if str(space).lower() == "cosine" else "mismatch"
 
 
-def _batched(items: list[Any], batch_size: int) -> list[list[Any]]:
-    safe_size = max(1, int(batch_size or 1))
-    return [items[index:index + safe_size] for index in range(0, len(items), safe_size)]
-
-
 def _metadata_status(meta: dict | None) -> str:
     return str((meta or {}).get("status") or "active")
 
@@ -351,24 +331,23 @@ class VectorMemory:
         self.persist_directory = persist_directory
         self._version = 0
         os.makedirs(self.persist_directory, exist_ok=True)
-        memory_settings = get_memory_endpoint_settings()
+        app_settings = get_app_settings()
+        memory_settings = app_settings.memory
         self.emb_fn = SiliconFlowEmbeddingFunction(
             api_key=api_key,
             session_id=session_id,
-            model=str(memory_settings["model"]),
-            base_url=str(memory_settings["base_url"]),
-            timeout=float(memory_settings["timeout"]),
+            model=memory_settings.model,
+            base_url=memory_settings.base_url,
+            timeout=memory_settings.timeout,
         )
-        
-        # 初始化 Reranker
+
         self.reranker = None
-        app_settings = get_app_settings()
         if app_settings.rerank_model:
             self.reranker = SiliconFlowReranker(
-                api_key=api_key, 
+                api_key=api_key,
                 model=app_settings.rerank_model,
-                api_url=str(memory_settings["rerank_base_url"]),
-                timeout=float(memory_settings["rerank_timeout"]),
+                api_url=memory_settings.rerank_base_url,
+                timeout=memory_settings.rerank_timeout,
             )
 
         self.client = chromadb.PersistentClient(path=self.persist_directory)
@@ -836,9 +815,9 @@ class VectorMemory:
                 if should_delete:
                     delete_ids.append(item_id)
 
-            for batch in _batched(delete_ids, 200):
+            for start in range(0, len(delete_ids), 200):
                 with BACKUP_IO_LOCK:
-                    self.collection.delete(ids=batch)
+                    self.collection.delete(ids=delete_ids[start:start + 200])
             if delete_ids:
                 self._bump_version()
             logger.info(f"Cleaned up {len(delete_ids)} expired vector memories")
@@ -952,18 +931,6 @@ class VectorMemory:
                 "reason": type(e).__name__,
             }
 
-    def _write_status_backfill_marker(self, report: dict[str, Any]) -> None:
-        marker_path = os.path.join(self.persist_directory, ".rag_status_backfill_complete.json")
-        payload = {
-            "collection": MEMORY_COLLECTION_NAME,
-            "completed_at": datetime.now().astimezone().isoformat(),
-            "total_count": report.get("total_count", 0),
-            "backfilled_count": report.get("backfilled_count", 0),
-            "verify_rounds": report.get("verify_rounds", 0),
-        }
-        with open(marker_path, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=False, sort_keys=True, indent=2)
-
     def clear(self):
         try:
             with BACKUP_IO_LOCK:
@@ -1002,21 +969,6 @@ class VectorMemory:
         except Exception as e:
             logger.warning(f"统计记忆数量失败: {e}")
             return 0
-
-    def add_memory_with_dedup(self, content: str, metadata: dict, threshold: float = 0.9) -> bool:
-        """
-        带去重的记忆添加
-        
-        Args:
-            content: 记忆内容
-            metadata: 元数据
-            threshold: 相似度阈值，超过此值视为重复
-            
-        Returns:
-            是否成功添加（False 表示重复跳过）
-        """
-        result = self.add_memories_with_dedup([(content, metadata)], threshold=threshold)
-        return result["added"] > 0
 
     def _reinforce_duplicate_memory(self, memory_ref: str, existing_metadata: dict, new_metadata: dict) -> bool:
         if not memory_ref:
@@ -1181,20 +1133,8 @@ class VectorMemory:
             use_rerank=use_rerank,
             merged_candidate_cap=merged_candidate_cap,
         )
-        if isinstance(retrieval_result, RetrievalResult):
-            raw_results = list(retrieval_result.records)
-            stats = dict(retrieval_result.stats)
-        else:
-            # Compatibility for injected/fake stores during gradual migration.
-            raw_results = list(retrieval_result or [])
-            stats = {
-                **_empty_retrieval_stats(
-                    use_rerank=use_rerank,
-                    fallback_reason="legacy_result",
-                ),
-                "candidate_count": len(raw_results),
-                "returned_count": len(raw_results),
-            }
+        raw_results = list(retrieval_result.records)
+        stats = dict(retrieval_result.stats)
         subject_results = self._retrieve_active_subject_records(active_scope_ids, limit=min(5, max(1, k)))
         if subject_results:
             merged_results = []
@@ -1232,26 +1172,17 @@ class VectorMemory:
             if scope == "other_subject":
                 other_subject_downweighted_count += 1
             active_results.append(item)
-            date = meta.get("date", 0)
 
             if meta.get("source") == "preset":
                 days_ago = 0
-                decay_factor = 1.0
                 effective_decay_rate = 0.0
-            elif date and isinstance(date, int) and date > 0:
-                # 计算天数差
-                try:
-                    memory_dt = datetime.strptime(str(date), "%Y%m%d")
-                    days_ago = max(0, (today_dt - memory_dt).days)
-                except ValueError:
+            else:
+                # 没有日期或日期非法的记忆，视为 60 天前
+                days_ago = _date_days_ago(meta, now=today_dt)
+                if days_ago is None:
                     days_ago = 60
                 effective_decay_rate = _memory_decay_rate(meta, decay_rate)
-                decay_factor = math.exp(-effective_decay_rate * days_ago)
-            else:
-                # 没有日期的记忆，视为较久以前
-                days_ago = 60
-                effective_decay_rate = _memory_decay_rate(meta, decay_rate)
-                decay_factor = math.exp(-effective_decay_rate * days_ago)
+            decay_factor = math.exp(-effective_decay_rate * days_ago)
             
             # 获取原始分数
             original_score = meta.get("rerank_score")
@@ -1292,7 +1223,6 @@ class VectorMemory:
         stats["scope_counts"] = dict(scope_counts)
         return RetrievalResult(final_results, stats)
 
-# ======== from memory/vector_clients.py ========
 class SiliconFlowReranker:
     """Small synchronous adapter for the configured rerank endpoint."""
 
@@ -1300,17 +1230,13 @@ class SiliconFlowReranker:
         self,
         api_key: str,
         model: str,
-        api_url: str | None = None,
-        timeout: float | None = None,
+        api_url: str,
+        timeout: float,
     ):
-        settings = get_memory_endpoint_settings()
         self.api_key = api_key
         self.model = model
-        self.api_url = api_url or str(settings["rerank_base_url"])
-        self._client = httpx.Client(
-            timeout=timeout or float(settings["rerank_timeout"]),
-            trust_env=False,
-        )
+        self.api_url = api_url
+        self._client = httpx.Client(timeout=timeout, trust_env=False)
 
     def rerank(
         self,
@@ -1352,18 +1278,17 @@ class SiliconFlowEmbeddingFunction(EmbeddingFunction):
         self,
         api_key: str,
         session_id: str,
-        model: str | None = None,
-        base_url: str | None = None,
-        timeout: float | None = None,
+        model: str,
+        base_url: str,
+        timeout: float,
     ):
-        settings = get_memory_endpoint_settings()
         self.api_key = api_key
         self.session_id = session_id
-        self.model = model or str(settings["model"])
+        self.model = model
         self._client = OpenAI(
             api_key=api_key,
-            base_url=base_url or str(settings["base_url"]),
-            timeout=timeout or float(settings["timeout"]),
+            base_url=base_url,
+            timeout=timeout,
             max_retries=0,
         )
 
@@ -1384,7 +1309,6 @@ class SiliconFlowEmbeddingFunction(EmbeddingFunction):
     def close(self) -> None:
         self._client.close()
 
-# ======== from core/rag_query.py ========
 # RAG 检索参数
 RAG_FINAL_K = 20
 RAG_PER_QUERY_RECALL_K = 40

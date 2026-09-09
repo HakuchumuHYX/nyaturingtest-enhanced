@@ -1,36 +1,27 @@
-# 由多个模块合并而来：llm/json_mode.py, llm/vision.py, core/http_client.py, llm/client.py, core/turn_call_factory.py
-
-from dataclasses import dataclass, field, replace
-import ssl
-import httpx
-from nonebot import logger
 import asyncio
-from dataclasses import dataclass, field
-import time
-from typing import Callable, Any, Optional
-from openai import AsyncOpenAI, APIConnectionError, APITimeoutError
 import json
 import re
+import ssl
+import time
 from collections.abc import Callable
-from dataclasses import dataclass
-from ..config import (
-    get_app_settings,
-    get_reasoning_effort,
-)
-from .metrics import log_event
-from .metrics import make_usage_recorder
+from dataclasses import dataclass, field
+from functools import partial
+from typing import Any, Optional
+
+import httpx
+from nonebot import logger
+from openai import APIConnectionError, APITimeoutError, AsyncOpenAI
+
+from ..config import get_app_settings
+from .metrics import record_token_usage
 
 
-# ======== from llm/json_mode.py ========
 def is_json_mode_unsupported_error(exc: Exception) -> bool:
     text = str(exc).lower()
     return (
         "json mode is not supported" in text
         or "response_format" in text and "not supported" in text
     )
-
-# ======== from llm/vision.py ========
-VISION_DETAILS = {"low", "high", "auto"}
 
 
 @dataclass(frozen=True)
@@ -42,12 +33,6 @@ class VisionInput:
     is_sticker: bool = False
     source: str = "primary"
     detail: str = "auto"
-
-    def with_detail(self, detail: str) -> "VisionInput":
-        normalized = str(detail or "auto").strip().lower()
-        if normalized not in VISION_DETAILS:
-            normalized = "auto"
-        return replace(self, detail=normalized)
 
     def to_openai_content(self) -> list[dict]:
         source_label = "引用消息图片" if self.source == "referenced" else "当前消息图片"
@@ -65,7 +50,7 @@ class VisionInput:
             },
         ]
 
-# ======== from core/http_client.py ========
+
 _HTTP_CLIENT: httpx.AsyncClient | None = None
 
 
@@ -94,23 +79,6 @@ async def close_http_client() -> None:
         _HTTP_CLIENT = None
         logger.info("全局 HTTP 客户端已关闭")
 
-# ======== from llm/client.py ========
-# nyaturingtest/client.py
-
-
-
-
-
-
-@dataclass
-class LLMResponse:
-    content: str
-    reasoning_content: str = ""
-    finish_reason: str = ""
-    model: str = ""
-    provider: str = "deepseek_official"
-    usage: dict[str, int | str] = field(default_factory=dict)
-
 
 @dataclass
 class ProviderStatus:
@@ -125,9 +93,7 @@ class ProviderStatus:
 
 
 class LLMClient:
-    """
-    Chat LLM client for DeepSeek official and OpenAI-compatible endpoints.
-    """
+    """Chat LLM client for DeepSeek official and OpenAI-compatible endpoints."""
 
     def __init__(
         self,
@@ -138,41 +104,15 @@ class LLMClient:
         base_url: str = "",
         api_key: str = "",
     ):
-        self.provider = self._normalize_provider(provider)
+        self.provider = (provider or "deepseek_official").strip().lower()
         self.openai_client = openai_client
         self.timeout = timeout
         self.base_url = (base_url or "").strip().rstrip("/")
         self.provider_status = ProviderStatus()
 
     @staticmethod
-    def _normalize_provider(provider: str | None) -> str:
-        value = (provider or "deepseek_official").strip().lower()
-        if value == "openai_compatible":
-            return value
-        if value == "deepseek_official":
-            return value
-        raise ValueError(f"Unsupported LLM provider: {value}")
-
-    def _openai_client_required(self) -> AsyncOpenAI:
-        if not self.openai_client:
-            raise RuntimeError("openai_client is required for LLMClient")
-        return self.openai_client
-
-    @staticmethod
     def _usage_to_dict(usage: Any, finish_reason: str) -> dict[str, int | str]:
-        if not usage:
-            data: dict[str, Any] = {}
-        elif hasattr(usage, "model_dump"):
-            data = usage.model_dump()
-        elif isinstance(usage, dict):
-            data = usage
-        else:
-            data = {
-                "prompt_tokens": getattr(usage, "prompt_tokens", 0) or 0,
-                "completion_tokens": getattr(usage, "completion_tokens", 0) or 0,
-                "total_tokens": getattr(usage, "total_tokens", 0) or 0,
-            }
-
+        data = usage.model_dump() if usage is not None else {}
         completion_details = data.get("completion_tokens_details") or {}
         if hasattr(completion_details, "model_dump"):
             completion_details = completion_details.model_dump()
@@ -218,34 +158,20 @@ class LLMClient:
             return "server_error"
         return "api_error"
 
-    def _error_response(self, model: str, error_type: str, message: str = "") -> LLMResponse:
+    def _fail(self, error_type: str, message: str = "") -> str:
         self.provider_status.last_error_type = error_type
         self.provider_status.last_error_message = message[:300]
         self.provider_status.last_error_time = time.time()
-        return LLMResponse(
-            content="",
-            model=model,
-            provider=self.provider,
-            usage={
-                "provider": self.provider,
-                "error_type": error_type,
-                "error_message": message[:300],
-            },
-        )
+        return ""
 
     @staticmethod
-    def _build_user_content(prompt: str, images: list[Any] | None) -> str | list[dict]:
+    def _build_user_content(prompt: str, images: list[VisionInput] | None) -> str | list[dict]:
         if not images:
             return prompt
         content: list[dict] = [{"type": "text", "text": prompt}]
         for image in images:
-            builder = getattr(image, "to_openai_content", None)
-            if not callable(builder):
-                continue
-            blocks = builder()
-            if isinstance(blocks, list):
-                content.extend(block for block in blocks if isinstance(block, dict))
-        return content if len(content) > 1 else prompt
+            content.extend(image.to_openai_content())
+        return content
 
     async def generate(
         self,
@@ -254,10 +180,11 @@ class LLMClient:
         temperature: float | None = None,
         system_prompt: str | None = None,
         on_usage: Callable[[dict], None] | None = None,
-        images: list[Any] | None = None,
+        images: list[VisionInput] | None = None,
         **kwargs,
-    ) -> LLMResponse:
-        """Generate a structured response using common OpenAI SDK parameters."""
+    ) -> str:
+        """Generate a response; returns the text content, or "" on failure."""
+
         system_content = system_prompt or "You are an intelligent agent. Output only valid JSON."
         max_retries = 3
         base_delay = 2
@@ -265,16 +192,7 @@ class LLMClient:
 
         for attempt in range(max_retries):
             if self.provider_status.circuit_until > time.time():
-                return LLMResponse(
-                    content="",
-                    model=model,
-                    provider=self.provider,
-                    usage={
-                        "provider": self.provider,
-                        "error_type": "circuit_open",
-                        "error_message": "provider circuit breaker is open",
-                    },
-                )
+                return self._fail("circuit_open", "provider circuit breaker is open")
             request_kwargs = dict(kwargs)
             request_timeout = request_kwargs.pop("timeout", self.timeout)
 
@@ -284,10 +202,10 @@ class LLMClient:
                 request_kwargs.pop("response_format", None)
             request_kwargs = {key: value for key, value in request_kwargs.items() if value is not None}
 
+            # 内层循环只用于 JSON mode 降级后原地重试一次，不消耗 attempt。
             while True:
                 try:
-                    client = self._openai_client_required()
-                    response = await client.chat.completions.create(
+                    response = await self.openai_client.chat.completions.create(
                         model=model,
                         messages=[
                             {"role": "system", "content": system_content},
@@ -298,21 +216,10 @@ class LLMClient:
                     )
 
                     choice = response.choices[0]
-                    message = choice.message
                     finish_reason = getattr(choice, "finish_reason", "") or ""
-                    content = getattr(message, "content", "") or ""
-                    reasoning_content = getattr(message, "reasoning_content", "") or ""
+                    content = getattr(choice.message, "content", "") or ""
                     usage = self._usage_to_dict(getattr(response, "usage", None), finish_reason)
                     usage["provider"] = self.provider
-
-                    result = LLMResponse(
-                        content=content,
-                        reasoning_content=reasoning_content,
-                        finish_reason=finish_reason,
-                        model=getattr(response, "model", "") or model,
-                        provider=self.provider,
-                        usage=usage,
-                    )
 
                     if on_usage:
                         try:
@@ -321,15 +228,14 @@ class LLMClient:
                             logger.warning(f"Usage callback failed: {ex}")
 
                     if finish_reason == "length":
-                        return self._error_response(model, "length", "finish_reason=length")
+                        return self._fail("length", "finish_reason=length")
                     if not content.strip() and attempt < max_retries - 1:
                         self.provider_status.last_error_type = "empty_content"
                         self.provider_status.last_error_message = "empty content from provider"
                         self.provider_status.last_error_time = time.time()
                         await asyncio.sleep(0.2)
                         break
-
-                    return result
+                    return content
 
                 except (APIConnectionError, APITimeoutError, httpx.ConnectError, httpx.ReadTimeout) as e:
                     logger.warning(f"[LLM] 网络请求失败 (尝试 {attempt + 1}/{max_retries}): {type(e).__name__} - {e}")
@@ -337,7 +243,7 @@ class LLMClient:
                         await asyncio.sleep(base_delay * (attempt + 1))
                         break
                     logger.error(f"[LLM] 最终请求失败: {e}")
-                    return self._error_response(model, "network_error", str(e))
+                    return self._fail("network_error", str(e))
 
                 except Exception as e:
                     if (
@@ -354,19 +260,13 @@ class LLMClient:
                     logger.error(f"[LLM] API 调用失败 [{error_type}]: {e}")
                     if error_type == "rate_limit":
                         self.provider_status.circuit_until = time.time() + 30
-                        return self._error_response(model, error_type, str(e))
+                        return self._fail(error_type, str(e))
                     if error_type in {"insufficient_system_resource", "server_error"} and attempt < max_retries - 1:
                         await asyncio.sleep(base_delay * (attempt + 1))
                         break
-                    return self._error_response(model, error_type, str(e))
+                    return self._fail(error_type, str(e))
 
-        return self._error_response(model, "retry_exhausted", "max retries exhausted")
-
-# ======== from core/turn_call_factory.py ========
-@dataclass(frozen=True)
-class TurnCalls:
-    chat: Callable
-    feedback: Callable
+        return self._fail("retry_exhausted", "max retries exhausted")
 
 
 CHAT_SYSTEM_PROMPT = (
@@ -388,69 +288,45 @@ FEEDBACK_SYSTEM_PROMPT = (
 )
 
 
-class TurnCallFactory:
-    def __init__(self, llm_response: Callable):
-        self._llm_response = llm_response
+def build_turn_calls(
+    llm_response: Callable,
+    *,
+    state,
+    session_id: str,
+    chat_images: list,
+    feedback_images: list,
+) -> tuple[Callable, Callable]:
+    """构造本轮对话的 chat / feedback 两个调用闭包。"""
 
-    def build(
-        self,
-        *,
-        state,
-        session_id: str,
-        chat_images: list,
-        feedback_images: list,
-    ) -> TurnCalls:
-        def usage_recorder(model_name: str):
-            def log_usage(usage: dict):
-                log_event(
-                    "token_usage",
-                    session_id=session_id,
-                    provider=usage.get("provider", ""),
-                    model=model_name,
-                    tokens=usage.get("total_tokens", 0),
-                    decision=usage.get("finish_reason", ""),
-                )
-
-            return make_usage_recorder(
-                session_id,
-                model_name,
-                event_logger=log_usage,
-            )
-
-        chat_model = get_app_settings().chat.model
-        feedback_model = get_app_settings().feedback.model
-
-        async def chat(message: str, json_mode: bool = False):
-            return await self._llm_response(
-                state.client,
+    def make_call(client, settings, temperature, system_prompt, images) -> Callable:
+        async def call(message: str, json_mode: bool = False):
+            return await llm_response(
+                client,
                 message,
-                model=chat_model,
-                temperature=0.7,
-                reasoning_effort=get_reasoning_effort("chat"),
+                model=settings.model,
+                temperature=temperature,
+                reasoning_effort=settings.reasoning_effort or None,
                 json_mode=bool(json_mode),
-                max_tokens=get_app_settings().chat.max_tokens,
-                timeout=get_app_settings().chat.timeout,
-                system_prompt=CHAT_SYSTEM_PROMPT,
-                on_usage=usage_recorder(chat_model),
-                images=chat_images,
+                max_tokens=settings.max_tokens,
+                timeout=settings.timeout,
+                system_prompt=system_prompt,
+                on_usage=partial(record_token_usage, session_id, settings.model),
+                images=images,
             )
 
-        async def feedback(message: str, json_mode: bool = False):
-            return await self._llm_response(
-                state.feedback_client,
-                message,
-                model=feedback_model,
-                temperature=0.1,
-                json_mode=bool(json_mode),
-                reasoning_effort=get_reasoning_effort("feedback"),
-                max_tokens=get_app_settings().feedback.max_tokens,
-                timeout=get_app_settings().feedback.timeout,
-                on_usage=usage_recorder(feedback_model),
-                system_prompt=FEEDBACK_SYSTEM_PROMPT,
-                images=feedback_images,
-            )
+        return call
 
-        return TurnCalls(chat=chat, feedback=feedback)
+    app_settings = get_app_settings()
+    return (
+        make_call(state.client, app_settings.chat, 0.7, CHAT_SYSTEM_PROMPT, chat_images),
+        make_call(
+            state.feedback_client,
+            app_settings.feedback,
+            0.1,
+            FEEDBACK_SYSTEM_PROMPT,
+            feedback_images,
+        ),
+    )
 
 
 def extract_and_parse_json(text: str) -> dict | list | None:

@@ -1,12 +1,6 @@
-# 由多个模块合并而来：models/database.py
-
 from tortoise import fields
 from tortoise.indexes import Index
 from tortoise.models import Model
-
-
-# ======== from models/database.py ========
-# nyaturingtest/models.py
 
 
 class SessionModel(Model):

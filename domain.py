@@ -1,13 +1,9 @@
-# 由多个模块合并而来：models/emotion.py, models/impression.py, models/profile.py
-
-from dataclasses import dataclass
-from datetime import datetime
+import math
 from collections import deque
 from dataclasses import dataclass, field
-import math
+from datetime import datetime
 
 
-# ======== from models/emotion.py ========
 def clamp_vad_value(value, lower: float, upper: float, default: float = 0.0) -> float:
     try:
         number = float(value)
@@ -20,82 +16,33 @@ def clamp_vad_value(value, lower: float, upper: float, default: float = 0.0) -> 
 
 @dataclass
 class EmotionState:
-    """
-    情感状态:
-    情感状态使用VAD模型表示, 包含三个维度: 愉悦度(valence)、唤醒度(arousal)和支配度(dominance)。
-    - 愉悦度(valence): 表示情感的正负向程度，范围为[-1.0, 1.0]。
-    - 唤醒度(arousal): 表示情感的激活程度，范围为[0.0, 1.0]。
-    - 支配度(dominance): 表示情感的控制程度，范围为[-1.0, 1.0]。
-    """
+    """情感状态（VAD）：valence [-1,1]、arousal [0,1]、dominance [-1,1]。"""
 
     valence: float = 0.0
-    """
-    愉悦度(valence): 表示情感的正负向程度，范围为[-1.0, 1.0]。
-    """
-
     arousal: float = 0.0
-    """
-    唤醒度(arousal): 表示情感的激活程度，范围为[0.0, 1.0]。
-    """
-
     dominance: float = 0.0
-    """
-    支配度(dominance): 表示情感的控制程度，范围为[-1.0, 1.0]。
-    """
 
-    def clamp(self) -> "EmotionState":
-        self.valence = clamp_vad_value(self.valence, -1.0, 1.0)
-        self.arousal = clamp_vad_value(self.arousal, 0.0, 1.0)
-        self.dominance = clamp_vad_value(self.dominance, -1.0, 1.0)
-        return self
 
-# ======== from models/impression.py ========
 @dataclass
 class Impression:
-    """
-    记录某次互动带来的印象
-    """
+    """记录某次互动带来的印象"""
 
     timestamp: datetime
     delta: dict
 
-# ======== from models/profile.py ========
+
 @dataclass
 class PersonProfile:
-    """
-    对人物的记忆与情感
-    """
+    """对人物的记忆与情感"""
 
     user_id: str
-    """
-    "你叫什么名字？"
-    """
     emotion: EmotionState = field(default_factory=EmotionState)
-    """
-    对你的情感倾向
-    """
     interactions: deque[Impression] = field(default_factory=deque)
-    """
-    交互的记录
-    """
     last_update_time: datetime = field(default_factory=lambda: datetime.now().astimezone())
-    """
-    上次更新情感的时间
-    """
     interaction_count: int = 0
     first_interaction_at: datetime | None = None
     last_interaction_at: datetime | None = None
-    _dirty: bool = field(default=True, init=False, repr=False, compare=False)
-
-    @property
-    def is_dirty(self) -> bool:
-        return self._dirty
-
-    def mark_dirty(self):
-        self._dirty = True
-
-    def mark_clean(self):
-        self._dirty = False
+    dirty: bool = field(default=True, repr=False, compare=False)
 
     def push_interaction(self, impression: Impression):
         """
@@ -137,7 +84,7 @@ class PersonProfile:
         if self.first_interaction_at is None:
             self.first_interaction_at = impression.timestamp
         self.last_interaction_at = impression.timestamp
-        self.mark_dirty()
+        self.dirty = True
 
     def merge_old_interactions(self):
         """
@@ -183,33 +130,19 @@ class PersonProfile:
         if elapsed_hours < 0.001:
             return
 
-        # 对当前情感状态应用时间衰减
+        # 对当前情感状态应用时间衰减：valence 正向慢、负向快；arousal 回到 0.3；dominance 回到 0
         old_state = (self.emotion.valence, self.emotion.arousal, self.emotion.dominance)
-        self.emotion.valence = decay_valence(elapsed_hours, self.emotion.valence)
-        self.emotion.arousal = decay_arousal(elapsed_hours, self.emotion.arousal)
-        self.emotion.dominance = decay_dominance(elapsed_hours, self.emotion.dominance)
+        valence, arousal, dominance = old_state
+        if valence > 0:
+            self.emotion.valence = valence * math.exp(-0.05 * elapsed_hours)
+        elif valence < 0:
+            self.emotion.valence = valence * math.exp(-0.15 * elapsed_hours)
+        else:
+            self.emotion.valence = 0.0
+        arousal_decay = math.exp(-0.2 * elapsed_hours)
+        self.emotion.arousal = arousal * arousal_decay + 0.3 * (1 - arousal_decay)
+        self.emotion.dominance = dominance * math.exp(-0.03 * elapsed_hours)
+
         new_state = (self.emotion.valence, self.emotion.arousal, self.emotion.dominance)
         if new_state != old_state:
-            self.mark_dirty()
-
-
-def decay_valence(
-        elapsed_hours: float, valence: float, decay_rate_positive: float = 0.05, decay_rate_negative: float = 0.15
-) -> float:
-    if valence > 0:
-        rate = decay_rate_positive
-    elif valence < 0:
-        rate = decay_rate_negative
-    else:
-        return 0.0
-    return valence * math.exp(-rate * elapsed_hours)
-
-
-def decay_arousal(elapsed_hours: float, arousal: float, target: float = 0.3, decay_rate: float = 0.2) -> float:
-    decay = math.exp(-decay_rate * elapsed_hours)
-    return arousal * decay + target * (1 - decay)
-
-
-def decay_dominance(elapsed_hours: float, dominance: float, target: float = 0.0, decay_rate: float = 0.03) -> float:
-    decay = math.exp(-decay_rate * elapsed_hours)
-    return dominance * decay + target * (1 - decay)
+            self.dirty = True

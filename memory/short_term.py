@@ -39,14 +39,10 @@ class Memory:
             self,
             compressed_message: str | None = None,
             messages: list[Message] | None = None,
-            context_limit: int = SHORT_CONTEXT_LIMIT,
-            buffer_size: int | None = SHORT_TERM_BUFFER_SIZE,
     ):
-        self.__context_limit = max(1, int(context_limit))
         self.__compressed_message = compressed_message or ""
-        maxlen = max(self.__context_limit, int(buffer_size or self.__context_limit * 10))
-        # 上下文窗口：保留缓冲区，access 只返回最近 context_limit 条
-        self.__messages = deque(messages, maxlen=maxlen) if messages else deque(maxlen=maxlen)
+        # 上下文窗口：保留缓冲区，access 只返回最近 SHORT_CONTEXT_LIMIT 条
+        self.__messages = deque(messages, maxlen=SHORT_TERM_BUFFER_SIZE) if messages else deque(maxlen=SHORT_TERM_BUFFER_SIZE)
         self.__dirty_messages: dict[int, Message] = {}
 
     async def clear(self) -> None:
@@ -65,21 +61,14 @@ class Memory:
         if new_summary is not None:
             self.__compressed_message = str(new_summary)
 
-    def access(self) -> MemoryRecord:
+    def access(self, limit: int | None = None) -> MemoryRecord:
+        """返回最近若干条消息与当前摘要；limit 省略时用 SHORT_CONTEXT_LIMIT。"""
+
+        size = SHORT_CONTEXT_LIMIT if limit is None else max(1, min(int(limit), SHORT_CONTEXT_LIMIT))
         return MemoryRecord(
-            messages=list(self.__messages)[-self.__context_limit:],
+            messages=list(self.__messages)[-size:],
             compressed_history=self.__compressed_message,
         )
-
-    def access_context(self, limit: int = 20) -> MemoryRecord:
-        safe_limit = max(1, min(int(limit or self.__context_limit), self.__messages.maxlen or self.__context_limit))
-        return MemoryRecord(
-            messages=list(self.__messages)[-safe_limit:],
-            compressed_history=self.__compressed_message,
-        )
-
-    def snapshot(self) -> list[Message]:
-        return list(self.__messages)
 
     def pending_messages(self) -> list[tuple[Message, int]]:
         return [

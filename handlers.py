@@ -1,56 +1,55 @@
-# 由多个模块合并而来：handlers/command_meta.py, handlers/commands.py, handlers/memory.py
-
+import json
 from dataclasses import dataclass
 from datetime import datetime
-from nonebot import on_command, on_message, logger
+
+from nonebot import logger, on_command, on_message
 from nonebot.adapters.onebot.v11 import (
     Bot,
-    GroupMessageEvent,
-    PrivateMessageEvent,
-    Message,
     Event,
-    MessageSegment
+    GroupMessageEvent,
+    Message,
+    MessageSegment,
+    PrivateMessageEvent,
 )
+from nonebot.exception import FinishedException
+from nonebot.matcher import Matcher
 from nonebot.params import CommandArg
 from nonebot.permission import SUPERUSER
-from nonebot.matcher import Matcher
+
+from .backup import backup_task
 from .config import (
     get_config_load_status,
     get_reasoning_effort,
     get_token_stats_model_names,
 )
-from .core.state_manager import (
-    ensure_group_state,
-    remove_group_state,
-    SELF_SENT_MSG_IDS,
-    runtime_enabled_groups,
-    group_states,
-    is_shutting_down
-)
-from .core.logic import QUEUE_MAX_SIZE, message2BotMessage
-from .core.metrics import log_event, metrics
-from .memory.short_term import Message as MMessage
-from .db import EnabledGroupRepository
-from .db import TokenUsageRepository
-from .backup import backup_task
-import json
-import time
-from nonebot import logger, on_command
-from nonebot.adapters.onebot.v11 import Bot, Event, GroupMessageEvent, Message
-from .core.logic import llm_response
+from .core.logic import QUEUE_MAX_SIZE, llm_response, message2BotMessage
 from .core.memory_query import (
     MemoryProfileQuery,
     MemoryProfileQueryService,
     MemoryQueryCooldownError,
     MemoryQueryCoordinator,
 )
-from .core.metrics import metrics
-from .memory.vector import RAG_FINAL_K, RAG_MERGED_CANDIDATE_CAP, RAG_PER_QUERY_RECALL_K
-from .core.state_manager import ensure_group_state
-from .memory.vector import search_memories, where_any
+from .core.metrics import log_event, metrics
+from .core.state_manager import (
+    SELF_SENT_MSG_IDS,
+    ensure_group_state,
+    group_states,
+    is_shutting_down,
+    remove_group_state,
+    runtime_enabled_groups,
+)
+from .db import disable_group, enable_group, get_token_stats
+from .memory.short_term import Message as MMessage
+from .memory.vector import (
+    RAG_FINAL_K,
+    RAG_MERGED_CANDIDATE_CAP,
+    RAG_PER_QUERY_RECALL_K,
+    search_memories,
+    where_any,
+)
+from .token_stats import render_token_stats_card
 
 
-# ======== from handlers/command_meta.py ========
 @dataclass(frozen=True)
 class CommandMeta:
     command: str
@@ -91,10 +90,6 @@ def render_private_help() -> str:
         lines.append(f"- {usage} - {item.description}")
     return "\n".join(lines)
 
-# ======== from handlers/commands.py ========
-# nyaturingtest/matchers.py
-
-
 
 # ==================== 辅助规则 ====================
 
@@ -123,12 +118,6 @@ async def _parse_group_id_or_finish(matcher: type[Matcher], raw: str) -> int:
     except ValueError:
         await matcher.finish("群号必须是数字")
         raise
-
-
-def sender_display_name(event, user_id: str) -> str:
-    card = str(event.sender.card or "").strip()
-    nickname = str(event.sender.nickname or "").strip()
-    return card or nickname or str(user_id)
 
 
 async def reset_session_with_backup(state, backup) -> bool:
@@ -277,7 +266,8 @@ async def _do_get_role(matcher: type[Matcher], group_id: int, _args: str):
     state = await _group_state_or_finish(matcher, group_id)
     async with state.session_lock:
         await state.session.load_session()
-        role = state.session.role()
+        session_state = state.session.state
+        role = f"{session_state.name}（{session_state.role}）"
     await matcher.finish(f"当前角色: {role}")
 
 
@@ -352,29 +342,10 @@ async def handle_manual_backup_pm():
 
 @list_groups_pm.handle()
 async def handle_list_groups_pm():
-    allowed_groups = runtime_enabled_groups
-    if not allowed_groups:
+    if not runtime_enabled_groups:
         await list_groups_pm.finish("没有启用的群组")
-    msg = "启用的群组:\n"
-    for group_id in allowed_groups:
-        msg += f"- {group_id}\n"
+    msg = "启用的群组:\n" + "".join(f"- {group_id}\n" for group_id in runtime_enabled_groups)
     await list_groups_pm.finish(msg)
-
-
-@manual_backup_cmd.handle()
-async def handle_manual_backup():
-    await manual_backup_cmd.send("开始手动备份 NyaTuringTest 数据，请稍候...")
-    if await backup_task():
-        await manual_backup_cmd.finish("备份完成！")
-    await manual_backup_cmd.finish("备份失败，请检查日志和数据目录。")
-
-
-@manual_backup_pm.handle()
-async def handle_manual_backup_pm():
-    await manual_backup_pm.send("开始手动备份 NyaTuringTest 数据，请稍候...")
-    if await backup_task():
-        await manual_backup_pm.finish("备份完成！")
-    await manual_backup_pm.finish("备份失败，请检查日志和数据目录。")
 
 
 @auto_chat.handle()
@@ -386,14 +357,9 @@ async def handle_auto_chat(bot: Bot, event: GroupMessageEvent):
 
     async with state.session_lock:
         await state.session.load_session()
-        bot_name = state.session.name()
-        recent_context_messages = state.session.runtime.short_term_memory.access_context(limit=4).messages
-        conversation_context = "\n".join(
-            f"{msg.user_name}: {msg.content}"
-            for msg in recent_context_messages
-        )[-600:]
+        bot_name = state.session.state.name
 
-    # Shutdown 检查：避免在关机时进入耗时的 VLM 处理
+    # Shutdown 检查：避免在关机时进入耗时的消息处理
     if is_shutting_down():
         return
 
@@ -405,8 +371,8 @@ async def handle_auto_chat(bot: Bot, event: GroupMessageEvent):
         raw_message_text,
     )
     async with state.data_lock:
-        max_size = QUEUE_MAX_SIZE
-        if len(state.messages_chunk) >= max_size and not pre_queue_priority:
+        # 转换前先挡一次：队列已满且非优先消息时，没必要再下载图片
+        if len(state.messages_chunk) >= QUEUE_MAX_SIZE and not pre_queue_priority:
             logger.warning(f"群 {group_id} 消息队列已满，转换前丢弃低优先级消息")
             log_event(
                 "queue_drop",
@@ -440,11 +406,14 @@ async def handle_auto_chat(bot: Bot, event: GroupMessageEvent):
         nickname = bot_name
 
     if not nickname:
-        nickname = sender_display_name(event, user_id)
+        nickname = (
+            str(event.sender.card or "").strip()
+            or str(event.sender.nickname or "").strip()
+            or user_id
+        )
 
     async with state.data_lock:
-        max_size = QUEUE_MAX_SIZE
-        if len(state.messages_chunk) >= max_size:
+        if len(state.messages_chunk) >= QUEUE_MAX_SIZE:
             is_priority = pre_queue_priority or _is_priority_message(
                 event.original_message,
                 str(bot.self_id),
@@ -481,7 +450,7 @@ async def handle_manage_autochat(event: GroupMessageEvent, args: Message = Comma
         if group_id in runtime_enabled_groups:
             await manage_cmd.finish("本群 Autochat 已处于启用状态")
 
-        await EnabledGroupRepository.enable_group(group_id)
+        await enable_group(group_id)
         # 更新内存
         runtime_enabled_groups.add(group_id)
         # 立即初始化状态
@@ -493,7 +462,7 @@ async def handle_manage_autochat(event: GroupMessageEvent, args: Message = Comma
         if group_id not in runtime_enabled_groups:
             await manage_cmd.finish("本群 Autochat 未启用")
 
-        await EnabledGroupRepository.disable_group(group_id)
+        await disable_group(group_id)
         # 更新内存
         runtime_enabled_groups.discard(group_id)
 
@@ -508,17 +477,13 @@ async def handle_manage_autochat(event: GroupMessageEvent, args: Message = Comma
 
 @token_stats.handle()
 async def handle_token_stats(bot: Bot, event: GroupMessageEvent, args: Message = CommandArg()):
-    from .token_stats import render_token_stats_card
-    from nonebot.adapters.onebot.v11 import MessageSegment
-    from nonebot.exception import FinishedException
-    
     group_id = event.group_id
     arg = args.extract_plain_text().strip().lower()
     token_stats_scope_all = arg in {"all", "全部", "历史", "history", "historical"}
     stats_model_names = get_token_stats_model_names()
     if token_stats_scope_all:
         stats_model_names = None
-    stats = await TokenUsageRepository.get_token_stats(
+    stats = await get_token_stats(
         group_id,
         model_names=stats_model_names,
     )
@@ -543,8 +508,6 @@ async def handle_token_stats(bot: Bot, event: GroupMessageEvent, args: Message =
         text_msg += f"24h全局: {stats.get('1d_global', [])}\n"
         await token_stats.finish(text_msg)
 
-# ======== from handlers/memory.py ========
-
 query_memory = on_command(
     "查询记忆",
     aliases={"memory"},
@@ -564,7 +527,7 @@ rag_debug = on_command(
 MEMORY_QUERY_USER_COOLDOWN_SECONDS = 30.0
 MEMORY_QUERY_GROUP_COOLDOWN_SECONDS = 3.0
 
-_MEMORY_QUERY_COORDINATOR = MemoryQueryCoordinator[str](
+_MEMORY_QUERY_COORDINATOR = MemoryQueryCoordinator(
     user_cooldown_seconds=MEMORY_QUERY_USER_COOLDOWN_SECONDS,
     group_cooldown_seconds=MEMORY_QUERY_GROUP_COOLDOWN_SECONDS,
 )
@@ -648,15 +611,6 @@ async def handle_rag_debug(
     await rag_debug.finish("\n".join(lines))
 
 
-def _query_target_id(event: GroupMessageEvent, args: Message) -> str:
-    for segment in args:
-        if segment.type == "at":
-            target_id = str(segment.data.get("qq", ""))
-            if target_id:
-                return target_id
-    return str(event.user_id)
-
-
 async def _target_display_name(
     bot: Bot,
     event: GroupMessageEvent,
@@ -681,7 +635,11 @@ async def handle_query_memory(
     event: GroupMessageEvent,
     args: Message = CommandArg(),
 ):
-    target_id = _query_target_id(event, args)
+    target_id = str(event.user_id)
+    for segment in args:
+        if segment.type == "at" and str(segment.data.get("qq", "")):
+            target_id = str(segment.data["qq"])
+            break
     target_name = await _target_display_name(bot, event, target_id)
     state = ensure_group_state(event.group_id)
     if not state:
@@ -692,8 +650,6 @@ async def handle_query_memory(
     vector_version = int(memory.version or 0)
     generation = int(state.session.state.generation or 0)
     key = (str(event.group_id), target_id, vector_version, generation)
-    started_at = time.perf_counter()
-    metrics.memory_query_count += 1
     await query_memory.send("正在回溯记忆深处...")
 
     service = MemoryProfileQueryService(
@@ -713,11 +669,7 @@ async def handle_query_memory(
                 )
             ),
         )
-        metrics.memory_query_singleflight_reused = (
-            _MEMORY_QUERY_COORDINATOR.stats.singleflight_reused
-        )
     except MemoryQueryCooldownError as e:
-        metrics.memory_query_cooldown_rejected += 1
         await query_memory.finish(
             f"记忆回溯正在冷却，请约 {max(1, int(e.retry_after + 0.5))} 秒后再试。"
         )
@@ -726,7 +678,3 @@ async def handle_query_memory(
         await query_memory.finish("大脑处理过载，记忆读取失败，请稍后再试。")
     else:
         await query_memory.finish(message)
-    finally:
-        metrics.memory_query_total_ms += (
-            time.perf_counter() - started_at
-        ) * 1000

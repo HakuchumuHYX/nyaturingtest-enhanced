@@ -10,15 +10,11 @@ from nonebot import logger, require
 from nonebot.utils import run_sync
 from PIL import Image
 
-try:
-    require("nonebot_plugin_apscheduler")
-    from nonebot_plugin_apscheduler import scheduler
-except Exception:
-    scheduler = None
+require("nonebot_plugin_apscheduler")
+from nonebot_plugin_apscheduler import scheduler  # noqa: E402  必须在 require 之后导入
 
-from ..config import get_image_cache_dir
-from ..core.llm import get_http_client
-from ..core.llm import VisionInput
+from ..config import IMAGE_CACHE_DIR
+from ..core.llm import VisionInput, get_http_client
 
 
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
@@ -28,7 +24,6 @@ MAX_CACHE_KEY_LEN = 128
 SAFE_IMAGE_CONTENT_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
 _CACHE_KEY_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 
-IMAGE_CACHE_DIR = get_image_cache_dir()
 _IMG_SEMAPHORE = asyncio.Semaphore(3)
 
 
@@ -209,12 +204,11 @@ async def cleanup_image_cache_task():
     await _clean_old_image_caches_sync()
 
 
-if scheduler:
-    scheduler.add_job(
-        cleanup_image_cache_task,
-        "cron",
-        hour=3,
-        minute=0,
-        id="nyabot_image_cache_cleanup",
-        replace_existing=True,
-    )
+scheduler.add_job(
+    cleanup_image_cache_task,
+    "cron",
+    hour=3,
+    minute=0,
+    id="nyabot_image_cache_cleanup",
+    replace_existing=True,
+)

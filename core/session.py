@@ -21,9 +21,14 @@ from .engagement import (
 from .prompts import PRESETS, reload_presets
 from ..domain import PersonProfile
 from .prompts import truncate_text
-from ..db import MessageRepository
-from ..db import ProfileRepository
-from ..db import SessionStateRepository
+from ..db import (
+    delete_session_data,
+    load_full_session_data,
+    log_interactions,
+    save_session_state,
+    sync_messages,
+    update_user_profiles,
+)
 from ..memory.vector import BACKUP_IO_LOCK
 from .metrics import log_event
 
@@ -74,11 +79,10 @@ class PersistenceCoordinator:
         finally:
             self._task = None
 
-    async def flush(self) -> bool:
+    async def flush(self) -> None:
         task = self._task
         if task is not None and not task.done():
             await asyncio.shield(task)
-        return not self._pending
 
 
 class ChattingState(Enum):
@@ -107,10 +111,8 @@ class SessionState:
     chat_summary: str = ""
     willingness: float = 0.0
     chatting_state: ChattingState = ChattingState.IDLE
-    last_activity_time: datetime = field(default_factory=datetime.now)
     last_decay_time: datetime = field(default_factory=datetime.now)
     last_speak_time: datetime = datetime.min
-    active_count: int = 0
     engaged: bool = False
     last_consolidated_time: datetime | None = None
     messages_since_consolidation: int = 0
@@ -138,7 +140,6 @@ class FeedbackOutcome:
 
     accepted: bool
     recalled_history: list[str] = field(default_factory=list)
-    state_changed: bool = False
     failure_reason: str = ""
 
     @classmethod
@@ -237,15 +238,6 @@ class Session:
         self.state.examples = ""
         await self.save_session()
 
-    def role(self) -> str:
-        return f"{self.state.name}（{self.state.role}）"
-
-    def name(self) -> str:
-        return self.state.name
-
-    def aliases(self) -> list[str]:
-        return list(self.state.aliases)
-
     async def reset(self):
         self.bump_generation("reset")
         self.state.name = "terminus"
@@ -259,8 +251,6 @@ class Session:
         self.state.chat_summary = ""
         self.state.chatting_state = ChattingState.IDLE
         self.state.willingness = 0.0
-        self.state.active_count = 0
-        self.state.last_activity_time = datetime.now()
         self.state.last_decay_time = datetime.now()
         self.state.last_speak_time = datetime.min
         self.state.engaged = False
@@ -270,7 +260,7 @@ class Session:
         # 清理数据库中的所有关联数据，并与后台持久化共用同一把锁：
         # 旧 generation 的后台写入要么已在删除前完成，要么拿锁后被跳过。
         async with self.runtime.save_lock:
-            await SessionStateRepository.delete_session_data(self.id)
+            await delete_session_data(self.id)
             await self._save_session_locked()
         logger.info(f"[Session {self.id}] 已完全重置（含数据库清理）")
 
@@ -280,8 +270,6 @@ class Session:
         self.state.profiles = {}
         self.state.chatting_state = ChattingState.IDLE
         self.state.willingness = 0.0
-        self.state.active_count = 0
-        self.state.last_activity_time = datetime.now()
         self.state.engaged = False
         await self.save_session()
 
@@ -292,7 +280,7 @@ class Session:
         # 同时重置所有用户画像的情绪
         for profile in self.state.profiles.values():
             profile.emotion = EmotionState()
-            profile.mark_dirty()
+            profile.dirty = True
         logger.info(f"[Session {self.id}] 情绪已初始化 (VAD -> 0, 0, 0)")
         await self.save_session()
 
@@ -307,8 +295,8 @@ class Session:
     def _schedule_save_session(self, force_index: bool = False):
         self.runtime.persistence.request(force_index=force_index)
 
-    async def flush_persistence(self) -> bool:
-        return await self.runtime.persistence.flush()
+    async def flush_persistence(self) -> None:
+        await self.runtime.persistence.flush()
 
     async def _save_coordinated(self, force_index: bool = False) -> bool:
         async with self.runtime.save_lock:
@@ -339,7 +327,7 @@ class Session:
     async def _save_session_locked(self, force_index: bool = False) -> bool:
         try:
             # 1. 保存基础状态
-            await SessionStateRepository.save_session_state(
+            await save_session_state(
                 self.id,
                 {
                     "name": self.state.name,
@@ -359,17 +347,17 @@ class Session:
             dirty_profiles = {
                 user_id: profile
                 for user_id, profile in self.state.profiles.items()
-                if profile.is_dirty
+                if profile.dirty
             }
             if dirty_profiles:
-                await ProfileRepository.update_user_profiles(self.id, dirty_profiles)
+                await update_user_profiles(self.id, dirty_profiles)
                 for profile in dirty_profiles.values():
-                    profile.mark_clean()
+                    profile.dirty = False
 
             # 3. 只同步新增或内容被图片观察丰富过的消息。
             pending_messages = self.runtime.short_term_memory.pending_messages()
             if pending_messages:
-                await MessageRepository.sync_messages(
+                await sync_messages(
                     self.id,
                     [message for message, _ in pending_messages],
                 )
@@ -385,7 +373,7 @@ class Session:
         if self.state.loaded: return
 
         # 使用 Repository 加载完整数据
-        data = await SessionStateRepository.load_full_session_data(self.id)
+        data = await load_full_session_data(self.id)
         
         if not data:
             logger.info(f"[Session {self.id}] 初始化新会话")
@@ -434,7 +422,7 @@ class Session:
             profile.first_interaction_at = user_data.get("first_interaction_at")
             profile.last_interaction_at = user_data.get("last_interaction_at")
 
-            profile.mark_clean()
+            profile.dirty = False
             self.state.profiles[user_id] = profile
 
         # 恢复短时记忆
@@ -568,17 +556,6 @@ class Session:
             except Exception as e:
                 logger.warning(f"[Session {self.id}] 关闭 HTTP 客户端失败: {e}")
 
-    async def _save_interaction_log(
-        self,
-        user_id: str,
-        delta: dict,
-        expected_generation: int | None = None,
-    ):
-        await self._save_interaction_logs(
-            [(user_id, delta)],
-            expected_generation=expected_generation,
-        )
-
     async def _save_interaction_logs(
         self,
         interactions: list[tuple[str, dict]],
@@ -591,4 +568,4 @@ class Session:
             if self.is_generation_stale(expected_generation):
                 self._log_stale_generation("interaction_log_locked", expected_generation)
                 return
-            await ProfileRepository.log_interactions(self.id, interactions)
+            await log_interactions(self.id, interactions)

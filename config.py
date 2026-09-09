@@ -19,7 +19,9 @@ CONFIG_FILE = Path(
 ).expanduser()
 
 WORKSPACE_ROOT = PLUGIN_DIR.resolve().parents[1]
-DEFAULT_PRESET_DIR = WORKSPACE_ROOT / "config" / "nyaturingtest" / "nya_presets"
+PRESET_DIR = WORKSPACE_ROOT / "config" / "nyaturingtest" / "nya_presets"
+BACKUP_DIR = WORKSPACE_ROOT / "data" / "nyaturingtest_backups"
+IMAGE_CACHE_DIR = WORKSPACE_ROOT / "cache" / "nyaturingtest" / "image_cache"
 
 
 def get_data_dir() -> Path:
@@ -32,24 +34,8 @@ def get_data_dir() -> Path:
     return path if path.is_absolute() else WORKSPACE_ROOT / path
 
 
-def get_cache_dir() -> Path:
-    return WORKSPACE_ROOT / "cache" / "nyaturingtest"
-
-
-def get_backup_dir() -> Path:
-    return WORKSPACE_ROOT / "data" / "nyaturingtest_backups"
-
-
-def get_preset_dir() -> Path:
-    return DEFAULT_PRESET_DIR
-
-
 def get_vector_dir(session_id: str) -> Path:
     return get_data_dir() / f"vector_index_{session_id}"
-
-
-def get_image_cache_dir() -> Path:
-    return get_cache_dir() / "image_cache"
 
 
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
@@ -169,8 +155,6 @@ def _deep_merge(default: dict[str, Any], loaded: dict[str, Any]) -> dict[str, An
 
 def _normalize_endpoint(section_name: str, section: dict[str, Any]) -> None:
     provider = str(section.get("provider") or "").strip().lower()
-    base_url = str(section.get("base_url") or "").strip().rstrip("/")
-
     if provider not in {DEEPSEEK_OFFICIAL, OPENAI_COMPATIBLE}:
         raise RuntimeError(f"Unsupported {section_name}.provider: {provider}")
 
@@ -191,29 +175,24 @@ def _require(value: str, field_name: str) -> str:
     return value
 
 
-def build_settings(config: dict[str, Any], *, require_api_keys: bool = False) -> AppSettings:
+def build_settings(config: dict[str, Any]) -> AppSettings:
     cfg = normalize_config(config)
 
-    def endpoint(name: str, *, require_key: bool, max_tokens_default: int = 0) -> EndpointSettings:
+    def endpoint(name: str, *, max_tokens_default: int = 0) -> EndpointSettings:
         section = cfg[name]
-        api_key = section.get("api_key", "")
-        if require_key:
-            api_key = _require(api_key, f"{name}.api_key")
-        base_url = _require(section.get("base_url", ""), f"{name}.base_url")
-        model = _require(section.get("model", ""), f"{name}.model")
         return EndpointSettings(
             provider=section.get("provider", ""),
-            api_key=api_key,
-            base_url=base_url,
-            model=model,
+            api_key=section.get("api_key", ""),
+            base_url=_require(section.get("base_url", ""), f"{name}.base_url"),
+            model=_require(section.get("model", ""), f"{name}.model"),
             timeout=float(section.get("timeout") or 60),
             max_tokens=int(section.get("max_tokens") or max_tokens_default),
             reasoning_effort=str(section.get("reasoning_effort") or ""),
         )
 
     return AppSettings(
-        chat=endpoint("chat", require_key=require_api_keys, max_tokens_default=4096),
-        feedback=endpoint("feedback", require_key=require_api_keys, max_tokens_default=2048),
+        chat=endpoint("chat", max_tokens_default=4096),
+        feedback=endpoint("feedback", max_tokens_default=2048),
         rerank_model=str(cfg.get("rerank", {}).get("model") or ""),
         rerank_threshold=float(cfg.get("rerank", {}).get("threshold") or 0.0),
         memory=_build_memory_endpoint_settings(cfg),
@@ -247,7 +226,7 @@ def load_plugin_config() -> dict:
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
             loaded = json.load(f)
         _plugin_config = normalize_config(loaded)
-        settings = build_settings(_plugin_config, require_api_keys=False)
+        settings = build_settings(_plugin_config)
         _set_config_load_status(ok=True, source="file")
         logger.info(f"已加载插件配置: {CONFIG_FILE}")
         logger.info(f"插件配置摘要: {describe_settings(settings)}")
@@ -264,36 +243,10 @@ def get_app_settings() -> AppSettings:
     return _app_settings
 
 
-
-
-
-
-
-
-
-
 def get_reasoning_effort(endpoint_name: str) -> str | None:
     if endpoint_name not in {"chat", "feedback"}:
         raise ValueError(f"Unsupported reasoning endpoint: {endpoint_name}")
     return getattr(get_app_settings(), endpoint_name).reasoning_effort or None
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 def get_token_stats_model_names() -> list[str]:
@@ -324,16 +277,5 @@ def _build_memory_endpoint_settings(
     )
 
 
-def get_memory_endpoint_settings() -> dict[str, str | float]:
-    value = get_app_settings().memory
-    return {
-        "model": value.model,
-        "base_url": value.base_url,
-        "timeout": value.timeout,
-        "rerank_base_url": value.rerank_base_url,
-        "rerank_timeout": value.rerank_timeout,
-    }
-
-
 plugin_config = load_plugin_config()
-_app_settings = build_settings(plugin_config, require_api_keys=False)
+_app_settings = build_settings(plugin_config)

@@ -1,7 +1,7 @@
 from dataclasses import dataclass
-from ..memory.short_term import Message
 from datetime import datetime
 
+from ..memory.short_term import Message
 
 
 # 意愿与参与策略参数
@@ -30,73 +30,57 @@ class EngagementDecision:
     engaged: bool
     cooldown_remaining: float
 
-    @property
-    def may_reply(self) -> bool:
-        return self.engaged and (self.relevant or self.cooldown_remaining <= 0)
 
-
-class EngagementPolicy:
+def evaluate_engagement(
+    *,
+    state,
+    messages: list[Message],
+    now: datetime,
+) -> EngagementDecision:
     """意愿值衰减/增长、参与态滞回与发言冷却。"""
 
-    def evaluate(
-        self,
-        *,
-        state,
-        messages: list,
-        now: datetime,
-    ) -> EngagementDecision:
-        last_decay = state.last_decay_time or now
-        elapsed_minutes = max(0.0, (now - last_decay).total_seconds()) / 60.0
-        last_speak = self._naive_local(state.last_speak_time)
-        idle = (now - last_speak).total_seconds() >= WILLINGNESS_IDLE_AFTER_SECONDS
-        decay_rate = WILLINGNESS_DECAY_RATE_IDLE if idle else WILLINGNESS_DECAY_RATE_ACTIVE
-        state.willingness = max(0.0, state.willingness - elapsed_minutes * decay_rate)
-        state.last_decay_time = now
-        state.last_activity_time = now
+    last_decay = state.last_decay_time or now
+    elapsed_minutes = max(0.0, (now - last_decay).total_seconds()) / 60.0
+    last_speak = state.last_speak_time
+    if last_speak.tzinfo is not None:
+        last_speak = last_speak.astimezone(None).replace(tzinfo=None)
+    idle = (now - last_speak).total_seconds() >= WILLINGNESS_IDLE_AFTER_SECONDS
+    decay_rate = WILLINGNESS_DECAY_RATE_IDLE if idle else WILLINGNESS_DECAY_RATE_ACTIVE
+    state.willingness = max(0.0, state.willingness - elapsed_minutes * decay_rate)
+    state.last_decay_time = now
 
-        relevant = check_relevance(state.name, state.aliases, messages)
-        if relevant:
-            state.willingness = max(state.willingness, RELEVANCE_WILLINGNESS_FLOOR)
-        elif state.willingness < PASSIVE_WILLINGNESS_GROWTH_LIMIT:
-            interest = score_message_interest(
-                [message.content for message in messages],
-                bot_name=state.name,
-                aliases=state.aliases,
-                lo=PASSIVE_GROWTH_MIN_FACTOR,
-                hi=PASSIVE_GROWTH_MAX_FACTOR,
-            )
-            growth = PASSIVE_WILLINGNESS_GROWTH_PER_MESSAGE * interest * len(messages)
-            state.willingness = min(1.0, state.willingness + growth)
-            if interest >= 1.6:
-                state.willingness = max(state.willingness, INTEREST_TOPIC_WILLINGNESS_FLOOR)
-
-        if relevant:
-            state.engaged = True
-        elif state.engaged and state.willingness < LOW_WILLINGNESS_SKIP_THRESHOLD:
-            state.engaged = False
-        elif (
-            not state.engaged
-            and state.willingness >= WILLINGNESS_REPLY_THRESHOLD
-        ):
-            state.engaged = True
-
-        since_speak = (now - last_speak).total_seconds()
-        cooldown_remaining = (
-            0.0
-            if since_speak < 0
-            else max(0.0, SPEAK_COOLDOWN_SECONDS - since_speak)
+    relevant = check_relevance(state.name, state.aliases, messages)
+    if relevant:
+        state.willingness = max(state.willingness, RELEVANCE_WILLINGNESS_FLOOR)
+    elif state.willingness < PASSIVE_WILLINGNESS_GROWTH_LIMIT:
+        interest = score_message_interest(
+            [message.content for message in messages],
+            state.name,
+            state.aliases,
+            lo=PASSIVE_GROWTH_MIN_FACTOR,
+            hi=PASSIVE_GROWTH_MAX_FACTOR,
         )
-        return EngagementDecision(
-            relevant=relevant,
-            engaged=state.engaged,
-            cooldown_remaining=cooldown_remaining,
-        )
+        growth = PASSIVE_WILLINGNESS_GROWTH_PER_MESSAGE * interest * len(messages)
+        state.willingness = min(1.0, state.willingness + growth)
+        if interest >= 1.6:
+            state.willingness = max(state.willingness, INTEREST_TOPIC_WILLINGNESS_FLOOR)
 
-    @staticmethod
-    def _naive_local(value: datetime) -> datetime:
-        if value.tzinfo is not None:
-            return value.astimezone(None).replace(tzinfo=None)
-        return value
+    if relevant:
+        state.engaged = True
+    elif state.engaged and state.willingness < LOW_WILLINGNESS_SKIP_THRESHOLD:
+        state.engaged = False
+    elif not state.engaged and state.willingness >= WILLINGNESS_REPLY_THRESHOLD:
+        state.engaged = True
+
+    since_speak = (now - last_speak).total_seconds()
+    cooldown_remaining = (
+        0.0 if since_speak < 0 else max(0.0, SPEAK_COOLDOWN_SECONDS - since_speak)
+    )
+    return EngagementDecision(
+        relevant=relevant,
+        engaged=state.engaged,
+        cooldown_remaining=cooldown_remaining,
+    )
 
 
 def check_relevance(
@@ -116,15 +100,15 @@ def check_relevance(
         for trigger in triggers
     )
 
+
 def score_message_interest(
     contents,
-    bot_name: str = "",
-    aliases=None,
+    bot_name: str,
+    aliases,
     *,
-    lo: float = 0.3,
-    hi: float = 2.0,
+    lo: float,
+    hi: float,
 ) -> float:
-    aliases = aliases or []
     text = " ".join(str(content or "") for content in (contents or []))
     if not text.strip():
         return lo
@@ -134,7 +118,7 @@ def score_message_interest(
     names = [str(bot_name or "").strip()]
     names.extend(
         str(alias).strip()
-        for alias in aliases
+        for alias in (aliases or [])
         if alias and len(str(alias).strip()) >= 2
     )
     if any(name and name in text for name in names):

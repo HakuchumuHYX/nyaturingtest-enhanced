@@ -1,27 +1,27 @@
-# 由多个模块合并而来：core/logic.py, core/debounced_inbox.py, core/reply_dispatcher.py, core/message_sender.py
-
 import asyncio
 import hashlib
+import random
+import re
 import time
 import traceback
-from collections.abc import Collection
+from dataclasses import dataclass
+
 from nonebot import logger
 from nonebot.adapters.onebot.v11 import Bot, Message, MessageSegment
-from .llm import LLMClient
-from .llm import VisionInput
+from nonebot.adapters.onebot.v11.exception import ActionFailed
+
 from ..memory.image import fetch_image_input
 from ..memory.short_term import Message as MMessage
-from .metrics import metrics
+from .llm import VisionInput, build_turn_calls
+from .metrics import log_event, metrics
 from .orchestrator import ConversationOrchestrator
-from .metrics import log_event
-from .state_manager import GroupState, SELF_SENT_MSG_IDS, is_shutting_down
-from .llm import TurnCallFactory
-from dataclasses import dataclass
-import random
-from nonebot.adapters.onebot.v11 import Message, MessageSegment
-from nonebot.adapters.onebot.v11.exception import ActionFailed
-import re
-# ======== from core/message_sender.py ========
+from .state_manager import SELF_SENT_MSG_IDS, GroupState, is_shutting_down
+
+
+DEBOUNCE_SECONDS = 2.0
+QUEUE_MAX_SIZE = 200
+MAX_REPLY_MESSAGES = 2
+
 _SPLIT_PATTERN = re.compile(r"(?<=[。！？!?~\n])\s*|(?<!\.)\.(?!\.)(?=\s|$|[\u4e00-\u9fff])\s*")
 _SINGLE_TRAILING_PERIOD = re.compile(r"(?<!\.)\.$")
 
@@ -43,23 +43,14 @@ def _split_text(text: str) -> list[str]:
     return parts or [text]
 
 
-def build_send_parts(text: str, *, max_messages: int = 2, strategy: str = "split_by_sentence") -> list[str]:
-    strategy = (strategy or "split_by_sentence").strip().lower()
-    if strategy == "single":
-        raw_parts = [text.strip()] if text and text.strip() else []
-    else:
-        raw_parts = _split_text(text)
-    parts = [_normalize_send_part(part) for part in raw_parts]
+def build_send_parts(text: str, max_messages: int = MAX_REPLY_MESSAGES) -> list[str]:
+    parts = [_normalize_send_part(part) for part in _split_text(text)]
     parts = [part for part in parts if part]
-    if max_messages > 0 and len(parts) > max_messages:
-        if max_messages == 1:
-            return [" ".join(parts)]
-        return [
-            *parts[: max_messages - 1],
-            " ".join(parts[max_messages - 1 :]),
-        ]
+    if len(parts) > max_messages:
+        return [*parts[: max_messages - 1], " ".join(parts[max_messages - 1 :])]
     return parts
-# ======== from core/debounced_inbox.py ========
+
+
 @dataclass(frozen=True)
 class InboxBatch:
     messages: list
@@ -67,190 +58,155 @@ class InboxBatch:
     event: object
 
 
-class DebouncedInbox:
-    """Drain the existing priority-aware deque/list after a quiet window."""
+async def next_inbox_batch(
+    state: GroupState,
+    *,
+    debounce_seconds: float,
+    idle_timeout: float = 20.0,
+) -> InboxBatch | None:
+    """等到静默窗口结束，再一次性取走积压的消息。"""
 
-    def __init__(self, state, *, debounce_seconds: float, idle_timeout: float = 20.0):
-        self.state = state
-        self.debounce_seconds = max(0.0, float(debounce_seconds))
-        self.idle_timeout = max(0.1, float(idle_timeout))
+    try:
+        await asyncio.wait_for(
+            state.new_message_signal.wait(),
+            timeout=idle_timeout,
+        )
+    except asyncio.TimeoutError:
+        return None
 
-    async def next_batch(self) -> InboxBatch | None:
-        try:
-            await asyncio.wait_for(
-                self.state.new_message_signal.wait(),
-                timeout=self.idle_timeout,
-            )
-        except asyncio.TimeoutError:
+    await asyncio.sleep(debounce_seconds)
+    state.new_message_signal.clear()
+    async with state.data_lock:
+        if state.bot is None or state.event is None or not state.messages_chunk:
             return None
-
-        await asyncio.sleep(self.debounce_seconds)
-        self.state.new_message_signal.clear()
-        async with self.state.data_lock:
-            if (
-                self.state.bot is None
-                or self.state.event is None
-                or not self.state.messages_chunk
-            ):
-                return None
-            batch = InboxBatch(
-                messages=list(self.state.messages_chunk),
-                bot=self.state.bot,
-                event=self.state.event,
-            )
-            self.state.messages_chunk.clear()
-            return batch
-# ======== from core/reply_dispatcher.py ========
-# 发送策略参数
-SEND_STRATEGY = "split_by_sentence"
-MAX_REPLY_MESSAGES = 2
-HUMANIZED_DELAY_SECONDS = 1.0
+        batch = InboxBatch(
+            messages=list(state.messages_chunk),
+            bot=state.bot,
+            event=state.event,
+        )
+        state.messages_chunk.clear()
+        return batch
 
 
-class ReplyDispatcher:
-    def __init__(self, self_sent_message_ids):
-        self._self_sent_message_ids = self_sent_message_ids
+def _response_content(response) -> tuple[str, object | None]:
+    if isinstance(response, str):
+        return response, None
+    if isinstance(response, dict):
+        return (
+            str(response.get("content") or ""),
+            response.get("target_id") or response.get("reply_to"),
+        )
+    return "", None
 
-    async def dispatch(
-        self,
-        *,
-        state,
-        responses: list,
-        bot,
-        event,
-        generation: int,
-    ) -> int:
-        if not responses:
-            return 0
+
+def _delay_seconds(part: str) -> float:
+    return min(1.0 + len(part) * 0.1, 5.0)
+
+
+async def send_one(
+    self_sent_ids,
+    *,
+    state,
+    bot,
+    event,
+    message,
+    generation: int,
+) -> bool:
+    try:
+        result = await bot.send(message=message, event=event)
+        sent_content = message.extract_plain_text()
+        if not sent_content and len(message) > 0:
+            sent_content = str(message)
+        message_id = ""
+        if isinstance(result, dict) and "message_id" in result:
+            message_id = str(result["message_id"])
+            self_sent_ids.append(message_id)
+
         if state.session.is_generation_stale(generation):
-            state.session._log_stale_generation("pre_send", generation)
-            return 0
-
-        total = len(responses)
-        sent_count = 0
-        max_messages = MAX_REPLY_MESSAGES
-        for response_index, response in enumerate(responses):
-            if sent_count >= max_messages:
-                break
-            raw_content, reply_id = self._response_content(response)
-            if not raw_content:
-                continue
-            parts = build_send_parts(
-                raw_content,
-                max_messages=max_messages - sent_count,
-                strategy=SEND_STRATEGY,
-            )
-            for part_index, part in enumerate(parts):
-                if sent_count >= max_messages:
-                    break
-                if state.session.is_generation_stale(generation):
-                    state.session._log_stale_generation("send_loop", generation)
-                    break
-                part = part.strip()
-                if not part:
-                    continue
-                message = Message(part)
-                if reply_id and response_index == 0 and part_index == 0:
-                    try:
-                        message.insert(0, MessageSegment.reply(int(reply_id)))
-                    except ValueError:
-                        logger.warning(f"引用ID无效: {reply_id}")
-
-                sent = await self._send_one(
-                    state=state,
-                    bot=bot,
-                    event=event,
-                    message=message,
-                    generation=generation,
-                )
-                if sent:
-                    sent_count += 1
-
-                has_more = (
-                    part_index < len(parts) - 1
-                    or response_index < total - 1
-                )
-                if has_more:
-                    await asyncio.sleep(self._delay_seconds(part))
-
-        if sent_count:
-            state.session._schedule_save_session()
-        return sent_count
-
-    @staticmethod
-    def _response_content(response) -> tuple[str, object | None]:
-        if isinstance(response, str):
-            return response, None
-        if isinstance(response, dict):
-            return (
-                str(response.get("content") or ""),
-                response.get("target_id") or response.get("reply_to"),
-            )
-        return "", None
-
-    async def _send_one(
-        self,
-        *,
-        state,
-        bot,
-        event,
-        message,
-        generation: int,
-    ) -> bool:
-        try:
-            result = await bot.send(message=message, event=event)
-            sent_content = message.extract_plain_text()
-            if not sent_content and len(message) > 0:
-                sent_content = str(message)
-            message_id = ""
-            if isinstance(result, dict) and "message_id" in result:
-                message_id = str(result["message_id"])
-                self._self_sent_message_ids.append(message_id)
-
+            state.session._log_stale_generation("append_self_message", generation)
+            return True
+        async with state.session_lock:
             if state.session.is_generation_stale(generation):
                 state.session._log_stale_generation(
-                    "append_self_message",
+                    "append_self_message_locked",
                     generation,
                 )
                 return True
-            async with state.session_lock:
-                if state.session.is_generation_stale(generation):
-                    state.session._log_stale_generation(
-                        "append_self_message_locked",
-                        generation,
-                    )
-                    return True
-                await state.session.append_self_message(
-                    sent_content,
-                    message_id,
-                    str(bot.self_id),
-                )
-            return True
-        except ActionFailed as e:
-            if getattr(e, "retcode", 0) == 1200 or "120" in str(e):
-                logger.warning("风控拦截 (1200), 冷却中...")
-                await asyncio.sleep(random.uniform(5.0, 10.0))
-            else:
-                logger.error(f"发送失败: {e}")
-        except Exception as e:
-            logger.error(f"发送未知错误: {e}")
-        return False
-
-    @staticmethod
-    def _delay_seconds(part: str) -> float:
-        if SEND_STRATEGY == "humanized_delay":
-            delay = HUMANIZED_DELAY_SECONDS + len(part) * 0.08
+            await state.session.append_self_message(
+                sent_content,
+                message_id,
+                str(bot.self_id),
+            )
+        return True
+    except ActionFailed as e:
+        if getattr(e, "retcode", 0) == 1200 or "120" in str(e):
+            logger.warning("风控拦截 (1200), 冷却中...")
+            await asyncio.sleep(random.uniform(5.0, 10.0))
         else:
-            delay = 1.0 + len(part) * 0.1
-        return min(delay, 5.0)
-# ======== from core/logic.py ========
-# nyaturingtest/logic.py
+            logger.error(f"发送失败: {e}")
+    except Exception as e:
+        logger.error(f"发送未知错误: {e}")
+    return False
 
 
+async def dispatch_replies(
+    self_sent_ids,
+    *,
+    state,
+    responses: list,
+    bot,
+    event,
+    generation: int,
+) -> int:
+    if not responses:
+        return 0
+    if state.session.is_generation_stale(generation):
+        state.session._log_stale_generation("pre_send", generation)
+        return 0
 
+    total = len(responses)
+    sent_count = 0
+    for response_index, response in enumerate(responses):
+        if sent_count >= MAX_REPLY_MESSAGES:
+            break
+        raw_content, reply_id = _response_content(response)
+        if not raw_content:
+            continue
+        parts = build_send_parts(raw_content, MAX_REPLY_MESSAGES - sent_count)
+        for part_index, part in enumerate(parts):
+            if sent_count >= MAX_REPLY_MESSAGES:
+                break
+            if state.session.is_generation_stale(generation):
+                state.session._log_stale_generation("send_loop", generation)
+                break
+            part = part.strip()
+            if not part:
+                continue
+            message = Message(part)
+            if reply_id and response_index == 0 and part_index == 0:
+                try:
+                    message.insert(0, MessageSegment.reply(int(reply_id)))
+                except ValueError:
+                    logger.warning(f"引用ID无效: {reply_id}")
 
-DEBOUNCE_SECONDS = 2.0
-QUEUE_MAX_SIZE = 200
+            sent = await send_one(
+                self_sent_ids,
+                state=state,
+                bot=bot,
+                event=event,
+                message=message,
+                generation=generation,
+            )
+            if sent:
+                sent_count += 1
+
+            has_more = part_index < len(parts) - 1 or response_index < total - 1
+            if has_more:
+                await asyncio.sleep(_delay_seconds(part))
+
+    if sent_count:
+        state.session._schedule_save_session()
+    return sent_count
 
 
 def _is_sticker_segment_data(data: dict) -> bool:
@@ -270,26 +226,16 @@ def _build_image_ref(
     return f"{scope_digest}:{source}:{segment_index}:{digest}"
 
 
-def _is_local_self_echo(msg: MMessage, bot_self_id: str, self_sent_ids: Collection[str]) -> bool:
-    msg_id = str(msg.id or "")
-    return bool(
-        msg_id
-        and str(msg.user_id) == str(bot_self_id)
-        and msg_id in self_sent_ids
-    )
-
-
 def _filter_local_self_echoes(
-        messages: list[MMessage],
-        bot_self_id: str,
-        self_sent_ids: Collection[str] | None = None,
+    messages: list[MMessage],
+    bot_self_id: str,
+    self_sent_ids,
 ) -> tuple[list[MMessage], list[MMessage]]:
-    if self_sent_ids is None:
-        self_sent_ids = set(SELF_SENT_MSG_IDS)
-    filtered = []
-    local_echoes = []
+    """按本地已发送消息 ID 分离自身回显。"""
+
+    filtered, local_echoes = [], []
     for msg in messages:
-        if _is_local_self_echo(msg, bot_self_id, self_sent_ids):
+        if msg.id and str(msg.user_id) == str(bot_self_id) and str(msg.id) in self_sent_ids:
             local_echoes.append(msg)
         else:
             filtered.append(msg)
@@ -297,7 +243,7 @@ def _filter_local_self_echoes(
 
 
 async def llm_response(
-    client: LLMClient,
+    client,
     message: str,
     model: str,
     temperature: float | None = None,
@@ -307,12 +253,10 @@ async def llm_response(
     images: list[VisionInput] | None = None,
     **kwargs,
 ) -> str:
-    """
-    封装 LLM 调用，支持高级参数透传
-    """
+    """封装 LLM 调用并记录指标；失败返回空串。"""
+
     started_at = time.perf_counter()
     try:
-        # 如果是 JSON 模式，合并到 kwargs
         if json_mode:
             kwargs["response_format"] = {"type": "json_object"}
 
@@ -325,7 +269,7 @@ async def llm_response(
             images=images,
             **kwargs
         )
-        if result.content:
+        if result:
             metrics.llm_success += 1
             log_event(
                 "llm_success",
@@ -335,7 +279,7 @@ async def llm_response(
                 tokens="recorded_by_usage_callback",
                 decision="content",
             )
-            return result.content
+            return result
         metrics.llm_failure += 1
         log_event(
             "llm_failure",
@@ -457,18 +401,12 @@ async def message2BotMessage(
     return (content, image_inputs)
 
 
-async def _process_inbox_batch(
-    state: GroupState,
-    batch,
-    *,
-    call_factory: TurnCallFactory,
-    dispatcher: ReplyDispatcher,
-) -> None:
+async def _process_inbox_batch(state: GroupState, batch: InboxBatch) -> None:
     bot_self_id = str(batch.bot.self_id)
     current_chunk, local_echoes = _filter_local_self_echoes(
         batch.messages,
         bot_self_id,
-        set(SELF_SENT_MSG_IDS),
+        SELF_SENT_MSG_IDS,
     )
     if local_echoes:
         logger.debug(f"过滤本机自身回显消息 {len(local_echoes)} 条")
@@ -487,7 +425,8 @@ async def _process_inbox_batch(
         session_id = str(state.session.id)
 
     images = [item for message in current_chunk for item in message.image_inputs]
-    calls = call_factory.build(
+    chat_call, feedback_call = build_turn_calls(
+        llm_response,
         state=state,
         session_id=session_id,
         chat_images=images,
@@ -496,8 +435,8 @@ async def _process_inbox_batch(
     try:
         responses = await ConversationOrchestrator(state.session).process_chunk(
             messages_chunk=current_chunk,
-            chat_llm_func=calls.chat,
-            feedback_llm_func=calls.feedback,
+            chat_llm_func=chat_call,
+            feedback_llm_func=feedback_call,
             publish=True,
             expected_generation=generation,
         )
@@ -505,7 +444,8 @@ async def _process_inbox_batch(
         for message in current_chunk:
             message.image_inputs.clear()
 
-    await dispatcher.dispatch(
+    await dispatch_replies(
+        SELF_SENT_MSG_IDS,
         state=state,
         responses=responses or [],
         bot=batch.bot,
@@ -518,24 +458,12 @@ async def spawn_state(state: GroupState):
     """Small worker boundary: debounce, invoke one turn, contain failures."""
 
     logger.info(f"GroupState 后台任务启动: {id(state)}")
-    call_factory = TurnCallFactory(llm_response)
-    dispatcher = ReplyDispatcher(SELF_SENT_MSG_IDS)
-
     while True:
         try:
-            inbox = DebouncedInbox(
-                state,
-                debounce_seconds=DEBOUNCE_SECONDS,
-            )
-            batch = await inbox.next_batch()
+            batch = await next_inbox_batch(state, debounce_seconds=DEBOUNCE_SECONDS)
             if batch is None:
                 continue
-            await _process_inbox_batch(
-                state,
-                batch,
-                call_factory=call_factory,
-                dispatcher=dispatcher,
-            )
+            await _process_inbox_batch(state, batch)
         except asyncio.CancelledError:
             logger.info(f"后台任务被取消: {id(state)}")
             break

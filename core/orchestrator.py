@@ -1,32 +1,28 @@
-# 由多个模块合并而来：core/orchestrator.py, core/llm_output.py
-
+import math
 import random
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass
 from datetime import datetime
+
 from nonebot import logger
 from nonebot.utils import run_sync
-from ..db import MessageRepository
-from ..memory.short_term import SHORT_CONTEXT_LIMIT, Message
+
+from ..db import get_history_before
+from ..domain import EmotionState, Impression, PersonProfile, clamp_vad_value
+from ..memory.short_term import Message
 from ..memory.validation import validate_memory_candidate
-from ..memory.vector import where_any
-from ..domain import clamp_vad_value
-from ..domain import Impression
-from ..domain import PersonProfile
-from .prompts import PromptBudget, get_chat_prompt, get_feedback_prompt
-from .engagement import EngagementPolicy
-from .metrics import log_event
 from ..memory.vector import (
-    RetrievalResult,
-    search_memories,
     RAG_DEBUG_LOG,
     RAG_DEFAULT_EVENT_TTL_DAYS,
     RAG_FINAL_K,
     RAG_MEMORY_CHAR_BUDGET,
     RAG_MERGED_CANDIDATE_CAP,
     RAG_PER_QUERY_RECALL_K,
+    RetrievalResult,
     build_chat_rag_queries,
+    search_memories,
+    where_any,
 )
 from .engagement import (
     ACTIVE_TO_BUBBLE_THRESHOLD,
@@ -35,17 +31,19 @@ from .engagement import (
     RELEVANCE_WILLINGNESS_FLOOR,
     RERANK_WILLINGNESS_THRESHOLD,
     SPEAK_WILLINGNESS_RETAIN_FACTOR,
+    evaluate_engagement,
+)
+from .llm import extract_and_parse_json
+from .metrics import log_event
+from .prompts import (
+    PromptBudget,
+    get_chat_prompt,
+    get_feedback_prompt,
+    get_time_description,
 )
 from .session import STALE_GENERATION_WRITE, ChattingState, FeedbackOutcome
-from ..memory.validation import should_store_memory
-from .prompts import get_time_description
-import math
-from dataclasses import dataclass
-from ..domain import EmotionState
-from .llm import extract_and_parse_json
 
 
-# ======== from core/orchestrator.py ========
 CONSOLIDATION_ENABLED = True
 CONSOLIDATION_MESSAGE_THRESHOLD = 8
 CONSOLIDATION_INTERVAL_SECONDS = 180.0
@@ -64,34 +62,12 @@ def _history_without_current_chunk(all_messages: list[Message], messages_chunk: 
     ]
 
 
-def _active_user_scope_ids(active_users: list[dict] | None) -> set[str]:
-    result = set()
-    for user in active_users or []:
-        if not isinstance(user, dict):
-            continue
-        user_id = str(user.get("user_id") or "").strip()
-        if user_id:
-            result.add(user_id)
-    return result
-
-
 @dataclass
 class _FeedbackContext:
     response_dict: dict
     existing_related_memories: list[dict]
     allow_memory_supersede: bool
     active_user_ids: set[str]
-
-
-
-
-def _score_stat_fields(stats: dict) -> dict:
-    return {
-        "adjusted_score_min": stats.get("adjusted_score_min"),
-        "adjusted_score_p50": stats.get("adjusted_score_p50"),
-        "adjusted_score_p90": stats.get("adjusted_score_p90"),
-        "adjusted_score_max": stats.get("adjusted_score_max"),
-    }
 
 
 def _rag_debug_records(records: list[dict]) -> list[dict]:
@@ -156,9 +132,8 @@ def _existing_related_memories(
 class ConversationOrchestrator:
     """一轮对话的编排：短时记忆 → 意愿/相关性 → RAG → Feedback → Chat。"""
 
-    def __init__(self, session, *, engagement_policy: EngagementPolicy | None = None):
+    def __init__(self, session):
         self.session = session
-        self.engagement_policy = engagement_policy or EngagementPolicy()
 
     async def process_chunk(
         self,
@@ -169,141 +144,125 @@ class ConversationOrchestrator:
         expected_generation: int | None = None,
     ) -> list[dict] | None:
         try:
-            return await self._process_chunk(
-                messages_chunk,
-                chat_llm_func,
-                feedback_llm_func,
-                publish=publish,
-                expected_generation=expected_generation,
+            session = self.session
+            state = session.state
+
+            if session.is_generation_stale(expected_generation):
+                session._log_stale_generation("process_start", expected_generation)
+                return None
+
+            await session.record_incoming(messages_chunk)
+            if session.is_generation_stale(expected_generation):
+                session._log_stale_generation("short_term_memory", expected_generation)
+                return None
+
+            if not publish:
+                return None
+
+            now = datetime.now()
+            engagement = evaluate_engagement(
+                state=state,
+                messages=messages_chunk,
+                now=now,
             )
-        finally:
-            await self.session.flush_persistence()
+            is_relevant = engagement.relevant
+            if is_relevant:
+                logger.info("检测到强关联，意愿值提升")
 
-    async def _process_chunk(
-        self,
-        messages_chunk: list[Message],
-        chat_llm_func: Callable[[str, bool], Awaitable[str]],
-        feedback_llm_func: Callable[[str, bool], Awaitable[str]],
-        publish: bool = True,
-        expected_generation: int | None = None,
-    ) -> list[dict] | None:
-        session = self.session
-        state = session.state
+            if not engagement.engaged and not is_relevant:
+                if CONSOLIDATION_ENABLED and self._consolidation_due():
+                    state.last_consolidation_attempt = datetime.now()
+                    pending_messages = session.runtime.short_term_memory.messages_after(
+                        state.last_consolidated_time,
+                        limit=CONSOLIDATION_MAX_MESSAGES,
+                    )
+                    await self.consolidate_stage(
+                        pending_messages,
+                        feedback_llm_func,
+                        expected_generation=expected_generation,
+                    )
+                logger.debug(f"未进入参与态 (意愿 {state.willingness:.2f})，跳过响应")
+                return None
 
-        if session.is_generation_stale(expected_generation):
-            session._log_stale_generation("process_start", expected_generation)
-            return None
-
-        await session.record_incoming(messages_chunk)
-        if session.is_generation_stale(expected_generation):
-            session._log_stale_generation("short_term_memory", expected_generation)
-            return None
-
-        if not publish:
-            return None
-
-        now = datetime.now()
-        engagement = self.engagement_policy.evaluate(
-            state=state,
-            messages=messages_chunk,
-            now=now,
-        )
-        is_relevant = engagement.relevant
-        if is_relevant:
-            logger.info("检测到强关联，意愿值提升")
-
-        if not engagement.engaged and not is_relevant:
-            if CONSOLIDATION_ENABLED and self._consolidation_due():
-                state.last_consolidation_attempt = datetime.now()
-                pending_messages = session.runtime.short_term_memory.messages_after(
-                    state.last_consolidated_time,
-                    limit=CONSOLIDATION_MAX_MESSAGES,
+            if engagement.cooldown_remaining > 0 and not is_relevant:
+                logger.debug(
+                    f"处于发言冷却期（剩余 {engagement.cooldown_remaining:.1f}s），"
+                    "跳过响应"
                 )
-                await self.consolidate_stage(
-                    pending_messages,
+                return None
+
+            # Reranker 使用第一条 query 作为主 query，因此必须最新消息优先。
+            queries = [msg.content for msg in reversed(messages_chunk[-3:])]
+            active_user_names = [msg.user_name for msg in messages_chunk if msg.user_name]
+            active_users = [
+                {
+                    "user_id": str(msg.user_id or ""),
+                    "user_name": msg.user_name,
+                }
+                for msg in messages_chunk
+                if msg.user_name
+            ]
+            use_rerank_strategy = (
+                state.willingness > RERANK_WILLINGNESS_THRESHOLD or is_relevant
+            )
+
+            search_result = await self.search_stage(
+                queries,
+                active_user_names=active_user_names,
+                active_users=active_users,
+                use_rerank=use_rerank_strategy,
+            )
+            if session.is_generation_stale(expected_generation):
+                session._log_stale_generation("rag_search", expected_generation)
+                return None
+
+            logger.debug("启用拟人化串行模式: Feedback -> Check -> Chat")
+
+            try:
+                feedback_outcome = await self.feedback_stage(
+                    messages_chunk,
                     feedback_llm_func,
+                    is_relevant=is_relevant,
+                    search_result=search_result,
                     expected_generation=expected_generation,
                 )
-            logger.debug(f"未进入参与态 (意愿 {state.willingness:.2f})，跳过响应")
-            return None
+            finally:
+                session._schedule_save_session()
 
-        if engagement.cooldown_remaining > 0 and not is_relevant:
-            logger.debug(
-                f"处于发言冷却期（剩余 {engagement.cooldown_remaining:.1f}s），"
-                "跳过响应"
-            )
-            return None
+            if session.is_generation_stale(expected_generation):
+                session._log_stale_generation("feedback", expected_generation)
+                return None
+            if feedback_outcome.accepted:
+                latest = max((msg.time for msg in messages_chunk), default=None)
+                if latest is not None and (
+                    state.last_consolidated_time is None
+                    or latest > state.last_consolidated_time
+                ):
+                    state.last_consolidated_time = latest
+                state.messages_since_consolidation = 0
+                state.last_consolidation_attempt = datetime.now()
+                session._schedule_save_session()
 
-        # Reranker 使用第一条 query 作为主 query，因此必须最新消息优先。
-        queries = [msg.content for msg in reversed(messages_chunk[-3:])]
-        active_user_names = [msg.user_name for msg in messages_chunk if msg.user_name]
-        active_users = [
-            {
-                "user_id": str(msg.user_id or ""),
-                "user_name": msg.user_name,
-            }
-            for msg in messages_chunk
-            if msg.user_name
-        ]
-        use_rerank_strategy = (
-            state.willingness > RERANK_WILLINGNESS_THRESHOLD or is_relevant
-        )
+            if state.willingness < POST_FEEDBACK_SKIP_THRESHOLD and not is_relevant:
+                return None
 
-        search_result = await self.search_stage(
-            queries,
-            active_user_names=active_user_names,
-            active_users=active_users,
-            use_rerank=use_rerank_strategy,
-        )
-        if session.is_generation_stale(expected_generation):
-            session._log_stale_generation("rag_search", expected_generation)
-            return None
-
-        logger.debug("启用拟人化串行模式: Feedback -> Check -> Chat")
-
-        try:
-            feedback_outcome = await self.feedback_stage(
+            reply_messages = await self.chat_stage(
                 messages_chunk,
-                feedback_llm_func,
-                is_relevant=is_relevant,
+                chat_llm_func,
+                recalled_history=feedback_outcome.recalled_history,
                 search_result=search_result,
                 expected_generation=expected_generation,
             )
+            if session.is_generation_stale(expected_generation):
+                session._log_stale_generation("chat", expected_generation)
+                return None
+
+            if reply_messages:
+                state.last_speak_time = datetime.now()
+
+            return reply_messages
         finally:
-            session._schedule_save_session()
-
-        if session.is_generation_stale(expected_generation):
-            session._log_stale_generation("feedback", expected_generation)
-            return None
-        if feedback_outcome.accepted:
-            latest = max((msg.time for msg in messages_chunk), default=None)
-            if latest is not None and (
-                state.last_consolidated_time is None
-                or latest > state.last_consolidated_time
-            ):
-                state.last_consolidated_time = latest
-            state.messages_since_consolidation = 0
-            state.last_consolidation_attempt = datetime.now()
-            session._schedule_save_session()
-
-        if state.willingness < POST_FEEDBACK_SKIP_THRESHOLD and not is_relevant:
-            return None
-
-        reply_messages = await self.chat_stage(
-            messages_chunk,
-            chat_llm_func,
-            recalled_history=feedback_outcome.recalled_history,
-            search_result=search_result,
-            expected_generation=expected_generation,
-        )
-        if session.is_generation_stale(expected_generation):
-            session._log_stale_generation("chat", expected_generation)
-            return None
-
-        if reply_messages:
-            state.last_speak_time = datetime.now()
-
-        return reply_messages
+            await self.session.flush_persistence()
 
     async def search_stage(
         self,
@@ -340,7 +299,11 @@ class ConversationOrchestrator:
             "scope_counts": {},
         }
 
-        active_scope_user_ids = _active_user_scope_ids(active_users)
+        active_scope_user_ids = {
+            str(user.get("user_id") or "").strip()
+            for user in active_users or []
+            if str(user.get("user_id") or "").strip()
+        }
         queries = build_chat_rag_queries(
             queries,
             chat_summary=self.session.state.chat_summary,
@@ -383,8 +346,11 @@ class ConversationOrchestrator:
                     "other_subject_downweighted_count": int(retrieval_stats.get("other_subject_downweighted_count") or 0),
                     "legacy_subject_count": int(retrieval_stats.get("legacy_subject_count") or 0),
                     "scope_counts": dict(retrieval_stats.get("scope_counts") or {}),
+                    "adjusted_score_min": retrieval_stats.get("adjusted_score_min"),
+                    "adjusted_score_p50": retrieval_stats.get("adjusted_score_p50"),
+                    "adjusted_score_p90": retrieval_stats.get("adjusted_score_p90"),
+                    "adjusted_score_max": retrieval_stats.get("adjusted_score_max"),
                 })
-                rag_stats.update(_score_stat_fields(retrieval_stats))
 
                 if raw_results:
                     formatted_results = []
@@ -480,7 +446,7 @@ class ConversationOrchestrator:
         ]
 
         # 过滤掉本次的新消息，避免 Prompt 上下文重复
-        context_record = self.session.runtime.short_term_memory.access_context(limit=SHORT_CONTEXT_LIMIT)
+        context_record = self.session.runtime.short_term_memory.access()
         all_messages = context_record.messages
         history_msgs = _history_without_current_chunk(all_messages, messages_chunk)
         # 历史消息格式化为结构化 dict
@@ -697,7 +663,7 @@ class ConversationOrchestrator:
             if current_msgs:
                 earliest_time = current_msgs[0].time
                 # 使用 Repository 查库
-                recalled_msgs = await MessageRepository.get_history_before(
+                recalled_msgs = await get_history_before(
                     self.session.id,
                     earliest_time,
                     limit=HISTORY_RECALL_LIMIT,
@@ -771,7 +737,6 @@ class ConversationOrchestrator:
         return FeedbackOutcome(
             accepted=True,
             recalled_history=recalled_history,
-            state_changed=True,
         )
 
     async def consolidate_stage(
@@ -821,7 +786,95 @@ class ConversationOrchestrator:
                 self.session.state.last_consolidated_time = latest
         self.session.state.messages_since_consolidation = 0
         self.session._schedule_save_session()
-        return FeedbackOutcome(accepted=True, state_changed=True)
+        return FeedbackOutcome(accepted=True)
+
+    @staticmethod
+    def _parse_memory_candidate(item, default_user_id: str) -> dict | None:
+        """把 LLM 返回的一条候选规范化；ignore / 未知 action / 空内容返回 None。"""
+
+        if isinstance(item, str):
+            content = item.strip()
+            if not content:
+                return None
+            return {
+                "action": "add",
+                "content": content,
+                "category": "event",
+                "confidence": 0.7,
+                "importance": 0.5,
+                "subject_user_id": default_user_id,
+                "subject_user_name": "",
+                "speaker_user_id": "",
+                "speaker_user_name": "",
+                "target_ref": "",
+                "reason": "",
+            }
+
+        if not isinstance(item, dict):
+            return None
+
+        action = str(item.get("action") or "add").strip().lower()
+        if action not in {"add", "supersede"}:
+            logger.debug(f"[Memory] 暂不处理的记忆 action: {action}")
+            return None
+
+        def bounded_float(value, default: float) -> float:
+            try:
+                return max(0.0, min(1.0, float(value)))
+            except (TypeError, ValueError):
+                return default
+
+        return {
+            "action": action,
+            "content": str(item.get("content") or "").strip(),
+            "category": str(item.get("category") or "event").strip().lower() or "event",
+            "confidence": bounded_float(item.get("confidence", 0.7), 0.7),
+            "importance": bounded_float(item.get("importance", 0.5), 0.5),
+            "subject_user_id": str(item.get("subject_user_id") or "").strip() or default_user_id,
+            "subject_user_name": str(item.get("subject_user_name") or "").strip(),
+            "speaker_user_id": str(item.get("speaker_user_id") or "").strip(),
+            "speaker_user_name": str(item.get("speaker_user_name") or "").strip(),
+            "target_ref": str(item.get("target_ref") or "").strip(),
+            "reason": str(item.get("reason") or ""),
+        }
+
+    async def _supersede_target_allowed(self, target_ref: str, candidate: dict) -> bool:
+        """确认 supersede 目标存在且可替换，否则记一条拒绝事件。"""
+
+        metadata = await run_sync(self.session.runtime.vector_memory.get_metadata_by_id)(target_ref)
+        if not metadata:
+            log_event(
+                "rag_action_hallucination",
+                session_id=self.session.id,
+                action="supersede",
+                target_ref=target_ref,
+                reason="target_ref_missing_in_vector_store",
+            )
+            return False
+
+        source = str(metadata.get("source") or candidate.get("source") or "memory")
+        memory_type = str(metadata.get("type") or candidate.get("type") or "event")
+        subtype = str(metadata.get("subtype") or candidate.get("subtype") or memory_type)
+        category = str(metadata.get("category") or candidate.get("category") or memory_type)
+        allowed_types = {"event", "preference", "profile", "relationship"}
+        if (
+            source != "memory"
+            or subtype == "bot_self"
+            or (memory_type not in allowed_types and category not in allowed_types)
+        ):
+            log_event(
+                "rag_action_rejected",
+                session_id=self.session.id,
+                action="supersede",
+                target_ref=target_ref,
+                source=source,
+                type=memory_type,
+                subtype=subtype,
+                category=category,
+                reason="target_not_supersedable",
+            )
+            return False
+        return True
 
     async def save_long_term_memory(
             self,
@@ -830,10 +883,8 @@ class ConversationOrchestrator:
             supersede_candidates: list[dict] | None = None,
             expected_generation: int | None = None,
     ):
-        """
-        后台任务：保存长期记忆到向量数据库
-        优化：增加质量过滤和去重
-        """
+        """后台任务：把 Feedback 提取的候选落进向量库（质量过滤 + 去重）。"""
+
         try:
             if self.session.is_generation_stale(expected_generation):
                 self.session._log_stale_generation("long_term_memory", expected_generation)
@@ -849,144 +900,72 @@ class ConversationOrchestrator:
                 if isinstance(item, dict) and item.get("memory_ref")
             }
 
-            for item in analyze_result:
-                content = ""
-                subject_user_id = ""
-                subject_user_name = ""
-                speaker_user_id = ""
-                speaker_user_name = ""
-                action = "add"
-                category = "event"
-                confidence = 0.7
-                importance = 0.5
-
-                # 情况 1: LLM 还是返回了字符串 (Prompt 没生效或模型太笨)
-                if isinstance(item, str) and item.strip():
-                    content = item.strip()
-                    subject_user_id = default_user_id if default_user_id else ""
-
-                # 情况 2: LLM 返回了我们要求的标准字典
-                elif isinstance(item, dict):
-                    action = str(item.get("action") or "add").strip().lower()
-                    if action == "ignore":
-                        continue
-                    if action not in {"add", "supersede"}:
-                        logger.debug(f"[Memory] 暂不处理的记忆 action: {action}")
-                        continue
-                    content = item.get("content", "").strip()
-                    subject_user_id = str(item.get("subject_user_id") or item.get("related_user_id") or "").strip()
-                    subject_user_name = str(item.get("subject_user_name") or "").strip()
-                    speaker_user_id = str(item.get("speaker_user_id") or "").strip()
-                    speaker_user_name = str(item.get("speaker_user_name") or "").strip()
-                    if not subject_user_id and default_user_id:
-                        subject_user_id = default_user_id
-                    category = str(item.get("category") or "event").strip().lower() or "event"
-                    try:
-                        confidence = max(0.0, min(1.0, float(item.get("confidence", 0.7))))
-                    except (TypeError, ValueError):
-                        confidence = 0.7
-                    try:
-                        importance = max(0.0, min(1.0, float(item.get("importance", 0.5))))
-                    except (TypeError, ValueError):
-                        importance = 0.5
-
-                if action == "supersede":
-                    target_ref = str(item.get("target_ref") or "").strip() if isinstance(item, dict) else ""
-                    candidate = allowed_supersede_refs.get(target_ref)
-                    if not candidate:
-                        log_event(
-                            "rag_action_hallucination",
-                            session_id=self.session.id,
-                            action=action,
-                            target_ref=target_ref,
-                            reason="target_ref_not_in_current_candidates",
-                        )
-                        continue
-
-                    target_metadata = await run_sync(self.session.runtime.vector_memory.get_metadata_by_id)(target_ref)
-                    if not target_metadata:
-                        log_event(
-                            "rag_action_hallucination",
-                            session_id=self.session.id,
-                            action=action,
-                            target_ref=target_ref,
-                            reason="target_ref_missing_in_vector_store",
-                        )
-                        continue
-
-                    target_source = str(target_metadata.get("source") or candidate.get("source") or "memory")
-                    target_type = str(target_metadata.get("type") or candidate.get("type") or "event")
-                    target_subtype = str(target_metadata.get("subtype") or candidate.get("subtype") or target_type)
-                    target_category = str(target_metadata.get("category") or candidate.get("category") or target_type)
-                    allowed_target_types = {"event", "preference", "profile", "relationship"}
-                    if (
-                        target_source != "memory"
-                        or target_subtype == "bot_self"
-                        or (target_type not in allowed_target_types and target_category not in allowed_target_types)
-                    ):
-                        log_event(
-                            "rag_action_rejected",
-                            session_id=self.session.id,
-                            action=action,
-                            target_ref=target_ref,
-                            source=target_source,
-                            type=target_type,
-                            subtype=target_subtype,
-                            category=target_category,
-                            reason="target_not_supersedable",
-                        )
-                        continue
-
-                # 质量过滤：基础长度/噪声过滤 + 服务端事实边界验证。
-                if not should_store_memory(content):
-                    skipped_quality += 1
-                    logger.debug(f"[Memory] 跳过低质量记忆: {content[:30]}...")
+            for raw_item in analyze_result:
+                candidate = self._parse_memory_candidate(raw_item, default_user_id)
+                if candidate is None:
                     continue
-                validation_result = validate_memory_candidate(
-                    content=content,
-                    category=category,
-                    confidence=confidence,
-                    subject_user_id=subject_user_id,
-                    subject_user_name=subject_user_name,
+
+                # 质量过滤：长度/噪声 + 类别/置信度/主体边界（先过滤，避免为废候选查库）
+                valid, reason = validate_memory_candidate(
+                    content=candidate["content"],
+                    category=candidate["category"],
+                    confidence=candidate["confidence"],
+                    subject_user_id=candidate["subject_user_id"],
+                    subject_user_name=candidate["subject_user_name"],
                 )
-                if not validation_result.valid:
+                if not valid:
                     skipped_quality += 1
                     log_event(
                         "memory_candidate_rejected",
                         session_id=self.session.id,
-                        action=action,
-                        category=category,
-                        reason=validation_result.reason,
+                        action=candidate["action"],
+                        category=candidate["category"],
+                        reason=reason,
                     )
                     logger.debug(
-                        f"[Memory] 跳过不可靠记忆({validation_result.reason}): {content[:30]}..."
+                        f"[Memory] 跳过不可靠记忆({reason}): {candidate['content'][:30]}..."
                     )
                     continue
+
+                if candidate["action"] == "supersede":
+                    target_ref = candidate["target_ref"]
+                    if target_ref not in allowed_supersede_refs:
+                        log_event(
+                            "rag_action_hallucination",
+                            session_id=self.session.id,
+                            action="supersede",
+                            target_ref=target_ref,
+                            reason="target_ref_not_in_current_candidates",
+                        )
+                        continue
+                    if not await self._supersede_target_allowed(
+                        target_ref, allowed_supersede_refs[target_ref]
+                    ):
+                        continue
 
                 metadata = {
                     "schema_version": 2,
                     "source": "memory",
-                    "type": category,
+                    "type": candidate["category"],
                     "date": today,
-                    "subject_user_id": subject_user_id,
-                    "subject_user_name": subject_user_name,
-                    "speaker_user_id": speaker_user_id,
-                    "speaker_user_name": speaker_user_name,
+                    "subject_user_id": candidate["subject_user_id"],
+                    "subject_user_name": candidate["subject_user_name"],
+                    "speaker_user_id": candidate["speaker_user_id"],
+                    "speaker_user_name": candidate["speaker_user_name"],
                     "status": "active",
-                    "category": category,
-                    "confidence": confidence,
-                    "importance": importance,
+                    "category": candidate["category"],
+                    "confidence": candidate["confidence"],
+                    "importance": candidate["importance"],
                     "ttl_days": RAG_DEFAULT_EVENT_TTL_DAYS,
                 }
 
-                if action == "supersede":
-                    target_ref = str(item.get("target_ref") or "").strip()
+                if candidate["action"] == "supersede":
                     operation_result = await self.session._run_sync_if_generation_current(
                         self.session.runtime.vector_memory.supersede_memory,
-                        content,
+                        candidate["content"],
                         metadata,
-                        target_ref,
-                        reason=str(item.get("reason") or ""),
+                        candidate["target_ref"],
+                        reason=candidate["reason"],
                         expected_generation=expected_generation,
                         stage="long_term_memory_supersede",
                     )
@@ -999,8 +978,8 @@ class ConversationOrchestrator:
                         log_event(
                             "rag_action_rejected",
                             session_id=self.session.id,
-                            action=action,
-                            target_ref=target_ref,
+                            action="supersede",
+                            target_ref=candidate["target_ref"],
                             reason="supersede_queued_for_repair",
                             queued_repair=(
                                 operation_result.get("queued_repair")
@@ -1011,7 +990,7 @@ class ConversationOrchestrator:
                         continue
                     superseded_count += 1
                 else:
-                    pending_memories.append((content, metadata))
+                    pending_memories.append((candidate["content"], metadata))
 
             store_result = {"added": 0, "skipped_dedup": 0}
             if pending_memories:
@@ -1052,7 +1031,7 @@ class ConversationOrchestrator:
         recalled_str = "\n".join(recalled_history) if recalled_history else "无"
 
         # 过滤掉本次的新消息，避免 Prompt 上下文重复
-        context_record = self.session.runtime.short_term_memory.access_context(limit=SHORT_CONTEXT_LIMIT)
+        context_record = self.session.runtime.short_term_memory.access()
         all_messages = context_record.messages
         history_msgs = _history_without_current_chunk(all_messages, messages_chunk)
         history_msgs_formatted = [
@@ -1117,23 +1096,17 @@ class ConversationOrchestrator:
             logger.error(f"对话阶段异常: {e}")
             return []
 
-    # 提高插话阈值，防止连击
     def _consolidation_due(self) -> bool:
+        """提高插话阈值，防止连击。"""
+
         state = self.session.state
         if state.messages_since_consolidation >= CONSOLIDATION_MESSAGE_THRESHOLD:
             return True
-        interval = CONSOLIDATION_INTERVAL_SECONDS
         return (
             state.messages_since_consolidation > 0
-            and interval > 0
-            and (datetime.now() - state.last_consolidation_attempt).total_seconds() >= interval
+            and (datetime.now() - state.last_consolidation_attempt).total_seconds()
+            >= CONSOLIDATION_INTERVAL_SECONDS
         )
-
-# ======== from core/llm_output.py ========
-"""LLM 输出的解析与校验边界。"""
-
-
-
 
 
 @dataclass(frozen=True)

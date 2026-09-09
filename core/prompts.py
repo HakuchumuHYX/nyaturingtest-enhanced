@@ -1,16 +1,14 @@
-# 由多个模块合并而来：core/time_context.py, prompts/presets.py, prompts/templates.py
-
+import json
+from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
+
 import chinese_calendar
 from nonebot import logger
-from dataclasses import dataclass, field
-import json
-from pathlib import Path
-from ..config import get_preset_dir
-from dataclasses import dataclass
+
+from ..config import PRESET_DIR
 
 
-# ======== from core/time_context.py ========
 def get_time_description(value: datetime) -> str:
     weekday = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")[
         value.weekday()
@@ -44,51 +42,20 @@ def get_time_description(value: datetime) -> str:
         status = "周末" if value.weekday() >= 5 else "工作日"
     return f"{value:%Y年%m月%d日 %H:%M} {weekday} [{period}] [{status}]"
 
-# ======== from prompts/presets.py ========
-# nyaturingtest/presets.py
-
-
-
 
 @dataclass
 class RolePreset:
+    """角色预设：人设、别名、预置记忆与对话样本。"""
+
     name: str
-    """
-    角色名称
-    """
     role: str
-    """
-    角色人设
-    """
     aliases: list[str] = field(default_factory=list)
-    """
-    角色别名列表
-    """
     knowledges: list[str] = field(default_factory=list)
-    """
-    预设知识
-    """
     relationships: list[str] = field(default_factory=list)
-    """
-    预设人物关系
-    """
     events: list[str] = field(default_factory=list)
-    """
-    预设了解的事件
-    """
     bot_self: list[str] = field(default_factory=list)
-    """
-    预设对自我的认知
-    """
     examples: list[dict] = field(default_factory=list)
-    """
-    对话示例，用于 Few-Shot Learning
-    格式: [{"user": "...", "bot": "..."}]
-    """
     hidden: bool = False
-    """
-    是否在/presets输出隐藏预设
-    """
 
 
 _猫娘预设 = RolePreset(
@@ -119,16 +86,10 @@ _BUILTIN_PRESETS: dict[str, RolePreset] = {"喵喵.json": _猫娘预设}
 PRESETS: dict[str, RolePreset] = dict(_BUILTIN_PRESETS)
 
 
-def get_preset_directory() -> Path:
-    """Return the single external preset source used by docs and commands."""
-
-    return get_preset_dir()
-
-
 def reload_presets(directory: str | Path | None = None) -> int:
     """Reload external presets without creating files or retaining stale entries."""
 
-    preset_dir = Path(directory) if directory is not None else get_preset_directory()
+    preset_dir = Path(directory) if directory is not None else PRESET_DIR
     loaded: dict[str, RolePreset] = {}
     if preset_dir.is_dir():
         paths = sorted(preset_dir.glob("*.json"), key=lambda path: path.name)
@@ -150,10 +111,6 @@ def reload_presets(directory: str | Path | None = None) -> int:
 
 # 启动时加载一次，命令执行时还会刷新以支持新增和修改文件。
 reload_presets()
-
-# ======== from prompts/templates.py ========
-# nyaturingtest/prompts.py
-
 
 DYNAMIC_INPUT_MARKER = "---- DYNAMIC INPUT ----"
 
@@ -182,15 +139,11 @@ def _truncate_messages(messages: list, total_limit: int) -> list:
     remaining = max(0, int(total_limit))
     selected = []
     for message in reversed(list(messages or [])):
-        item = dict(message) if isinstance(message, dict) else message
-        content = item.get("content", "") if isinstance(item, dict) else str(item)
+        item = dict(message)
         if remaining <= 0:
             break
-        truncated = truncate_text(content, remaining)
-        if isinstance(item, dict):
-            item["content"] = truncated
-        else:
-            item = truncated
+        truncated = truncate_text(item.get("content", ""), remaining)
+        item["content"] = truncated
         selected.append(item)
         remaining -= len(truncated)
     selected.reverse()
@@ -218,27 +171,14 @@ def _canonical_json(data) -> str:
     return json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
-def _coerce_json_array(value) -> list:
-    if isinstance(value, list):
-        return value
-    if isinstance(value, str) and value.strip():
-        try:
-            parsed = json.loads(value)
-            if isinstance(parsed, list):
-                return parsed
-        except Exception:
-            return []
-    return []
-
-
 def _memory_action_schema(allow_memory_supersede: bool) -> str:
     base_schema = """
-   - {{"action":"add","content":"完整的记忆内容，必须包含明确主语","related_user_id":"兼容字段，必须等于 subject_user_id；无法确定则为空字符串","subject_user_id":"事实主要描述的用户ID；无法确定则为空字符串","subject_user_name":"事实主要描述的用户名称；无法确定则为空字符串","speaker_user_id":"说出或确认该事实的新消息发送者ID","speaker_user_name":"说出或确认该事实的新消息发送者名称","category":"event|preference|profile|relationship","confidence":0.7,"importance":0.5}}
+   - {{"action":"add","content":"完整的记忆内容，必须包含明确主语","subject_user_id":"事实主要描述的用户ID；无法确定则为空字符串","subject_user_name":"事实主要描述的用户名称；无法确定则为空字符串","speaker_user_id":"说出或确认该事实的新消息发送者ID","speaker_user_name":"说出或确认该事实的新消息发送者名称","category":"event|preference|profile|relationship","confidence":0.7,"importance":0.5}}
    - {{"action":"ignore","reason":"低价值、重复或不应永久记忆的原因"}}"""
     if not allow_memory_supersede:
         return base_schema + "\n   当前没有可引用的旧记忆 ID，只允许 add/ignore。"
     return base_schema + """
-   - {{"action":"supersede","target_ref":"existing_related_memories 中的 memory_ref","content":"新的完整记忆内容，必须包含明确主语","related_user_id":"兼容字段，必须等于 subject_user_id；无法确定则为空字符串","subject_user_id":"事实主要描述的用户ID；无法确定则为空字符串","subject_user_name":"事实主要描述的用户名称；无法确定则为空字符串","speaker_user_id":"说出或确认该事实的新消息发送者ID","speaker_user_name":"说出或确认该事实的新消息发送者名称","category":"event|preference|profile|relationship","confidence":0.82,"importance":0.6,"reason":"用户明确更新、纠正或否定旧事实"}}"""
+   - {{"action":"supersede","target_ref":"existing_related_memories 中的 memory_ref","content":"新的完整记忆内容，必须包含明确主语","subject_user_id":"事实主要描述的用户ID；无法确定则为空字符串","subject_user_name":"事实主要描述的用户名称；无法确定则为空字符串","speaker_user_id":"说出或确认该事实的新消息发送者ID","speaker_user_name":"说出或确认该事实的新消息发送者名称","category":"event|preference|profile|relationship","confidence":0.82,"importance":0.6,"reason":"用户明确更新、纠正或否定旧事实"}}"""
 
 
 def _sanitize_existing_related_memories(items: list | None, *, allow_memory_supersede: bool) -> list:
@@ -262,7 +202,7 @@ def get_feedback_prompt(
         recent_msgs: list,
         new_msgs_formatted: list,
         emotion: dict,
-        related_profiles_json: str,
+        related_profiles: list,
         search_result: list,
         last_summary: str,
         is_relevant: bool = False,
@@ -299,7 +239,7 @@ def get_feedback_prompt(
             "dominance": round(float((emotion or {}).get("dominance", 0.0)), 2),
         },
         "summary": summary,
-        "related_profiles": _coerce_json_array(related_profiles_json),
+        "related_profiles": related_profiles or [],
         "search_result": _truncate_rag_items(search_result or [], budget),
         "existing_related_memories": safe_existing_related_memories,
         "memory_actions_allowed": memory_actions_allowed,
@@ -370,7 +310,7 @@ JSON 需包含以下字段：
 {memory_action_guidance}
    只记录包含新信息的事实（如偏好、经历、观点、个人信息等）。
    subject_* 表示事实描述对象；speaker_* 表示说出该事实的新消息发送者。
-   如果 B 说了关于 A 的事实，subject_* 填 A，speaker_* 填 B，related_user_id 必须等于 subject_user_id。
+   如果 B 说了关于 A 的事实，subject_* 填 A，speaker_* 填 B。
 2. "willing" (Float): 更新后的发言意愿 (0.0~1.0)。如果消息是在叫角色，设为 1.0；如果与角色无关，适当降低。
 3. "new_emotion" (Object): 必须提供。更新后的 VAD 情绪对象，格式: {{"valence": float, "arousal": float, "dominance": float}}。
    - valence (愉悦度): 范围 [-1.0, 1.0]，基于当前值渐进调整
@@ -396,7 +336,7 @@ def get_chat_prompt(
         recent_msgs: list,
         new_msgs_formatted: list,
         emotion: dict,
-        related_profiles_json: str,
+        related_profiles: list,
         search_result: list,
         chat_summary: str,
         examples_text: str = "",
@@ -434,7 +374,7 @@ def get_chat_prompt(
             "arousal": arousal_guide,
             "dominance": dominance_guide,
         },
-        "related_profiles": _coerce_json_array(related_profiles_json),
+        "related_profiles": related_profiles or [],
         "search_result": _truncate_rag_items(search_result or [], budget),
         "examples_text": examples_text or "",
         "recalled_history": truncate_text(

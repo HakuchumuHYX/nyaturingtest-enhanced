@@ -1,37 +1,34 @@
-# 由多个模块合并而来：database/backup_lock.py, database/retention.py, database/backup.py
+# 数据备份、保留期清理与定时任务
 
-from threading import RLock
-from datetime import datetime, timedelta
-from nonebot import logger
-from .models import GlobalMessageModel, InteractionLogModel, TokenUsageModel
+import asyncio
 import os
 import shutil
 import sqlite3
-from tempfile import TemporaryDirectory
 import zipfile
-import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
+from tempfile import TemporaryDirectory
+
 from nonebot import logger, require
-from .config import get_backup_dir, get_data_dir
-from nonebot_plugin_apscheduler import scheduler
 
+require("nonebot_plugin_apscheduler")
+from nonebot_plugin_apscheduler import scheduler  # noqa: E402  必须在 require 之后导入
 
-# ======== from database/backup_lock.py ========
-BACKUP_IO_LOCK = RLock()
+from .config import BACKUP_DIR, get_data_dir
+from .core.state_manager import maintain_vector_memories
+from .memory.vector import BACKUP_IO_LOCK
+from .models import GlobalMessageModel, InteractionLogModel, TokenUsageModel
 
-# ======== from database/retention.py ========
-RETENTION_DISABLED_DAYS = 0
-
-# 原始明细保留天数；0 表示永不清理
+# 原始明细保留天数
 RAW_MESSAGE_RETENTION_DAYS = 180
 RAW_INTERACTION_RETENTION_DAYS = 180
 TOKEN_USAGE_RETENTION_DAYS = 90
 
+DEFAULT_BACKUP_RETENTION_COUNT = 7
+SQLITE_FILENAME = "nyabot.sqlite"
+
 
 async def _delete_older_than(model, field_name: str, days: int) -> int:
-    if days <= RETENTION_DISABLED_DAYS:
-        return 0
     cutoff = datetime.now() - timedelta(days=days)
     return await model.filter(**{f"{field_name}__lt": cutoff}).delete()
 
@@ -42,51 +39,25 @@ async def cleanup_raw_data_retention() -> dict[str, int]:
     刻意不触碰长期向量记忆：语义记忆的生命周期由向量库清理路径负责。
     """
 
-    result = {
-        "messages": 0,
-        "interactions": 0,
-        "token_usage": 0,
-    }
-
     try:
-        result["messages"] = await _delete_older_than(
-            GlobalMessageModel,
-            "time",
-            RAW_MESSAGE_RETENTION_DAYS,
-        )
-        result["interactions"] = await _delete_older_than(
-            InteractionLogModel,
-            "timestamp",
-            RAW_INTERACTION_RETENTION_DAYS,
-        )
-        result["token_usage"] = await _delete_older_than(
-            TokenUsageModel,
-            "timestamp",
-            TOKEN_USAGE_RETENTION_DAYS,
-        )
+        result = {
+            "messages": await _delete_older_than(
+                GlobalMessageModel, "time", RAW_MESSAGE_RETENTION_DAYS
+            ),
+            "interactions": await _delete_older_than(
+                InteractionLogModel, "timestamp", RAW_INTERACTION_RETENTION_DAYS
+            ),
+            "token_usage": await _delete_older_than(
+                TokenUsageModel, "timestamp", TOKEN_USAGE_RETENTION_DAYS
+            ),
+        }
     except Exception as e:
         logger.error(f"[Retention] 原始数据库行清理失败: {e}")
         raise
 
     if any(result.values()):
-        logger.info(
-            "[Retention] 清理原始数据库行: "
-            f"messages={result['messages']}, "
-            f"interactions={result['interactions']}, "
-            f"token_usage={result['token_usage']}"
-        )
+        logger.info(f"[Retention] 清理原始数据库行: {result}")
     return result
-
-# ======== from database/backup.py ========
-# 确保调度器插件已加载
-require("nonebot_plugin_apscheduler")
-
-DEFAULT_BACKUP_RETENTION_COUNT = 7
-SQLITE_FILENAME = "nyabot.sqlite"
-
-
-def get_backup_dirs() -> tuple[Path, Path]:
-    return get_data_dir(), get_backup_dir()
 
 
 def _copy_sqlite_snapshot(source: Path, target: Path):
@@ -101,8 +72,7 @@ def _copy_data_to_staging(data_dir: Path, staging_dir: Path):
     sqlite_path = data_dir / SQLITE_FILENAME
     for root, dirs, files in os.walk(data_dir):
         root_path = Path(root)
-        rel_root = root_path.relative_to(data_dir)
-        target_root = staging_dir / rel_root
+        target_root = staging_dir / root_path.relative_to(data_dir)
         target_root.mkdir(parents=True, exist_ok=True)
 
         for dirname in list(dirs):
@@ -111,41 +81,30 @@ def _copy_data_to_staging(data_dir: Path, staging_dir: Path):
 
         for file in files:
             file_path = root_path / file
-            if file_path == sqlite_path or file_path.name in {f"{SQLITE_FILENAME}-wal", f"{SQLITE_FILENAME}-shm"}:
+            if file_path == sqlite_path or file_path.name in {
+                f"{SQLITE_FILENAME}-wal",
+                f"{SQLITE_FILENAME}-shm",
+            }:
                 continue
             # 字体是静态资源，每个备份包重复约 24MB，没必要打包
             if file_path.suffix.lower() in {".ttf", ".otf", ".ttc"}:
                 continue
-            target_path = target_root / file
-            shutil.copy2(file_path, target_path)
+            shutil.copy2(file_path, target_root / file)
 
     _copy_sqlite_snapshot(sqlite_path, staging_dir / SQLITE_FILENAME)
 
 
-def _backup_retention_count() -> int:
-    try:
-        value = DEFAULT_BACKUP_RETENTION_COUNT
-        return max(1, int(value or DEFAULT_BACKUP_RETENTION_COUNT))
-    except (TypeError, ValueError):
-        return DEFAULT_BACKUP_RETENTION_COUNT
-
-
 def _backup_data_sync() -> bool:
     """同步的备份执行函数"""
-    data_dir, backup_dir = get_backup_dirs()
-    
+    data_dir = get_data_dir()
+    backup_dir = BACKUP_DIR
+
     if not data_dir.exists():
         logger.warning(f"备份失败：数据目录 {data_dir} 不存在。")
         return False
 
-    # 确保备份目录存在
     backup_dir.mkdir(parents=True, exist_ok=True)
-
-    # 构造备份文件名: nyabot_backup_YYYYMMDD_HHMMSS.zip
-    now = datetime.now()
-    backup_filename = f"nyabot_backup_{now.strftime('%Y%m%d_%H%M%S')}.zip"
-    backup_filepath = backup_dir / backup_filename
-
+    backup_filepath = backup_dir / f"nyabot_backup_{datetime.now():%Y%m%d_%H%M%S}.zip"
     logger.info(f"开始备份 NyaTuringTest 数据到: {backup_filepath}")
 
     try:
@@ -159,96 +118,42 @@ def _backup_data_sync() -> bool:
                     for root, _, files in os.walk(staging_dir):
                         for file in files:
                             file_path = Path(root) / file
-                            arcname = file_path.relative_to(staging_dir)
-                            zipf.write(file_path, arcname)
-
+                            zipf.write(file_path, file_path.relative_to(staging_dir))
         logger.info(f"备份完成: {backup_filepath}")
-
     except Exception as e:
         logger.error(f"备份过程发生异常: {e}")
-        # 如果出错，尝试清理不完整的备份文件
         if backup_filepath.exists():
-            try:
-                backup_filepath.unlink()
-            except:
-                pass
+            backup_filepath.unlink(missing_ok=True)
         return False
 
-    # 清理过期的备份文件
     _clean_old_backups_sync()
     return True
 
 
-def backup_before_schema_upgrade(
-    database_path: Path,
-    target_version: int,
-) -> bool:
-    """Create a recoverable snapshot before applying an existing DB upgrade."""
+def _clean_old_backups_sync():
+    """只保留最近 DEFAULT_BACKUP_RETENTION_COUNT 个备份。"""
 
-    database_path = Path(database_path)
-    if not database_path.exists() or database_path.stat().st_size == 0:
-        return True
-    current_version = 0
-    try:
-        with sqlite3.connect(str(database_path)) as connection:
-            has_version_table = connection.execute(
-                """
-                SELECT 1 FROM sqlite_master
-                WHERE type='table' AND name='nyabot_schema_version'
-                """
-            ).fetchone()
-            if has_version_table:
-                row = connection.execute(
-                    "SELECT version FROM nyabot_schema_version WHERE id=1"
-                ).fetchone()
-                current_version = int(row[0]) if row else 0
-    except sqlite3.Error as e:
-        logger.error(f"迁移前检查数据库版本失败: {e}")
-        return False
-    if current_version >= int(target_version):
-        return True
-    logger.info(
-        f"数据库将从 schema {current_version} 升级到 {target_version}，先创建快照"
-    )
-    return _backup_data_sync()
-
-
-def _clean_old_backups_sync(retention_count: int | None = None):
-    """同步清理旧的备份文件"""
-    _, backup_dir = get_backup_dirs()
+    backup_dir = BACKUP_DIR
     if not backup_dir.exists():
         return
-    keep_value = retention_count if retention_count is not None else _backup_retention_count()
     try:
-        keep_count = max(1, int(keep_value or DEFAULT_BACKUP_RETENTION_COUNT))
-    except (TypeError, ValueError):
-        keep_count = DEFAULT_BACKUP_RETENTION_COUNT
-
-    try:
-        backups = []
-        for file in backup_dir.glob("nyabot_backup_*.zip"):
-            if file.is_file():
-                # 获取文件的最后修改时间
-                mtime = file.stat().st_mtime
-                backups.append((mtime, file))
-
-        # 按时间从新到旧排序
-        backups.sort(key=lambda x: x[0], reverse=True)
-
-        # 保留最近 backup_retention_count 个备份，删除多余的。
-        if len(backups) > keep_count:
-            for _, old_file in backups[keep_count:]:
-                logger.info(f"删除过期的备份文件: {old_file}")
-                old_file.unlink()
-
+        backups = [
+            (file.stat().st_mtime, file)
+            for file in backup_dir.glob("nyabot_backup_*.zip")
+            if file.is_file()
+        ]
+        backups.sort(key=lambda item: item[0], reverse=True)
+        for _, old_file in backups[DEFAULT_BACKUP_RETENTION_COUNT:]:
+            logger.info(f"删除过期的备份文件: {old_file}")
+            old_file.unlink()
     except Exception as e:
         logger.error(f"清理过期备份时发生异常: {e}")
 
 
 async def backup_task() -> bool:
     """执行一次数据备份；仅备份文件创建成功时返回 ``True``。"""
+
     logger.info("触发自动备份任务...")
-    # 由于文件压缩可能比较耗时且是阻塞的 I/O 操作，将其放入 asyncio 线程池中运行
     if not await asyncio.to_thread(_backup_data_sync):
         return False
 
@@ -261,26 +166,20 @@ async def backup_task() -> bool:
     return True
 
 
-async def vector_maintenance_task() -> None:
-    from .core.state_manager import maintain_vector_memories
-
-    await maintain_vector_memories()
-
-
 def setup_backup_job():
-    """注册定时备份任务"""
-    # 每天凌晨 04:00 执行
+    """注册定时备份与向量记忆维护任务"""
+
     scheduler.add_job(
         backup_task,
         "cron",
         hour=4,
         minute=0,
         id="nyaturingtest_daily_backup",
-        misfire_grace_time=3600, # 允许误差一小时（比如刚好四点时机器人没开机）
-        replace_existing=True
+        misfire_grace_time=3600,  # 允许误差一小时（比如刚好四点时机器人没开机）
+        replace_existing=True,
     )
     scheduler.add_job(
-        vector_maintenance_task,
+        maintain_vector_memories,
         "cron",
         hour=3,
         minute=30,
