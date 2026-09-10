@@ -93,7 +93,6 @@ class TokenUsageModel(Model):
     id = fields.IntField(pk=True)
     session_id = fields.CharField(max_length=255)  # 群号
     model_name = fields.CharField(max_length=255)  # 模型名称
-    provider = fields.CharField(max_length=64, default="")
     prompt_tokens = fields.IntField()
     completion_tokens = fields.IntField()
     prompt_cache_hit_tokens = fields.IntField(default=0)
@@ -123,7 +122,6 @@ class DailyTokenUsageModel(Model):
     day = fields.DateField()
     session_id = fields.CharField(max_length=255)
     model_name = fields.CharField(max_length=255)
-    provider = fields.CharField(max_length=64, default="")
     prompt_tokens = fields.BigIntField(default=0)
     completion_tokens = fields.BigIntField(default=0)
     prompt_cache_hit_tokens = fields.BigIntField(default=0)
@@ -133,7 +131,7 @@ class DailyTokenUsageModel(Model):
 
     class Meta:
         table = "nyabot_daily_token_usage"
-        unique_together = (("day", "session_id", "model_name", "provider"),)
+        unique_together = (("day", "session_id", "model_name"),)
         indexes = (
             Index(
                 fields=("session_id", "day"),

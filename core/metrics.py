@@ -32,7 +32,6 @@ def record_token_usage(session_id: str, model_name: str, usage: dict) -> None:
     log_event(
         "token_usage",
         session_id=session_id,
-        provider=usage.get("provider", ""),
         model=model_name,
         tokens=usage.get("total_tokens", 0),
         decision=usage.get("finish_reason", ""),
@@ -47,7 +46,6 @@ def record_token_usage(session_id: str, model_name: str, usage: dict) -> None:
             prompt_cache_miss_tokens=usage.get("prompt_cache_miss_tokens", 0),
             reasoning_tokens=usage.get("reasoning_tokens", 0),
             finish_reason=usage.get("finish_reason", ""),
-            provider=usage.get("provider", ""),
         )
     )
     _PENDING_USAGE_TASKS.add(task)

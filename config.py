@@ -37,17 +37,11 @@ def get_vector_dir(session_id: str) -> Path:
     return get_data_dir() / f"vector_index_{session_id}"
 
 
-DEEPSEEK_BASE_URL = "https://api.deepseek.com"
-DEEPSEEK_CHAT_MODEL = "deepseek-v4-flash"
-OPENAI_COMPATIBLE = "openai_compatible"
-DEEPSEEK_OFFICIAL = "deepseek_official"
-
 _plugin_config: dict[str, Any] = {}
 
 
 @dataclass(frozen=True)
 class EndpointSettings:
-    provider: str
     api_key: str
     base_url: str
     model: str
@@ -112,19 +106,17 @@ def get_config_load_status() -> ConfigLoadStatus:
 def get_default_config() -> dict:
     return {
         "chat": {
-            "provider": DEEPSEEK_OFFICIAL,
             "api_key": "",
-            "base_url": DEEPSEEK_BASE_URL,
-            "model": DEEPSEEK_CHAT_MODEL,
+            "base_url": "",
+            "model": "",
             "reasoning_effort": "low",
             "max_tokens": 4096,
             "timeout": 180,
         },
         "feedback": {
-            "provider": DEEPSEEK_OFFICIAL,
             "api_key": "",
-            "base_url": DEEPSEEK_BASE_URL,
-            "model": DEEPSEEK_CHAT_MODEL,
+            "base_url": "",
+            "model": "",
             "reasoning_effort": "",
             "max_tokens": 2048,
             "timeout": 60,
@@ -154,19 +146,8 @@ def _deep_merge(default: dict[str, Any], loaded: dict[str, Any]) -> dict[str, An
     return result
 
 
-def _normalize_endpoint(section_name: str, section: dict[str, Any]) -> None:
-    provider = str(section.get("provider") or "").strip().lower()
-    if provider not in {DEEPSEEK_OFFICIAL, OPENAI_COMPATIBLE}:
-        raise RuntimeError(f"Unsupported {section_name}.provider: {provider}")
-
-
 def normalize_config(config: dict[str, Any]) -> dict[str, Any]:
-    merged = _deep_merge(get_default_config(), config)
-
-    _normalize_endpoint("chat", merged["chat"])
-    _normalize_endpoint("feedback", merged["feedback"])
-
-    return merged
+    return _deep_merge(get_default_config(), config)
 
 
 def _require(value: str, field_name: str) -> str:
@@ -182,7 +163,6 @@ def build_settings(config: dict[str, Any]) -> AppSettings:
     def endpoint(name: str, *, max_tokens_default: int = 0) -> EndpointSettings:
         section = cfg[name]
         return EndpointSettings(
-            provider=section.get("provider", ""),
             api_key=section.get("api_key", ""),
             base_url=_require(section.get("base_url", ""), f"{name}.base_url"),
             model=_require(section.get("model", ""), f"{name}.model"),
@@ -204,7 +184,7 @@ def build_settings(config: dict[str, Any]) -> AppSettings:
 def describe_settings(settings: AppSettings) -> str:
     def endpoint(name: str, value: EndpointSettings) -> str:
         key_state = "set" if value.api_key else "missing"
-        return f"{name}: provider={value.provider}, model={value.model}, base_url={value.base_url}, api_key={key_state}"
+        return f"{name}: model={value.model}, base_url={value.base_url}, api_key={key_state}"
 
     return "; ".join(
         [

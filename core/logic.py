@@ -280,7 +280,6 @@ async def llm_response(
             metrics.llm_success += 1
             log_event(
                 "llm_success",
-                provider=client.provider,
                 model=model,
                 latency_ms=int((time.perf_counter() - started_at) * 1000),
                 tokens="recorded_by_usage_callback",
@@ -290,7 +289,6 @@ async def llm_response(
         metrics.llm_failure += 1
         log_event(
             "llm_failure",
-            provider=client.provider,
             model=model,
             latency_ms=int((time.perf_counter() - started_at) * 1000),
             decision="empty",
@@ -300,7 +298,6 @@ async def llm_response(
         metrics.llm_failure += 1
         log_event(
             "llm_error",
-            provider=client.provider,
             model=model,
             latency_ms=int((time.perf_counter() - started_at) * 1000),
             decision="exception",

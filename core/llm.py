@@ -94,21 +94,16 @@ class ProviderStatus:
 
 
 class LLMClient:
-    """Chat LLM client for DeepSeek official and OpenAI-compatible endpoints."""
+    """OpenAI-compatible chat completions client."""
 
     def __init__(
         self,
         *,
-        provider: str = "deepseek_official",
         openai_client: Optional[AsyncOpenAI] = None,
         timeout: float = 60.0,
-        base_url: str = "",
-        api_key: str = "",
     ):
-        self.provider = (provider or "deepseek_official").strip().lower()
         self.openai_client = openai_client
         self.timeout = timeout
-        self.base_url = (base_url or "").strip().rstrip("/")
         self.provider_status = ProviderStatus()
 
     @staticmethod
@@ -237,7 +232,6 @@ class LLMClient:
                     usage = self._usage_to_dict(
                         getattr(response, "usage", None), finish_reason
                     )
-                    usage["provider"] = self.provider
 
                     if on_usage:
                         try:

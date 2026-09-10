@@ -47,12 +47,12 @@ def _format_totals(totals: Mapping[str, int]) -> dict[str, int | float]:
 
 
 def merge_token_stats_by_model(
-    aggregate: Mapping[tuple[str, str], Mapping[str, int]],
+    aggregate: Mapping[str, Mapping[str, int]],
 ) -> list[dict]:
     """按规范化模型名合并（大小写不敏感），保留每个模型的汇总。"""
 
     models: dict[str, dict] = {}
-    for (raw_model, _raw_provider), totals in aggregate.items():
+    for raw_model, totals in aggregate.items():
         model_name = _clean_model_name(raw_model)
         key = _model_key(model_name)
         entry = models.setdefault(key, {"model": model_name, "totals": _empty_totals()})

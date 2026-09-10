@@ -17,7 +17,6 @@ from .session import MEMORY_DRAIN_TIMEOUT_SECONDS, Session
 
 def build_llm_client(settings: EndpointSettings) -> LLMClient:
     return LLMClient(
-        provider=settings.provider,
         openai_client=AsyncOpenAI(
             api_key=settings.api_key,
             base_url=settings.base_url,
@@ -25,8 +24,6 @@ def build_llm_client(settings: EndpointSettings) -> LLMClient:
             max_retries=0,
         ),
         timeout=settings.timeout,
-        base_url=settings.base_url,
-        api_key=settings.api_key,
     )
 
 

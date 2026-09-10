@@ -370,14 +370,12 @@ async def log_token_usage(
     prompt_cache_miss_tokens: int = 0,
     reasoning_tokens: int = 0,
     finish_reason: str = "",
-    provider: str = "",
 ):
     await log_token_usages(
         [
             {
                 "session_id": session_id,
                 "model_name": model_name,
-                "provider": provider,
                 "prompt_tokens": prompt_tokens,
                 "completion_tokens": completion_tokens,
                 "prompt_cache_hit_tokens": prompt_cache_hit_tokens,
@@ -396,14 +394,13 @@ async def log_token_usages(rows: list[dict]):
         return
     now = datetime.now().astimezone()
     day = now.date().isoformat()
-    grouped: dict[tuple[str, str, str], dict[str, int]] = defaultdict(
+    grouped: dict[tuple[str, str], dict[str, int]] = defaultdict(
         lambda: {field: 0 for field in TOKEN_FIELDS} | {"request_count": 0}
     )
     for row in rows:
         key = (
             str(row.get("session_id") or ""),
             str(row.get("model_name") or ""),
-            str(row.get("provider") or ""),
         )
         for field in TOKEN_FIELDS:
             grouped[key][field] += int(row.get(field, 0) or 0)
@@ -416,7 +413,6 @@ async def log_token_usages(rows: list[dict]):
                     TokenUsageModel(
                         session_id=row.get("session_id", ""),
                         model_name=row.get("model_name", ""),
-                        provider=row.get("provider", ""),
                         prompt_tokens=row.get("prompt_tokens", 0),
                         completion_tokens=row.get("completion_tokens", 0),
                         prompt_cache_hit_tokens=row.get("prompt_cache_hit_tokens", 0),
@@ -431,12 +427,12 @@ async def log_token_usages(rows: list[dict]):
             await conn.execute_many(
                 """
                 INSERT INTO nyabot_daily_token_usage (
-                    day, session_id, model_name, provider,
+                    day, session_id, model_name,
                     prompt_tokens, completion_tokens,
                     prompt_cache_hit_tokens, prompt_cache_miss_tokens,
                     reasoning_tokens, request_count
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(day, session_id, model_name, provider)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(day, session_id, model_name)
                 DO UPDATE SET
                     prompt_tokens = prompt_tokens + excluded.prompt_tokens,
                     completion_tokens = completion_tokens + excluded.completion_tokens,
@@ -450,7 +446,6 @@ async def log_token_usages(rows: list[dict]):
                         day,
                         session_id,
                         model_name,
-                        provider,
                         totals["prompt_tokens"],
                         totals["completion_tokens"],
                         totals["prompt_cache_hit_tokens"],
@@ -458,7 +453,7 @@ async def log_token_usages(rows: list[dict]):
                         totals["reasoning_tokens"],
                         totals["request_count"],
                     ]
-                    for (session_id, model_name, provider), totals in grouped.items()
+                    for (session_id, model_name), totals in grouped.items()
                 ],
             )
     except Exception as e:
@@ -489,7 +484,6 @@ async def get_token_stats(
             "day",
             "session_id",
             "model_name",
-            "provider",
             *TOKEN_FIELDS,
         )
 
@@ -501,7 +495,7 @@ async def get_token_stats(
             row_day = row["day"]
             if isinstance(row_day, str):
                 row_day = date.fromisoformat(row_day)
-            key = (str(row.get("model_name") or ""), str(row.get("provider") or ""))
+            key = str(row.get("model_name") or "")
             is_local = str(row.get("session_id") or "") == group_id_str
             targets = ["all_global"]
             if row_day >= seven_day_cutoff:
