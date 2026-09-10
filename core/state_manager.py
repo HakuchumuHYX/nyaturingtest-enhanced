@@ -42,7 +42,9 @@ class GroupState:
 
     messages_chunk: list[MMessage] = field(default_factory=list)
 
-    client: LLMClient = field(default_factory=lambda: build_llm_client(get_app_settings().chat))
+    client: LLMClient = field(
+        default_factory=lambda: build_llm_client(get_app_settings().chat)
+    )
     feedback_client: LLMClient = field(
         default_factory=lambda: build_llm_client(get_app_settings().feedback)
     )
@@ -96,7 +98,9 @@ def ensure_group_state(group_id: int):
         from .logic import spawn_state
 
         logger.info(f"启动群 {group_id} 的 spawn_state 后台任务...")
-        _group_tasks[group_id] = asyncio.create_task(spawn_state(state=group_states[group_id]))
+        _group_tasks[group_id] = asyncio.create_task(
+            spawn_state(state=group_states[group_id])
+        )
 
     return group_states[group_id]
 

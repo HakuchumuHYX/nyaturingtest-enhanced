@@ -1,11 +1,11 @@
 # nyaturingtest/mem.py
+
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
 from nonebot import logger
-
 
 SHORT_CONTEXT_LIMIT = 20
 SHORT_TERM_BUFFER_SIZE = 200
@@ -36,13 +36,17 @@ class MemoryRecord:
 
 class Memory:
     def __init__(
-            self,
-            compressed_message: str | None = None,
-            messages: list[Message] | None = None,
+        self,
+        compressed_message: str | None = None,
+        messages: list[Message] | None = None,
     ):
         self.__compressed_message = compressed_message or ""
         # 上下文窗口：保留缓冲区，access 只返回最近 SHORT_CONTEXT_LIMIT 条
-        self.__messages = deque(messages, maxlen=SHORT_TERM_BUFFER_SIZE) if messages else deque(maxlen=SHORT_TERM_BUFFER_SIZE)
+        self.__messages = (
+            deque(messages, maxlen=SHORT_TERM_BUFFER_SIZE)
+            if messages
+            else deque(maxlen=SHORT_TERM_BUFFER_SIZE)
+        )
         self.__dirty_messages: dict[int, Message] = {}
 
     async def clear(self) -> None:
@@ -64,7 +68,11 @@ class Memory:
     def access(self, limit: int | None = None) -> MemoryRecord:
         """返回最近若干条消息与当前摘要；limit 省略时用 SHORT_CONTEXT_LIMIT。"""
 
-        size = SHORT_CONTEXT_LIMIT if limit is None else max(1, min(int(limit), SHORT_CONTEXT_LIMIT))
+        size = (
+            SHORT_CONTEXT_LIMIT
+            if limit is None
+            else max(1, min(int(limit), SHORT_CONTEXT_LIMIT))
+        )
         return MemoryRecord(
             messages=list(self.__messages)[-size:],
             compressed_history=self.__compressed_message,
@@ -72,8 +80,7 @@ class Memory:
 
     def pending_messages(self) -> list[tuple[Message, int]]:
         return [
-            (message, message.revision)
-            for message in self.__dirty_messages.values()
+            (message, message.revision) for message in self.__dirty_messages.values()
         ]
 
     def mark_persisted(self, persisted: list[tuple[Message, int]]) -> None:
@@ -96,7 +103,11 @@ class Memory:
         messages = list(self.__messages)
         if watermark is not None:
             watermark_ts = watermark.timestamp()
-            messages = [message for message in messages if message.time.timestamp() > watermark_ts]
+            messages = [
+                message
+                for message in messages
+                if message.time.timestamp() > watermark_ts
+            ]
         if limit is not None:
             safe_limit = max(1, int(limit))
             messages = messages[-safe_limit:]
@@ -108,7 +119,7 @@ class Memory:
         增加基于 message_id 的去重逻辑
         """
         existing_ids = {msg.id for msg in self.__messages if msg.id}
-        
+
         to_add = []
         for m in message_chunk:
             # 如果消息有ID且已存在，则跳过

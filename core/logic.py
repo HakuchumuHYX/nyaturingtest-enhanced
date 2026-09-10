@@ -17,12 +17,13 @@ from .metrics import log_event, metrics
 from .orchestrator import ConversationOrchestrator
 from .state_manager import SELF_SENT_MSG_IDS, GroupState, is_shutting_down
 
-
 DEBOUNCE_SECONDS = 2.0
 QUEUE_MAX_SIZE = 200
 MAX_REPLY_MESSAGES = 2
 
-_SPLIT_PATTERN = re.compile(r"(?<=[。！？!?~\n])\s*|(?<!\.)\.(?!\.)(?=\s|$|[\u4e00-\u9fff])\s*")
+_SPLIT_PATTERN = re.compile(
+    r"(?<=[。！？!?~\n])\s*|(?<!\.)\.(?!\.)(?=\s|$|[\u4e00-\u9fff])\s*"
+)
 _SINGLE_TRAILING_PERIOD = re.compile(r"(?<!\.)\.$")
 
 
@@ -219,7 +220,9 @@ def _build_image_ref(
     segment_index: int,
     identifier: str,
 ) -> str:
-    digest = hashlib.sha1(str(identifier or "").encode("utf-8", "ignore")).hexdigest()[:12]
+    digest = hashlib.sha1(str(identifier or "").encode("utf-8", "ignore")).hexdigest()[
+        :12
+    ]
     scope_digest = hashlib.sha1(
         str(message_scope or "").encode("utf-8", "ignore")
     ).hexdigest()[:10]
@@ -235,7 +238,11 @@ def _filter_local_self_echoes(
 
     filtered, local_echoes = [], []
     for msg in messages:
-        if msg.id and str(msg.user_id) == str(bot_self_id) and str(msg.id) in self_sent_ids:
+        if (
+            msg.id
+            and str(msg.user_id) == str(bot_self_id)
+            and str(msg.id) in self_sent_ids
+        ):
             local_echoes.append(msg)
         else:
             filtered.append(msg)
@@ -267,7 +274,7 @@ async def llm_response(
             system_prompt=system_prompt,
             on_usage=on_usage,
             images=images,
-            **kwargs
+            **kwargs,
         )
         if result:
             metrics.llm_success += 1
@@ -326,7 +333,9 @@ async def message2BotMessage(
                 url,
                 file_unique,
                 is_sticker=_is_sticker_segment_data(seg.data),
-                ref_id=_build_image_ref(message_scope, "primary", segment_index, file_unique or url),
+                ref_id=_build_image_ref(
+                    message_scope, "primary", segment_index, file_unique or url
+                ),
                 source="primary",
             )
             return (text, [vision_input] if vision_input else [])
@@ -338,8 +347,12 @@ async def message2BotMessage(
             if target == str(bot.self_id):
                 return (f" @{bot_name} ", [])
             try:
-                user_info = await bot.get_group_member_info(group_id=group_id, user_id=int(target))
-                nickname = user_info.get("card") or user_info.get("nickname") or str(target)
+                user_info = await bot.get_group_member_info(
+                    group_id=group_id, user_id=int(target)
+                )
+                nickname = (
+                    user_info.get("card") or user_info.get("nickname") or str(target)
+                )
                 return (f" @{nickname} ", [])
             except Exception:
                 return (f" @{target} ", [])
@@ -386,7 +399,7 @@ async def message2BotMessage(
 
                 if len(source_text) > 800:
                     source_text = source_text[:800] + "..."
-                return (f" [回复 {sender}: \"{source_text}\"] ", image_inputs)
+                return (f' [回复 {sender}: "{source_text}"] ', image_inputs)
             except Exception as e:
                 logger.warning(f"获取回复内容失败: {e}")
                 return (" [回复] ", [])

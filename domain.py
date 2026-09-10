@@ -38,7 +38,9 @@ class PersonProfile:
     user_id: str
     emotion: EmotionState = field(default_factory=EmotionState)
     interactions: deque[Impression] = field(default_factory=deque)
-    last_update_time: datetime = field(default_factory=lambda: datetime.now().astimezone())
+    last_update_time: datetime = field(
+        default_factory=lambda: datetime.now().astimezone()
+    )
     interaction_count: int = 0
     first_interaction_at: datetime | None = None
     last_interaction_at: datetime | None = None
@@ -59,7 +61,9 @@ class PersonProfile:
         # 3. 应用峰值保持逻辑 (Peak Hold Logic)
 
         # --- Valence (愉悦度) ---
-        if (self.emotion.valence >= 0 and new_val >= 0) or (self.emotion.valence < 0 and new_val < 0):
+        if (self.emotion.valence >= 0 and new_val >= 0) or (
+            self.emotion.valence < 0 and new_val < 0
+        ):
             if abs(new_val) > abs(self.emotion.valence):
                 self.emotion.valence = new_val
         else:
@@ -71,7 +75,9 @@ class PersonProfile:
         self.emotion.arousal = max(0.0, min(1.0, self.emotion.arousal))
 
         # --- Dominance (支配度) ---
-        if (self.emotion.dominance >= 0 and new_dom >= 0) or (self.emotion.dominance < 0 and new_dom < 0):
+        if (self.emotion.dominance >= 0 and new_dom >= 0) or (
+            self.emotion.dominance < 0 and new_dom < 0
+        ):
             if abs(new_dom) > abs(self.emotion.dominance):
                 self.emotion.dominance = new_dom
         else:

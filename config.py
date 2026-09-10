@@ -12,7 +12,6 @@ from typing import Any
 
 from nonebot import logger
 
-
 PLUGIN_DIR = Path(__file__).parent
 CONFIG_FILE = Path(
     os.environ.get("NYATURINGTEST_CONFIG_FILE", str(PLUGIN_DIR / "config.json"))
@@ -85,7 +84,9 @@ class ConfigLoadStatus:
     error_message: str = ""
 
 
-_config_load_status = ConfigLoadStatus(ok=True, source="not_loaded", path=str(CONFIG_FILE))
+_config_load_status = ConfigLoadStatus(
+    ok=True, source="not_loaded", path=str(CONFIG_FILE)
+)
 
 
 def _set_config_load_status(
@@ -205,10 +206,12 @@ def describe_settings(settings: AppSettings) -> str:
         key_state = "set" if value.api_key else "missing"
         return f"{name}: provider={value.provider}, model={value.model}, base_url={value.base_url}, api_key={key_state}"
 
-    return "; ".join([
-        endpoint("chat", settings.chat),
-        endpoint("feedback", settings.feedback),
-    ])
+    return "; ".join(
+        [
+            endpoint("chat", settings.chat),
+            endpoint("feedback", settings.feedback),
+        ]
+    )
 
 
 def load_plugin_config() -> dict:
@@ -270,9 +273,13 @@ def _build_memory_endpoint_settings(
     rerank = config.get("rerank", {}) or {}
     return MemoryEndpointSettings(
         model=str(embedding.get("model") or "BAAI/bge-m3"),
-        base_url=str(embedding.get("base_url") or "https://api.siliconflow.cn/v1").rstrip("/"),
+        base_url=str(
+            embedding.get("base_url") or "https://api.siliconflow.cn/v1"
+        ).rstrip("/"),
         timeout=float(embedding.get("timeout") or 30),
-        rerank_base_url=str(rerank.get("base_url") or "https://api.siliconflow.cn/v1/rerank").rstrip("/"),
+        rerank_base_url=str(
+            rerank.get("base_url") or "https://api.siliconflow.cn/v1/rerank"
+        ).rstrip("/"),
         rerank_timeout=float(rerank.get("timeout") or 10),
     )
 

@@ -1,26 +1,18 @@
 # nyaturingtest/session.py
+
 import asyncio
-from dataclasses import dataclass, field
-from datetime import datetime
 import json
 import time
+from dataclasses import dataclass, field
+from datetime import datetime
 from enum import Enum
 from typing import Any
 
 import httpx
 from nonebot import logger
 from nonebot.utils import run_sync
+
 from ..config import get_vector_dir
-from ..domain import EmotionState
-from ..memory.vector import VectorMemory
-from ..memory.short_term import Memory, Message
-from .engagement import (
-    LOW_WILLINGNESS_SKIP_THRESHOLD,
-    WILLINGNESS_LOAD_VALUE,
-)
-from .prompts import PRESETS, reload_presets
-from ..domain import PersonProfile
-from .prompts import truncate_text
 from ..db import (
     delete_session_data,
     load_full_session_data,
@@ -29,9 +21,15 @@ from ..db import (
     sync_messages,
     update_user_profiles,
 )
-from ..memory.vector import BACKUP_IO_LOCK
+from ..domain import EmotionState, PersonProfile
+from ..memory.short_term import Memory, Message
+from ..memory.vector import BACKUP_IO_LOCK, VectorMemory
+from .engagement import (
+    LOW_WILLINGNESS_SKIP_THRESHOLD,
+    WILLINGNESS_LOAD_VALUE,
+)
 from .metrics import log_event
-
+from .prompts import PRESETS, reload_presets, truncate_text
 
 # 角色与摘要文本上限、后台任务排空超时
 ROLE_MAX_CHARS = 4000
@@ -156,17 +154,17 @@ class Session:
     """
 
     def __init__(
-            self,
-            siliconflow_api_key: str,
-            id: str = "global",
-            name: str = "terminus",
-            http_client: httpx.AsyncClient | None = None
+        self,
+        siliconflow_api_key: str,
+        id: str = "global",
+        name: str = "terminus",
+        http_client: httpx.AsyncClient | None = None,
     ):
         self.id = id
         if http_client is None:
             http_client = httpx.AsyncClient(
                 limits=httpx.Limits(max_keepalive_connections=5, max_connections=10),
-                timeout=60.0
+                timeout=60.0,
             )
             owns_http_client = True
         else:
@@ -189,7 +187,8 @@ class Session:
 
     def bump_generation(self, reason: str = "") -> int:
         self.state.generation += 1
-        log_event("session_generation_bumped",
+        log_event(
+            "session_generation_bumped",
             session_id=self.id,
             generation=self.state.generation,
             reason=reason,
@@ -197,10 +196,16 @@ class Session:
         return self.state.generation
 
     def is_generation_stale(self, expected_generation: int | None) -> bool:
-        return expected_generation is not None and self.state.generation != expected_generation
+        return (
+            expected_generation is not None
+            and self.state.generation != expected_generation
+        )
 
-    def _log_stale_generation(self, stage: str, expected_generation: int | None) -> None:
-        log_event("stale_turn_discarded",
+    def _log_stale_generation(
+        self, stage: str, expected_generation: int | None
+    ) -> None:
+        log_event(
+            "stale_turn_discarded",
             session_id=self.id,
             stage=stage,
             expected_generation=expected_generation,
@@ -339,8 +344,8 @@ class Session:
                     "chat_summary": self.state.chat_summary,
                     "last_speak_time": self.state.last_speak_time,
                     "last_consolidated_time": self.state.last_consolidated_time,
-                    "chatting_state": self.state.chatting_state.value
-                }
+                    "chatting_state": self.state.chatting_state.value,
+                },
             )
 
             # 2. 更新变化过的画像，避免高频保存重复写全量 profiles。
@@ -370,18 +375,19 @@ class Session:
             return False
 
     async def load_session(self):
-        if self.state.loaded: return
+        if self.state.loaded:
+            return
 
         # 使用 Repository 加载完整数据
         data = await load_full_session_data(self.id)
-        
+
         if not data:
             logger.info(f"[Session {self.id}] 初始化新会话")
             self.state.loaded = True
             return
-            
+
         session_db = data["session"]
-        
+
         self.state.name = session_db.name
         self.state.role = truncate_text(session_db.role, ROLE_MAX_CHARS)
         self.state.aliases = session_db.aliases if session_db.aliases else []
@@ -389,7 +395,7 @@ class Session:
         self.state.global_emotion.valence = session_db.valence
         self.state.global_emotion.arousal = session_db.arousal
         self.state.global_emotion.dominance = session_db.dominance
-        
+
         if session_db.last_speak_time:
             t = session_db.last_speak_time
             if t.tzinfo is not None:
@@ -409,7 +415,7 @@ class Session:
             self.state.chatting_state = ChattingState.IDLE
             self.state.engaged = False
         self.state.profiles = {}
-        
+
         # 恢复用户画像
         for user_data in data["users"]:
             user_id = user_data["user_id"]
@@ -475,7 +481,9 @@ class Session:
         else:
             self.state.role = truncate_text(base_role, ROLE_MAX_CHARS)
 
-        await run_sync(self.runtime.vector_memory.delete_by_metadata)({"source": "preset"})
+        await run_sync(self.runtime.vector_memory.delete_by_metadata)(
+            {"source": "preset"}
+        )
 
         preset_items: list[tuple[str, str]] = []
         preset_items.extend((item, "knowledge") for item in preset.knowledges)
@@ -488,14 +496,20 @@ class Session:
                 {"source": "preset", "type": "rule", "subtype": subtype}
                 for _, subtype in preset_items
             ]
-            await run_sync(self.runtime.vector_memory.add_texts)(to_add, metadatas=metadatas)
+            await run_sync(self.runtime.vector_memory.add_texts)(
+                to_add, metadatas=metadatas
+            )
 
         await self.save_session()
         return True
 
     def status(self) -> str:
         recent_messages = self.runtime.short_term_memory.access().messages
-        recent_str = "\n".join([f"{m.user_name}: {m.content}" for m in recent_messages]) if recent_messages else "无"
+        recent_str = (
+            "\n".join([f"{m.user_name}: {m.content}" for m in recent_messages])
+            if recent_messages
+            else "无"
+        )
         return f"""
 名字：{self.state.name}
 设定：{self.state.role}
@@ -512,15 +526,17 @@ class Session:
         """
         主动记录 Bot 自己的发言 (防止等待回显导致记忆延迟)
         """
-        logger.debug(f"[Session {self.id}] 主动写入自身记忆: {content[:20]}... (ID: {msg_id})")
+        logger.debug(
+            f"[Session {self.id}] 主动写入自身记忆: {content[:20]}... (ID: {msg_id})"
+        )
         msg = Message(
             time=datetime.now(),
             user_name=self.state.name,
             content=content,
             id=msg_id,
-            user_id=bot_user_id
+            user_id=bot_user_id,
         )
-        
+
         await self.runtime.short_term_memory.update([msg])
 
     async def record_incoming(self, messages_chunk: list[Message]) -> None:
@@ -537,9 +553,13 @@ class Session:
         if not pending:
             return
         try:
-            await asyncio.wait_for(asyncio.gather(*pending, return_exceptions=True), timeout=timeout)
+            await asyncio.wait_for(
+                asyncio.gather(*pending, return_exceptions=True), timeout=timeout
+            )
         except asyncio.TimeoutError:
-            logger.warning(f"[Session {self.id}] 等待后台任务超时，取消 {len(pending)} 个任务")
+            logger.warning(
+                f"[Session {self.id}] 等待后台任务超时，取消 {len(pending)} 个任务"
+            )
             for task in pending:
                 if not task.done():
                     task.cancel()
@@ -566,6 +586,8 @@ class Session:
             return
         async with self.runtime.save_lock:
             if self.is_generation_stale(expected_generation):
-                self._log_stale_generation("interaction_log_locked", expected_generation)
+                self._log_stale_generation(
+                    "interaction_log_locked", expected_generation
+                )
                 return
             await log_interactions(self.id, interactions)

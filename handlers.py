@@ -59,9 +59,15 @@ class CommandMeta:
 
 COMMANDS: tuple[CommandMeta, ...] = (
     CommandMeta("autochat <enable/disable>", "在本群启用或禁用 Autochat"),
-    CommandMeta("status", "查看 Bot 状态、provider 错误和基础 metrics", "status <群号>"),
+    CommandMeta(
+        "status", "查看 Bot 状态、provider 错误和基础 metrics", "status <群号>"
+    ),
     CommandMeta("role", "查看当前角色", "role <群号>"),
-    CommandMeta("set_role <角色名> <角色设定>", "设置角色，设定可包含空格", "set_role <群号> <角色名> <角色设定>"),
+    CommandMeta(
+        "set_role <角色名> <角色设定>",
+        "设置角色，设定可包含空格",
+        "set_role <群号> <角色名> <角色设定>",
+    ),
     CommandMeta("presets", "查看可用预设", "presets <群号>"),
     CommandMeta("set_preset <文件名>", "加载预设", "set_preset <群号> <文件名>"),
     CommandMeta("rag_debug <query>", "诊断 RAG 记忆检索"),
@@ -102,7 +108,9 @@ async def is_private_message(event: Event) -> bool:
     return isinstance(event, PrivateMessageEvent)
 
 
-def _is_priority_message(message: Message, bot_self_id: str, bot_name: str, rendered_text: str) -> bool:
+def _is_priority_message(
+    message: Message, bot_self_id: str, bot_name: str, rendered_text: str
+) -> bool:
     for seg in message:
         if seg.type == "at" and str(seg.data.get("qq", "")) == bot_self_id:
             return True
@@ -174,52 +182,77 @@ async def describe_status(state) -> str:
 
 # ==================== 命令注册 ====================
 
+
+def _is_group_or_private(event: Event) -> bool:
+    return isinstance(event, (GroupMessageEvent, PrivateMessageEvent))
+
+
 help_cmd = on_command(
-    rule=is_group_message, permission=SUPERUSER, cmd="help", aliases={"帮助"}, priority=0, block=True
-)
-help_pm = on_command(
-    rule=is_private_message, permission=SUPERUSER, cmd="help", aliases={"帮助"}, priority=0, block=True
+    rule=_is_group_or_private,
+    permission=SUPERUSER,
+    cmd="help",
+    aliases={"帮助"},
+    priority=0,
+    block=True,
 )
 list_groups_pm = on_command(
-    rule=is_private_message, permission=SUPERUSER, cmd="list_groups", aliases={"群组列表"}, priority=0, block=True
+    rule=is_private_message,
+    permission=SUPERUSER,
+    cmd="list_groups",
+    aliases={"群组列表"},
+    priority=0,
+    block=True,
 )
 manual_backup_cmd = on_command(
-    rule=is_group_message, permission=SUPERUSER, cmd="backup_data", aliases={"备份数据"}, priority=0, block=True
-)
-manual_backup_pm = on_command(
-    rule=is_private_message, permission=SUPERUSER, cmd="backup_data", aliases={"备份数据"}, priority=0, block=True
+    rule=_is_group_or_private,
+    permission=SUPERUSER,
+    cmd="backup_data",
+    aliases={"备份数据"},
+    priority=0,
+    block=True,
 )
 manage_cmd = on_command(
     rule=is_group_message, permission=SUPERUSER, cmd="autochat", priority=1, block=True
 )
 token_stats = on_command(
-    rule=is_group_message, permission=SUPERUSER, cmd="token统计", aliases={"autochat token统计"}, priority=1, block=True
+    rule=is_group_message,
+    permission=SUPERUSER,
+    cmd="token统计",
+    aliases={"autochat token统计"},
+    priority=1,
+    block=True,
 )
 auto_chat = on_message(rule=is_group_message, priority=99, block=False)
 
 
 def _dual_command(cmd: str, aliases: set[str], handler):
-    """注册群聊与私聊两个 matcher，共用 handler(matcher, group_id, args_text)。
+    """注册一个群聊/私聊通用的 matcher，调用 handler(matcher, group_id, args_text)。
 
-    群聊直接用 event.group_id；私聊先取第一个参数作为群号。
+    群聊直接用 event.group_id；私聊把第一个参数当群号。
+    两个 matcher 会触发 nonebot 的「Duplicated prefix rule」告警，所以合成一个。
     """
 
-    group = on_command(rule=is_group_message, permission=SUPERUSER, cmd=cmd, aliases=aliases, priority=0, block=True)
-    private = on_command(rule=is_private_message, permission=SUPERUSER, cmd=cmd, aliases=aliases, priority=0, block=True)
+    matcher = on_command(
+        rule=_is_group_or_private,
+        permission=SUPERUSER,
+        cmd=cmd,
+        aliases=aliases,
+        priority=0,
+        block=True,
+    )
 
-    @group.handle()
-    async def _group_entry(event: GroupMessageEvent, args: Message = CommandArg()):
-        await handler(group, event.group_id, args.extract_plain_text().strip())
-
-    @private.handle()
-    async def _private_entry(args: Message = CommandArg()):
+    @matcher.handle()
+    async def _entry(event: Event, args: Message = CommandArg()):
+        if isinstance(event, GroupMessageEvent):
+            await handler(matcher, event.group_id, args.extract_plain_text().strip())
+            return
         parts = args.extract_plain_text().strip().split(" ", 1)
         if not parts[0]:
-            await private.finish("请提供<群号>")
-        group_id = await _parse_group_id_or_finish(private, parts[0])
-        await handler(private, group_id, parts[1].strip() if len(parts) > 1 else "")
+            await matcher.finish("请提供<群号>")
+        group_id = await _parse_group_id_or_finish(matcher, parts[0])
+        await handler(matcher, group_id, parts[1].strip() if len(parts) > 1 else "")
 
-    return group, private
+    return matcher
 
 
 async def _group_state_or_finish(matcher: type[Matcher], group_id: int):
@@ -289,7 +322,9 @@ async def _do_reset_emotion(matcher: type[Matcher], group_id: int, _args: str):
 
 async def _do_reset(matcher: type[Matcher], group_id: int, args: str):
     if args.lower() != "confirm":
-        await matcher.finish("危险操作：将清空本群会话、记忆和画像。确认执行请发送：reset confirm")
+        await matcher.finish(
+            "危险操作：将清空本群会话、记忆和画像。确认执行请发送：reset confirm"
+        )
     state = await _group_state_or_finish(matcher, group_id)
     await matcher.send("即将重置，会先执行一次数据备份...")
     if not await reset_session_with_backup(state, backup_task):
@@ -303,24 +338,23 @@ async def _do_status(matcher: type[Matcher], group_id: int, _args: str):
     await matcher.finish(await describe_status(state))
 
 
-get_presets, get_presets_pm = _dual_command("presets", {"preset"}, _do_get_presets)
-set_presets, set_presets_pm = _dual_command("set_preset", {"set_presets"}, _do_set_presets)
-get_role, get_role_pm = _dual_command("role", {"当前角色"}, _do_get_role)
-set_role, set_role_pm = _dual_command("set_role", {"设置角色"}, _do_set_role)
-calm_down, calm_down_pm = _dual_command("calm", {"冷静"}, _do_calm_down)
-reset_emotion, reset_emotion_pm = _dual_command("reset_emotion", {"重置情绪"}, _do_reset_emotion)
-reset, reset_pm = _dual_command("reset", {"重置"}, _do_reset)
-get_status, get_status_pm = _dual_command("status", {"状态"}, _do_status)
+get_presets = _dual_command("presets", {"preset"}, _do_get_presets)
+set_presets = _dual_command("set_preset", {"set_presets"}, _do_set_presets)
+get_role = _dual_command("role", {"当前角色"}, _do_get_role)
+set_role = _dual_command("set_role", {"设置角色"}, _do_set_role)
+calm_down = _dual_command("calm", {"冷静"}, _do_calm_down)
+reset_emotion = _dual_command("reset_emotion", {"重置情绪"}, _do_reset_emotion)
+reset = _dual_command("reset", {"重置"}, _do_reset)
+get_status = _dual_command("status", {"状态"}, _do_status)
 
 
 @help_cmd.handle()
-async def handle_help():
-    await help_cmd.finish(render_group_help())
-
-
-@help_pm.handle()
-async def handle_help_pm():
-    await help_pm.finish(render_private_help())
+async def handle_help(event: Event):
+    await help_cmd.finish(
+        render_group_help()
+        if isinstance(event, GroupMessageEvent)
+        else render_private_help()
+    )
 
 
 async def _do_manual_backup(matcher: type[Matcher]):
@@ -335,16 +369,13 @@ async def handle_manual_backup():
     await _do_manual_backup(manual_backup_cmd)
 
 
-@manual_backup_pm.handle()
-async def handle_manual_backup_pm():
-    await _do_manual_backup(manual_backup_pm)
-
-
 @list_groups_pm.handle()
 async def handle_list_groups_pm():
     if not runtime_enabled_groups:
         await list_groups_pm.finish("没有启用的群组")
-    msg = "启用的群组:\n" + "".join(f"- {group_id}\n" for group_id in runtime_enabled_groups)
+    msg = "启用的群组:\n" + "".join(
+        f"- {group_id}\n" for group_id in runtime_enabled_groups
+    )
     await list_groups_pm.finish(msg)
 
 
@@ -424,7 +455,12 @@ async def handle_auto_chat(bot: Bot, event: GroupMessageEvent):
                 state.messages_chunk.pop(0)
             else:
                 logger.warning(f"群 {group_id} 消息队列已满，丢弃低优先级消息")
-                log_event("queue_drop", group_id=group_id, decision="drop_low_priority", queue_len=len(state.messages_chunk))
+                log_event(
+                    "queue_drop",
+                    group_id=group_id,
+                    decision="drop_low_priority",
+                    queue_len=len(state.messages_chunk),
+                )
                 return
         state.event = event
         state.bot = bot
@@ -442,7 +478,9 @@ async def handle_auto_chat(bot: Bot, event: GroupMessageEvent):
 
 
 @manage_cmd.handle()
-async def handle_manage_autochat(event: GroupMessageEvent, args: Message = CommandArg()):
+async def handle_manage_autochat(
+    event: GroupMessageEvent, args: Message = CommandArg()
+):
     arg = args.extract_plain_text().strip().lower()
     group_id = event.group_id
 
@@ -472,11 +510,15 @@ async def handle_manage_autochat(event: GroupMessageEvent, args: Message = Comma
         await manage_cmd.finish("Autochat 已在本群禁用")
 
     else:
-        await manage_cmd.finish("指令格式错误。请使用: autochat enable 或 autochat disable")
+        await manage_cmd.finish(
+            "指令格式错误。请使用: autochat enable 或 autochat disable"
+        )
 
 
 @token_stats.handle()
-async def handle_token_stats(bot: Bot, event: GroupMessageEvent, args: Message = CommandArg()):
+async def handle_token_stats(
+    bot: Bot, event: GroupMessageEvent, args: Message = CommandArg()
+):
     group_id = event.group_id
     arg = args.extract_plain_text().strip().lower()
     token_stats_scope_all = arg in {"all", "全部", "历史", "history", "historical"}
@@ -488,13 +530,13 @@ async def handle_token_stats(bot: Bot, event: GroupMessageEvent, args: Message =
         model_names=stats_model_names,
     )
     scope_label = "全部历史模型" if token_stats_scope_all else "当前模型"
-    
+
     try:
         img_bytes = await render_token_stats_card(
             stats=stats,
             scope_label=scope_label,
         )
-        
+
         # 发送图片消息
         await token_stats.finish(MessageSegment.image(img_bytes))
     except FinishedException:
@@ -507,6 +549,7 @@ async def handle_token_stats(bot: Bot, event: GroupMessageEvent, args: Message =
         text_msg += f"24h本群: {stats.get('1d_local', [])}\n"
         text_msg += f"24h全局: {stats.get('1d_global', [])}\n"
         await token_stats.finish(text_msg)
+
 
 query_memory = on_command(
     "查询记忆",
@@ -582,7 +625,8 @@ async def handle_rag_debug(
         await rag_debug.finish("长期记忆库不可用。")
         return
 
-    result = await search_memories(memory, 
+    result = await search_memories(
+        memory,
         [query],
         k=RAG_FINAL_K,
         where=where_filter,
@@ -594,9 +638,9 @@ async def handle_rag_debug(
         "RAG debug",
         f"query: {query}",
         f"where: {json.dumps(where_filter, ensure_ascii=False, sort_keys=True)}",
-        f'candidate_count: {result.stats.get("candidate_count", 0)}',
-        f'returned_count: {result.stats.get("returned_count", len(result.records))}',
-        f'fallback_reason: {result.stats.get("fallback_reason") or "none"}',
+        f"candidate_count: {result.stats.get('candidate_count', 0)}",
+        f"returned_count: {result.stats.get('returned_count', len(result.records))}",
+        f"fallback_reason: {result.stats.get('fallback_reason') or 'none'}",
         "score_fields: adjusted_score, retrieval_score, rerank_score",
         "top_records:",
     ]

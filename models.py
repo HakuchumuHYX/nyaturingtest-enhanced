@@ -43,7 +43,9 @@ class UserProfileModel(Model):
 
 class InteractionLogModel(Model):
     id = fields.IntField(pk=True)
-    user = fields.ForeignKeyField("models.UserProfileModel", related_name="interactions")
+    user = fields.ForeignKeyField(
+        "models.UserProfileModel", related_name="interactions"
+    )
     timestamp = fields.DatetimeField()
     delta_valence = fields.FloatField()
     delta_arousal = fields.FloatField()
@@ -78,6 +80,7 @@ class GlobalMessageModel(Model):
 
 class EnabledGroupModel(Model):
     """存储启用的群组ID"""
+
     group_id = fields.BigIntField(pk=True)
 
     class Meta:
@@ -86,6 +89,7 @@ class EnabledGroupModel(Model):
 
 class TokenUsageModel(Model):
     """记录 Token 消耗"""
+
     id = fields.IntField(pk=True)
     session_id = fields.CharField(max_length=255)  # 群号
     model_name = fields.CharField(max_length=255)  # 模型名称

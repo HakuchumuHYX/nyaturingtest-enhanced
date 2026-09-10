@@ -1,4 +1,5 @@
 # 图片下载、压缩与原生多模态输入准备
+
 import asyncio
 import base64
 import io
@@ -10,12 +11,11 @@ from nonebot import logger, require
 from nonebot.utils import run_sync
 from PIL import Image
 
-require("nonebot_plugin_apscheduler")
-from nonebot_plugin_apscheduler import scheduler  # noqa: E402  必须在 require 之后导入
-
 from ..config import IMAGE_CACHE_DIR
 from ..core.llm import VisionInput, get_http_client
 
+require("nonebot_plugin_apscheduler")
+from nonebot_plugin_apscheduler import scheduler  # noqa: E402  必须在 require 之后导入
 
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
 MAX_IMAGE_PIXELS = 4096 * 4096
@@ -91,9 +91,15 @@ async def fetch_image_input(
                         resp = await client.get(url, timeout=10.0)
                         resp.raise_for_status()
                         content_type = (
-                            (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
+                            (resp.headers.get("content-type") or "")
+                            .split(";")[0]
+                            .strip()
+                            .lower()
                         )
-                        if content_type and content_type not in SAFE_IMAGE_CONTENT_TYPES:
+                        if (
+                            content_type
+                            and content_type not in SAFE_IMAGE_CONTENT_TYPES
+                        ):
                             logger.warning(f"拒绝非图片响应: {content_type}")
                             return ("\n[图片类型不支持]\n", None)
                         if len(resp.content) > MAX_IMAGE_BYTES:
@@ -109,7 +115,9 @@ async def fetch_image_input(
             if not image_bytes:
                 return ("\n[图片下载失败]\n", None)
 
-            payload = await _prepare_native_image_payload(image_bytes, max_side=MAX_IMAGE_SIDE)
+            payload = await _prepare_native_image_payload(
+                image_bytes, max_side=MAX_IMAGE_SIDE
+            )
             if not payload:
                 return (placeholder, None)
             payload_bytes, image_format = payload
@@ -144,9 +152,10 @@ def _prepare_native_image_payload(
         raw_format = (image.format or "JPEG").lower()
         if raw_format == "jpg":
             raw_format = "jpeg"
-        if image.is_animated and image.n_frames > 1:
-            if raw_format == "gif":
-                return image_bytes, "gif"
+        # 只有 GIF/WebP 这类多帧插件才有 is_animated/n_frames，JPEG 上这两个属性不存在
+        if raw_format == "gif" and getattr(image, "n_frames", 1) > 1:
+            return image_bytes, "gif"
+        if getattr(image, "is_animated", False):
             image.seek(0)
 
         w, h = image.size
@@ -186,7 +195,9 @@ def _clean_old_image_caches_sync():
             raw_dir = IMAGE_CACHE_DIR.joinpath("raw")
             if raw_dir.exists():
                 for file_path in raw_dir.iterdir():
-                    if file_path.is_file() and (now - file_path.stat().st_mtime > retention_seconds):
+                    if file_path.is_file() and (
+                        now - file_path.stat().st_mtime > retention_seconds
+                    ):
                         try:
                             file_path.unlink()
                             count += 1

@@ -1,11 +1,12 @@
 # __init__.py
+
 from nonebot import get_driver, logger
 from tortoise import Tortoise
 
-from .core.state_manager import cleanup_global_resources, init_enabled_groups
 from . import handlers  # 导入即注册所有 matcher
 from .backup import setup_backup_job
 from .config import get_data_dir
+from .core.state_manager import cleanup_global_resources, init_enabled_groups
 
 driver = get_driver()
 
@@ -16,11 +17,11 @@ async def init_db():
     data_dir.mkdir(parents=True, exist_ok=True)
     db_path = data_dir / "nyabot.sqlite"
     await Tortoise.init(
-        db_url=f'sqlite://{db_path}',
-        modules={'models': [f'{__package__}.models']},
+        db_url=f"sqlite://{db_path}",
+        modules={"models": [f"{__package__}.models"]},
         use_tz=False,
         _create_db=True,
-        _enable_global_fallback=True
+        _enable_global_fallback=True,
     )
     await Tortoise.generate_schemas()
     logger.info(f"数据库已连接: {db_path}")

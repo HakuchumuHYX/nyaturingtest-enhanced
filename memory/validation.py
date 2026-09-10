@@ -9,13 +9,41 @@ MIN_MEMORY_CONFIDENCE = 0.6
 MIN_CONTENT_CHARS = 10
 
 NOISE_WORDS = {
-    "好的", "好", "嗯", "嗯嗯", "哦", "哦哦",
-    "ok", "收到", "了解", "明白",
-    "哈哈", "哈哈哈", "233", "666", "厉害",
-    "是的", "对", "对的", "是啊", "好吧",
-    "行", "可以", "没问题", "好呀", "好哒",
-    "谢谢", "感谢", "辛苦了", "拜拜", "再见",
-    "早", "晚安", "午安", "早安", "晚上好",
+    "好的",
+    "好",
+    "嗯",
+    "嗯嗯",
+    "哦",
+    "哦哦",
+    "ok",
+    "收到",
+    "了解",
+    "明白",
+    "哈哈",
+    "哈哈哈",
+    "233",
+    "666",
+    "厉害",
+    "是的",
+    "对",
+    "对的",
+    "是啊",
+    "好吧",
+    "行",
+    "可以",
+    "没问题",
+    "好呀",
+    "好哒",
+    "谢谢",
+    "感谢",
+    "辛苦了",
+    "拜拜",
+    "再见",
+    "早",
+    "晚安",
+    "午安",
+    "早安",
+    "晚上好",
 }
 
 
@@ -49,7 +77,10 @@ def validate_memory_candidate(
     if numeric_confidence < MIN_MEMORY_CONFIDENCE:
         return False, "low_confidence"
 
-    if not str(subject_user_id or "").strip() and not str(subject_user_name or "").strip():
+    if (
+        not str(subject_user_id or "").strip()
+        and not str(subject_user_name or "").strip()
+    ):
         return False, "missing_subject"
 
     return True, ""

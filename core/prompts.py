@@ -10,9 +10,7 @@ from ..config import PRESET_DIR
 
 
 def get_time_description(value: datetime) -> str:
-    weekday = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")[
-        value.weekday()
-    ]
+    weekday = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")[value.weekday()]
     hour = value.hour
     if hour < 6 or hour >= 23:
         period = "深夜"
@@ -33,7 +31,9 @@ def get_time_description(value: datetime) -> str:
             status = (
                 f"节假日({holiday_name})"
                 if holiday_name
-                else "周末休息" if value.weekday() >= 5 else "休息日"
+                else "周末休息"
+                if value.weekday() >= 5
+                else "休息日"
             )
         else:
             status = "工作日"
@@ -78,8 +78,8 @@ _猫娘预设 = RolePreset(
     ],
     examples=[
         {"user": "喵喵叫一声", "bot": "喵~ 主人好！"},
-        {"user": "你几岁了", "bot": "喵喵永远三岁啦~"}
-    ]
+        {"user": "你几岁了", "bot": "喵喵永远三岁啦~"},
+    ],
 )
 
 _BUILTIN_PRESETS: dict[str, RolePreset] = {"喵喵.json": _猫娘预设}
@@ -177,11 +177,16 @@ def _memory_action_schema(allow_memory_supersede: bool) -> str:
    - {{"action":"ignore","reason":"低价值、重复或不应永久记忆的原因"}}"""
     if not allow_memory_supersede:
         return base_schema + "\n   当前没有可引用的旧记忆 ID，只允许 add/ignore。"
-    return base_schema + """
+    return (
+        base_schema
+        + """
    - {{"action":"supersede","target_ref":"existing_related_memories 中的 memory_ref","content":"新的完整记忆内容，必须包含明确主语","subject_user_id":"事实主要描述的用户ID；无法确定则为空字符串","subject_user_name":"事实主要描述的用户名称；无法确定则为空字符串","speaker_user_id":"说出或确认该事实的新消息发送者ID","speaker_user_name":"说出或确认该事实的新消息发送者名称","category":"event|preference|profile|relationship","confidence":0.82,"importance":0.6,"reason":"用户明确更新、纠正或否定旧事实"}}"""
+    )
 
 
-def _sanitize_existing_related_memories(items: list | None, *, allow_memory_supersede: bool) -> list:
+def _sanitize_existing_related_memories(
+    items: list | None, *, allow_memory_supersede: bool
+) -> list:
     sanitized = []
     for item in items or []:
         if not isinstance(item, dict):
@@ -194,24 +199,24 @@ def _sanitize_existing_related_memories(items: list | None, *, allow_memory_supe
 
 
 def get_feedback_prompt(
-        bot_name: str,
-        role: str,
-        willingness: float,
-        chat_state_value: int,
-        history_summary: str,
-        recent_msgs: list,
-        new_msgs_formatted: list,
-        emotion: dict,
-        related_profiles: list,
-        search_result: list,
-        last_summary: str,
-        is_relevant: bool = False,
-        time_info: str = "",
-        existing_related_memories: list | None = None,
-        allow_memory_supersede: bool = False,
-        new_msg_speakers: list | None = None,
-        budget: PromptBudget | None = None,
-        has_images: bool = False,
+    bot_name: str,
+    role: str,
+    willingness: float,
+    chat_state_value: int,
+    history_summary: str,
+    recent_msgs: list,
+    new_msgs_formatted: list,
+    emotion: dict,
+    related_profiles: list,
+    search_result: list,
+    last_summary: str,
+    is_relevant: bool = False,
+    time_info: str = "",
+    existing_related_memories: list | None = None,
+    allow_memory_supersede: bool = False,
+    new_msg_speakers: list | None = None,
+    budget: PromptBudget | None = None,
+    has_images: bool = False,
 ) -> str:
     """
     反馈阶段 Prompt - 观察者模式
@@ -244,7 +249,9 @@ def get_feedback_prompt(
         "existing_related_memories": safe_existing_related_memories,
         "memory_actions_allowed": memory_actions_allowed,
         "recent_msgs": _truncate_messages(recent_msgs or [], budget.history_chars),
-        "new_msgs": _truncate_messages(new_msgs_formatted or [], budget.recent_message_chars),
+        "new_msgs": _truncate_messages(
+            new_msgs_formatted or [], budget.recent_message_chars
+        ),
         "new_msg_speakers": new_msg_speakers or [],
         "is_relevant": bool(is_relevant),
         "time_info": time_info or "",
@@ -261,10 +268,14 @@ def get_feedback_prompt(
         else "   普通新事实用 add；低价值、重复或不应永久记忆的内容用 ignore。"
     )
     has_native_image_refs = bool(has_images)
-    image_observation_requirement = """
+    image_observation_requirement = (
+        """
 7. "image_observations" (Array): new_msgs 含原生图片时，为每张可见图片输出一条简短观察。每项格式：
    {{"image_ref":"原样复制引用ID","summary":"一句话说明这张图是什么（40字以内）"}}
-""" if has_native_image_refs else ""
+"""
+        if has_native_image_refs
+        else ""
+    )
 
     return f"""
 # System Role
@@ -329,20 +340,20 @@ JSON 需包含以下字段：
 
 
 def get_chat_prompt(
-        bot_name: str,
-        role: str,
-        chat_state_value: int,
-        history_summary: str,
-        recent_msgs: list,
-        new_msgs_formatted: list,
-        emotion: dict,
-        related_profiles: list,
-        search_result: list,
-        chat_summary: str,
-        examples_text: str = "",
-        recalled_history: str = "",
-        time_info: str = "",
-        budget: PromptBudget | None = None,
+    bot_name: str,
+    role: str,
+    chat_state_value: int,
+    history_summary: str,
+    recent_msgs: list,
+    new_msgs_formatted: list,
+    emotion: dict,
+    related_profiles: list,
+    search_result: list,
+    chat_summary: str,
+    examples_text: str = "",
+    recalled_history: str = "",
+    time_info: str = "",
+    budget: PromptBudget | None = None,
 ) -> str:
     """
     对话阶段 Prompt - 深度角色扮演 (全中文优化版)
@@ -351,9 +362,21 @@ def get_chat_prompt(
     valence = float(emotion.get("valence", 0.0))
     arousal = float(emotion.get("arousal", 0.0))
     dominance = float(emotion.get("dominance", 0.0))
-    valence_guide = "心情很好，语气可以轻快一些" if valence > 0.3 else "心情一般" if valence > -0.3 else "心情不太好，回复可以简短冷淡一些，但不要带攻击性"
+    valence_guide = (
+        "心情很好，语气可以轻快一些"
+        if valence > 0.3
+        else "心情一般"
+        if valence > -0.3
+        else "心情不太好，回复可以简短冷淡一些，但不要带攻击性"
+    )
     arousal_guide = "比较激动，可以多说几句" if arousal > 0.5 else "比较平静，正常回复"
-    dominance_guide = "比较自信" if dominance > 0.3 else "比较随和" if dominance > -0.3 else "有点没底气，语气可以谦虚一些"
+    dominance_guide = (
+        "比较自信"
+        if dominance > 0.3
+        else "比较随和"
+        if dominance > -0.3
+        else "有点没底气，语气可以谦虚一些"
+    )
 
     budget = budget or PromptBudget()
     summary = truncate_text(chat_summary or history_summary, budget.summary_chars)
@@ -363,7 +386,9 @@ def get_chat_prompt(
         "chat_state_value": int(chat_state_value or 0),
         "summary": summary,
         "recent_msgs": _truncate_messages(recent_msgs or [], budget.history_chars),
-        "new_msgs": _truncate_messages(new_msgs_formatted or [], budget.recent_message_chars),
+        "new_msgs": _truncate_messages(
+            new_msgs_formatted or [], budget.recent_message_chars
+        ),
         "emotion": {
             "valence": round(valence, 2),
             "arousal": round(arousal, 2),

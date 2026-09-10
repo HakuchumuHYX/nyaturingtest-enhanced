@@ -114,7 +114,9 @@ def _backup_data_sync() -> bool:
                 staging_dir.mkdir(parents=True, exist_ok=True)
                 _copy_data_to_staging(data_dir, staging_dir)
 
-                with zipfile.ZipFile(backup_filepath, "w", zipfile.ZIP_DEFLATED) as zipf:
+                with zipfile.ZipFile(
+                    backup_filepath, "w", zipfile.ZIP_DEFLATED
+                ) as zipf:
                     for root, _, files in os.walk(staging_dir):
                         for file in files:
                             file_path = Path(root) / file

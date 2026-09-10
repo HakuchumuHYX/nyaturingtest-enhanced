@@ -1,13 +1,12 @@
 # 由多个模块合并而来：database/token_stats_aggregation.py, presenters/token_stats_card.py
 
-from collections.abc import Mapping
-
-from .config import get_data_dir
+import sys
 import unicodedata
+from collections.abc import Mapping
 from io import BytesIO
 from pathlib import Path
-import sys
 
+from .config import get_data_dir
 
 TOKEN_FIELDS = (
     "prompt_tokens",
@@ -126,7 +125,9 @@ async def render_token_stats_card(
                 TextBox(
                     f"模型: {item['model']}",
                     style=model_style,
-                ).set_w(content_width).set_padding((8, 2))
+                )
+                .set_w(content_width)
+                .set_padding((8, 2))
             )
             result.append(
                 TextBox(
@@ -134,13 +135,11 @@ async def render_token_stats_card(
                     f"Completion: {item['completion']:,}  |  "
                     f"Total: {item['total']:,}",
                     style=value_style,
-                ).set_w(content_width).set_padding((16, 2))
+                )
+                .set_w(content_width)
+                .set_padding((16, 2))
             )
-            if (
-                item.get("reasoning")
-                or item.get("cache_hit")
-                or item.get("cache_miss")
-            ):
+            if item.get("reasoning") or item.get("cache_hit") or item.get("cache_miss"):
                 result.append(
                     TextBox(
                         f"  Reasoning: {item.get('reasoning', 0):,}  |  "
@@ -148,7 +147,9 @@ async def render_token_stats_card(
                         f"Cache miss: {item.get('cache_miss', 0):,}  |  "
                         f"Hit ratio: {item.get('cache_hit_ratio', 0.0):.1%}",
                         style=label_style,
-                    ).set_w(content_width).set_padding((16, 2))
+                    )
+                    .set_w(content_width)
+                    .set_padding((16, 2))
                 )
         return result
 
@@ -160,15 +161,17 @@ async def render_token_stats_card(
             TextBox(
                 "【本群消耗】" if local else "【本群消耗】无数据",
                 style=label_style,
-            ).set_w(content_width).set_padding((0, 4)),
+            )
+            .set_w(content_width)
+            .set_padding((0, 4)),
             *rows(local),
             Spacer(1, 8),
             TextBox(
-                "【全局所有群消耗】"
-                if global_
-                else "【全局所有群消耗】无数据",
+                "【全局所有群消耗】" if global_ else "【全局所有群消耗】无数据",
                 style=label_style,
-            ).set_w(content_width).set_padding((0, 4)),
+            )
+            .set_w(content_width)
+            .set_padding((0, 4)),
             *rows(global_),
         ]
         return (
@@ -182,7 +185,9 @@ async def render_token_stats_card(
         TextBox(
             f"Token 使用统计（{scope_label}）",
             style=title_style,
-        ).set_w(content_width).set_padding(0),
+        )
+        .set_w(content_width)
+        .set_padding(0),
         Spacer(1, 16),
         period(
             "今日统计",

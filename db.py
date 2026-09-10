@@ -55,7 +55,9 @@ async def delete_session_data(session_id: str):
     for user in users:
         deleted_count = await InteractionLogModel.filter(user=user).delete()
         if deleted_count:
-            logger.debug(f"[Repo] 删除用户 {user.user_id} 的 {deleted_count} 条交互日志")
+            logger.debug(
+                f"[Repo] 删除用户 {user.user_id} 的 {deleted_count} 条交互日志"
+            )
 
     profile_count = await UserProfileModel.filter(session=session_db).delete()
     msg_count = await GlobalMessageModel.filter(session=session_db).delete()
@@ -106,9 +108,11 @@ async def load_full_session_data(session_id: str):
         for user_db in await UserProfileModel.filter(session=session_db)
     ]
 
-    msgs_db = await GlobalMessageModel.filter(session=session_db).order_by(
-        "-time"
-    ).limit(SHORT_TERM_BUFFER_SIZE)
+    msgs_db = (
+        await GlobalMessageModel.filter(session=session_db)
+        .order_by("-time")
+        .limit(SHORT_TERM_BUFFER_SIZE)
+    )
     history_msgs = [
         Message(
             time=msg_db.time,
@@ -129,7 +133,11 @@ async def load_full_session_data(session_id: str):
 
 
 def _field_changed(field: str, existing, value) -> bool:
-    if field == "time" and isinstance(existing, datetime) and isinstance(value, datetime):
+    if (
+        field == "time"
+        and isinstance(existing, datetime)
+        and isinstance(value, datetime)
+    ):
         return abs(existing.timestamp() - value.timestamp()) > 0.000001
     return existing != value
 
@@ -139,12 +147,14 @@ def _message_final_id(msg: Message) -> str:
         return msg._persistence_id
     final_msg_id = str(msg.id or "")
     if not final_msg_id:
-        unique_str = "_".join([
-            sanitize_text(msg.content),
-            str(msg.time.timestamp()),
-            str(msg.user_id or ""),
-            sanitize_text(msg.user_name),
-        ])
+        unique_str = "_".join(
+            [
+                sanitize_text(msg.content),
+                str(msg.time.timestamp()),
+                str(msg.user_id or ""),
+                sanitize_text(msg.user_name),
+            ]
+        )
         final_msg_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, unique_str))
     msg._persistence_id = final_msg_id
     return final_msg_id
@@ -204,17 +214,23 @@ async def sync_messages(session_id: str, recent_msgs: list[Message]):
         logger.debug(f"[Repo] 更新了 {len(updates)} 条已丰富消息")
 
 
-async def get_history_before(session_id: str, time_point: datetime, limit: int = 20) -> list[Message]:
+async def get_history_before(
+    session_id: str, time_point: datetime, limit: int = 20
+) -> list[Message]:
     """获取指定时间之前的历史消息"""
 
     session_db = await SessionModel.get_or_none(id=session_id)
     if not session_db:
         return []
 
-    history_rows = await GlobalMessageModel.filter(
-        session=session_db,
-        time__lt=time_point,
-    ).order_by("-time").limit(limit)
+    history_rows = (
+        await GlobalMessageModel.filter(
+            session=session_db,
+            time__lt=time_point,
+        )
+        .order_by("-time")
+        .limit(limit)
+    )
 
     return [
         Message(
@@ -242,16 +258,24 @@ async def get_recent_messages_by_user(
 
     db_msgs = []
     if user_id and str(user_id).strip():
-        db_msgs = await GlobalMessageModel.filter(
-            session=session_db,
-            user_id=str(user_id),
-        ).order_by("-time").limit(limit)
+        db_msgs = (
+            await GlobalMessageModel.filter(
+                session=session_db,
+                user_id=str(user_id),
+            )
+            .order_by("-time")
+            .limit(limit)
+        )
 
     if not db_msgs and user_name:
-        db_msgs = await GlobalMessageModel.filter(
-            session=session_db,
-            user_name=user_name,
-        ).order_by("-time").limit(limit)
+        db_msgs = (
+            await GlobalMessageModel.filter(
+                session=session_db,
+                user_name=user_name,
+            )
+            .order_by("-time")
+            .limit(limit)
+        )
 
     return [m.content for m in reversed(db_msgs)]
 
@@ -283,16 +307,23 @@ async def log_interactions(session_id: str, interactions: list[tuple[str, dict]]
         return
 
     user_ids = [str(user_id) for user_id, _ in interactions]
-    existing_users = await UserProfileModel.filter(session=session_db, user_id__in=user_ids)
+    existing_users = await UserProfileModel.filter(
+        session=session_db, user_id__in=user_ids
+    )
     user_map = {user.user_id: user for user in existing_users}
 
     missing_ids = [user_id for user_id in user_ids if user_id not in user_map]
     if missing_ids:
         await UserProfileModel.bulk_create(
-            [UserProfileModel(session=session_db, user_id=user_id) for user_id in set(missing_ids)],
+            [
+                UserProfileModel(session=session_db, user_id=user_id)
+                for user_id in set(missing_ids)
+            ],
             ignore_conflicts=True,
         )
-        existing_users = await UserProfileModel.filter(session=session_db, user_id__in=user_ids)
+        existing_users = await UserProfileModel.filter(
+            session=session_db, user_id__in=user_ids
+        )
         user_map = {user.user_id: user for user in existing_users}
 
     now = datetime.now()

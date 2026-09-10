@@ -19,7 +19,6 @@ from openai import OpenAI
 
 from ..config import get_app_settings
 
-
 MEMORY_COLLECTION_NAME = "nyabot_memory"
 # 备份打包整个向量目录，写入方用同一把进程级锁串行化
 BACKUP_IO_LOCK = threading.RLock()
@@ -83,7 +82,9 @@ def _score_from_distance(distance: float | int | None) -> float:
     return max(0.0, min(1.0, score))
 
 
-def _empty_retrieval_stats(*, use_rerank: bool = False, fallback_reason: str = "none") -> dict[str, Any]:
+def _empty_retrieval_stats(
+    *, use_rerank: bool = False, fallback_reason: str = "none"
+) -> dict[str, Any]:
     return {
         "candidate_count": 0,
         "returned_count": 0,
@@ -170,12 +171,10 @@ def where_all(*conditions: dict) -> dict:
 
 
 def _subject_user_where(user_ids: set[str]) -> dict:
-    subject_conditions = [
-        {"subject_user_id": {"$eq": user_id}} for user_id in sorted(user_ids)
-    ]
+    # where_any 在只有一个用户时返回单条件而不是单元素 $or（Chroma 要求 $or 至少两项）
     return where_all(
         {"source": {"$eq": "memory"}},
-        {"$or": subject_conditions},
+        where_any("subject_user_id", sorted(user_ids)),
     )
 
 
@@ -197,7 +196,9 @@ def _normalized_metadata(meta: dict | None) -> dict[str, Any]:
     data = dict(meta or {})
     source = str(data.get("source") or "memory")
     memory_type = str(data.get("type") or "event")
-    subtype = str(data.get("subtype") or ("legacy_rule" if source == "preset" else memory_type))
+    subtype = str(
+        data.get("subtype") or ("legacy_rule" if source == "preset" else memory_type)
+    )
     subject_user_id = _clean_metadata_string(data.get("subject_user_id"))
     data["source"] = source
     data["type"] = memory_type
@@ -224,7 +225,10 @@ def _dedup_scope_key(meta: dict | None) -> tuple[str, str, str]:
 
 def _same_dedup_scope(candidate: dict | None, existing: dict | None) -> bool:
     existing_metadata = _normalized_metadata(existing)
-    if existing_metadata["source"] == "memory" and _metadata_status(existing_metadata) != "active":
+    if (
+        existing_metadata["source"] == "memory"
+        and _metadata_status(existing_metadata) != "active"
+    ):
         return False
     return _dedup_scope_key(candidate) == _dedup_scope_key(existing_metadata)
 
@@ -248,7 +252,9 @@ def _dedup_where(metadata: dict) -> dict:
 def _source_type_weight(meta: dict) -> float:
     source = str(meta.get("source") or "memory")
     memory_type = str(meta.get("type") or "event")
-    subtype = str(meta.get("subtype") or ("legacy_rule" if source == "preset" else memory_type))
+    subtype = str(
+        meta.get("subtype") or ("legacy_rule" if source == "preset" else memory_type)
+    )
     if source == "preset":
         return PRESET_TYPE_WEIGHT.get(subtype, PRESET_TYPE_WEIGHT["legacy_rule"])
     return MEMORY_TYPE_WEIGHT.get(memory_type, 1.0)
@@ -275,7 +281,9 @@ def _query_mentions_name(queries: list[str], name: str) -> bool:
     return any(clean_name in str(query or "") for query in queries or [])
 
 
-def _memory_scope(meta: dict, active_scope_ids: set[str], queries: list[str]) -> tuple[str, float]:
+def _memory_scope(
+    meta: dict, active_scope_ids: set[str], queries: list[str]
+) -> tuple[str, float]:
     if meta.get("source") == "preset":
         return "global", SCOPE_WEIGHT["global"]
 
@@ -327,7 +335,9 @@ class VectorMemory:
     nonebot.utils.run_sync or another thread-pool adapter.
     """
 
-    def __init__(self, api_key: str, persist_directory: str, session_id: str = "global"):
+    def __init__(
+        self, api_key: str, persist_directory: str, session_id: str = "global"
+    ):
         self.persist_directory = persist_directory
         self._version = 0
         os.makedirs(self.persist_directory, exist_ok=True)
@@ -354,7 +364,7 @@ class VectorMemory:
         self.collection = self.client.get_or_create_collection(
             name=MEMORY_COLLECTION_NAME,
             embedding_function=self.emb_fn,
-            metadata=MEMORY_COLLECTION_METADATA
+            metadata=MEMORY_COLLECTION_METADATA,
         )
         self._check_collection_metric_once()
         self.replay_pending()
@@ -372,10 +382,14 @@ class VectorMemory:
             return state
         _metric_check_done.add(self.persist_directory)
         if state == "unknown":
-            logger.warning(f"Vector collection metric metadata unknown: {self.persist_directory}")
+            logger.warning(
+                f"Vector collection metric metadata unknown: {self.persist_directory}"
+            )
         elif state == "mismatch":
             metadata = self.collection.metadata
-            logger.error(f"Vector collection metric mismatch: {self.persist_directory} metadata={metadata}")
+            logger.error(
+                f"Vector collection metric mismatch: {self.persist_directory} metadata={metadata}"
+            )
         return state
 
     def _wal_path(self) -> str:
@@ -384,20 +398,24 @@ class VectorMemory:
     def _append_wal(self, items: list[tuple[str, dict]]) -> bool:
         operations = []
         for content, metadata in items:
-            operation_id = str(metadata.get("operation_id") or "") or _memory_operation_id(
+            operation_id = str(
+                metadata.get("operation_id") or ""
+            ) or _memory_operation_id(
                 "add",
                 content,
                 metadata,
             )
             normalized_metadata = dict(metadata)
             normalized_metadata["operation_id"] = operation_id
-            operations.append({
-                "operation_id": operation_id,
-                "operation": "add",
-                "content": content,
-                "metadata": normalized_metadata,
-                "target_ref": "",
-            })
+            operations.append(
+                {
+                    "operation_id": operation_id,
+                    "operation": "add",
+                    "content": content,
+                    "metadata": normalized_metadata,
+                    "target_ref": "",
+                }
+            )
         return self._append_wal_operations(operations)
 
     def _append_wal_operations(self, operations: list[dict]) -> bool:
@@ -431,9 +449,13 @@ class VectorMemory:
             content = str(obj.get("content") or "").strip()
             if not content:
                 continue
-            metadata = obj.get("metadata") if isinstance(obj.get("metadata"), dict) else {}
+            metadata = (
+                obj.get("metadata") if isinstance(obj.get("metadata"), dict) else {}
+            )
             operation = str(obj.get("operation") or "add")
-            operation_id = str(obj.get("operation_id") or metadata.get("operation_id") or "")
+            operation_id = str(
+                obj.get("operation_id") or metadata.get("operation_id") or ""
+            )
             if not operation_id:
                 operation_id = _memory_operation_id(
                     operation,
@@ -441,13 +463,15 @@ class VectorMemory:
                     metadata,
                     str(obj.get("target_ref") or ""),
                 )
-            operations.append({
-                **obj,
-                "operation": operation,
-                "operation_id": operation_id,
-                "content": content,
-                "metadata": metadata,
-            })
+            operations.append(
+                {
+                    **obj,
+                    "operation": operation,
+                    "operation_id": operation_id,
+                    "content": content,
+                    "metadata": metadata,
+                }
+            )
 
         if not operations:
             try:
@@ -473,13 +497,17 @@ class VectorMemory:
                 else:
                     result = self.add_texts(
                         [operation["content"]],
-                        metadatas=[{
-                            **operation["metadata"],
-                            "operation_id": operation["operation_id"],
-                        }],
+                        metadatas=[
+                            {
+                                **operation["metadata"],
+                                "operation_id": operation["operation_id"],
+                            }
+                        ],
                         queue_on_failure=False,
                     )
-                    success = int(result.get("confirmed") or result.get("added") or 0) >= 1
+                    success = (
+                        int(result.get("confirmed") or result.get("added") or 0) >= 1
+                    )
                 if success:
                     completed += 1
                 else:
@@ -516,8 +544,11 @@ class VectorMemory:
         }
         if not texts:
             return empty_result
-        valid_data = [(t, metadatas[i] if metadatas and i < len(metadatas) else {})
-                      for i, t in enumerate(texts) if t and t.strip()]
+        valid_data = [
+            (t, metadatas[i] if metadatas and i < len(metadatas) else {})
+            for i, t in enumerate(texts)
+            if t and t.strip()
+        ]
         if not valid_data:
             return empty_result
 
@@ -539,7 +570,11 @@ class VectorMemory:
                 try:
                     with BACKUP_IO_LOCK:
                         existing = self.collection.get(ids=ids, include=[])
-                    existing_ids = set(existing.get("ids") or []) if isinstance(existing, dict) else set()
+                    existing_ids = (
+                        set(existing.get("ids") or [])
+                        if isinstance(existing, dict)
+                        else set()
+                    )
                 except Exception:
                     existing_ids = set()
                 missing = [
@@ -570,18 +605,24 @@ class VectorMemory:
                     "memory_refs": ids,
                 }
             except Exception as e:
-                logger.error(f"Vector add failed (attempt {attempt + 1}/{max_retries + 1}): {e}")
+                logger.error(
+                    f"Vector add failed (attempt {attempt + 1}/{max_retries + 1}): {e}"
+                )
                 if attempt < max_retries and base_delay > 0:
-                    time.sleep(base_delay * (2 ** attempt))
+                    time.sleep(base_delay * (2**attempt))
 
         if queue_on_failure and self._append_wal(prepared_data):
-            logger.warning(f"Vector add exhausted retries, wrote {len(prepared_data)} memories to WAL")
+            logger.warning(
+                f"Vector add exhausted retries, wrote {len(prepared_data)} memories to WAL"
+            )
             return {
                 **empty_result,
                 "queued_wal": len(prepared_data),
                 "memory_refs": ids,
             }
-        logger.error(f"Vector add exhausted retries and WAL append failed for {len(prepared_data)} memories")
+        logger.error(
+            f"Vector add exhausted retries and WAL append failed for {len(prepared_data)} memories"
+        )
         return {
             **empty_result,
             "failed": len(prepared_data),
@@ -606,15 +647,17 @@ class VectorMemory:
         unique_queries = _dedupe_preserve_order([q for q in queries if q.strip()])
         if not unique_queries:
             return RetrievalResult([], _empty_retrieval_stats(use_rerank=use_rerank))
-        
+
         initial_k = max(1, int(k or 1))
-        
+
         try:
-            results = self.collection.query(query_texts=unique_queries, n_results=initial_k, where=where)
-            
+            results = self.collection.query(
+                query_texts=unique_queries, n_results=initial_k, where=where
+            )
+
             # 第一步：合并去重初筛结果
             candidate_by_content: dict[str, dict[str, Any]] = {}
-            
+
             documents = results.get("documents") or []
             metadatas = results.get("metadatas") or []
             distances = results.get("distances") or []
@@ -625,23 +668,24 @@ class VectorMemory:
                     metas = metadatas[i] if i < len(metadatas) else []
                     row_distances = distances[i] if i < len(distances) else []
                     row_ids = ids[i] if i < len(ids) else []
-                    
+
                     for j, doc in enumerate(docs):
                         if not doc:
                             continue
-                        metadata = _normalized_metadata(metas[j] if j < len(metas) else {})
+                        metadata = _normalized_metadata(
+                            metas[j] if j < len(metas) else {}
+                        )
                         distance = row_distances[j] if j < len(row_distances) else None
                         metadata["retrieval_score"] = _score_from_distance(distance)
                         if j < len(row_ids):
                             metadata["memory_ref"] = row_ids[j]
                         existing = candidate_by_content.get(doc)
-                        if (
-                            existing is None
-                            or metadata["retrieval_score"] > existing["metadata"].get("retrieval_score", 0.0)
-                        ):
+                        if existing is None or metadata["retrieval_score"] > existing[
+                            "metadata"
+                        ].get("retrieval_score", 0.0):
                             candidate_by_content[doc] = {
                                 "content": doc,
-                                "metadata": metadata
+                                "metadata": metadata,
                             }
             flattened_candidates = sorted(
                 candidate_by_content.values(),
@@ -651,16 +695,20 @@ class VectorMemory:
             if merged_candidate_cap is not None:
                 cap = max(1, int(merged_candidate_cap or 1))
                 flattened_candidates = flattened_candidates[:cap]
-            
+
             # 如果没有结果，直接返回
             if not flattened_candidates:
-                return RetrievalResult([], _empty_retrieval_stats(use_rerank=use_rerank))
+                return RetrievalResult(
+                    [], _empty_retrieval_stats(use_rerank=use_rerank)
+                )
 
             # 如果不使用 Rerank 或 Reranker 未初始化，直接截断返回
             if not use_rerank or not self.reranker:
                 results = flattened_candidates[:k]
                 stats = {
-                    **_empty_retrieval_stats(use_rerank=use_rerank, fallback_reason="rerank_disabled"),
+                    **_empty_retrieval_stats(
+                        use_rerank=use_rerank, fallback_reason="rerank_disabled"
+                    ),
                     "candidate_count": len(flattened_candidates),
                     "returned_count": len(results),
                 }
@@ -669,49 +717,55 @@ class VectorMemory:
             # 第二步：Rerank
             # search_stage 已把最新有效消息排在第一位；summary/name query 只做补充召回。
             main_query = unique_queries[0]
-            
+
             candidate_docs = [item["content"] for item in flattened_candidates]
-            
+
             rerank_results = self.reranker.rerank(
                 query=main_query,
                 documents=candidate_docs,
-                top_n=len(candidate_docs), # 全排，然后本地过滤
+                top_n=len(candidate_docs),  # 全排，然后本地过滤
             )
             if not rerank_results:
                 logger.debug("Rerank无结果，回退到初筛候选")
                 results = flattened_candidates[:k]
                 stats = {
-                    **_empty_retrieval_stats(use_rerank=use_rerank, fallback_reason="rerank_api_empty"),
+                    **_empty_retrieval_stats(
+                        use_rerank=use_rerank, fallback_reason="rerank_api_empty"
+                    ),
                     "candidate_count": len(flattened_candidates),
                     "returned_count": len(results),
                 }
                 return RetrievalResult(results, stats)
-            
+
             final_results = []
             threshold = get_app_settings().rerank_threshold
-            
+
             for res in rerank_results:
                 idx = res.get("index")
                 score = res.get("relevance_score", 0.0)
-                
+
                 if score < threshold:
                     continue
-                    
+
                 if isinstance(idx, int) and 0 <= idx < len(flattened_candidates):
                     item = flattened_candidates[idx]
                     # 可以把分数附加上去，方便调试
                     item["metadata"]["rerank_score"] = score
                     final_results.append(item)
-                    
+
                 if len(final_results) >= k:
                     break
-            
-            logger.debug(f"Rerank完成: 初筛{len(candidate_docs)} -> 终选{len(final_results)} (阈值{threshold})")
+
+            logger.debug(
+                f"Rerank完成: 初筛{len(candidate_docs)} -> 终选{len(final_results)} (阈值{threshold})"
+            )
             if not final_results:
                 logger.debug("Rerank结果全部被过滤，回退到初筛候选")
                 results = flattened_candidates[:k]
                 stats = {
-                    **_empty_retrieval_stats(use_rerank=use_rerank, fallback_reason="rerank_all_filtered"),
+                    **_empty_retrieval_stats(
+                        use_rerank=use_rerank, fallback_reason="rerank_all_filtered"
+                    ),
                     "candidate_count": len(flattened_candidates),
                     "returned_count": len(results),
                 }
@@ -746,7 +800,9 @@ class VectorMemory:
             return []
         try:
             with BACKUP_IO_LOCK:
-                result = self.collection.get(where=where, include=["documents", "metadatas"])
+                result = self.collection.get(
+                    where=where, include=["documents", "metadatas"]
+                )
         except Exception as e:
             logger.warning(f"Active subject memory recall failed: {e}")
             return []
@@ -758,19 +814,28 @@ class VectorMemory:
         for index, document in enumerate(documents):
             if not document:
                 continue
-            metadata = _normalized_metadata(metadatas[index] if index < len(metadatas) else {})
-            if metadata.get("source") != "memory" or _metadata_status(metadata) != "active":
+            metadata = _normalized_metadata(
+                metadatas[index] if index < len(metadatas) else {}
+            )
+            if (
+                metadata.get("source") != "memory"
+                or _metadata_status(metadata) != "active"
+            ):
                 continue
             subject_user_id = _clean_metadata_string(metadata.get("subject_user_id"))
             if subject_user_id not in active_user_ids:
                 continue
             if index < len(ids):
                 metadata["memory_ref"] = ids[index]
-            metadata["retrieval_score"] = _clamp_float(metadata.get("retrieval_score"), 0.5, 0.0, 1.0)
-            records.append({
-                "content": document,
-                "metadata": metadata,
-            })
+            metadata["retrieval_score"] = _clamp_float(
+                metadata.get("retrieval_score"), 0.5, 0.0, 1.0
+            )
+            records.append(
+                {
+                    "content": document,
+                    "metadata": metadata,
+                }
+            )
 
         records.sort(
             key=lambda item: (
@@ -779,7 +844,7 @@ class VectorMemory:
             ),
             reverse=True,
         )
-        return records[:max(1, int(limit or 1))]
+        return records[: max(1, int(limit or 1))]
 
     def delete_by_metadata(self, where: dict):
         """删除指定条件的记忆"""
@@ -809,15 +874,14 @@ class VectorMemory:
                 importance = _clamp_float(metadata.get("importance"), 0.0, 0.0, 1.0)
                 effective_ttl_days = int(ttl_days * (1.0 + importance))
                 should_delete = (
-                    (status in {"archived", "superseded"} and days_ago > days_retention)
-                    or (metadata.get("type") == "event" and days_ago > effective_ttl_days)
-                )
+                    status in {"archived", "superseded"} and days_ago > days_retention
+                ) or (metadata.get("type") == "event" and days_ago > effective_ttl_days)
                 if should_delete:
                     delete_ids.append(item_id)
 
             for start in range(0, len(delete_ids), 200):
                 with BACKUP_IO_LOCK:
-                    self.collection.delete(ids=delete_ids[start:start + 200])
+                    self.collection.delete(ids=delete_ids[start : start + 200])
             if delete_ids:
                 self._bump_version()
             logger.info(f"Cleaned up {len(delete_ids)} expired vector memories")
@@ -870,7 +934,11 @@ class VectorMemory:
             normalized_target.get("source") != "memory"
             or normalized_target.get("subtype") == "bot_self"
         ):
-            return {"completed": False, "queued_repair": 0, "reason": "target_not_supersedable"}
+            return {
+                "completed": False,
+                "queued_repair": 0,
+                "reason": "target_not_supersedable",
+            }
 
         operation_id = operation_id or _memory_operation_id(
             "supersede",
@@ -879,12 +947,14 @@ class VectorMemory:
             target_ref,
         )
         replacement_metadata = _normalized_metadata(metadata)
-        replacement_metadata.update({
-            "operation_id": operation_id,
-            "supersede_operation_id": operation_id,
-            "supersedes": target_ref,
-            "status": "pending_supersede",
-        })
+        replacement_metadata.update(
+            {
+                "operation_id": operation_id,
+                "supersede_operation_id": operation_id,
+                "supersedes": target_ref,
+                "status": "pending_supersede",
+            }
+        )
         replacement_ref = str(uuid.uuid5(uuid.NAMESPACE_URL, operation_id))
         operation = {
             "operation_id": operation_id,
@@ -960,17 +1030,19 @@ class VectorMemory:
         try:
             if not user_id or not user_id.strip():
                 return 0
-            
+
             results = self.collection.get(
                 where={"subject_user_id": {"$eq": user_id}},
-                include=[]  # 不需要实际内容，只需要 ID
+                include=[],  # 不需要实际内容，只需要 ID
             )
             return len(results.get("ids", []))
         except Exception as e:
             logger.warning(f"统计记忆数量失败: {e}")
             return 0
 
-    def _reinforce_duplicate_memory(self, memory_ref: str, existing_metadata: dict, new_metadata: dict) -> bool:
+    def _reinforce_duplicate_memory(
+        self, memory_ref: str, existing_metadata: dict, new_metadata: dict
+    ) -> bool:
         if not memory_ref:
             return False
         metadata = _normalized_metadata(existing_metadata)
@@ -995,13 +1067,21 @@ class VectorMemory:
         self.update_metadata_by_id(memory_ref, metadata)
         return True
 
-    def add_memories_with_dedup(self, memories: list[tuple[str, dict]], threshold: float = 0.9) -> dict[str, int]:
+    def add_memories_with_dedup(
+        self, memories: list[tuple[str, dict]], threshold: float = 0.9
+    ) -> dict[str, int]:
         """
         批量去重并添加长期记忆。
 
         对同一批候选记忆只做一次 Chroma query 和一次 add，避免逐条 embedding/query/add。
         """
-        result = {"added": 0, "skipped_empty": 0, "skipped_dedup": 0, "reinforced": 0, "dedup_errors": 0}
+        result = {
+            "added": 0,
+            "skipped_empty": 0,
+            "skipped_dedup": 0,
+            "reinforced": 0,
+            "dedup_errors": 0,
+        }
         valid: list[tuple[str, dict]] = []
         seen_batch = set()
         for content, metadata in memories:
@@ -1070,7 +1150,9 @@ class VectorMemory:
                         f"(相似度 {similarity:.2f}): {content[:30]}..."
                     )
                     result["skipped_dedup"] += 1
-                    if self._reinforce_duplicate_memory(memory_ref, existing_metadata, metadata):
+                    if self._reinforce_duplicate_memory(
+                        memory_ref, existing_metadata, metadata
+                    ):
                         result["reinforced"] += 1
 
             if to_add:
@@ -1093,10 +1175,10 @@ class VectorMemory:
             return result
 
     def retrieve_with_decay(
-        self, 
-        queries: List[str], 
-        k: int = 5, 
-        where: dict | None = None, 
+        self,
+        queries: List[str],
+        k: int = 5,
+        where: dict | None = None,
         use_rerank: bool = True,
         decay_rate: float = 0.02,
         candidate_k: int | None = None,
@@ -1105,7 +1187,7 @@ class VectorMemory:
     ) -> RetrievalResult:
         """
         带时间衰减的检索
-        
+
         Args:
             queries: 查询语句列表
             k: 返回结果数量
@@ -1115,7 +1197,7 @@ class VectorMemory:
             candidate_k: 每条 query 的召回数量，None 时使用 k
             merged_candidate_cap: 合并去重后送入 rerank 的候选上限
             active_user_ids: 当前活跃用户 ID；不传时保持旧 caller 行为
-            
+
         Returns:
             检索结果列表，按综合分数排序
         """
@@ -1135,7 +1217,9 @@ class VectorMemory:
         )
         raw_results = list(retrieval_result.records)
         stats = dict(retrieval_result.stats)
-        subject_results = self._retrieve_active_subject_records(active_scope_ids, limit=min(5, max(1, k)))
+        subject_results = self._retrieve_active_subject_records(
+            active_scope_ids, limit=min(5, max(1, k))
+        )
         if subject_results:
             merged_results = []
             seen = set()
@@ -1151,7 +1235,10 @@ class VectorMemory:
             subject_added_count = max(0, len(merged_results) - len(raw_results or []))
             raw_results = merged_results
             stats["subject_recall_count"] = len(subject_results)
-            stats["candidate_count"] = int(stats.get("candidate_count") or len(raw_results)) + subject_added_count
+            stats["candidate_count"] = (
+                int(stats.get("candidate_count") or len(raw_results))
+                + subject_added_count
+            )
 
         if not raw_results:
             return RetrievalResult([], stats)
@@ -1161,7 +1248,7 @@ class VectorMemory:
         active_results = []
         other_subject_downweighted_count = 0
         scope_counts: dict[str, int] = {}
-        
+
         for item in raw_results:
             meta = item.get("metadata", {})
             meta.update(_normalized_metadata(meta))
@@ -1183,17 +1270,26 @@ class VectorMemory:
                     days_ago = 60
                 effective_decay_rate = _memory_decay_rate(meta, decay_rate)
             decay_factor = math.exp(-effective_decay_rate * days_ago)
-            
+
             # 获取原始分数
             original_score = meta.get("rerank_score")
             if original_score is None:
                 original_score = meta.get("retrieval_score", 0.5)
-            
+
             # 计算调整后的分数
             source_type_weight = _source_type_weight(meta)
             confidence_weight = _confidence_weight(meta)
-            importance_weight = 1.0 + _clamp_float(meta.get("importance"), 0.0, 0.0, 1.0) * 0.15
-            adjusted_score = original_score * decay_factor * source_type_weight * confidence_weight * importance_weight * scope_weight
+            importance_weight = (
+                1.0 + _clamp_float(meta.get("importance"), 0.0, 0.0, 1.0) * 0.15
+            )
+            adjusted_score = (
+                original_score
+                * decay_factor
+                * source_type_weight
+                * confidence_weight
+                * importance_weight
+                * scope_weight
+            )
             meta["adjusted_score"] = adjusted_score
             meta["days_ago"] = days_ago
             meta["decay_rate"] = effective_decay_rate
@@ -1203,14 +1299,14 @@ class VectorMemory:
             meta["importance_weight"] = importance_weight
             meta["scope"] = scope
             meta["scope_weight"] = scope_weight
-        
+
         # 3. 重新排序
         sorted_results = sorted(
             active_results,
-            key=lambda x: x.get("metadata", {}).get("adjusted_score", 0), 
-            reverse=True
+            key=lambda x: x.get("metadata", {}).get("adjusted_score", 0),
+            reverse=True,
         )
-        
+
         # 4. 截取前 k 个
         final_results = sorted_results[:k]
         adjusted_scores = [
@@ -1222,6 +1318,7 @@ class VectorMemory:
         stats["other_subject_downweighted_count"] = other_subject_downweighted_count
         stats["scope_counts"] = dict(scope_counts)
         return RetrievalResult(final_results, stats)
+
 
 class SiliconFlowReranker:
     """Small synchronous adapter for the configured rerank endpoint."""
@@ -1309,6 +1406,7 @@ class SiliconFlowEmbeddingFunction(EmbeddingFunction):
     def close(self) -> None:
         self._client.close()
 
+
 # RAG 检索参数
 RAG_FINAL_K = 20
 RAG_PER_QUERY_RECALL_K = 40
@@ -1319,10 +1417,33 @@ RAG_DEFAULT_EVENT_TTL_DAYS = 90
 
 
 _NOISE_QUERIES = {
-    "?", "？", "??", "？？", "???", "？？？",
-    "。", "！", "!", "...", "…",
-    "草", "艹", "笑死", "哈哈", "哈哈哈", "hhh", "www",
-    "233", "666", "ok", "OK", "嗯", "嗯嗯", "哦", "好", "好的",
+    "?",
+    "？",
+    "??",
+    "？？",
+    "???",
+    "？？？",
+    "。",
+    "！",
+    "!",
+    "...",
+    "…",
+    "草",
+    "艹",
+    "笑死",
+    "哈哈",
+    "哈哈哈",
+    "hhh",
+    "www",
+    "233",
+    "666",
+    "ok",
+    "OK",
+    "嗯",
+    "嗯嗯",
+    "哦",
+    "好",
+    "好的",
 }
 _EMOJI_ONLY_RE = re.compile(r"^[\W_]+$", re.UNICODE)
 
@@ -1398,7 +1519,9 @@ def build_chat_rag_queries(
     return _dedupe_preserve_order(effective_queries)
 
 
-async def search_memories(long_term_memory, queries: list[str], **kwargs) -> RetrievalResult:
+async def search_memories(
+    long_term_memory, queries: list[str], **kwargs
+) -> RetrievalResult:
     """异步检索入口：把同步的向量检索放到线程里执行。"""
 
     return await run_sync(long_term_memory.retrieve_with_decay)(queries, **kwargs)

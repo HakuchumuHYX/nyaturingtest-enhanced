@@ -20,7 +20,8 @@ def is_json_mode_unsupported_error(exc: Exception) -> bool:
     text = str(exc).lower()
     return (
         "json mode is not supported" in text
-        or "response_format" in text and "not supported" in text
+        or "response_format" in text
+        and "not supported" in text
     )
 
 
@@ -123,12 +124,16 @@ class LLMClient:
         miss_tokens = int(data.get("prompt_cache_miss_tokens") or 0)
         reasoning_tokens = int(data.get("reasoning_tokens") or 0)
         if isinstance(completion_details, dict):
-            reasoning_tokens = int(completion_details.get("reasoning_tokens") or reasoning_tokens)
+            reasoning_tokens = int(
+                completion_details.get("reasoning_tokens") or reasoning_tokens
+            )
 
         return {
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
-            "total_tokens": int(data.get("total_tokens") or prompt_tokens + completion_tokens),
+            "total_tokens": int(
+                data.get("total_tokens") or prompt_tokens + completion_tokens
+            ),
             "prompt_cache_hit_tokens": hit_tokens,
             "prompt_cache_miss_tokens": miss_tokens,
             "reasoning_tokens": reasoning_tokens,
@@ -138,7 +143,9 @@ class LLMClient:
     @staticmethod
     def _status_code(exc: Exception) -> int:
         response = getattr(exc, "response", None)
-        return int(getattr(response, "status_code", 0) or getattr(exc, "status_code", 0) or 0)
+        return int(
+            getattr(response, "status_code", 0) or getattr(exc, "status_code", 0) or 0
+        )
 
     @staticmethod
     def _error_text(exc: Exception) -> str:
@@ -165,7 +172,9 @@ class LLMClient:
         return ""
 
     @staticmethod
-    def _build_user_content(prompt: str, images: list[VisionInput] | None) -> str | list[dict]:
+    def _build_user_content(
+        prompt: str, images: list[VisionInput] | None
+    ) -> str | list[dict]:
         if not images:
             return prompt
         content: list[dict] = [{"type": "text", "text": prompt}]
@@ -185,7 +194,9 @@ class LLMClient:
     ) -> str:
         """Generate a response; returns the text content, or "" on failure."""
 
-        system_content = system_prompt or "You are an intelligent agent. Output only valid JSON."
+        system_content = (
+            system_prompt or "You are an intelligent agent. Output only valid JSON."
+        )
         max_retries = 3
         base_delay = 2
         json_mode_fallback_used = False
@@ -200,7 +211,9 @@ class LLMClient:
                 request_kwargs["temperature"] = temperature
             if json_mode_fallback_used:
                 request_kwargs.pop("response_format", None)
-            request_kwargs = {key: value for key, value in request_kwargs.items() if value is not None}
+            request_kwargs = {
+                key: value for key, value in request_kwargs.items() if value is not None
+            }
 
             # 内层循环只用于 JSON mode 降级后原地重试一次，不消耗 attempt。
             while True:
@@ -209,7 +222,10 @@ class LLMClient:
                         model=model,
                         messages=[
                             {"role": "system", "content": system_content},
-                            {"role": "user", "content": self._build_user_content(prompt, images)},
+                            {
+                                "role": "user",
+                                "content": self._build_user_content(prompt, images),
+                            },
                         ],
                         timeout=request_timeout,
                         **request_kwargs,
@@ -218,7 +234,9 @@ class LLMClient:
                     choice = response.choices[0]
                     finish_reason = getattr(choice, "finish_reason", "") or ""
                     content = getattr(choice.message, "content", "") or ""
-                    usage = self._usage_to_dict(getattr(response, "usage", None), finish_reason)
+                    usage = self._usage_to_dict(
+                        getattr(response, "usage", None), finish_reason
+                    )
                     usage["provider"] = self.provider
 
                     if on_usage:
@@ -231,14 +249,23 @@ class LLMClient:
                         return self._fail("length", "finish_reason=length")
                     if not content.strip() and attempt < max_retries - 1:
                         self.provider_status.last_error_type = "empty_content"
-                        self.provider_status.last_error_message = "empty content from provider"
+                        self.provider_status.last_error_message = (
+                            "empty content from provider"
+                        )
                         self.provider_status.last_error_time = time.time()
                         await asyncio.sleep(0.2)
                         break
                     return content
 
-                except (APIConnectionError, APITimeoutError, httpx.ConnectError, httpx.ReadTimeout) as e:
-                    logger.warning(f"[LLM] 网络请求失败 (尝试 {attempt + 1}/{max_retries}): {type(e).__name__} - {e}")
+                except (
+                    APIConnectionError,
+                    APITimeoutError,
+                    httpx.ConnectError,
+                    httpx.ReadTimeout,
+                ) as e:
+                    logger.warning(
+                        f"[LLM] 网络请求失败 (尝试 {attempt + 1}/{max_retries}): {type(e).__name__} - {e}"
+                    )
                     if attempt < max_retries - 1:
                         await asyncio.sleep(base_delay * (attempt + 1))
                         break
@@ -251,7 +278,9 @@ class LLMClient:
                         and not json_mode_fallback_used
                         and is_json_mode_unsupported_error(e)
                     ):
-                        logger.warning("LLM 模型不支持 JSON mode，已降级为普通文本 JSON 提示重试")
+                        logger.warning(
+                            "LLM 模型不支持 JSON mode，已降级为普通文本 JSON 提示重试"
+                        )
                         request_kwargs.pop("response_format", None)
                         json_mode_fallback_used = True
                         continue
@@ -261,7 +290,10 @@ class LLMClient:
                     if error_type == "rate_limit":
                         self.provider_status.circuit_until = time.time() + 30
                         return self._fail(error_type, str(e))
-                    if error_type in {"insufficient_system_resource", "server_error"} and attempt < max_retries - 1:
+                    if (
+                        error_type in {"insufficient_system_resource", "server_error"}
+                        and attempt < max_retries - 1
+                    ):
                         await asyncio.sleep(base_delay * (attempt + 1))
                         break
                     return self._fail(error_type, str(e))
@@ -318,7 +350,9 @@ def build_turn_calls(
 
     app_settings = get_app_settings()
     return (
-        make_call(state.client, app_settings.chat, 0.7, CHAT_SYSTEM_PROMPT, chat_images),
+        make_call(
+            state.client, app_settings.chat, 0.7, CHAT_SYSTEM_PROMPT, chat_images
+        ),
         make_call(
             state.feedback_client,
             app_settings.feedback,
@@ -344,10 +378,10 @@ def extract_and_parse_json(text: str) -> dict | list | None:
     array_start = text.find("[")
     if object_start != -1 and (array_start == -1 or object_start < array_start):
         end = text.rfind("}")
-        payload = text[object_start:end + 1] if end != -1 else ""
+        payload = text[object_start : end + 1] if end != -1 else ""
     elif array_start != -1:
         end = text.rfind("]")
-        payload = text[array_start:end + 1] if end != -1 else ""
+        payload = text[array_start : end + 1] if end != -1 else ""
     else:
         payload = ""
     if not payload:

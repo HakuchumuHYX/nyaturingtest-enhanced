@@ -3,7 +3,6 @@ from datetime import datetime
 
 from ..memory.short_term import Message
 
-
 # 意愿与参与策略参数
 SPEAK_COOLDOWN_SECONDS = 16.0
 WILLINGNESS_IDLE_AFTER_SECONDS = 300.0
@@ -90,9 +89,7 @@ def check_relevance(
 ) -> bool:
     triggers = [bot_name, *(aliases or [])]
     triggers = [
-        value.strip().lower()
-        for value in triggers
-        if value and len(value.strip()) >= 2
+        value.strip().lower() for value in triggers if value and len(value.strip()) >= 2
     ]
     return any(
         trigger in message.content.lower()
