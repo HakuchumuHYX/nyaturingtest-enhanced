@@ -68,7 +68,6 @@ def _history_without_current_chunk(
 class _FeedbackContext:
     response_dict: dict
     existing_related_memories: list[dict]
-    allow_memory_supersede: bool
     active_user_ids: set[str]
 
 
@@ -324,7 +323,15 @@ class ConversationOrchestrator:
             or self.session.state.willingness > LOW_WILLINGNESS_SKIP_THRESHOLD
         )
 
-        long_term_memory = []
+        preset_lines = [
+            f"【设定/{record['metadata'].get('subtype') or 'legacy_rule'}】 {record['content']}"
+            for record in await run_sync(
+                self.session.runtime.vector_memory.get_source_records
+            )("preset")
+        ]
+        # 预设每轮完全相同，排序固定，才能作为不变的前缀参与缓存
+        preset_lines.sort()
+        memory_lines = []
         raw_results = []
         search_result = RetrievalResult(records=[], stats=rag_stats)
         try:
@@ -335,13 +342,11 @@ class ConversationOrchestrator:
             else:
                 logger.debug(f"触发长期记忆检索: {queries[:5]}...")
 
-                where_filter = where_any("source", ["preset", "memory"])
-
                 retrieval_result = await search_memories(
                     self.session.runtime.vector_memory,
                     queries,
                     k=RAG_FINAL_K,
-                    where=where_filter,
+                    where=where_any("source", ["memory"]),
                     use_rerank=use_rerank,
                     candidate_k=RAG_PER_QUERY_RECALL_K,
                     merged_candidate_cap=RAG_MERGED_CANDIDATE_CAP,
@@ -375,39 +380,31 @@ class ConversationOrchestrator:
                 )
 
                 if raw_results:
-                    formatted_results = []
-                    total_len = 0
-                    max_len = RAG_MEMORY_CHAR_BUDGET
+                    memory_lines = []
+                    memory_chars = 0
 
                     for item in raw_results:
                         content = item.get("content", "")
                         meta = item.get("metadata", {})
-                        source = meta.get("source", "unknown")
-                        date_str = str(meta.get("date", ""))
 
-                        if source == "preset":
-                            subtype = str(meta.get("subtype") or "legacy_rule")
-                            prefix = f"【设定/{subtype}】"
-                        else:
-                            prefix = f"【记忆/d:{date_str}】"
-                        line = f"{prefix} {content}"
-
-                        remaining = max_len - total_len
+                        remaining = RAG_MEMORY_CHAR_BUDGET - memory_chars
                         if remaining <= 0:
                             break
+                        line = f"【记忆/d:{meta.get('date', '')}】 {content}"
                         if len(line) > remaining:
                             line = line[:remaining].rstrip()
                         if not line:
                             break
-                        formatted_results.append(line)
-                        total_len += len(line)
+                        memory_lines.append(line)
+                        memory_chars += len(line)
 
-                    long_term_memory = formatted_results
-                    rag_stats["injected_count"] = len(long_term_memory)
-                    rag_stats["injected_chars"] = sum(
-                        len(item) for item in long_term_memory
+                    rag_stats["injected_count"] = len(preset_lines) + len(memory_lines)
+                    rag_stats["injected_chars"] = memory_chars + sum(
+                        len(line) for line in preset_lines
                     )
-                    logger.debug(f"搜索结果：命中 {len(long_term_memory)} 条")
+                    logger.debug(
+                        f"搜索结果：设定 {len(preset_lines)} 条、记忆 {len(memory_lines)} 条"
+                    )
         finally:
             rag_stats["elapsed_ms"] = int((time.perf_counter() - started_at) * 1000)
             if RAG_DEBUG_LOG:
@@ -416,7 +413,8 @@ class ConversationOrchestrator:
             search_result = RetrievalResult(
                 records=raw_results,
                 stats=rag_stats,
-                prompt_lines=long_term_memory,
+                preset_lines=preset_lines,
+                memory_lines=memory_lines,
             )
         return search_result
 
@@ -443,7 +441,7 @@ class ConversationOrchestrator:
             {"user_id": p.user_id, "emotion_tends_to_user": asdict(p.emotion)}
             for p in related_profiles
         ]
-        search_history = search_result.prompt_lines if search_result else []
+        search_history = search_result.memory_lines if search_result else []
         active_user_ids = {
             str(msg.user_id)
             for msg in messages_chunk
@@ -452,9 +450,6 @@ class ConversationOrchestrator:
         existing_related_memories = _existing_related_memories(
             search_result.records if search_result else [],
             active_user_ids,
-        )
-        allow_memory_supersede = any(
-            item.get("memory_ref") for item in existing_related_memories
         )
 
         formatted_msgs = [
@@ -504,11 +499,10 @@ class ConversationOrchestrator:
             self.session.state.chat_summary,
             is_relevant=is_relevant,
             time_info=time_str,
+            presets=search_result.preset_lines if search_result else [],
             existing_related_memories=existing_related_memories,
-            allow_memory_supersede=allow_memory_supersede,
             new_msg_speakers=new_msg_speakers,
             budget=PromptBudget(),
-            has_images=any(message.image_inputs for message in messages_chunk),
         )
 
         try:
@@ -550,7 +544,6 @@ class ConversationOrchestrator:
             _FeedbackContext(
                 response_dict=response_dict,
                 existing_related_memories=existing_related_memories,
-                allow_memory_supersede=allow_memory_supersede,
                 active_user_ids=active_user_ids,
             ),
             "",
@@ -1125,7 +1118,8 @@ class ConversationOrchestrator:
         expected_generation: int | None = None,
     ) -> list[dict]:
         logger.debug(">> 对话阶段 (Chat) 开始")
-        search_history = search_result.prompt_lines if search_result else []
+        search_history = search_result.memory_lines if search_result else []
+        preset_history = search_result.preset_lines if search_result else []
         formatted_msgs = [
             {
                 "id": str(msg.id or ""),
@@ -1181,6 +1175,7 @@ class ConversationOrchestrator:
             search_history,
             self.session.state.chat_summary,
             examples_text=self.session.state.examples,
+            presets=preset_history,
             recalled_history=recalled_str,
             time_info=time_str,
             budget=PromptBudget(),
@@ -1191,6 +1186,8 @@ class ConversationOrchestrator:
             chat_prompt_total_chars=len(prompt),
             rag_injected_count=len(search_history),
             rag_injected_chars=sum(len(item) for item in search_history),
+            preset_injected_count=len(preset_history),
+            preset_injected_chars=sum(len(item) for item in preset_history),
             history_chars=len(context_record.compressed_history or "")
             + sum(len(item.get("content", "")) for item in history_msgs_formatted),
             recent_chars=sum(len(item.get("content", "")) for item in formatted_msgs),

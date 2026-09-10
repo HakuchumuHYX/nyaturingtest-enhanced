@@ -112,11 +112,15 @@ class LLMClient:
         completion_details = data.get("completion_tokens_details") or {}
         if hasattr(completion_details, "model_dump"):
             completion_details = completion_details.model_dump()
+        prompt_details = data.get("prompt_tokens_details") or {}
+        if hasattr(prompt_details, "model_dump"):
+            prompt_details = prompt_details.model_dump()
 
         prompt_tokens = int(data.get("prompt_tokens") or 0)
         completion_tokens = int(data.get("completion_tokens") or 0)
-        hit_tokens = int(data.get("prompt_cache_hit_tokens") or 0)
-        miss_tokens = int(data.get("prompt_cache_miss_tokens") or 0)
+        # 命中数来自 OpenAI 形状的 prompt_tokens_details.cached_tokens，未命中即剩余部分
+        hit_tokens = min(int((prompt_details or {}).get("cached_tokens") or 0), prompt_tokens)
+        miss_tokens = max(0, prompt_tokens - hit_tokens)
         reasoning_tokens = int(data.get("reasoning_tokens") or 0)
         if isinstance(completion_details, dict):
             reasoning_tokens = int(

@@ -17,7 +17,8 @@
 - **长期记忆**：每群独立的 ChromaDB 向量库，Embedding 召回 + Rerank 重排 + 时间衰减排序，
   支持相似度去重、事实更新（supersede）与失败写入的 WAL 重放。
 - **原生多模态**：图片下载压缩后作为 `image_url` 随请求附带，Feedback 额外返回一句话图片观察写回消息文本。
-- **Token 统计**：记录 prompt / completion / reasoning / DeepSeek cache hit-miss，按模型归并后渲染成卡片。
+- **Token 统计**：记录 prompt / completion / reasoning 与缓存命中（`prompt_tokens_details.cached_tokens`，
+  未命中部分由 `prompt_tokens` 减去命中数推出），按模型归并后渲染成卡片。
 - **SQLite 持久化与每日备份**：会话、消息、画像、启用的群与 Token 明细入库；数据目录每天自动打包。
 
 ## 运行环境
@@ -70,6 +71,15 @@ plugins/nyaturingtest/
 - `core/orchestrator.py` 从 `core/session.py` 单向导入 `ChattingState` / `FeedbackOutcome`；
   `core/state_manager.py` 内部局部导入 `logic.spawn_state`（`logic` 反向引用 `GroupState`）。
 
+提示词构造有两条硬约束，都是为了命中上游的前缀缓存（命中部分按缓存价计费）：
+
+- **模板是唯一常量**：不允许按本轮情况分叉（feedback 的 supersede 指令、图片观察要求都写死在模板里，
+  由动态输入里的 `memory_actions_allowed` 与是否有图片决定模型怎么用）。
+- **动态输入字段顺序固定为「不变量 → 每轮变化」**：`bot_name` / `role` / `examples_text` / `presets`
+  在最前，`related_profiles`、`search_result`、`summary` 居中，`emotion` / `recent_msgs` / `new_msgs` /
+  `time_info` 在最后。相邻两轮的公共前缀因此从约 24% 提升到约 48%（chat）、38% 提升到约 59%（feedback）。
+- `presets`（角色预设条目，每轮相同）与 `search_result`（每轮检索结果）分开注入，前者不占记忆字符预算。
+
 ## 一轮对话怎么走
 
 ```text
@@ -90,8 +100,9 @@ plugins/nyaturingtest/
    直接把意愿拉到 `RELEVANCE_WILLINGNESS_FLOOR` → 否则按内容兴趣被动增长 → 更新参与态滞回与发言冷却。
 3. 不参与且不相关时：满足固化条件（`messages_since_consolidation >= 8`，或距上次尝试 180s）
    就走 `consolidate_stage`，静默沉淀记忆，**不产生回复**。
-4. `search_stage`：构造 RAG query → 检索长期记忆 → 按字符预算拼成 `prompt_lines`，
-   统计写进 `rag_search` 事件日志（`RAG_DEBUG_LOG=True` 时附每条记录的分数明细）。
+4. `search_stage`：构造 RAG query → 检索长期记忆 → 预设条目与记忆行分别按字符预算整理成
+   `preset_lines` / `memory_lines`，统计写进 `rag_search` 事件日志
+   （`RAG_DEBUG_LOG=True` 时附每条记录的分数明细）。
 5. `feedback_stage`（观察者模型，temperature 0.1）：解析 JSON → 应用图片观察 → 沉淀 → 发言决策。
    - `_apply_image_observations`：把 Feedback 对图片的一句话观察写回消息文本（`[图片: …]` / `[表情包: …]`），
      让历史里保留图片线索。
@@ -192,7 +203,7 @@ SQLite 表（`models.py`，启动时由 `Tortoise.generate_schemas()` 建表）�
 | `nyabot_interactions` | 每次互动的情感增量明细 |
 | `nyabot_global_messages` | 消息明细（`(session, msg_id)` 唯一，含时间与会话索引） |
 | `nyabot_enabled_groups` | 启用的群号，**唯一来源** |
-| `nyabot_token_usage` | Token 明细：prompt / completion / cache hit / cache miss / reasoning |
+| `nyabot_token_usage` | Token 明细：prompt / completion / cache hit / cache miss / reasoning，其中 cache hit 取 `prompt_tokens_details.cached_tokens` |
 | `nyabot_daily_token_usage` | 按 `(day, session, model)` 聚合的日汇总，卡片统计只读这张表 |
 
 `db.py` 是唯一的数据库访问层，除同步工具 `sanitize_text` 外全是模块级 async 函数。

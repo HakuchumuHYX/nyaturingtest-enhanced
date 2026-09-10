@@ -60,7 +60,9 @@ _metric_check_done: set[str] = set()
 class RetrievalResult(Sequence[dict[str, Any]]):
     records: list[dict[str, Any]]
     stats: dict[str, Any]
-    prompt_lines: list[str] = field(default_factory=list)
+    # 预设条目每轮都一样，与每轮变化的记忆分开送进 Prompt，便于前缀缓存命中
+    preset_lines: list[str] = field(default_factory=list)
+    memory_lines: list[str] = field(default_factory=list)
 
     def __iter__(self) -> Iterator[dict[str, Any]]:
         return iter(self.records)
@@ -557,7 +559,9 @@ class VectorMemory:
         prepared_data = []
         ids = []
         for content, metadata in valid_data:
-            prepared_metadata = dict(metadata or {})
+            # 统一在写入时补全 status/schema_version 等字段：磁盘上的记录形状必须与读取路径一致，
+            # 否则「清理旧格式记录」会误删只有 source/type/subtype 的预设条目
+            prepared_metadata = _normalized_metadata(metadata)
             operation_id = str(prepared_metadata.get("operation_id") or "")
             if not operation_id:
                 operation_id = _memory_operation_id("add", content, prepared_metadata)
@@ -845,6 +849,33 @@ class VectorMemory:
             reverse=True,
         )
         return records[: max(1, int(limit or 1))]
+
+    def get_source_records(self, source: str) -> list[dict[str, Any]]:
+        """按 source 取固定条目（当前只有 preset），不受检索排名与 rerank 影响。"""
+
+        try:
+            with BACKUP_IO_LOCK:
+                result = self.collection.get(
+                    where={"source": {"$eq": source}},
+                    include=["documents", "metadatas"],
+                )
+        except Exception as e:
+            logger.warning(f"Fetch source records failed ({source}): {e}")
+            return []
+
+        documents = result.get("documents") or []
+        metadatas = result.get("metadatas") or []
+        records = []
+        for index, document in enumerate(documents):
+            if not document:
+                continue
+            metadata = _normalized_metadata(
+                metadatas[index] if index < len(metadatas) else {}
+            )
+            if _metadata_status(metadata) != "active":
+                continue
+            records.append({"content": document, "metadata": metadata})
+        return records
 
     def delete_by_metadata(self, where: dict):
         """删除指定条件的记忆"""
