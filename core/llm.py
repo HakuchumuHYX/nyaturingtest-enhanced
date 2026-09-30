@@ -3,26 +3,16 @@ import json
 import re
 import ssl
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from functools import partial
-from typing import Any, Optional
+from typing import Any
 
 import httpx
 from nonebot import logger
 from openai import APIConnectionError, APITimeoutError, AsyncOpenAI
 
-from ..config import get_app_settings
-from .metrics import record_token_usage
-
-
-def is_json_mode_unsupported_error(exc: Exception) -> bool:
-    text = str(exc).lower()
-    return (
-        "json mode is not supported" in text
-        or "response_format" in text
-        and "not supported" in text
-    )
+from ..config import EndpointSettings, get_app_settings
+from .metrics import log_event, metrics, record_token_usage
 
 
 @dataclass(frozen=True)
@@ -85,7 +75,6 @@ async def close_http_client() -> None:
 class ProviderStatus:
     last_error_type: str = ""
     last_error_message: str = ""
-    last_error_time: float = 0.0
     circuit_until: float = 0.0
 
     @property
@@ -93,210 +82,174 @@ class ProviderStatus:
         return max(0, int(self.circuit_until - time.time()))
 
 
-class LLMClient:
-    """OpenAI-compatible chat completions client."""
+LLM_MAX_ATTEMPTS = 3
+LLM_RETRY_BASE_DELAY = 2.0
+RATE_LIMIT_CIRCUIT_SECONDS = 30.0
+JSON_SYSTEM_PROMPT = "You are an intelligent agent. Output only valid JSON."
 
-    def __init__(
-        self,
-        *,
-        openai_client: Optional[AsyncOpenAI] = None,
-        timeout: float = 60.0,
-    ):
-        self.openai_client = openai_client
-        self.timeout = timeout
+
+def _usage_to_dict(usage: Any, finish_reason: str) -> dict[str, int | str]:
+    data = usage.model_dump() if usage is not None else {}
+    prompt_details = data.get("prompt_tokens_details") or {}
+    completion_details = data.get("completion_tokens_details") or {}
+    prompt_tokens = int(data.get("prompt_tokens") or 0)
+    completion_tokens = int(data.get("completion_tokens") or 0)
+    # 命中数来自 OpenAI 形状的 prompt_tokens_details.cached_tokens，未命中即剩余部分
+    hit_tokens = min(int(prompt_details.get("cached_tokens") or 0), prompt_tokens)
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": int(data.get("total_tokens") or prompt_tokens + completion_tokens),
+        "prompt_cache_hit_tokens": hit_tokens,
+        "prompt_cache_miss_tokens": prompt_tokens - hit_tokens,
+        "reasoning_tokens": int(
+            completion_details.get("reasoning_tokens")
+            or data.get("reasoning_tokens")
+            or 0
+        ),
+        "finish_reason": finish_reason or "",
+    }
+
+
+def _classify_exception(exc: Exception) -> str:
+    status_code = int(getattr(exc, "status_code", 0) or 0)
+    text = str(exc).lower()
+    if status_code == 429:
+        return "rate_limit"
+    if "content_filter" in text:
+        return "content_filter"
+    if "insufficient_system_resource" in text:
+        return "insufficient_system_resource"
+    if status_code >= 500:
+        return "server_error"
+    return "api_error"
+
+
+class LLMClient:
+    """一个端点的 OpenAI 兼容客户端：JSON 输出、重试、429 熔断、指标与 Token 记录。"""
+
+    def __init__(self, settings: EndpointSettings):
+        self.settings = settings
+        self.openai_client = AsyncOpenAI(
+            api_key=settings.api_key,
+            base_url=settings.base_url,
+            http_client=get_http_client(),
+            max_retries=0,
+        )
         self.provider_status = ProviderStatus()
 
-    @staticmethod
-    def _usage_to_dict(usage: Any, finish_reason: str) -> dict[str, int | str]:
-        data = usage.model_dump() if usage is not None else {}
-        completion_details = data.get("completion_tokens_details") or {}
-        if hasattr(completion_details, "model_dump"):
-            completion_details = completion_details.model_dump()
-        prompt_details = data.get("prompt_tokens_details") or {}
-        if hasattr(prompt_details, "model_dump"):
-            prompt_details = prompt_details.model_dump()
-
-        prompt_tokens = int(data.get("prompt_tokens") or 0)
-        completion_tokens = int(data.get("completion_tokens") or 0)
-        # 命中数来自 OpenAI 形状的 prompt_tokens_details.cached_tokens，未命中即剩余部分
-        hit_tokens = min(int((prompt_details or {}).get("cached_tokens") or 0), prompt_tokens)
-        miss_tokens = max(0, prompt_tokens - hit_tokens)
-        reasoning_tokens = int(data.get("reasoning_tokens") or 0)
-        if isinstance(completion_details, dict):
-            reasoning_tokens = int(
-                completion_details.get("reasoning_tokens") or reasoning_tokens
-            )
-
-        return {
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": int(
-                data.get("total_tokens") or prompt_tokens + completion_tokens
-            ),
-            "prompt_cache_hit_tokens": hit_tokens,
-            "prompt_cache_miss_tokens": miss_tokens,
-            "reasoning_tokens": reasoning_tokens,
-            "finish_reason": finish_reason or "",
-        }
-
-    @staticmethod
-    def _status_code(exc: Exception) -> int:
-        response = getattr(exc, "response", None)
-        return int(
-            getattr(response, "status_code", 0) or getattr(exc, "status_code", 0) or 0
-        )
-
-    @staticmethod
-    def _error_text(exc: Exception) -> str:
-        response = getattr(exc, "response", None)
-        return str(getattr(response, "text", "") or exc)
-
-    def _classify_exception(self, exc: Exception) -> str:
-        status_code = self._status_code(exc)
-        text = self._error_text(exc).lower()
-        if status_code == 429:
-            return "rate_limit"
-        if "content_filter" in text:
-            return "content_filter"
-        if "insufficient_system_resource" in text:
-            return "insufficient_system_resource"
-        if status_code >= 500:
-            return "server_error"
-        return "api_error"
-
-    def _fail(self, error_type: str, message: str = "") -> str:
+    def _fail(self, error_type: str, message: str) -> None:
         self.provider_status.last_error_type = error_type
         self.provider_status.last_error_message = message[:300]
-        self.provider_status.last_error_time = time.time()
-        return ""
-
-    @staticmethod
-    def _build_user_content(
-        prompt: str, images: list[VisionInput] | None
-    ) -> str | list[dict]:
-        if not images:
-            return prompt
-        content: list[dict] = [{"type": "text", "text": prompt}]
-        for image in images:
-            content.extend(image.to_openai_content())
-        return content
 
     async def generate(
         self,
         prompt: str,
-        model: str,
-        temperature: float | None = None,
-        system_prompt: str | None = None,
-        on_usage: Callable[[dict], None] | None = None,
+        *,
+        session_id: str,
+        temperature: float,
+        system_prompt: str = JSON_SYSTEM_PROMPT,
         images: list[VisionInput] | None = None,
-        **kwargs,
     ) -> str:
-        """Generate a response; returns the text content, or "" on failure."""
+        """返回模型文本；失败返回空串，原因记在 provider_status。"""
 
-        system_content = (
-            system_prompt or "You are an intelligent agent. Output only valid JSON."
+        started_at = time.perf_counter()
+        content = await self._request(
+            prompt, session_id, temperature, system_prompt, images or []
         )
-        max_retries = 3
-        base_delay = 2
-        json_mode_fallback_used = False
+        if content:
+            metrics.llm_success += 1
+        else:
+            metrics.llm_failure += 1
+        log_event(
+            "llm_success" if content else "llm_failure",
+            model=self.settings.model,
+            latency_ms=int((time.perf_counter() - started_at) * 1000),
+            decision="content" if content else self.provider_status.last_error_type,
+        )
+        return content
 
-        for attempt in range(max_retries):
+    async def _request(
+        self,
+        prompt: str,
+        session_id: str,
+        temperature: float,
+        system_prompt: str,
+        images: list[VisionInput],
+    ) -> str:
+        user_content: str | list[dict] = prompt
+        if images:
+            user_content = [{"type": "text", "text": prompt}]
+            for image in images:
+                user_content.extend(image.to_openai_content())
+        extra = {}
+        if self.settings.reasoning_effort:
+            extra["reasoning_effort"] = self.settings.reasoning_effort
+
+        for attempt in range(LLM_MAX_ATTEMPTS):
             if self.provider_status.circuit_until > time.time():
-                return self._fail("circuit_open", "provider circuit breaker is open")
-            request_kwargs = dict(kwargs)
-            request_timeout = request_kwargs.pop("timeout", self.timeout)
-
-            if temperature is not None:
-                request_kwargs["temperature"] = temperature
-            if json_mode_fallback_used:
-                request_kwargs.pop("response_format", None)
-            request_kwargs = {
-                key: value for key, value in request_kwargs.items() if value is not None
-            }
-
-            # 内层循环只用于 JSON mode 降级后原地重试一次，不消耗 attempt。
-            while True:
-                try:
-                    response = await self.openai_client.chat.completions.create(
-                        model=model,
-                        messages=[
-                            {"role": "system", "content": system_content},
-                            {
-                                "role": "user",
-                                "content": self._build_user_content(prompt, images),
-                            },
-                        ],
-                        timeout=request_timeout,
-                        **request_kwargs,
+                self._fail("circuit_open", "provider circuit breaker is open")
+                return ""
+            last_attempt = attempt == LLM_MAX_ATTEMPTS - 1
+            try:
+                response = await self.openai_client.chat.completions.create(
+                    model=self.settings.model,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_content},
+                    ],
+                    temperature=temperature,
+                    max_tokens=self.settings.max_tokens,
+                    timeout=self.settings.timeout,
+                    response_format={"type": "json_object"},
+                    **extra,
+                )
+            except (
+                APIConnectionError,
+                APITimeoutError,
+                httpx.ConnectError,
+                httpx.ReadTimeout,
+            ) as e:
+                logger.warning(
+                    f"[LLM] 网络请求失败 (尝试 {attempt + 1}/{LLM_MAX_ATTEMPTS}): {type(e).__name__} - {e}"
+                )
+                self._fail("network_error", str(e))
+                if last_attempt:
+                    return ""
+                await asyncio.sleep(LLM_RETRY_BASE_DELAY * (attempt + 1))
+                continue
+            except Exception as e:
+                error_type = _classify_exception(e)
+                logger.error(f"[LLM] API 调用失败 [{error_type}]: {e}")
+                self._fail(error_type, str(e))
+                if error_type == "rate_limit":
+                    self.provider_status.circuit_until = (
+                        time.time() + RATE_LIMIT_CIRCUIT_SECONDS
                     )
+                    return ""
+                retryable = error_type in {"insufficient_system_resource", "server_error"}
+                if last_attempt or not retryable:
+                    return ""
+                await asyncio.sleep(LLM_RETRY_BASE_DELAY * (attempt + 1))
+                continue
 
-                    choice = response.choices[0]
-                    finish_reason = getattr(choice, "finish_reason", "") or ""
-                    content = getattr(choice.message, "content", "") or ""
-                    usage = self._usage_to_dict(
-                        getattr(response, "usage", None), finish_reason
-                    )
-
-                    if on_usage:
-                        try:
-                            on_usage(usage)
-                        except Exception as ex:
-                            logger.warning(f"Usage callback failed: {ex}")
-
-                    if finish_reason == "length":
-                        return self._fail("length", "finish_reason=length")
-                    if not content.strip() and attempt < max_retries - 1:
-                        self.provider_status.last_error_type = "empty_content"
-                        self.provider_status.last_error_message = (
-                            "empty content from provider"
-                        )
-                        self.provider_status.last_error_time = time.time()
-                        await asyncio.sleep(0.2)
-                        break
-                    return content
-
-                except (
-                    APIConnectionError,
-                    APITimeoutError,
-                    httpx.ConnectError,
-                    httpx.ReadTimeout,
-                ) as e:
-                    logger.warning(
-                        f"[LLM] 网络请求失败 (尝试 {attempt + 1}/{max_retries}): {type(e).__name__} - {e}"
-                    )
-                    if attempt < max_retries - 1:
-                        await asyncio.sleep(base_delay * (attempt + 1))
-                        break
-                    logger.error(f"[LLM] 最终请求失败: {e}")
-                    return self._fail("network_error", str(e))
-
-                except Exception as e:
-                    if (
-                        "response_format" in request_kwargs
-                        and not json_mode_fallback_used
-                        and is_json_mode_unsupported_error(e)
-                    ):
-                        logger.warning(
-                            "LLM 模型不支持 JSON mode，已降级为普通文本 JSON 提示重试"
-                        )
-                        request_kwargs.pop("response_format", None)
-                        json_mode_fallback_used = True
-                        continue
-
-                    error_type = self._classify_exception(e)
-                    logger.error(f"[LLM] API 调用失败 [{error_type}]: {e}")
-                    if error_type == "rate_limit":
-                        self.provider_status.circuit_until = time.time() + 30
-                        return self._fail(error_type, str(e))
-                    if (
-                        error_type in {"insufficient_system_resource", "server_error"}
-                        and attempt < max_retries - 1
-                    ):
-                        await asyncio.sleep(base_delay * (attempt + 1))
-                        break
-                    return self._fail(error_type, str(e))
-
-        return self._fail("retry_exhausted", "max retries exhausted")
+            choice = response.choices[0]
+            finish_reason = choice.finish_reason or ""
+            record_token_usage(
+                session_id,
+                self.settings.model,
+                _usage_to_dict(response.usage, finish_reason),
+            )
+            if finish_reason == "length":
+                self._fail("length", "finish_reason=length")
+                return ""
+            content = choice.message.content or ""
+            if content.strip():
+                return content
+            self._fail("empty_content", "empty content from provider")
+            if not last_attempt:
+                await asyncio.sleep(0.2)
+        return ""
 
 
 CHAT_SYSTEM_PROMPT = (
@@ -317,48 +270,35 @@ FEEDBACK_SYSTEM_PROMPT = (
     "请在内部完成分析，但最终输出只包含一个合法 JSON 对象，不要输出 Markdown、解释或思考过程。"
 )
 
+# 所有群共用：限流与熔断本来就是按 API key 算的
+chat_client = LLMClient(get_app_settings().chat)
+feedback_client = LLMClient(get_app_settings().feedback)
+
 
 def build_turn_calls(
-    llm_response: Callable,
-    *,
-    state,
-    session_id: str,
-    chat_images: list,
-    feedback_images: list,
-) -> tuple[Callable, Callable]:
-    """构造本轮对话的 chat / feedback 两个调用闭包。"""
+    session_id: str, images: list[VisionInput]
+) -> tuple[Callable[[str], Awaitable[str]], Callable[[str], Awaitable[str]]]:
+    """构造本轮对话的 chat / feedback 两个调用闭包（带上本轮图片）。"""
 
-    def make_call(client, settings, temperature, system_prompt, images) -> Callable:
-        async def call(message: str, json_mode: bool = False):
-            return await llm_response(
-                client,
-                message,
-                model=settings.model,
-                temperature=temperature,
-                reasoning_effort=settings.reasoning_effort or None,
-                json_mode=bool(json_mode),
-                max_tokens=settings.max_tokens,
-                timeout=settings.timeout,
-                system_prompt=system_prompt,
-                on_usage=partial(record_token_usage, session_id, settings.model),
-                images=images,
-            )
+    async def chat_call(prompt: str) -> str:
+        return await chat_client.generate(
+            prompt,
+            session_id=session_id,
+            temperature=0.7,
+            system_prompt=CHAT_SYSTEM_PROMPT,
+            images=images,
+        )
 
-        return call
+    async def feedback_call(prompt: str) -> str:
+        return await feedback_client.generate(
+            prompt,
+            session_id=session_id,
+            temperature=0.1,
+            system_prompt=FEEDBACK_SYSTEM_PROMPT,
+            images=images,
+        )
 
-    app_settings = get_app_settings()
-    return (
-        make_call(
-            state.client, app_settings.chat, 0.7, CHAT_SYSTEM_PROMPT, chat_images
-        ),
-        make_call(
-            state.feedback_client,
-            app_settings.feedback,
-            0.1,
-            FEEDBACK_SYSTEM_PROMPT,
-            feedback_images,
-        ),
-    )
+    return chat_call, feedback_call
 
 
 def extract_and_parse_json(text: str) -> dict | list | None:

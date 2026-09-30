@@ -2,23 +2,20 @@ import asyncio
 import hashlib
 import random
 import re
-import time
 import traceback
 from dataclasses import dataclass
 
 from nonebot import logger
-from nonebot.adapters.onebot.v11 import Bot, Message, MessageSegment
+from nonebot.adapters.onebot.v11 import Bot, Event, Message, MessageSegment
 from nonebot.adapters.onebot.v11.exception import ActionFailed
 
 from ..memory.image import fetch_image_input
 from ..memory.short_term import Message as MMessage
 from .llm import VisionInput, build_turn_calls
-from .metrics import log_event, metrics
 from .orchestrator import ConversationOrchestrator
 from .state_manager import SELF_SENT_MSG_IDS, GroupState, is_shutting_down
 
 DEBOUNCE_SECONDS = 2.0
-QUEUE_MAX_SIZE = 200
 MAX_REPLY_MESSAGES = 2
 
 _SPLIT_PATTERN = re.compile(
@@ -54,28 +51,16 @@ def build_send_parts(text: str, max_messages: int = MAX_REPLY_MESSAGES) -> list[
 
 @dataclass(frozen=True)
 class InboxBatch:
-    messages: list
-    bot: object
-    event: object
+    messages: list[MMessage]
+    bot: Bot
+    event: Event
 
 
-async def next_inbox_batch(
-    state: GroupState,
-    *,
-    debounce_seconds: float,
-    idle_timeout: float = 20.0,
-) -> InboxBatch | None:
+async def next_inbox_batch(state: GroupState) -> InboxBatch | None:
     """等到静默窗口结束，再一次性取走积压的消息。"""
 
-    try:
-        await asyncio.wait_for(
-            state.new_message_signal.wait(),
-            timeout=idle_timeout,
-        )
-    except asyncio.TimeoutError:
-        return None
-
-    await asyncio.sleep(debounce_seconds)
+    await state.new_message_signal.wait()
+    await asyncio.sleep(DEBOUNCE_SECONDS)
     state.new_message_signal.clear()
     async with state.data_lock:
         if state.bot is None or state.event is None or not state.messages_chunk:
@@ -105,35 +90,24 @@ def _delay_seconds(part: str) -> float:
 
 
 async def send_one(
-    self_sent_ids,
     *,
-    state,
-    bot,
-    event,
-    message,
+    state: GroupState,
+    bot: Bot,
+    event: Event,
+    message: Message,
     generation: int,
 ) -> bool:
     try:
         result = await bot.send(message=message, event=event)
-        sent_content = message.extract_plain_text()
-        if not sent_content and len(message) > 0:
-            sent_content = str(message)
+        sent_content = message.extract_plain_text() or str(message)
         message_id = ""
         if isinstance(result, dict) and "message_id" in result:
             message_id = str(result["message_id"])
-            self_sent_ids.append(message_id)
+            SELF_SENT_MSG_IDS.append(message_id)
 
-        if state.session.is_generation_stale(generation):
-            state.session._log_stale_generation("append_self_message", generation)
-            return True
-        async with state.session_lock:
-            if state.session.is_generation_stale(generation):
-                state.session._log_stale_generation(
-                    "append_self_message_locked",
-                    generation,
-                )
-                return True
-            await state.session.append_self_message(
+        # 同步写入短时记忆，中间没有 await，不需要再拿 session_lock
+        if not state.session.stale(generation, "append_self_message"):
+            state.session.append_self_message(
                 sent_content,
                 message_id,
                 str(bot.self_id),
@@ -151,18 +125,14 @@ async def send_one(
 
 
 async def dispatch_replies(
-    self_sent_ids,
     *,
-    state,
+    state: GroupState,
     responses: list,
-    bot,
-    event,
+    bot: Bot,
+    event: Event,
     generation: int,
 ) -> int:
-    if not responses:
-        return 0
-    if state.session.is_generation_stale(generation):
-        state.session._log_stale_generation("pre_send", generation)
+    if not responses or state.session.stale(generation, "pre_send"):
         return 0
 
     total = len(responses)
@@ -177,12 +147,8 @@ async def dispatch_replies(
         for part_index, part in enumerate(parts):
             if sent_count >= MAX_REPLY_MESSAGES:
                 break
-            if state.session.is_generation_stale(generation):
-                state.session._log_stale_generation("send_loop", generation)
+            if state.session.stale(generation, "send_loop"):
                 break
-            part = part.strip()
-            if not part:
-                continue
             message = Message(part)
             if reply_id and response_index == 0 and part_index == 0:
                 try:
@@ -191,7 +157,6 @@ async def dispatch_replies(
                     logger.warning(f"引用ID无效: {reply_id}")
 
             sent = await send_one(
-                self_sent_ids,
                 state=state,
                 bot=bot,
                 event=event,
@@ -206,7 +171,7 @@ async def dispatch_replies(
                 await asyncio.sleep(_delay_seconds(part))
 
     if sent_count:
-        state.session._schedule_save_session()
+        state.session.schedule_save()
     return sent_count
 
 
@@ -230,80 +195,17 @@ def _build_image_ref(
 
 
 def _filter_local_self_echoes(
-    messages: list[MMessage],
-    bot_self_id: str,
-    self_sent_ids,
+    messages: list[MMessage], bot_self_id: str
 ) -> tuple[list[MMessage], list[MMessage]]:
     """按本地已发送消息 ID 分离自身回显。"""
 
     filtered, local_echoes = [], []
     for msg in messages:
-        if (
-            msg.id
-            and str(msg.user_id) == str(bot_self_id)
-            and str(msg.id) in self_sent_ids
-        ):
+        if msg.id and msg.user_id == bot_self_id and msg.id in SELF_SENT_MSG_IDS:
             local_echoes.append(msg)
         else:
             filtered.append(msg)
     return filtered, local_echoes
-
-
-async def llm_response(
-    client,
-    message: str,
-    model: str,
-    temperature: float | None = None,
-    json_mode: bool = False,
-    system_prompt: str | None = None,
-    on_usage=None,
-    images: list[VisionInput] | None = None,
-    **kwargs,
-) -> str:
-    """封装 LLM 调用并记录指标；失败返回空串。"""
-
-    started_at = time.perf_counter()
-    try:
-        if json_mode:
-            kwargs["response_format"] = {"type": "json_object"}
-
-        result = await client.generate(
-            prompt=message,
-            model=model,
-            temperature=temperature,
-            system_prompt=system_prompt,
-            on_usage=on_usage,
-            images=images,
-            **kwargs,
-        )
-        if result:
-            metrics.llm_success += 1
-            log_event(
-                "llm_success",
-                model=model,
-                latency_ms=int((time.perf_counter() - started_at) * 1000),
-                tokens="recorded_by_usage_callback",
-                decision="content",
-            )
-            return result
-        metrics.llm_failure += 1
-        log_event(
-            "llm_failure",
-            model=model,
-            latency_ms=int((time.perf_counter() - started_at) * 1000),
-            decision="empty",
-        )
-        return ""
-    except Exception as e:
-        metrics.llm_failure += 1
-        log_event(
-            "llm_error",
-            model=model,
-            latency_ms=int((time.perf_counter() - started_at) * 1000),
-            decision="exception",
-        )
-        logger.error(f"LLM Error [{model}]: {e}")
-        return "Error occurred."
 
 
 async def message2BotMessage(
@@ -413,17 +315,13 @@ async def message2BotMessage(
 
 async def _process_inbox_batch(state: GroupState, batch: InboxBatch) -> None:
     bot_self_id = str(batch.bot.self_id)
-    current_chunk, local_echoes = _filter_local_self_echoes(
-        batch.messages,
-        bot_self_id,
-        SELF_SENT_MSG_IDS,
-    )
+    current_chunk, local_echoes = _filter_local_self_echoes(batch.messages, bot_self_id)
     if local_echoes:
         logger.debug(f"过滤本机自身回显消息 {len(local_echoes)} 条")
     if not current_chunk:
         return
 
-    if all(str(message.user_id) == bot_self_id for message in current_chunk):
+    if all(message.user_id == bot_self_id for message in current_chunk):
         # 自身账号发出的消息已由 append_self_message 写入记忆，这里直接丢弃
         return
     if is_shutting_down():
@@ -435,27 +333,16 @@ async def _process_inbox_batch(state: GroupState, batch: InboxBatch) -> None:
         session_id = str(state.session.id)
 
     images = [item for message in current_chunk for item in message.image_inputs]
-    chat_call, feedback_call = build_turn_calls(
-        llm_response,
-        state=state,
-        session_id=session_id,
-        chat_images=images,
-        feedback_images=images,
-    )
+    chat_call, feedback_call = build_turn_calls(session_id, images)
     try:
         responses = await ConversationOrchestrator(state.session).process_chunk(
-            messages_chunk=current_chunk,
-            chat_llm_func=chat_call,
-            feedback_llm_func=feedback_call,
-            publish=True,
-            expected_generation=generation,
+            current_chunk, chat_call, feedback_call, generation
         )
     finally:
         for message in current_chunk:
             message.image_inputs.clear()
 
     await dispatch_replies(
-        SELF_SENT_MSG_IDS,
         state=state,
         responses=responses or [],
         bot=batch.bot,
@@ -470,7 +357,7 @@ async def spawn_state(state: GroupState):
     logger.info(f"GroupState 后台任务启动: {id(state)}")
     while True:
         try:
-            batch = await next_inbox_batch(state, debounce_seconds=DEBOUNCE_SECONDS)
+            batch = await next_inbox_batch(state)
             if batch is None:
                 continue
             await _process_inbox_batch(state, batch)

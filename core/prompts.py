@@ -1,7 +1,6 @@
 import json
 from dataclasses import dataclass, field
 from datetime import datetime
-from pathlib import Path
 
 import chinese_calendar
 from nonebot import logger
@@ -86,27 +85,19 @@ _BUILTIN_PRESETS: dict[str, RolePreset] = {"喵喵.json": _猫娘预设}
 PRESETS: dict[str, RolePreset] = dict(_BUILTIN_PRESETS)
 
 
-def reload_presets(directory: str | Path | None = None) -> int:
-    """Reload external presets without creating files or retaining stale entries."""
+def reload_presets() -> None:
+    """重新扫描预设目录；删掉的文件不会残留在 PRESETS 里。"""
 
-    preset_dir = Path(directory) if directory is not None else PRESET_DIR
     loaded: dict[str, RolePreset] = {}
-    if preset_dir.is_dir():
-        paths = sorted(preset_dir.glob("*.json"), key=lambda path: path.name)
-    else:
-        paths = []
-    for path in paths:
-        if path.is_file():
-            try:
-                with open(path, encoding="utf-8") as f:
-                    data = json.load(f)
-                loaded[path.name] = RolePreset(**data)
-            except Exception as e:
-                logger.warning(f"无法加载预设 {path.name}: {e}")
+    for path in sorted(PRESET_DIR.glob("*.json")):
+        try:
+            with open(path, encoding="utf-8") as f:
+                loaded[path.name] = RolePreset(**json.load(f))
+        except Exception as e:
+            logger.warning(f"无法加载预设 {path.name}: {e}")
     PRESETS.clear()
     PRESETS.update(_BUILTIN_PRESETS)
     PRESETS.update(loaded)
-    return len(loaded)
 
 
 # 启动时加载一次，命令执行时还会刷新以支持新增和修改文件。
@@ -115,56 +106,32 @@ reload_presets()
 DYNAMIC_INPUT_MARKER = "---- DYNAMIC INPUT ----"
 
 
-@dataclass(frozen=True)
-class PromptBudget:
-    summary_chars: int = 1200
-    recent_message_chars: int = 1600
-    history_chars: int = 2400
-    rag_total_chars: int = 1500
-    rag_item_chars: int = 500
-    recalled_history_chars: int = 1200
+# Prompt 各段字符预算
+SUMMARY_CHARS = 1200
+RECENT_MESSAGE_CHARS = 1600
+HISTORY_CHARS = 2400
+RECALLED_HISTORY_CHARS = 1200
 
 
-def truncate_text(value, limit: int) -> str:
-    text = str(value or "")
-    safe_limit = max(0, int(limit))
-    if len(text) <= safe_limit:
+def truncate_text(text: str, limit: int) -> str:
+    if len(text) <= limit:
         return text
-    if safe_limit <= 1:
-        return text[:safe_limit]
-    return text[: safe_limit - 1].rstrip() + "…"
+    return text[: limit - 1].rstrip() + "…"
 
 
-def _truncate_messages(messages: list, total_limit: int) -> list:
-    remaining = max(0, int(total_limit))
+def _truncate_messages(messages: list[dict], total_limit: int) -> list[dict]:
+    """从最新一条往前保留，总字数不超过 total_limit。"""
+
+    remaining = total_limit
     selected = []
-    for message in reversed(list(messages or [])):
-        item = dict(message)
+    for message in reversed(messages):
         if remaining <= 0:
             break
-        truncated = truncate_text(item.get("content", ""), remaining)
-        item["content"] = truncated
-        selected.append(item)
-        remaining -= len(truncated)
+        content = truncate_text(message["content"], remaining)
+        selected.append({**message, "content": content})
+        remaining -= len(content)
     selected.reverse()
     return selected
-
-
-def _truncate_rag_items(items: list, budget: PromptBudget) -> list[str]:
-    remaining = max(0, budget.rag_total_chars)
-    result = []
-    for item in items or []:
-        if remaining <= 0:
-            break
-        truncated = truncate_text(
-            item,
-            min(remaining, max(0, budget.rag_item_chars)),
-        )
-        if not truncated:
-            continue
-        result.append(truncated)
-        remaining -= len(truncated)
-    return result
 
 
 def _canonical_json(data) -> str:
@@ -180,59 +147,46 @@ MEMORY_ACTION_SCHEMA = """
 
 
 def get_feedback_prompt(
+    *,
     bot_name: str,
     role: str,
     willingness: float,
     chat_state_value: int,
-    history_summary: str,
-    recent_msgs: list,
-    new_msgs_formatted: list,
+    summary: str,
+    recent_msgs: list[dict],
+    new_msgs: list[dict],
     emotion: dict,
-    related_profiles: list,
-    search_result: list,
-    last_summary: str,
-    is_relevant: bool = False,
-    time_info: str = "",
-    presets: list | None = None,
-    existing_related_memories: list | None = None,
-    new_msg_speakers: list | None = None,
-    budget: PromptBudget | None = None,
+    related_profiles: list[dict],
+    search_result: list[str],
+    is_relevant: bool,
+    time_info: str,
+    presets: list[str],
+    existing_related_memories: list[dict],
+    new_msg_speakers: list[dict],
 ) -> str:
     """
     反馈阶段 Prompt - 观察者模式
     """
-    candidates = [
-        dict(item) for item in (existing_related_memories or []) if isinstance(item, dict)
-    ]
     memory_actions_allowed = (
-        ["add", "supersede", "ignore"] if candidates else ["add", "ignore"]
+        ["add", "supersede", "ignore"] if existing_related_memories else ["add", "ignore"]
     )
-
-    budget = budget or PromptBudget()
-    summary = truncate_text(last_summary or history_summary, budget.summary_chars)
     dynamic_payload = {
-        "bot_name": bot_name or "",
-        "role": role or "",
-        "presets": presets or [],
-        "related_profiles": related_profiles or [],
-        "search_result": _truncate_rag_items(search_result or [], budget),
-        "existing_related_memories": candidates,
+        "bot_name": bot_name,
+        "role": role,
+        "presets": presets,
+        "related_profiles": related_profiles,
+        "search_result": search_result,
+        "existing_related_memories": existing_related_memories,
         "memory_actions_allowed": memory_actions_allowed,
-        "summary": summary,
-        "recent_msgs": _truncate_messages(recent_msgs or [], budget.history_chars),
-        "new_msgs": _truncate_messages(
-            new_msgs_formatted or [], budget.recent_message_chars
-        ),
-        "new_msg_speakers": new_msg_speakers or [],
-        "is_relevant": bool(is_relevant),
-        "chat_state_value": int(chat_state_value or 0),
-        "willingness": round(float(willingness or 0.0), 2),
-        "emotion": {
-            "valence": round(float((emotion or {}).get("valence", 0.0)), 2),
-            "arousal": round(float((emotion or {}).get("arousal", 0.0)), 2),
-            "dominance": round(float((emotion or {}).get("dominance", 0.0)), 2),
-        },
-        "time_info": time_info or "",
+        "summary": truncate_text(summary, SUMMARY_CHARS),
+        "recent_msgs": _truncate_messages(recent_msgs, HISTORY_CHARS),
+        "new_msgs": _truncate_messages(new_msgs, RECENT_MESSAGE_CHARS),
+        "new_msg_speakers": new_msg_speakers,
+        "is_relevant": is_relevant,
+        "chat_state_value": chat_state_value,
+        "willingness": round(willingness, 2),
+        "emotion": {key: round(value, 2) for key, value in emotion.items()},
+        "time_info": time_info,
     }
 
     return f"""
@@ -301,29 +255,27 @@ JSON 需包含以下字段：
 
 
 def get_chat_prompt(
+    *,
     bot_name: str,
     role: str,
     chat_state_value: int,
-    history_summary: str,
-    recent_msgs: list,
-    new_msgs_formatted: list,
+    summary: str,
+    recent_msgs: list[dict],
+    new_msgs: list[dict],
     emotion: dict,
-    related_profiles: list,
-    search_result: list,
-    chat_summary: str,
-    examples_text: str = "",
-    presets: list | None = None,
-    recalled_history: str = "",
-    time_info: str = "",
-    budget: PromptBudget | None = None,
+    related_profiles: list[dict],
+    search_result: list[str],
+    examples_text: str,
+    presets: list[str],
+    recalled_history: str,
+    time_info: str,
 ) -> str:
     """
     对话阶段 Prompt - 深度角色扮演 (全中文优化版)
     """
-    emotion = emotion or {}
-    valence = float(emotion.get("valence", 0.0))
-    arousal = float(emotion.get("arousal", 0.0))
-    dominance = float(emotion.get("dominance", 0.0))
+    valence = emotion["valence"]
+    arousal = emotion["arousal"]
+    dominance = emotion["dominance"]
     valence_guide = (
         "心情很好，语气可以轻快一些"
         if valence > 0.3
@@ -340,36 +292,25 @@ def get_chat_prompt(
         else "有点没底气，语气可以谦虚一些"
     )
 
-    budget = budget or PromptBudget()
-    summary = truncate_text(chat_summary or history_summary, budget.summary_chars)
     dynamic_payload = {
-        "bot_name": bot_name or "",
-        "role": role or "",
-        "examples_text": examples_text or "",
-        "presets": presets or [],
-        "related_profiles": related_profiles or [],
-        "search_result": _truncate_rag_items(search_result or [], budget),
-        "summary": summary,
-        "chat_state_value": int(chat_state_value or 0),
-        "emotion": {
-            "valence": round(valence, 2),
-            "arousal": round(arousal, 2),
-            "dominance": round(dominance, 2),
-        },
+        "bot_name": bot_name,
+        "role": role,
+        "examples_text": examples_text,
+        "presets": presets,
+        "related_profiles": related_profiles,
+        "search_result": search_result,
+        "summary": truncate_text(summary, SUMMARY_CHARS),
+        "chat_state_value": chat_state_value,
+        "emotion": {key: round(value, 2) for key, value in emotion.items()},
         "emotion_guides": {
             "valence": valence_guide,
             "arousal": arousal_guide,
             "dominance": dominance_guide,
         },
-        "recent_msgs": _truncate_messages(recent_msgs or [], budget.history_chars),
-        "new_msgs": _truncate_messages(
-            new_msgs_formatted or [], budget.recent_message_chars
-        ),
-        "recalled_history": truncate_text(
-            recalled_history or "无",
-            budget.recalled_history_chars,
-        ),
-        "time_info": time_info or "",
+        "recent_msgs": _truncate_messages(recent_msgs, HISTORY_CHARS),
+        "new_msgs": _truncate_messages(new_msgs, RECENT_MESSAGE_CHARS),
+        "recalled_history": truncate_text(recalled_history, RECALLED_HISTORY_CHARS),
+        "time_info": time_info,
     }
 
     return f"""

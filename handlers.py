@@ -17,23 +17,13 @@ from nonebot.params import CommandArg
 from nonebot.permission import SUPERUSER
 
 from .backup import backup_task
-from .config import (
-    get_config_load_status,
-    get_reasoning_effort,
-    get_token_stats_model_names,
-)
-from .core.logic import QUEUE_MAX_SIZE, llm_response, message2BotMessage
-from .core.memory_query import (
-    MemoryProfileQuery,
-    MemoryProfileQueryService,
-    MemoryQueryCooldownError,
-    MemoryQueryCoordinator,
-)
-from .core.metrics import log_event, metrics
+from .config import get_app_settings, get_token_stats_model_names
+from .core.llm import chat_client, feedback_client
+from .core.logic import message2BotMessage
+from .core.memory_query import acquire_query_slot, query_memory_profile
+from .core.metrics import metrics
 from .core.state_manager import (
-    SELF_SENT_MSG_IDS,
     ensure_group_state,
-    group_states,
     is_shutting_down,
     remove_group_state,
     runtime_enabled_groups,
@@ -45,7 +35,6 @@ from .memory.vector import (
     RAG_MERGED_CANDIDATE_CAP,
     RAG_PER_QUERY_RECALL_K,
     search_memories,
-    where_any,
 )
 from .token_stats import render_token_stats_card
 
@@ -108,17 +97,6 @@ async def is_private_message(event: Event) -> bool:
     return isinstance(event, PrivateMessageEvent)
 
 
-def _is_priority_message(
-    message: Message, bot_self_id: str, bot_name: str, rendered_text: str
-) -> bool:
-    for seg in message:
-        if seg.type == "at" and str(seg.data.get("qq", "")) == bot_self_id:
-            return True
-        if seg.type == "reply":
-            return True
-    return f"@{bot_name}" in rendered_text or bot_self_id in rendered_text
-
-
 async def _parse_group_id_or_finish(matcher: type[Matcher], raw: str) -> int:
     raw_group_id = raw.strip()
     try:
@@ -152,18 +130,16 @@ async def describe_status(state) -> str:
     async with state.session_lock:
         await state.session.load_session()
         status = state.session.status()
+    settings = get_app_settings()
     lines = [
         "",
         "Provider:",
-        f"- Chat reasoning_effort: {get_reasoning_effort('chat') or '未指定（由上游决定）'}",
-        f"- Feedback reasoning_effort: {get_reasoning_effort('feedback') or '未指定（由上游决定）'}",
+        f"- Chat reasoning_effort: {settings.chat.reasoning_effort or '未指定（由上游决定）'}",
+        f"- Feedback reasoning_effort: {settings.feedback.reasoning_effort or '未指定（由上游决定）'}",
         f"- Queue length: {len(state.messages_chunk)}",
         f"- Metrics: llm={metrics.llm_success}/{metrics.llm_failure}",
     ]
-    for name, client in (
-        ("Chat", state.client),
-        ("Feedback", state.feedback_client),
-    ):
+    for name, client in (("Chat", chat_client), ("Feedback", feedback_client)):
         provider_status = client.provider_status
         if provider_status.last_error_type:
             lines.append(
@@ -171,12 +147,6 @@ async def describe_status(state) -> str:
                 "circuit_remaining="
                 f"{provider_status.circuit_remaining_seconds}s"
             )
-    config_status = get_config_load_status()
-    if not config_status.ok or config_status.source != "file":
-        lines.append(
-            f"- Config: source={config_status.source} "
-            f"ok={config_status.ok} error={config_status.error_type}"
-        )
     return status + "\n".join(lines)
 
 
@@ -394,25 +364,6 @@ async def handle_auto_chat(bot: Bot, event: GroupMessageEvent):
     if is_shutting_down():
         return
 
-    raw_message_text = event.original_message.extract_plain_text()
-    pre_queue_priority = _is_priority_message(
-        event.original_message,
-        str(bot.self_id),
-        bot_name,
-        raw_message_text,
-    )
-    async with state.data_lock:
-        # 转换前先挡一次：队列已满且非优先消息时，没必要再下载图片
-        if len(state.messages_chunk) >= QUEUE_MAX_SIZE and not pre_queue_priority:
-            logger.warning(f"群 {group_id} 消息队列已满，转换前丢弃低优先级消息")
-            log_event(
-                "queue_drop",
-                group_id=group_id,
-                decision="drop_pre_conversion",
-                queue_len=len(state.messages_chunk),
-            )
-            return
-
     message_content, image_inputs = await message2BotMessage(
         bot_name=bot_name,
         group_id=group_id,
@@ -424,19 +375,9 @@ async def handle_auto_chat(bot: Bot, event: GroupMessageEvent):
         return
 
     user_id = str(event.user_id)
-    msg_id = str(event.message_id)
-    self_id = str(bot.self_id)
-    nickname = ""
-
-    if user_id == self_id:
-        if msg_id in SELF_SENT_MSG_IDS:
-            logger.debug(f"检测到自身回显 (Echo): {msg_id}")
-        else:
-            logger.debug(f"检测到非本机发送的自身消息 (可能是其他插件或端): {msg_id}")
-
+    if user_id == str(bot.self_id):
         nickname = bot_name
-
-    if not nickname:
+    else:
         nickname = (
             str(event.sender.card or "").strip()
             or str(event.sender.nickname or "").strip()
@@ -444,24 +385,6 @@ async def handle_auto_chat(bot: Bot, event: GroupMessageEvent):
         )
 
     async with state.data_lock:
-        if len(state.messages_chunk) >= QUEUE_MAX_SIZE:
-            is_priority = pre_queue_priority or _is_priority_message(
-                event.original_message,
-                str(bot.self_id),
-                bot_name,
-                message_content,
-            )
-            if is_priority:
-                state.messages_chunk.pop(0)
-            else:
-                logger.warning(f"群 {group_id} 消息队列已满，丢弃低优先级消息")
-                log_event(
-                    "queue_drop",
-                    group_id=group_id,
-                    decision="drop_low_priority",
-                    queue_len=len(state.messages_chunk),
-                )
-                return
         state.event = event
         state.bot = bot
         state.messages_chunk.append(
@@ -469,7 +392,7 @@ async def handle_auto_chat(bot: Bot, event: GroupMessageEvent):
                 time=datetime.now(),
                 user_name=nickname,
                 content=message_content,
-                id=msg_id,
+                id=str(event.message_id),
                 user_id=user_id,
                 image_inputs=image_inputs,
             )
@@ -567,15 +490,6 @@ rag_debug = on_command(
     block=True,
 )
 
-MEMORY_QUERY_USER_COOLDOWN_SECONDS = 30.0
-MEMORY_QUERY_GROUP_COOLDOWN_SECONDS = 3.0
-
-_MEMORY_QUERY_COORDINATOR = MemoryQueryCoordinator(
-    user_cooldown_seconds=MEMORY_QUERY_USER_COOLDOWN_SECONDS,
-    group_cooldown_seconds=MEMORY_QUERY_GROUP_COOLDOWN_SECONDS,
-)
-
-
 def _format_rag_debug_score(value) -> str:
     if value is None:
         return "-"
@@ -617,16 +531,11 @@ async def handle_rag_debug(
         await rag_debug.finish("本群尚未启用 AI 功能。")
         return
 
-    where_filter = where_any("source", ["preset", "memory"])
+    where_filter = {"$or": [{"source": {"$eq": "preset"}}, {"source": {"$eq": "memory"}}]}
     async with state.session_lock:
         await state.session.load_session()
-        memory = state.session.runtime.vector_memory
-    if memory is None:
-        await rag_debug.finish("长期记忆库不可用。")
-        return
-
     result = await search_memories(
-        memory,
+        state.session.runtime.vector_memory,
         [query],
         k=RAG_FINAL_K,
         where=where_filter,
@@ -639,7 +548,7 @@ async def handle_rag_debug(
         f"query: {query}",
         f"where: {json.dumps(where_filter, ensure_ascii=False, sort_keys=True)}",
         f"candidate_count: {result.stats.get('candidate_count', 0)}",
-        f"returned_count: {result.stats.get('returned_count', len(result.records))}",
+        f"returned_count: {result.stats.get('returned_count', 0)}",
         f"fallback_reason: {result.stats.get('fallback_reason') or 'none'}",
         "score_fields: adjusted_score, retrieval_score, rerank_score",
         "top_records:",
@@ -690,35 +599,21 @@ async def handle_query_memory(
         await query_memory.finish("本群尚未启用 AI 功能。")
         return
 
-    memory = state.session.runtime.vector_memory
-    vector_version = int(memory.version or 0)
-    generation = int(state.session.state.generation or 0)
-    key = (str(event.group_id), target_id, vector_version, generation)
+    retry_after = acquire_query_slot(str(event.group_id), str(event.user_id))
+    if retry_after > 0:
+        await query_memory.finish(
+            f"记忆回溯正在冷却，请约 {max(1, int(retry_after + 0.5))} 秒后再试。"
+        )
     await query_memory.send("正在回溯记忆深处...")
 
-    service = MemoryProfileQueryService(
-        state=state,
-        llm_response=llm_response,
-    )
     try:
-        message = await _MEMORY_QUERY_COORDINATOR.run(
-            key=key,
-            group_id=str(event.group_id),
-            user_id=str(event.user_id),
-            factory=lambda: service.execute(
-                MemoryProfileQuery(
-                    target_id=target_id,
-                    target_name=target_name,
-                    sender_id=str(event.user_id),
-                )
-            ),
-        )
-    except MemoryQueryCooldownError as e:
-        await query_memory.finish(
-            f"记忆回溯正在冷却，请约 {max(1, int(e.retry_after + 0.5))} 秒后再试。"
+        message = await query_memory_profile(
+            state,
+            target_id=target_id,
+            target_name=target_name,
+            sender_id=str(event.user_id),
         )
     except Exception as e:
         logger.error(f"查询记忆失败: {e}")
         await query_memory.finish("大脑处理过载，记忆读取失败，请稍后再试。")
-    else:
-        await query_memory.finish(message)
+    await query_memory.finish(message)

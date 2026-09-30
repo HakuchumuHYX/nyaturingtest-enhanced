@@ -37,17 +37,14 @@ def get_vector_dir(session_id: str) -> Path:
     return get_data_dir() / f"vector_index_{session_id}"
 
 
-_plugin_config: dict[str, Any] = {}
-
-
 @dataclass(frozen=True)
 class EndpointSettings:
     api_key: str
     base_url: str
     model: str
     timeout: float
-    max_tokens: int = 0
-    reasoning_effort: str = ""
+    max_tokens: int
+    reasoning_effort: str
 
 
 @dataclass(frozen=True)
@@ -69,71 +66,36 @@ class AppSettings:
     siliconflow_api_key: str
 
 
-@dataclass(frozen=True)
-class ConfigLoadStatus:
-    ok: bool
-    source: str
-    path: str
-    error_type: str = ""
-    error_message: str = ""
-
-
-_config_load_status = ConfigLoadStatus(
-    ok=True, source="not_loaded", path=str(CONFIG_FILE)
-)
-
-
-def _set_config_load_status(
-    *,
-    ok: bool,
-    source: str,
-    error: Exception | None = None,
-) -> None:
-    global _config_load_status
-    _config_load_status = ConfigLoadStatus(
-        ok=ok,
-        source=source,
-        path=str(CONFIG_FILE),
-        error_type=type(error).__name__ if error else "",
-        error_message=str(error)[:300] if error else "",
-    )
-
-
-def get_config_load_status() -> ConfigLoadStatus:
-    return _config_load_status
-
-
-def get_default_config() -> dict:
-    return {
-        "chat": {
-            "api_key": "",
-            "base_url": "",
-            "model": "",
-            "reasoning_effort": "low",
-            "max_tokens": 4096,
-            "timeout": 180,
-        },
-        "feedback": {
-            "api_key": "",
-            "base_url": "",
-            "model": "",
-            "reasoning_effort": "",
-            "max_tokens": 2048,
-            "timeout": 60,
-        },
-        "siliconflow_api_key": "",
-        "embedding": {
-            "model": "BAAI/bge-m3",
-            "base_url": "https://api.siliconflow.cn/v1",
-            "timeout": 30,
-        },
-        "rerank": {
-            "model": "Qwen/Qwen3-Reranker-4B",
-            "base_url": "https://api.siliconflow.cn/v1/rerank",
-            "timeout": 10,
-            "threshold": 0.1,
-        },
-    }
+DEFAULT_CONFIG: dict[str, Any] = {
+    "chat": {
+        "api_key": "",
+        "base_url": "",
+        "model": "",
+        "reasoning_effort": "low",
+        "max_tokens": 4096,
+        "timeout": 180,
+    },
+    "feedback": {
+        "api_key": "",
+        "base_url": "",
+        "model": "",
+        "reasoning_effort": "",
+        "max_tokens": 2048,
+        "timeout": 60,
+    },
+    "siliconflow_api_key": "",
+    "embedding": {
+        "model": "BAAI/bge-m3",
+        "base_url": "https://api.siliconflow.cn/v1",
+        "timeout": 30,
+    },
+    "rerank": {
+        "model": "Qwen/Qwen3-Reranker-4B",
+        "base_url": "https://api.siliconflow.cn/v1/rerank",
+        "timeout": 10,
+        "threshold": 0.1,
+    },
+}
 
 
 def _deep_merge(default: dict[str, Any], loaded: dict[str, Any]) -> dict[str, Any]:
@@ -146,123 +108,65 @@ def _deep_merge(default: dict[str, Any], loaded: dict[str, Any]) -> dict[str, An
     return result
 
 
-def normalize_config(config: dict[str, Any]) -> dict[str, Any]:
-    return _deep_merge(get_default_config(), config)
-
-
-def _require(value: str, field_name: str) -> str:
-    value = (value or "").strip()
+def _require(section: dict, name: str, field_name: str) -> str:
+    value = str(section.get(field_name) or "").strip()
     if not value:
-        raise RuntimeError(f"Missing required config field: {field_name}")
+        raise RuntimeError(f"Missing required config field: {name}.{field_name}")
     return value
 
 
+def _endpoint(cfg: dict[str, Any], name: str) -> EndpointSettings:
+    section = cfg[name]
+    return EndpointSettings(
+        api_key=str(section["api_key"] or ""),
+        base_url=_require(section, name, "base_url"),
+        model=_require(section, name, "model"),
+        timeout=float(section["timeout"]),
+        max_tokens=int(section["max_tokens"]),
+        reasoning_effort=str(section["reasoning_effort"] or ""),
+    )
+
+
 def build_settings(config: dict[str, Any]) -> AppSettings:
-    cfg = normalize_config(config)
-
-    def endpoint(name: str, *, max_tokens_default: int = 0) -> EndpointSettings:
-        section = cfg[name]
-        return EndpointSettings(
-            api_key=section.get("api_key", ""),
-            base_url=_require(section.get("base_url", ""), f"{name}.base_url"),
-            model=_require(section.get("model", ""), f"{name}.model"),
-            timeout=float(section.get("timeout") or 60),
-            max_tokens=int(section.get("max_tokens") or max_tokens_default),
-            reasoning_effort=str(section.get("reasoning_effort") or ""),
-        )
-
+    cfg = _deep_merge(DEFAULT_CONFIG, config)
+    embedding = cfg["embedding"]
+    rerank = cfg["rerank"]
     return AppSettings(
-        chat=endpoint("chat", max_tokens_default=4096),
-        feedback=endpoint("feedback", max_tokens_default=2048),
-        rerank_model=str(cfg.get("rerank", {}).get("model") or ""),
-        rerank_threshold=float(cfg.get("rerank", {}).get("threshold") or 0.0),
-        memory=_build_memory_endpoint_settings(cfg),
-        siliconflow_api_key=str(cfg.get("siliconflow_api_key") or ""),
+        chat=_endpoint(cfg, "chat"),
+        feedback=_endpoint(cfg, "feedback"),
+        rerank_model=str(rerank["model"] or ""),
+        rerank_threshold=float(rerank["threshold"]),
+        memory=MemoryEndpointSettings(
+            model=str(embedding["model"]),
+            base_url=str(embedding["base_url"]).rstrip("/"),
+            timeout=float(embedding["timeout"]),
+            rerank_base_url=str(rerank["base_url"]).rstrip("/"),
+            rerank_timeout=float(rerank["timeout"]),
+        ),
+        siliconflow_api_key=str(cfg["siliconflow_api_key"] or ""),
     )
 
 
-def describe_settings(settings: AppSettings) -> str:
-    def endpoint(name: str, value: EndpointSettings) -> str:
-        key_state = "set" if value.api_key else "missing"
-        return f"{name}: model={value.model}, base_url={value.base_url}, api_key={key_state}"
+def _load_settings() -> AppSettings:
+    with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+        settings = build_settings(json.load(f))
+    logger.info(f"已加载插件配置: {CONFIG_FILE}")
+    for name, endpoint in (("chat", settings.chat), ("feedback", settings.feedback)):
+        key_state = "set" if endpoint.api_key else "missing"
+        logger.info(
+            f"{name}: model={endpoint.model}, base_url={endpoint.base_url}, "
+            f"api_key={key_state}"
+        )
+    return settings
 
-    return "; ".join(
-        [
-            endpoint("chat", settings.chat),
-            endpoint("feedback", settings.feedback),
-        ]
-    )
 
-
-def load_plugin_config() -> dict:
-    """从 config.json 加载插件配置。"""
-
-    global _plugin_config
-
-    if not CONFIG_FILE.exists():
-        logger.warning(f"配置文件不存在，使用内置默认配置: {CONFIG_FILE}")
-        _plugin_config = get_default_config()
-        _set_config_load_status(ok=True, source="default")
-        return _plugin_config
-
-    try:
-        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            loaded = json.load(f)
-        _plugin_config = normalize_config(loaded)
-        settings = build_settings(_plugin_config)
-        _set_config_load_status(ok=True, source="file")
-        logger.info(f"已加载插件配置: {CONFIG_FILE}")
-        logger.info(f"插件配置摘要: {describe_settings(settings)}")
-        return _plugin_config
-    except RuntimeError as e:
-        _set_config_load_status(ok=False, source="invalid", error=e)
-        raise
-    except Exception as e:
-        _set_config_load_status(ok=False, source="invalid", error=e)
-        raise
+_app_settings = _load_settings()
 
 
 def get_app_settings() -> AppSettings:
     return _app_settings
 
 
-def get_reasoning_effort(endpoint_name: str) -> str | None:
-    if endpoint_name not in {"chat", "feedback"}:
-        raise ValueError(f"Unsupported reasoning endpoint: {endpoint_name}")
-    return getattr(get_app_settings(), endpoint_name).reasoning_effort or None
-
-
 def get_token_stats_model_names() -> list[str]:
-    models = [
-        get_app_settings().chat.model.strip(),
-        get_app_settings().feedback.model.strip(),
-    ]
-    result = []
-    seen = set()
-    for model in models:
-        if model and model not in seen:
-            result.append(model)
-            seen.add(model)
-    return result
-
-
-def _build_memory_endpoint_settings(
-    config: dict[str, Any],
-) -> MemoryEndpointSettings:
-    embedding = config.get("embedding", {}) or {}
-    rerank = config.get("rerank", {}) or {}
-    return MemoryEndpointSettings(
-        model=str(embedding.get("model") or "BAAI/bge-m3"),
-        base_url=str(
-            embedding.get("base_url") or "https://api.siliconflow.cn/v1"
-        ).rstrip("/"),
-        timeout=float(embedding.get("timeout") or 30),
-        rerank_base_url=str(
-            rerank.get("base_url") or "https://api.siliconflow.cn/v1/rerank"
-        ).rstrip("/"),
-        rerank_timeout=float(rerank.get("timeout") or 10),
-    )
-
-
-plugin_config = load_plugin_config()
-_app_settings = build_settings(plugin_config)
+    models = [_app_settings.chat.model, _app_settings.feedback.model]
+    return list(dict.fromkeys(model.strip() for model in models))

@@ -1,14 +1,8 @@
-# nyaturingtest/session.py
-
 import asyncio
-import json
-import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Any
 
-import httpx
 from nonebot import logger
 from nonebot.utils import run_sync
 
@@ -24,63 +18,15 @@ from ..db import (
 from ..domain import EmotionState, PersonProfile
 from ..memory.short_term import Memory, Message
 from ..memory.vector import BACKUP_IO_LOCK, VectorMemory
-from .engagement import (
-    LOW_WILLINGNESS_SKIP_THRESHOLD,
-    WILLINGNESS_LOAD_VALUE,
-)
+from .engagement import WILLINGNESS_LOAD_VALUE
 from .metrics import log_event
 from .prompts import PRESETS, reload_presets, truncate_text
 
-# 角色与摘要文本上限、后台任务排空超时
+# 角色与摘要文本上限、后台任务排空超时、保存去抖
 ROLE_MAX_CHARS = 4000
 EXAMPLES_MAX_CHARS = 2000
 MEMORY_DRAIN_TIMEOUT_SECONDS = 10.0
-
-
-class PersistenceCoordinator:
-    """合并同一会话的重复保存请求：去抖 + 单飞 + 显式 flush。"""
-
-    def __init__(
-        self,
-        save_callback,
-        *,
-        task_factory=asyncio.create_task,
-        debounce_seconds: float = 0.05,
-    ):
-        self._save_callback = save_callback
-        self._task_factory = task_factory
-        self._debounce_seconds = max(0.0, float(debounce_seconds))
-        self._pending = False
-        self._force_index = False
-        self._task: asyncio.Task | None = None
-
-    def request(self, *, force_index: bool = False) -> None:
-        self._pending = True
-        self._force_index = self._force_index or force_index
-        self._ensure_task()
-
-    def _ensure_task(self) -> None:
-        if not self._pending:
-            return
-        if self._task is None or self._task.done():
-            self._task = self._task_factory(self._run())
-
-    async def _run(self) -> None:
-        try:
-            if self._debounce_seconds:
-                await asyncio.sleep(self._debounce_seconds)
-            while self._pending:
-                self._pending = False
-                force_index = self._force_index
-                self._force_index = False
-                await self._save_callback(force_index)
-        finally:
-            self._task = None
-
-    async def flush(self) -> None:
-        task = self._task
-        if task is not None and not task.done():
-            await asyncio.shield(task)
+SAVE_DEBOUNCE_SECONDS = 0.05
 
 
 class ChattingState(Enum):
@@ -121,28 +67,12 @@ class SessionState:
 
 @dataclass
 class SessionRuntime:
-    """一个 Session 持有的 I/O 资源与后台任务协调。"""
+    """一个 Session 持有的 I/O 资源与后台任务。"""
 
-    short_term_memory: Any = None
-    vector_memory: Any = None
-    http_client: Any = None
-    owns_http_client: bool = False
-    persistence: Any = None
+    short_term_memory: Memory
+    vector_memory: VectorMemory
     background_tasks: set[asyncio.Task] = field(default_factory=set)
     save_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-
-
-@dataclass(frozen=True)
-class FeedbackOutcome:
-    """一次 Feedback 的结构化结果。accepted 与 recalled_history 分离，避免用空列表判断成功。"""
-
-    accepted: bool
-    recalled_history: list[str] = field(default_factory=list)
-    failure_reason: str = ""
-
-    @classmethod
-    def rejected(cls, reason: str) -> "FeedbackOutcome":
-        return cls(accepted=False, failure_reason=reason)
 
 
 STALE_GENERATION_WRITE = object()
@@ -153,39 +83,21 @@ class Session:
     群聊会话
     """
 
-    def __init__(
-        self,
-        siliconflow_api_key: str,
-        id: str = "global",
-        name: str = "terminus",
-        http_client: httpx.AsyncClient | None = None,
-    ):
+    def __init__(self, id: str, siliconflow_api_key: str):
         self.id = id
-        if http_client is None:
-            http_client = httpx.AsyncClient(
-                limits=httpx.Limits(max_keepalive_connections=5, max_connections=10),
-                timeout=60.0,
-            )
-            owns_http_client = True
-        else:
-            owns_http_client = False
-
-        self.state = SessionState(name=name)
+        self.state = SessionState()
         self.runtime = SessionRuntime(
             short_term_memory=Memory(),
             vector_memory=VectorMemory(
                 api_key=siliconflow_api_key,
                 persist_directory=str(get_vector_dir(id)),
             ),
-            http_client=http_client,
-            owns_http_client=owns_http_client,
         )
-        self.runtime.persistence = PersistenceCoordinator(
-            self._save_coordinated,
-            task_factory=self._create_safe_task,
-        )
+        # 保存请求去抖 + 单飞：频繁的 schedule_save 合并成一次后台写库
+        self._save_pending = False
+        self._save_task: asyncio.Task | None = None
 
-    def bump_generation(self, reason: str = "") -> int:
+    def bump_generation(self, reason: str) -> int:
         self.state.generation += 1
         log_event(
             "session_generation_bumped",
@@ -195,44 +107,34 @@ class Session:
         )
         return self.state.generation
 
-    def is_generation_stale(self, expected_generation: int | None) -> bool:
-        return (
-            expected_generation is not None
-            and self.state.generation != expected_generation
-        )
+    def stale(self, generation: int, stage: str) -> bool:
+        """本轮开始后会话被 reset/set_role 等作废过，就丢弃这一步并记一条事件。"""
 
-    def _log_stale_generation(
-        self, stage: str, expected_generation: int | None
-    ) -> None:
+        if self.state.generation == generation:
+            return False
         log_event(
             "stale_turn_discarded",
             session_id=self.id,
             stage=stage,
-            expected_generation=expected_generation,
+            expected_generation=generation,
             current_generation=self.state.generation,
         )
+        return True
 
-    async def _run_sync_if_generation_current(
-        self,
-        func,
-        *args,
-        expected_generation: int | None = None,
-        stage: str,
-        **kwargs,
+    async def run_sync_if_current(
+        self, generation: int, stage: str, func, *args, **kwargs
     ):
-        if self.is_generation_stale(expected_generation):
-            self._log_stale_generation(stage, expected_generation)
-            return STALE_GENERATION_WRITE
+        """在线程里执行向量写入；与备份共用锁，拿锁后再确认代际。"""
 
         def guarded():
             with BACKUP_IO_LOCK:
-                if self.is_generation_stale(expected_generation):
+                if self.state.generation != generation:
                     return STALE_GENERATION_WRITE
                 return func(*args, **kwargs)
 
         result = await run_sync(guarded)()
         if result is STALE_GENERATION_WRITE:
-            self._log_stale_generation(stage, expected_generation)
+            self.stale(generation, stage)
         return result
 
     async def set_role(self, name: str, role: str):
@@ -244,24 +146,10 @@ class Session:
         await self.save_session()
 
     async def reset(self):
-        self.bump_generation("reset")
-        self.state.name = "terminus"
-        self.state.aliases = []
-        self.state.role = "一个男性人类"
-        self.state.examples = ""
-        await self.runtime.short_term_memory.clear()
+        generation = self.bump_generation("reset")
+        self.state = SessionState(loaded=True, generation=generation)
+        self.runtime.short_term_memory.clear()
         self.runtime.vector_memory.clear()
-        self.state.profiles = {}
-        self.state.global_emotion = EmotionState()
-        self.state.chat_summary = ""
-        self.state.chatting_state = ChattingState.IDLE
-        self.state.willingness = 0.0
-        self.state.last_decay_time = datetime.now()
-        self.state.last_speak_time = datetime.min
-        self.state.engaged = False
-        self.state.last_consolidated_time = None
-        self.state.messages_since_consolidation = 0
-        self.state.last_consolidation_attempt = datetime.min
         # 清理数据库中的所有关联数据，并与后台持久化共用同一把锁：
         # 旧 generation 的后台写入要么已在删除前完成，要么拿锁后被跳过。
         async with self.runtime.save_lock:
@@ -289,47 +177,42 @@ class Session:
         logger.info(f"[Session {self.id}] 情绪已初始化 (VAD -> 0, 0, 0)")
         await self.save_session()
 
-    def _create_safe_task(self, coro):
-        """创建带异常捕获的后台任务"""
+    def spawn(self, coro) -> asyncio.Task:
+        """创建受 drain_background_tasks 管理、异常会记日志的后台任务"""
         task = asyncio.create_task(coro)
-        task.add_done_callback(self._on_task_done)
         self.runtime.background_tasks.add(task)
-        task.add_done_callback(self.runtime.background_tasks.discard)
+        task.add_done_callback(self._on_task_done)
         return task
 
-    def _schedule_save_session(self, force_index: bool = False):
-        self.runtime.persistence.request(force_index=force_index)
-
-    async def flush_persistence(self) -> None:
-        await self.runtime.persistence.flush()
-
-    async def _save_coordinated(self, force_index: bool = False) -> bool:
-        async with self.runtime.save_lock:
-            return await self._save_session_locked(force_index=force_index)
-
-    @staticmethod
-    def _on_task_done(task: asyncio.Task):
+    def _on_task_done(self, task: asyncio.Task):
+        self.runtime.background_tasks.discard(task)
         if task.cancelled():
             return
         exc = task.exception()
         if exc:
-            logger.error(f"[Session] 后台任务异常: {exc}")
+            logger.error(f"[Session {self.id}] 后台任务异常: {exc}")
 
-    async def save_session(
-        self,
-        force_index: bool = False,
-        expected_generation: int | None = None,
-    ) -> bool:
-        if self.is_generation_stale(expected_generation):
-            self._log_stale_generation("save_session", expected_generation)
-            return False
+    def schedule_save(self) -> None:
+        self._save_pending = True
+        if self._save_task is None or self._save_task.done():
+            self._save_task = self.spawn(self._run_pending_saves())
+
+    async def _run_pending_saves(self) -> None:
+        await asyncio.sleep(SAVE_DEBOUNCE_SECONDS)
+        while self._save_pending:
+            self._save_pending = False
+            await self.save_session()
+
+    async def flush_persistence(self) -> None:
+        task = self._save_task
+        if task is not None and not task.done():
+            await asyncio.shield(task)
+
+    async def save_session(self) -> bool:
         async with self.runtime.save_lock:
-            if self.is_generation_stale(expected_generation):
-                self._log_stale_generation("save_session_locked", expected_generation)
-                return False
-            return await self._save_session_locked(force_index=force_index)
+            return await self._save_session_locked()
 
-    async def _save_session_locked(self, force_index: bool = False) -> bool:
+    async def _save_session_locked(self) -> bool:
         try:
             # 1. 保存基础状态
             await save_session_state(
@@ -378,7 +261,6 @@ class Session:
         if self.state.loaded:
             return
 
-        # 使用 Repository 加载完整数据
         data = await load_full_session_data(self.id)
 
         if not data:
@@ -402,18 +284,16 @@ class Session:
                 t = t.astimezone(None).replace(tzinfo=None)
             self.state.last_speak_time = t
         self.state.last_consolidated_time = session_db.last_consolidated_time
-        self.state.chatting_state = ChattingState(session_db.chatting_state)
 
         if "[对话样本]" in self.state.role:
             parts = self.state.role.split("[对话样本]")
             if len(parts) > 1:
                 self.state.examples = parts[1].strip()
 
+        # 重启后意愿从低值起步，状态一并回到潜水，避免「状态=对话中但意愿=静音」的矛盾
         self.state.willingness = WILLINGNESS_LOAD_VALUE
-        # 重启一致性：低意愿时强制回到潜水态，避免「状态=对话中但意愿=静音」的矛盾
-        if self.state.willingness < LOW_WILLINGNESS_SKIP_THRESHOLD:
-            self.state.chatting_state = ChattingState.IDLE
-            self.state.engaged = False
+        self.state.chatting_state = ChattingState.IDLE
+        self.state.engaged = False
         self.state.profiles = {}
 
         # 恢复用户画像
@@ -431,12 +311,7 @@ class Session:
             profile.dirty = False
             self.state.profiles[user_id] = profile
 
-        # 恢复短时记忆
-        # 注意：这里将数据库中的 chat_summary 同步给 Memory，确保摘要不丢失
-        self.runtime.short_term_memory = Memory(
-            compressed_message=self.state.chat_summary,
-            messages=data["messages"],
-        )
+        self.runtime.short_term_memory = Memory(messages=data["messages"])
 
         self.state.loaded = True
         logger.info(f"[Session {self.id}] 加载完成")
@@ -504,7 +379,7 @@ class Session:
         return True
 
     def status(self) -> str:
-        recent_messages = self.runtime.short_term_memory.access().messages
+        recent_messages = self.runtime.short_term_memory.access()
         recent_str = (
             "\n".join([f"{m.user_name}: {m.content}" for m in recent_messages])
             if recent_messages
@@ -522,7 +397,7 @@ class Session:
 {recent_str}
 """
 
-    async def append_self_message(self, content: str, msg_id: str, bot_user_id: str):
+    def append_self_message(self, content: str, msg_id: str, bot_user_id: str):
         """
         主动记录 Bot 自己的发言 (防止等待回显导致记忆延迟)
         """
@@ -536,25 +411,23 @@ class Session:
             id=msg_id,
             user_id=bot_user_id,
         )
+        self.runtime.short_term_memory.update([msg])
 
-        await self.runtime.short_term_memory.update([msg])
-
-    async def record_incoming(self, messages_chunk: list[Message]) -> None:
+    def record_incoming(self, messages_chunk: list[Message]) -> None:
         """写入短时记忆并累计固化窗口。"""
 
-        await self.runtime.short_term_memory.update(messages_chunk)
+        self.runtime.short_term_memory.update(messages_chunk)
         self.state.messages_since_consolidation += len(messages_chunk)
-        self._schedule_save_session()
+        self.schedule_save()
 
-    async def drain_background_tasks(self, timeout: float | None = None):
-        if timeout is None:
-            timeout = MEMORY_DRAIN_TIMEOUT_SECONDS
+    async def drain_background_tasks(self):
         pending = [task for task in self.runtime.background_tasks if not task.done()]
         if not pending:
             return
         try:
             await asyncio.wait_for(
-                asyncio.gather(*pending, return_exceptions=True), timeout=timeout
+                asyncio.gather(*pending, return_exceptions=True),
+                timeout=MEMORY_DRAIN_TIMEOUT_SECONDS,
             )
         except asyncio.TimeoutError:
             logger.warning(
@@ -565,29 +438,16 @@ class Session:
                     task.cancel()
             await asyncio.gather(*pending, return_exceptions=True)
 
-    async def close(self):
+    def close(self):
         try:
             self.runtime.vector_memory.close()
         except Exception as e:
             logger.warning(f"[Session {self.id}] 关闭向量记忆失败: {e}")
-        if self.runtime.http_client is not None and self.runtime.owns_http_client:
-            try:
-                await self.runtime.http_client.aclose()
-            except Exception as e:
-                logger.warning(f"[Session {self.id}] 关闭 HTTP 客户端失败: {e}")
 
-    async def _save_interaction_logs(
-        self,
-        interactions: list[tuple[str, dict]],
-        expected_generation: int | None = None,
+    async def save_interaction_logs(
+        self, interactions: list[tuple[str, dict]], generation: int
     ):
-        if self.is_generation_stale(expected_generation):
-            self._log_stale_generation("interaction_log", expected_generation)
-            return
         async with self.runtime.save_lock:
-            if self.is_generation_stale(expected_generation):
-                self._log_stale_generation(
-                    "interaction_log_locked", expected_generation
-                )
+            if self.stale(generation, "interaction_log"):
                 return
             await log_interactions(self.id, interactions)

@@ -42,7 +42,7 @@ plugins/nyaturingtest/
 ├── handlers.py          全部 16 个 matcher：管理命令、自动消息入口、/查询记忆、/rag_debug
 ├── models.py            7 个 Tortoise ORM 模型
 ├── db.py                全部数据库读写（会话/消息/画像/交互/群开关/Token）
-├── domain.py            EmotionState / Impression / PersonProfile（纯领域对象）
+├── domain.py            EmotionState / PersonProfile（纯领域对象）
 ├── token_stats.py       Token 聚合与模型名归并 + 统计卡片 PNG 渲染
 ├── backup.py            备份、保留期清理、定时任务注册
 ├── core/
@@ -51,12 +51,12 @@ plugins/nyaturingtest/
 │   ├── orchestrator.py  一轮对话的编排：search / feedback / consolidate / chat 四个 stage
 │   ├── session.py       SessionState + SessionRuntime、持久化协调、记忆读写
 │   ├── engagement.py    意愿值衰减与增长、参与态滞回、冷却、相关性/兴趣打分
-│   ├── llm.py           LLMClient（重试/熔断）、全局 HTTP 池、system prompt、JSON 解析
-│   ├── prompts.py       Feedback / Chat 提示词模板、PromptBudget、角色预设加载、时间描述
+│   ├── llm.py           LLMClient（重试/熔断/指标/Token 记录）与 chat、feedback 两个全局实例、HTTP 池、JSON 解析
+│   ├── prompts.py       Feedback / Chat 提示词模板、字符预算常量、角色预设加载、时间描述
 │   ├── metrics.py       结构化事件日志、运行时计数、Token 落库任务
-│   └── memory_query.py  /查询记忆：动态 k、冷却与单飞、印象生成
+│   └── memory_query.py  /查询记忆：冷却、动态 k、VAD 推断、印象生成
 └── memory/
-    ├── short_term.py    短时消息窗口与摘要载体（含增量落库标记）
+    ├── short_term.py    短时消息窗口（含增量落库标记）
     ├── vector.py        VectorMemory（ChromaDB）、Embedding/Rerank 客户端、RAG 检索
     ├── image.py         图片下载/缓存/压缩 → 原生多模态输入
     └── validation.py    长期记忆候选的确定性校验
@@ -68,7 +68,7 @@ plugins/nyaturingtest/
 
 - `memory/vector.py` 持有全局 `BACKUP_IO_LOCK`（`threading.RLock`）。备份要打包整个向量目录，
   必须和向量写入用**同一把**进程级锁；锁定义在向量侧、由 `backup.py` 反向导入，避免循环依赖。
-- `core/orchestrator.py` 从 `core/session.py` 单向导入 `ChattingState` / `FeedbackOutcome`；
+- `core/orchestrator.py` 从 `core/session.py` 单向导入 `Session` / `ChattingState`；
   `core/state_manager.py` 内部局部导入 `logic.spawn_state`（`logic` 反向引用 `GroupState`）。
 
 提示词构造有两条硬约束，都是为了命中上游的前缀缓存（命中部分按缓存价计费）：
@@ -84,7 +84,7 @@ plugins/nyaturingtest/
 
 ```text
 群消息 → handlers.handle_auto_chat（on_message, priority=99, block=False）
-       → 队列 state.messages_chunk（logic.QUEUE_MAX_SIZE=200，满了丢低优先级）
+       → 队列 state.messages_chunk（deque(maxlen=200)，满了丢最旧的）
        → logic.spawn_state 后台循环：等静默 → 防抖 2s → 整批取走
        → logic._process_inbox_batch
             ├─ 按 local self-sent id 过滤自身回显
@@ -101,12 +101,11 @@ plugins/nyaturingtest/
 3. 不参与且不相关时：满足固化条件（`messages_since_consolidation >= 8`，或距上次尝试 180s）
    就走 `consolidate_stage`，静默沉淀记忆，**不产生回复**。
 4. `search_stage`：构造 RAG query → 检索长期记忆 → 预设条目与记忆行分别按字符预算整理成
-   `preset_lines` / `memory_lines`，统计写进 `rag_search` 事件日志
-   （`RAG_DEBUG_LOG=True` 时附每条记录的分数明细）。
+   `preset_lines` / `memory_lines`，统计写进 `rag_search` 事件日志。
 5. `feedback_stage`（观察者模型，temperature 0.1）：解析 JSON → 应用图片观察 → 沉淀 → 发言决策。
    - `_apply_image_observations`：把 Feedback 对图片的一句话观察写回消息文本（`[图片: …]` / `[表情包: …]`），
      让历史里保留图片线索。
-   - `_apply_sediment`：更新全局 VAD 情绪（`clamp_vad_value` 限幅）→ 逐条消息更新用户印象
+   - `_apply_sediment`：更新全局 VAD 情绪（`parse_feedback` 已校验限幅）→ 逐条消息更新用户印象
      （峰值保持 + 时间衰减）→ 更新话题摘要 → 把 `analyze_result` 交给后台任务写长期记忆。
    - `_apply_decision`：`need_history` 为真时按时间回溯最多 20 条更早的历史消息 → 更新意愿值
      （相关时兜底抬到 `RELEVANCE_WILLINGNESS_FLOOR`）→ 潜水/冒泡/对话三态流转。
@@ -114,14 +113,15 @@ plugins/nyaturingtest/
 7. `chat_stage`（角色模型，temperature 0.7）生成回复；有回复则意愿乘以 0.35、状态置为「对话状态」。
 
 **代际控制**：`Session.bump_generation()` 在 `set_role` / `load_preset` / `reset` / `reset_emotion` /
-`calm_down` 时自增。每轮开始时记下 `generation`，所有写入路径（短时记忆、Feedback 沉淀、长期记忆、发送）
-都用 `is_generation_stale()` 检查；过期就丢弃并记一条 `stale_turn_discarded` 事件。
+`calm_down` 时自增。每轮开始时记下 `generation`，阶段边界和写入点（短时记忆、Feedback 沉淀、长期记忆、发送）
+都用 `session.stale(generation, stage)` 检查；过期就丢弃并记一条 `stale_turn_discarded` 事件。
+向量写入走 `run_sync_if_current`，在备份锁内再确认一次代际。
 
 ## 记忆体系
 
 ### 短时记忆（`memory/short_term.py`）
 
-- `deque(maxlen=200)` 滚动缓冲，`Memory.access()` 只返回最近 `SHORT_CONTEXT_LIMIT=20` 条 + 当前摘要。
+- `deque(maxlen=200)` 滚动缓冲，`Memory.access()` 只返回最近 `SHORT_CONTEXT_LIMIT=20` 条；话题摘要只存在 `SessionState.chat_summary`。
 - 每条 `Message` 带 `revision`；`mark_dirty` 把它放进待落库字典，`_save_session_locked` 只同步
   新增或被图片观察改写过（revision 变化）的消息，避免高频全量写库。
 - `image_inputs`（原生图片负载）只在进程内短期持有，不序列化、不落库。
@@ -189,7 +189,7 @@ plugins/nyaturingtest/
 
 ### 记忆候选校验（`memory/validation.py`）
 
-只做确定性过滤：长度 ≥ 10、不在噪声词表、类别在白名单内、confidence ≥ 0.6、主体非空。
+只做确定性过滤：长度 ≥ 10（「好的」「哈哈哈」这类噪声都更短）、类别在白名单内、confidence ≥ 0.6、主体非空。
 「是不是玩笑 / 有没有注入指令」交给 Feedback 的 prompt 与 confidence 判断，代码里不写启发式规则表。
 
 ## 存储层
@@ -215,13 +215,13 @@ SQLite 表（`models.py`，启动时由 `Tortoise.generate_schemas()` 建表）�
 
 `domain.py` 里的 `PersonProfile` 用**峰值保持 + 时间衰减**更新印象：同向取绝对值更大者，异向相加，
 valence 正向半衰期约 14 小时、负向约 5 小时，dominance 约 23 小时，arousal 以 5 小时量级的时间常数
-回落到 0.3。每次 `push_interaction` 前先结算衰减，`merge_old_interactions` 丢弃 5 小时前的交互记录。
+回落到 0.3。每次 `push_interaction` 前先结算衰减。
 这些是内存态计算，落库只写 VAD 与交互计数。
 
 ## 配置
 
 配置文件：`plugins/nyaturingtest/config.json`（已被 `.gitignore` 忽略），模板见 `config.example.json`。
-文件不存在时使用内置默认值并在日志中告警。
+文件必须存在；缺失字段用内置默认值补齐，`chat` / `feedback` 的 `base_url` 与 `model` 必填，缺了启动即报错。
 
 | 段 | 字段 |
 | --- | --- |
@@ -250,7 +250,7 @@ valence 正向半衰期约 14 小时、负向约 5 小时，dominance 约 23 小
 | `/help` | `/帮助` | 查看帮助（群聊/私聊各一套文案） |
 | `/autochat enable` | - | 在本群启用，写库并立即初始化状态 |
 | `/autochat disable` | - | 在本群禁用，取消后台任务并释放资源 |
-| `/status` | `/状态` | 会话状态 + reasoning_effort + 队列长度 + LLM 计数 + provider 熔断/错误 + 配置加载状态 |
+| `/status` | `/状态` | 会话状态 + reasoning_effort + 队列长度 + LLM 计数 + provider 熔断/错误 |
 | `/role` | `/当前角色` | 查看当前角色 |
 | `/set_role <角色名> <角色设定>` | `/设置角色` | 修改角色，设定可含空格 |
 | `/presets` | `/preset` | 列出可用预设 |
@@ -327,16 +327,16 @@ config/nyaturingtest/nya_presets/      角色预设
 | 模块 | 常量的作用 |
 | --- | --- |
 | `core/engagement.py` | 意愿衰减率（活跃 0.04 / 闲置 0.08 每分钟）、强关联下限 0.85、参与阈值 0.47、被动增长上限 0.6 与每消息 0.026、发言冷却 16s、跳过阈值 0.32 / 0.38、启用 Rerank 的意愿阈值 0.68 |
-| `core/orchestrator.py` | 固化开关与条件（消息数 8、间隔 180s、最多 60 条）、历史回溯条数 20 |
-| `memory/vector.py` | `RAG_FINAL_K=20`、每 query 召回 40、合并候选上限 64、注入字符预算 1500、事件 TTL 90 天、类型权重/衰减率/作用域权重表 |
-| `core/prompts.py` | `PromptBudget`：摘要 1200、最近消息 1600、历史 2400、RAG 合计 1500 / 单条 500、回溯历史 1200 字 |
+| `core/orchestrator.py` | 固化条件（消息数 8、间隔 180s、最多 60 条）、历史回溯条数 20 |
+| `memory/vector.py` | `RAG_FINAL_K=20`、每 query 召回 40、合并候选上限 64、注入字符预算 1500 / 单条 500、事件 TTL 90 天、类型权重/衰减率/作用域权重表 |
+| `core/prompts.py` | 字符预算：摘要 1200、最近消息 1600、历史 2400、回溯历史 1200 字 |
 | `memory/short_term.py` | 上下文窗口 20 条、缓冲上限 200 条 |
-| `core/logic.py` | 防抖 2s、队列上限 200、单轮最多发 2 条、拟人延迟 1.0 + 0.1×字数（封顶 5s） |
-| `core/session.py` | role 4000 字 / examples 2000 字上限、后台任务排空超时 10s |
-| `core/memory_query.py` | VAD 缓存 256 条 / 24 小时、动态 k 的计算规则 |
-| `handlers.py` | `/查询记忆` 冷却：同用户 30s、同群 3s |
+| `core/logic.py` | 防抖 2s、单轮最多发 2 条、拟人延迟 1.0 + 0.1×字数（封顶 5s） |
+| `core/state_manager.py` | 消息队列上限 200 |
+| `core/session.py` | role 4000 字 / examples 2000 字上限、后台任务排空超时 10s、保存去抖 50ms |
+| `core/memory_query.py` | `/查询记忆` 冷却（同用户 30s、同群 3s）、动态 k 的计算规则 |
 | `memory/image.py` | 8MB / 4096² 像素上限、最大边 1280、并发 3、缓存 48 小时 |
-| `memory/validation.py` | 允许的记忆类别、最低置信度 0.6、最短 10 字、噪声词表 |
+| `memory/validation.py` | 允许的记忆类别、最低置信度 0.6、最短 10 字 |
 | `backup.py` | 备份保留 7 个、消息/交互 180 天、Token 明细 90 天 |
 | `core/llm.py` | 重试 3 次、退避基数 2s、429 熔断 30s、chat/feedback 的 system prompt |
 

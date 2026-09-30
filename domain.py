@@ -1,5 +1,4 @@
 import math
-from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -24,20 +23,11 @@ class EmotionState:
 
 
 @dataclass
-class Impression:
-    """记录某次互动带来的印象"""
-
-    timestamp: datetime
-    delta: dict
-
-
-@dataclass
 class PersonProfile:
     """对人物的记忆与情感"""
 
     user_id: str
     emotion: EmotionState = field(default_factory=EmotionState)
-    interactions: deque[Impression] = field(default_factory=deque)
     last_update_time: datetime = field(
         default_factory=lambda: datetime.now().astimezone()
     )
@@ -46,17 +36,17 @@ class PersonProfile:
     last_interaction_at: datetime | None = None
     dirty: bool = field(default=True, repr=False, compare=False)
 
-    def push_interaction(self, impression: Impression):
+    def push_interaction(self, delta: dict):
         """
-        添加交互记录 (O(1) 版本的峰值保持模式)
+        记一次互动的情感增量 (O(1) 版本的峰值保持模式)
         """
         # 1. 关键步骤：先结算时间衰减
         self.update_emotion_tends()
 
         # 2. 获取新消息的情感输入
-        new_val = impression.delta.get("valence", 0.0)
-        new_aro = impression.delta.get("arousal", 0.0)
-        new_dom = impression.delta.get("dominance", 0.0)
+        new_val = delta.get("valence", 0.0)
+        new_aro = delta.get("arousal", 0.0)
+        new_dom = delta.get("dominance", 0.0)
 
         # 3. 应用峰值保持逻辑 (Peak Hold Logic)
 
@@ -84,36 +74,12 @@ class PersonProfile:
             self.emotion.dominance += new_dom
         self.emotion.dominance = max(-1.0, min(1.0, self.emotion.dominance))
 
-        # 将新的印象加入队列
-        self.interactions.appendleft(impression)
+        now = datetime.now().astimezone()
         self.interaction_count += 1
         if self.first_interaction_at is None:
-            self.first_interaction_at = impression.timestamp
-        self.last_interaction_at = impression.timestamp
+            self.first_interaction_at = now
+        self.last_interaction_at = now
         self.dirty = True
-
-    def merge_old_interactions(self):
-        """
-        仅清理过期的交互记录，不再重新计算情感 (增量更新 - 清理)
-        """
-        if not self.interactions:
-            return
-
-        # 统一使用带时区的时间，防止 TypeError
-        now = datetime.now().astimezone()
-
-        while len(self.interactions) > 0:
-            last_interaction = self.interactions[-1]
-
-            current_interaction_time = last_interaction.timestamp
-            # 确保交互记录的时间也是 aware 的，如果不是则假设为本地时间
-            if current_interaction_time.tzinfo is None:
-                current_interaction_time = current_interaction_time.astimezone()
-
-            if (now - current_interaction_time).total_seconds() / 3600 > 5:
-                self.interactions.pop()
-            else:
-                break
 
     def update_emotion_tends(self):
         """

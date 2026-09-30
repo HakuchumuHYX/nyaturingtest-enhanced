@@ -4,28 +4,16 @@ from dataclasses import dataclass, field
 
 from nonebot import logger
 from nonebot.adapters.onebot.v11 import Bot, Event
-from openai import AsyncOpenAI
 from tortoise import Tortoise
 
-from ..config import EndpointSettings, get_app_settings
+from ..config import get_app_settings
 from ..db import load_enabled_group_ids
 from ..memory.short_term import Message as MMessage
-from .llm import LLMClient, close_http_client, get_http_client
+from .llm import close_http_client
 from .metrics import drain_usage_tasks
-from .session import MEMORY_DRAIN_TIMEOUT_SECONDS, Session
+from .session import Session
 
-
-def build_llm_client(settings: EndpointSettings) -> LLMClient:
-    return LLMClient(
-        openai_client=AsyncOpenAI(
-            api_key=settings.api_key,
-            base_url=settings.base_url,
-            http_client=get_http_client(),
-            max_retries=0,
-        ),
-        timeout=settings.timeout,
-    )
-
+QUEUE_MAX_SIZE = 200
 
 SELF_SENT_MSG_IDS = deque(maxlen=50)
 
@@ -37,14 +25,11 @@ class GroupState:
     event: Event | None = None
     bot: Bot | None = None
 
-    messages_chunk: list[MMessage] = field(default_factory=list)
+    # 满了丢最旧的：2s 防抖下几乎不可能积压到上限
+    messages_chunk: deque[MMessage] = field(
+        default_factory=lambda: deque(maxlen=QUEUE_MAX_SIZE)
+    )
 
-    client: LLMClient = field(
-        default_factory=lambda: build_llm_client(get_app_settings().chat)
-    )
-    feedback_client: LLMClient = field(
-        default_factory=lambda: build_llm_client(get_app_settings().feedback)
-    )
     data_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     session_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     new_message_signal: asyncio.Event = field(default_factory=asyncio.Event)
@@ -83,7 +68,6 @@ def ensure_group_state(group_id: int):
             session=Session(
                 id=f"{group_id}",
                 siliconflow_api_key=get_app_settings().siliconflow_api_key,
-                http_client=get_http_client(),
             )
         )
 
@@ -118,8 +102,8 @@ async def remove_group_state(group_id: int):
     if group_id in group_states:
         logger.info(f"移除群 {group_id} 的 GroupState...")
         state = group_states.pop(group_id)
-        await state.session.drain_background_tasks(timeout=MEMORY_DRAIN_TIMEOUT_SECONDS)
-        await state.session.close()
+        await state.session.drain_background_tasks()
+        state.session.close()
 
 
 async def maintain_vector_memories() -> None:
@@ -156,10 +140,9 @@ async def cleanup_global_resources():
                 logger.error(f"清理任务 {gid} 异常: {e}")
 
     # 2. worker 停止后再排空后台写入，并在数据库仍可用时做最终保存。
-    drain_timeout = MEMORY_DRAIN_TIMEOUT_SECONDS
     for state in group_states.values():
         try:
-            await state.session.drain_background_tasks(timeout=drain_timeout)
+            await state.session.drain_background_tasks()
         except Exception as e:
             logger.warning(f"排空群会话后台任务失败: {e}")
 
@@ -167,7 +150,7 @@ async def cleanup_global_resources():
     for group_id, state in group_states.items():
         if state.session.state.loaded:
             logger.info(f"正在保存群 {group_id} 的会话状态...")
-            save_tasks.append(state.session.save_session(force_index=True))
+            save_tasks.append(state.session.save_session())
 
     if save_tasks:
         try:
@@ -181,12 +164,9 @@ async def cleanup_global_resources():
 
     # 3. 所有 worker 和写任务都停止后，才关闭 Session 持有的资源。
     for state in group_states.values():
-        try:
-            await state.session.close()
-        except Exception as e:
-            logger.warning(f"关闭群会话资源失败: {e}")
+        state.session.close()
 
-    await drain_usage_tasks(timeout=MEMORY_DRAIN_TIMEOUT_SECONDS)
+    await drain_usage_tasks()
 
     # 5. Provider/usage 都已停止后关闭共享 HTTP，最后关闭数据库。
     await close_http_client()

@@ -128,7 +128,6 @@ async def load_full_session_data(session_id: str):
         "session": session_db,
         "users": users_data,
         "messages": history_msgs,
-        "last_consolidated_time": session_db.last_consolidated_time,
     }
 
 
@@ -360,78 +359,28 @@ async def log_interactions(session_id: str, interactions: list[tuple[str, dict]]
     )
 
 
-async def log_token_usage(
-    session_id: str,
-    model_name: str,
-    prompt_tokens: int,
-    completion_tokens: int,
-    *,
-    prompt_cache_hit_tokens: int = 0,
-    prompt_cache_miss_tokens: int = 0,
-    reasoning_tokens: int = 0,
-    finish_reason: str = "",
-):
-    await log_token_usages(
-        [
-            {
-                "session_id": session_id,
-                "model_name": model_name,
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens,
-                "prompt_cache_hit_tokens": prompt_cache_hit_tokens,
-                "prompt_cache_miss_tokens": prompt_cache_miss_tokens,
-                "reasoning_tokens": reasoning_tokens,
-                "finish_reason": finish_reason,
-            }
-        ]
-    )
+async def log_token_usage(session_id: str, model_name: str, usage: dict):
+    """同一事务里追加一条明细，并原子累加当日汇总。"""
 
-
-async def log_token_usages(rows: list[dict]):
-    """In one transaction, append raw usage and atomically increment daily totals."""
-
-    if not rows:
-        return
-    now = datetime.now().astimezone()
-    day = now.date().isoformat()
-    grouped: dict[tuple[str, str], dict[str, int]] = defaultdict(
-        lambda: {field: 0 for field in TOKEN_FIELDS} | {"request_count": 0}
-    )
-    for row in rows:
-        key = (
-            str(row.get("session_id") or ""),
-            str(row.get("model_name") or ""),
-        )
-        for field in TOKEN_FIELDS:
-            grouped[key][field] += int(row.get(field, 0) or 0)
-        grouped[key]["request_count"] += 1
-
+    day = datetime.now().astimezone().date().isoformat()
+    tokens = [int(usage.get(field) or 0) for field in TOKEN_FIELDS]
     try:
         async with in_transaction("default") as conn:
-            await TokenUsageModel.bulk_create(
-                [
-                    TokenUsageModel(
-                        session_id=row.get("session_id", ""),
-                        model_name=row.get("model_name", ""),
-                        prompt_tokens=row.get("prompt_tokens", 0),
-                        completion_tokens=row.get("completion_tokens", 0),
-                        prompt_cache_hit_tokens=row.get("prompt_cache_hit_tokens", 0),
-                        prompt_cache_miss_tokens=row.get("prompt_cache_miss_tokens", 0),
-                        reasoning_tokens=row.get("reasoning_tokens", 0),
-                        finish_reason=row.get("finish_reason", ""),
-                    )
-                    for row in rows
-                ],
+            await TokenUsageModel.create(
+                session_id=session_id,
+                model_name=model_name,
+                finish_reason=usage.get("finish_reason", ""),
+                **dict(zip(TOKEN_FIELDS, tokens)),
                 using_db=conn,
             )
-            await conn.execute_many(
+            await conn.execute_query(
                 """
                 INSERT INTO nyabot_daily_token_usage (
                     day, session_id, model_name,
                     prompt_tokens, completion_tokens,
                     prompt_cache_hit_tokens, prompt_cache_miss_tokens,
                     reasoning_tokens, request_count
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
                 ON CONFLICT(day, session_id, model_name)
                 DO UPDATE SET
                     prompt_tokens = prompt_tokens + excluded.prompt_tokens,
@@ -441,20 +390,7 @@ async def log_token_usages(rows: list[dict]):
                     reasoning_tokens = reasoning_tokens + excluded.reasoning_tokens,
                     request_count = request_count + excluded.request_count
                 """,
-                [
-                    [
-                        day,
-                        session_id,
-                        model_name,
-                        totals["prompt_tokens"],
-                        totals["completion_tokens"],
-                        totals["prompt_cache_hit_tokens"],
-                        totals["prompt_cache_miss_tokens"],
-                        totals["reasoning_tokens"],
-                        totals["request_count"],
-                    ]
-                    for (session_id, model_name), totals in grouped.items()
-                ],
+                [day, session_id, model_name, *tokens],
             )
     except Exception as e:
         logger.error(f"[Repo] 记录 Token 消耗失败: {e}")

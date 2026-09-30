@@ -1,11 +1,7 @@
-# nyaturingtest/mem.py
-
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
-
-from nonebot import logger
 
 SHORT_CONTEXT_LIMIT = 20
 SHORT_TERM_BUFFER_SIZE = 200
@@ -23,60 +19,21 @@ class Message:
     revision: int = field(default=0, repr=False, compare=False)
     _persistence_id: str = field(default="", repr=False, compare=False)
 
-    def mark_dirty(self) -> int:
-        self.revision += 1
-        return self.revision
-
-
-@dataclass
-class MemoryRecord:
-    messages: list[Message]
-    compressed_history: str
-
 
 class Memory:
-    def __init__(
-        self,
-        compressed_message: str | None = None,
-        messages: list[Message] | None = None,
-    ):
-        self.__compressed_message = compressed_message or ""
-        # 上下文窗口：保留缓冲区，access 只返回最近 SHORT_CONTEXT_LIMIT 条
-        self.__messages = (
-            deque(messages, maxlen=SHORT_TERM_BUFFER_SIZE)
-            if messages
-            else deque(maxlen=SHORT_TERM_BUFFER_SIZE)
-        )
+    """短时消息窗口；话题摘要只存在 SessionState.chat_summary，这里不再保留副本。"""
+
+    def __init__(self, messages: list[Message] | None = None):
+        # 保留缓冲区，access 只返回最近 SHORT_CONTEXT_LIMIT 条
+        self.__messages = deque(messages or [], maxlen=SHORT_TERM_BUFFER_SIZE)
         self.__dirty_messages: dict[int, Message] = {}
 
-    async def clear(self) -> None:
-        """
-        清除所有记忆
-        """
+    def clear(self) -> None:
         self.__messages.clear()
         self.__dirty_messages.clear()
-        self.__compressed_message = ""
-        logger.info("已清除所有记忆")
 
-    def update_summary(self, new_summary: str):
-        """
-        手动更新记忆摘要
-        """
-        if new_summary is not None:
-            self.__compressed_message = str(new_summary)
-
-    def access(self, limit: int | None = None) -> MemoryRecord:
-        """返回最近若干条消息与当前摘要；limit 省略时用 SHORT_CONTEXT_LIMIT。"""
-
-        size = (
-            SHORT_CONTEXT_LIMIT
-            if limit is None
-            else max(1, min(int(limit), SHORT_CONTEXT_LIMIT))
-        )
-        return MemoryRecord(
-            messages=list(self.__messages)[-size:],
-            compressed_history=self.__compressed_message,
-        )
+    def access(self) -> list[Message]:
+        return list(self.__messages)[-SHORT_CONTEXT_LIMIT:]
 
     def pending_messages(self) -> list[tuple[Message, int]]:
         return [
@@ -85,53 +42,30 @@ class Memory:
 
     def mark_persisted(self, persisted: list[tuple[Message, int]]) -> None:
         for message, revision in persisted:
-            key = id(message)
             if message.revision == revision:
-                self.__dirty_messages.pop(key, None)
+                self.__dirty_messages.pop(id(message), None)
 
     def mark_dirty(self, message: Message) -> None:
-        message.mark_dirty()
+        message.revision += 1
         self.__dirty_messages[id(message)] = message
 
-    def messages_after(
-        self,
-        watermark: datetime | None,
-        limit: int | None = None,
-    ) -> list[Message]:
-        """Return buffered messages newer than a consolidation watermark."""
+    def messages_after(self, watermark: datetime | None, limit: int) -> list[Message]:
+        """固化水位之后的缓冲消息，最多 limit 条。"""
 
         messages = list(self.__messages)
         if watermark is not None:
             watermark_ts = watermark.timestamp()
-            messages = [
-                message
-                for message in messages
-                if message.time.timestamp() > watermark_ts
-            ]
-        if limit is not None:
-            safe_limit = max(1, int(limit))
-            messages = messages[-safe_limit:]
-        return messages
+            messages = [m for m in messages if m.time.timestamp() > watermark_ts]
+        return messages[-limit:]
 
-    async def update(self, message_chunk: list[Message]):
-        """
-        仅更新上下文窗口，不再触发后台压缩任务
-        增加基于 message_id 的去重逻辑
-        """
+    def update(self, message_chunk: list[Message]) -> None:
+        """追加到滚动窗口，按消息 ID 去重。"""
+
         existing_ids = {msg.id for msg in self.__messages if msg.id}
-
-        to_add = []
-        for m in message_chunk:
-            # 如果消息有ID且已存在，则跳过
-            if m.id and str(m.id) in existing_ids:
+        for message in message_chunk:
+            if message.id and message.id in existing_ids:
                 continue
-            to_add.append(m)
-            # 把新加的ID也放入集合，防止本次chunk内部重复（虽然不太可能）
-            if m.id:
-                existing_ids.add(str(m.id))
-
-        if to_add:
-            # 1. 更新上下文窗口 (Rolling Window)
-            self.__messages.extend(to_add)
-            for message in to_add:
-                self.mark_dirty(message)
+            if message.id:
+                existing_ids.add(message.id)
+            self.__messages.append(message)
+            self.mark_dirty(message)

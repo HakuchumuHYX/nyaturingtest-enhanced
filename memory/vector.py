@@ -5,7 +5,6 @@ import re
 import threading
 import time
 import uuid
-from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, List
@@ -53,25 +52,15 @@ SCOPE_WEIGHT = {
     "global": 1.0,
     "other_subject": 0.5,
 }
-_metric_check_done: set[str] = set()
 
 
 @dataclass(frozen=True)
-class RetrievalResult(Sequence[dict[str, Any]]):
+class RetrievalResult:
     records: list[dict[str, Any]]
     stats: dict[str, Any]
     # 预设条目每轮都一样，与每轮变化的记忆分开送进 Prompt，便于前缀缓存命中
     preset_lines: list[str] = field(default_factory=list)
     memory_lines: list[str] = field(default_factory=list)
-
-    def __iter__(self) -> Iterator[dict[str, Any]]:
-        return iter(self.records)
-
-    def __len__(self) -> int:
-        return len(self.records)
-
-    def __getitem__(self, index):
-        return self.records[index]
 
 
 def _score_from_distance(distance: float | int | None) -> float:
@@ -84,18 +73,13 @@ def _score_from_distance(distance: float | int | None) -> float:
     return max(0.0, min(1.0, score))
 
 
-def _empty_retrieval_stats(
-    *, use_rerank: bool = False, fallback_reason: str = "none"
+def _retrieval_stats(
+    candidates: list, results: list, fallback_reason: str = "none"
 ) -> dict[str, Any]:
     return {
-        "candidate_count": 0,
-        "returned_count": 0,
-        "use_rerank": bool(use_rerank),
+        "candidate_count": len(candidates),
+        "returned_count": len(results),
         "fallback_reason": fallback_reason,
-        "adjusted_score_min": None,
-        "adjusted_score_p50": None,
-        "adjusted_score_p90": None,
-        "adjusted_score_max": None,
     }
 
 
@@ -262,15 +246,6 @@ def _source_type_weight(meta: dict) -> float:
     return MEMORY_TYPE_WEIGHT.get(memory_type, 1.0)
 
 
-def _memory_decay_rate(meta: dict, default_decay_rate: float) -> float:
-    if str(meta.get("source") or "memory") == "preset":
-        return 0.0
-    if default_decay_rate <= 0:
-        return 0.0
-    memory_type = str(meta.get("type") or "event")
-    return MEMORY_TYPE_DECAY_RATE.get(memory_type, default_decay_rate)
-
-
 def _confidence_weight(meta: dict) -> float:
     confidence = _clamp_float(meta.get("confidence"), 1.0, 0.0, 1.0)
     return 0.7 + confidence * 0.3
@@ -304,16 +279,6 @@ def _memory_scope(
     return "global", SCOPE_WEIGHT["global"]
 
 
-def _collection_metric_state(collection) -> str:
-    metadata = collection.metadata
-    if not isinstance(metadata, dict):
-        return "unknown"
-    space = metadata.get("hnsw:space")
-    if not space:
-        return "unknown"
-    return "cosine" if str(space).lower() == "cosine" else "mismatch"
-
-
 def _metadata_status(meta: dict | None) -> str:
     return str((meta or {}).get("status") or "active")
 
@@ -337,17 +302,13 @@ class VectorMemory:
     nonebot.utils.run_sync or another thread-pool adapter.
     """
 
-    def __init__(
-        self, api_key: str, persist_directory: str, session_id: str = "global"
-    ):
+    def __init__(self, api_key: str, persist_directory: str):
         self.persist_directory = persist_directory
-        self._version = 0
         os.makedirs(self.persist_directory, exist_ok=True)
         app_settings = get_app_settings()
         memory_settings = app_settings.memory
         self.emb_fn = SiliconFlowEmbeddingFunction(
             api_key=api_key,
-            session_id=session_id,
             model=memory_settings.model,
             base_url=memory_settings.base_url,
             timeout=memory_settings.timeout,
@@ -368,31 +329,7 @@ class VectorMemory:
             embedding_function=self.emb_fn,
             metadata=MEMORY_COLLECTION_METADATA,
         )
-        self._check_collection_metric_once()
         self.replay_pending()
-
-    @property
-    def version(self) -> int:
-        return int(self._version or 0)
-
-    def _bump_version(self) -> None:
-        self._version = self.version + 1
-
-    def _check_collection_metric_once(self) -> str:
-        state = _collection_metric_state(self.collection)
-        if self.persist_directory in _metric_check_done:
-            return state
-        _metric_check_done.add(self.persist_directory)
-        if state == "unknown":
-            logger.warning(
-                f"Vector collection metric metadata unknown: {self.persist_directory}"
-            )
-        elif state == "mismatch":
-            metadata = self.collection.metadata
-            logger.error(
-                f"Vector collection metric mismatch: {self.persist_directory} metadata={metadata}"
-            )
-        return state
 
     def _wal_path(self) -> str:
         return os.path.join(self.persist_directory, "pending_memories.jsonl")
@@ -600,7 +537,6 @@ class VectorMemory:
                         metadatas=[data[1] for _, data in missing],
                         ids=[item_id for item_id, _ in missing],
                     )
-                self._bump_version()
                 return {
                     "added": len(missing),
                     "confirmed": len(prepared_data),
@@ -641,155 +577,93 @@ class VectorMemory:
         use_rerank: bool = True,
         merged_candidate_cap: int | None = None,
     ) -> RetrievalResult:
-        """
-        检索逻辑：
-        1. k 表示每条 query 的召回数量
-        2. 如果未启用，直接召回 Top K
-        """
-        if not queries:
-            return RetrievalResult([], _empty_retrieval_stats(use_rerank=use_rerank))
+        """k 既是每条 query 的召回数，也是最终返回上限；rerank 失败或全被过滤时回退到初筛。"""
+
         unique_queries = _dedupe_preserve_order([q for q in queries if q.strip()])
         if not unique_queries:
-            return RetrievalResult([], _empty_retrieval_stats(use_rerank=use_rerank))
-
-        initial_k = max(1, int(k or 1))
+            return RetrievalResult([], _retrieval_stats([], []))
 
         try:
             results = self.collection.query(
-                query_texts=unique_queries, n_results=initial_k, where=where
+                query_texts=unique_queries, n_results=max(1, k), where=where
             )
 
-            # 第一步：合并去重初筛结果
+            # 第一步：多 query 结果按内容合并，同一内容取最高分
             candidate_by_content: dict[str, dict[str, Any]] = {}
-
             documents = results.get("documents") or []
             metadatas = results.get("metadatas") or []
             distances = results.get("distances") or []
             ids = results.get("ids") or []
-
-            if documents:
-                for i, docs in enumerate(documents):
-                    metas = metadatas[i] if i < len(metadatas) else []
-                    row_distances = distances[i] if i < len(distances) else []
-                    row_ids = ids[i] if i < len(ids) else []
-
-                    for j, doc in enumerate(docs):
-                        if not doc:
-                            continue
-                        metadata = _normalized_metadata(
-                            metas[j] if j < len(metas) else {}
-                        )
-                        distance = row_distances[j] if j < len(row_distances) else None
-                        metadata["retrieval_score"] = _score_from_distance(distance)
-                        if j < len(row_ids):
-                            metadata["memory_ref"] = row_ids[j]
-                        existing = candidate_by_content.get(doc)
-                        if existing is None or metadata["retrieval_score"] > existing[
-                            "metadata"
-                        ].get("retrieval_score", 0.0):
-                            candidate_by_content[doc] = {
-                                "content": doc,
-                                "metadata": metadata,
-                            }
-            flattened_candidates = sorted(
+            for i, docs in enumerate(documents):
+                for j, doc in enumerate(docs):
+                    if not doc:
+                        continue
+                    metadata = _normalized_metadata(metadatas[i][j])
+                    metadata["retrieval_score"] = _score_from_distance(distances[i][j])
+                    metadata["memory_ref"] = ids[i][j]
+                    existing = candidate_by_content.get(doc)
+                    if (
+                        existing is None
+                        or metadata["retrieval_score"]
+                        > existing["metadata"]["retrieval_score"]
+                    ):
+                        candidate_by_content[doc] = {"content": doc, "metadata": metadata}
+            candidates = sorted(
                 candidate_by_content.values(),
-                key=lambda item: item.get("metadata", {}).get("retrieval_score", 0.0),
+                key=lambda item: item["metadata"]["retrieval_score"],
                 reverse=True,
             )
             if merged_candidate_cap is not None:
-                cap = max(1, int(merged_candidate_cap or 1))
-                flattened_candidates = flattened_candidates[:cap]
+                candidates = candidates[:merged_candidate_cap]
 
-            # 如果没有结果，直接返回
-            if not flattened_candidates:
+            if not candidates:
+                return RetrievalResult([], _retrieval_stats([], []))
+            if not use_rerank or not self.reranker:
+                fallback = candidates[:k]
                 return RetrievalResult(
-                    [], _empty_retrieval_stats(use_rerank=use_rerank)
+                    fallback, _retrieval_stats(candidates, fallback, "rerank_disabled")
                 )
 
-            # 如果不使用 Rerank 或 Reranker 未初始化，直接截断返回
-            if not use_rerank or not self.reranker:
-                results = flattened_candidates[:k]
-                stats = {
-                    **_empty_retrieval_stats(
-                        use_rerank=use_rerank, fallback_reason="rerank_disabled"
-                    ),
-                    "candidate_count": len(flattened_candidates),
-                    "returned_count": len(results),
-                }
-                return RetrievalResult(results, stats)
-
-            # 第二步：Rerank
-            # search_stage 已把最新有效消息排在第一位；summary/name query 只做补充召回。
-            main_query = unique_queries[0]
-
-            candidate_docs = [item["content"] for item in flattened_candidates]
-
+            # 第二步：Rerank。search_stage 已把最新有效消息排在第一位；summary/name query 只做补充召回。
             rerank_results = self.reranker.rerank(
-                query=main_query,
-                documents=candidate_docs,
-                top_n=len(candidate_docs),  # 全排，然后本地过滤
+                query=unique_queries[0],
+                documents=[item["content"] for item in candidates],
+                top_n=len(candidates),  # 全排，然后本地过滤
             )
             if not rerank_results:
-                logger.debug("Rerank无结果，回退到初筛候选")
-                results = flattened_candidates[:k]
-                stats = {
-                    **_empty_retrieval_stats(
-                        use_rerank=use_rerank, fallback_reason="rerank_api_empty"
-                    ),
-                    "candidate_count": len(flattened_candidates),
-                    "returned_count": len(results),
-                }
-                return RetrievalResult(results, stats)
+                fallback = candidates[:k]
+                return RetrievalResult(
+                    fallback, _retrieval_stats(candidates, fallback, "rerank_api_empty")
+                )
 
-            final_results = []
             threshold = get_app_settings().rerank_threshold
-
+            final_results = []
             for res in rerank_results:
-                idx = res.get("index")
                 score = res.get("relevance_score", 0.0)
-
                 if score < threshold:
                     continue
-
-                if isinstance(idx, int) and 0 <= idx < len(flattened_candidates):
-                    item = flattened_candidates[idx]
-                    # 可以把分数附加上去，方便调试
-                    item["metadata"]["rerank_score"] = score
-                    final_results.append(item)
-
+                item = candidates[res["index"]]
+                item["metadata"]["rerank_score"] = score
+                final_results.append(item)
                 if len(final_results) >= k:
                     break
 
             logger.debug(
-                f"Rerank完成: 初筛{len(candidate_docs)} -> 终选{len(final_results)} (阈值{threshold})"
+                f"Rerank完成: 初筛{len(candidates)} -> 终选{len(final_results)} (阈值{threshold})"
             )
             if not final_results:
-                logger.debug("Rerank结果全部被过滤，回退到初筛候选")
-                results = flattened_candidates[:k]
-                stats = {
-                    **_empty_retrieval_stats(
-                        use_rerank=use_rerank, fallback_reason="rerank_all_filtered"
-                    ),
-                    "candidate_count": len(flattened_candidates),
-                    "returned_count": len(results),
-                }
-                return RetrievalResult(results, stats)
-            stats = {
-                **_empty_retrieval_stats(use_rerank=use_rerank),
-                "candidate_count": len(flattened_candidates),
-                "returned_count": len(final_results),
-            }
-            return RetrievalResult(final_results, stats)
+                fallback = candidates[:k]
+                return RetrievalResult(
+                    fallback,
+                    _retrieval_stats(candidates, fallback, "rerank_all_filtered"),
+                )
+            return RetrievalResult(
+                final_results, _retrieval_stats(candidates, final_results)
+            )
 
         except Exception as e:
             logger.error(f"Vector retrieve failed: {e}")
-            return RetrievalResult(
-                [],
-                _empty_retrieval_stats(
-                    use_rerank=use_rerank,
-                    fallback_reason="retrieve_error",
-                ),
-            )
+            return RetrievalResult([], _retrieval_stats([], [], "retrieve_error"))
 
     def _retrieve_active_subject_records(
         self,
@@ -882,7 +756,6 @@ class VectorMemory:
         try:
             with BACKUP_IO_LOCK:
                 self.collection.delete(where=where)
-            self._bump_version()
             logger.info(f"Deleted vectors where {where}")
         except Exception as e:
             logger.error(f"Vector delete failed: {e}")
@@ -913,8 +786,6 @@ class VectorMemory:
             for start in range(0, len(delete_ids), 200):
                 with BACKUP_IO_LOCK:
                     self.collection.delete(ids=delete_ids[start : start + 200])
-            if delete_ids:
-                self._bump_version()
             logger.info(f"Cleaned up {len(delete_ids)} expired vector memories")
         except Exception as e:
             logger.error(f"Cleanup failed: {e}")
@@ -943,7 +814,6 @@ class VectorMemory:
             return
         with BACKUP_IO_LOCK:
             self.collection.update(ids=[memory_ref], metadatas=[dict(metadata or {})])
-        self._bump_version()
 
     def supersede_memory(
         self,
@@ -1041,7 +911,6 @@ class VectorMemory:
                     embedding_function=self.emb_fn,
                     metadata=MEMORY_COLLECTION_METADATA,
                 )
-            self._bump_version()
         except Exception as e:
             logger.error(f"Clear failed: {e}")
 
@@ -1211,43 +1080,23 @@ class VectorMemory:
         k: int = 5,
         where: dict | None = None,
         use_rerank: bool = True,
-        decay_rate: float = 0.02,
         candidate_k: int | None = None,
         merged_candidate_cap: int | None = None,
-        active_user_ids: set[str] | list[str] | tuple[str, ...] | None = None,
+        active_user_ids: set[str] = frozenset(),
     ) -> RetrievalResult:
-        """
-        带时间衰减的检索
+        """带时间衰减的检索：语义召回（每条 query 取 candidate_k）+ 活跃主体结构化召回，
+        再按衰减/类型/置信度/作用域加权排序取前 k。"""
 
-        Args:
-            queries: 查询语句列表
-            k: 返回结果数量
-            where: 过滤条件
-            use_rerank: 是否使用 Rerank
-            decay_rate: 时间衰减率（默认 0.02，约 35 天半衰期）
-            candidate_k: 每条 query 的召回数量，None 时使用 k
-            merged_candidate_cap: 合并去重后送入 rerank 的候选上限
-            active_user_ids: 当前活跃用户 ID；不传时保持旧 caller 行为
-
-        Returns:
-            检索结果列表，按综合分数排序
-        """
-        active_scope_ids = {
-            str(user_id).strip()
-            for user_id in active_user_ids or []
-            if str(user_id).strip()
-        }
-        # 1. 调用原有语义检索方法，再补充当前主体的结构化 metadata 召回。
-        effective_candidate_k = candidate_k if candidate_k is not None else k
+        active_scope_ids = set(active_user_ids)
         retrieval_result = self.retrieve(
             queries,
-            k=effective_candidate_k,
+            k=candidate_k or k,
             where=where,
             use_rerank=use_rerank,
             merged_candidate_cap=merged_candidate_cap,
         )
         raw_results = list(retrieval_result.records)
-        stats = dict(retrieval_result.stats)
+        stats = {"use_rerank": use_rerank, **retrieval_result.stats}
         subject_results = self._retrieve_active_subject_records(
             active_scope_ids, limit=min(5, max(1, k))
         )
@@ -1299,7 +1148,9 @@ class VectorMemory:
                 days_ago = _date_days_ago(meta, now=today_dt)
                 if days_ago is None:
                     days_ago = 60
-                effective_decay_rate = _memory_decay_rate(meta, decay_rate)
+                effective_decay_rate = MEMORY_TYPE_DECAY_RATE.get(
+                    meta["type"], MEMORY_TYPE_DECAY_RATE["event"]
+                )
             decay_factor = math.exp(-effective_decay_rate * days_ago)
 
             # 获取原始分数
@@ -1405,13 +1256,11 @@ class SiliconFlowEmbeddingFunction(EmbeddingFunction):
     def __init__(
         self,
         api_key: str,
-        session_id: str,
         model: str,
         base_url: str,
         timeout: float,
     ):
         self.api_key = api_key
-        self.session_id = session_id
         self.model = model
         self._client = OpenAI(
             api_key=api_key,
@@ -1443,111 +1292,34 @@ RAG_FINAL_K = 20
 RAG_PER_QUERY_RECALL_K = 40
 RAG_MERGED_CANDIDATE_CAP = 64
 RAG_MEMORY_CHAR_BUDGET = 1500
-RAG_DEBUG_LOG = False
+RAG_ITEM_CHARS = 500
 RAG_DEFAULT_EVENT_TTL_DAYS = 90
 
 
-_NOISE_QUERIES = {
-    "?",
-    "？",
-    "??",
-    "？？",
-    "???",
-    "？？？",
-    "。",
-    "！",
-    "!",
-    "...",
-    "…",
-    "草",
-    "艹",
-    "笑死",
-    "哈哈",
-    "哈哈哈",
-    "hhh",
-    "www",
-    "233",
-    "666",
-    "ok",
-    "OK",
-    "嗯",
-    "嗯嗯",
-    "哦",
-    "好",
-    "好的",
-}
+# 纯表情/标点（「？？？」「哈哈哈」「233」这类都短于 4 字，长度过滤已覆盖）
 _EMOJI_ONLY_RE = re.compile(r"^[\W_]+$", re.UNICODE)
 
 
-def _active_user_query_names(
-    active_user_names: list[str] | None,
-    active_users: list[dict] | None,
-) -> list[str]:
-    result = []
-    seen = set()
-    seen_names = set()
-
-    for user in active_users or []:
-        if not isinstance(user, dict):
-            continue
-        user_id = str(user.get("user_id") or "").strip()
-        user_name = str(user.get("user_name") or "").strip()
-        if not user_name:
-            continue
-        key = f"id:{user_id}" if user_id else f"name:{user_name}"
-        if key in seen or user_name in seen_names:
-            continue
-        seen.add(key)
-        seen_names.add(user_name)
-        result.append(user_name)
-
-    for user_name in active_user_names or []:
-        user_name = str(user_name or "").strip()
-        if not user_name:
-            continue
-        key = f"name:{user_name}"
-        if key in seen or user_name in seen_names:
-            continue
-        seen.add(key)
-        seen_names.add(user_name)
-        result.append(user_name)
-
-    return result
-
-
 def is_low_value_rag_query(text: str) -> bool:
-    query = str(text or "").strip()
-    if not query:
-        return True
-    if query in _NOISE_QUERIES or query.lower() in _NOISE_QUERIES:
-        return True
-    if query.startswith("[表情包]"):
-        return True
-    if len(query) < 4:
-        return True
-    return bool(_EMOJI_ONLY_RE.fullmatch(query))
+    query = text.strip()
+    return (
+        len(query) < 4
+        or query.startswith("[表情包]")
+        or bool(_EMOJI_ONLY_RE.fullmatch(query))
+    )
 
 
 def build_chat_rag_queries(
     raw_queries: list[str],
     *,
-    chat_summary: str = "",
-    active_user_names: list[str] | None = None,
-    active_users: list[dict] | None = None,
+    chat_summary: str,
+    user_names: list[str],
 ) -> list[str]:
-    effective_queries = [
-        str(query or "").strip()
-        for query in raw_queries or []
-        if not is_low_value_rag_query(str(query or ""))
-    ]
-
-    if chat_summary and str(chat_summary).strip():
-        effective_queries.append(str(chat_summary).strip())
-
-    active_query_names = _active_user_query_names(active_user_names, active_users)
-    effective_queries.extend([f"关于{name}" for name in active_query_names])
-
-    return _dedupe_preserve_order(effective_queries)
+    queries = [query.strip() for query in raw_queries if not is_low_value_rag_query(query)]
+    if chat_summary.strip():
+        queries.append(chat_summary.strip())
+    queries.extend(f"关于{name}" for name in user_names)
+    return _dedupe_preserve_order(queries)
 
 
 async def search_memories(

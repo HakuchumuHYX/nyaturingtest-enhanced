@@ -26,6 +26,7 @@ class RuntimeMetrics:
 metrics = RuntimeMetrics()
 
 _PENDING_USAGE_TASKS: set[asyncio.Task] = set()
+USAGE_DRAIN_TIMEOUT_SECONDS = 10.0
 
 
 def record_token_usage(session_id: str, model_name: str, usage: dict) -> None:
@@ -36,18 +37,7 @@ def record_token_usage(session_id: str, model_name: str, usage: dict) -> None:
         tokens=usage.get("total_tokens", 0),
         decision=usage.get("finish_reason", ""),
     )
-    task = asyncio.create_task(
-        log_token_usage(
-            session_id=session_id,
-            model_name=model_name,
-            prompt_tokens=usage.get("prompt_tokens", 0),
-            completion_tokens=usage.get("completion_tokens", 0),
-            prompt_cache_hit_tokens=usage.get("prompt_cache_hit_tokens", 0),
-            prompt_cache_miss_tokens=usage.get("prompt_cache_miss_tokens", 0),
-            reasoning_tokens=usage.get("reasoning_tokens", 0),
-            finish_reason=usage.get("finish_reason", ""),
-        )
-    )
+    task = asyncio.create_task(log_token_usage(session_id, model_name, usage))
     _PENDING_USAGE_TASKS.add(task)
     task.add_done_callback(_log_usage_task_error)
 
@@ -61,12 +51,12 @@ def _log_usage_task_error(task: asyncio.Task) -> None:
         logger.error(f"记录 Token 消耗失败: {exc}")
 
 
-async def drain_usage_tasks(timeout: float | None = None) -> None:
+async def drain_usage_tasks() -> None:
     if not _PENDING_USAGE_TASKS:
         return
 
     tasks = list(_PENDING_USAGE_TASKS)
-    done, pending = await asyncio.wait(tasks, timeout=timeout)
+    done, pending = await asyncio.wait(tasks, timeout=USAGE_DRAIN_TIMEOUT_SECONDS)
     if done:
         await asyncio.gather(*done, return_exceptions=True)
     if pending:
