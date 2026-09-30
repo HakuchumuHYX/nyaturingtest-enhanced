@@ -115,7 +115,8 @@ plugins/nyaturingtest/
    - `_apply_decision`：`need_history` 为真时按时间回溯最多 20 条更早的历史消息 → 规则意愿与模型的
      `willing` 各占一半（模型不再直接覆盖），相关时兜底到 0.85；记一条 `willingness_decision` 事件。
 6. 不相关且意愿低于 `SPEAK_THRESHOLD`(0.5) → 不接话。对话窗口里规则意愿至少 0.55，模型给到 0.45 以上就会接。
-7. `chat_stage`（角色模型，temperature 0.7）生成回复；有回复则意愿乘以 0.7。
+7. `chat_stage`（角色模型，temperature 0.9，换取用词和句式的变化）生成回复；动态输入额外带上
+   `my_recent_replies`（Bot 最近 6 句），prompt 要求不重复自己的句式。有回复则意愿乘以 0.7。
    发言冷却不再跳过整轮，而是在发送前补足 16s 间隔，对方秒回时对话不会被掐断。
 
 **代际控制**：`Session.bump_generation()` 在 `set_role` / `load_preset` / `reset` / `reset_emotion` /

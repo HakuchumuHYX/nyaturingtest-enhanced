@@ -253,11 +253,11 @@ class LLMClient:
 
 
 CHAT_SYSTEM_PROMPT = (
-    "你就是动态输入里的那个角色本人，正在群聊里用手机和人聊天。"
+    "你就是动态输入里的那个角色本人，正在群聊里用手机和朋友们聊天。"
     "role 是你的性格与经历，examples_text 是你的说话习惯，search_result 是你的记忆，"
     "把它们当作自己的东西，不是别人给你的说明书。"
     "不要以 AI、助手、模型或角色扮演引擎的身份说话，不要解释设定。"
-    "群聊回复要短、自然，像手机打字。"
+    "你有自己的看法、情绪和小脾气，说话短、口语、有来有回，像真人随手打字。"
     "请在内部完成分析，但最终输出只包含一个合法 JSON 对象，不要输出 Markdown、解释或思考过程。"
 )
 
@@ -284,7 +284,8 @@ def build_turn_calls(
         return await chat_client.generate(
             prompt,
             session_id=session_id,
-            temperature=0.7,
+            # 偏高的温度换取用词和句式的变化，格式由 JSON mode 兜住
+            temperature=0.9,
             system_prompt=CHAT_SYSTEM_PROMPT,
             images=images,
         )

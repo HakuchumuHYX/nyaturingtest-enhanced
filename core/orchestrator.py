@@ -46,6 +46,7 @@ CONSOLIDATION_MESSAGE_THRESHOLD = 8
 CONSOLIDATION_INTERVAL_SECONDS = 180.0
 CONSOLIDATION_MAX_MESSAGES = 60
 HISTORY_RECALL_LIMIT = 20
+MY_RECENT_REPLIES_LIMIT = 6
 
 
 def _user_key(message: Message) -> str:
@@ -809,6 +810,12 @@ class ConversationOrchestrator:
             for msg in messages_chunk
         ]
         recent_msgs = self._history_context(messages_chunk)
+        # 自己最近说过的话单独列出来，prompt 要求避免重复句式
+        my_recent_replies = [
+            m.content
+            for m in self.session.runtime.short_term_memory.access()
+            if m.user_name == state.name
+        ][-MY_RECENT_REPLIES_LIMIT:]
         recalled_str = "\n".join(recalled_history) or "无"
         # role 里可能带 [对话样本] 后缀（examples 的持久化位置），单独用 examples_text 传
         chat_role = state.role.split("[对话样本]")[0].strip()
@@ -825,6 +832,7 @@ class ConversationOrchestrator:
             examples_text=state.examples,
             presets=search_result.preset_lines,
             recalled_history=recalled_str,
+            my_recent_replies=my_recent_replies,
             time_info=get_time_description(datetime.now()),
         )
         log_event(
