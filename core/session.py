@@ -1,7 +1,6 @@
 import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime
-from enum import Enum
 
 from nonebot import logger
 from nonebot.utils import run_sync
@@ -18,7 +17,7 @@ from ..db import (
 from ..domain import EmotionState, PersonProfile
 from ..memory.short_term import Memory, Message
 from ..memory.vector import BACKUP_IO_LOCK, VectorMemory
-from .engagement import WILLINGNESS_LOAD_VALUE
+from .engagement import WILLINGNESS_LOAD_VALUE, chatting_state
 from .metrics import log_event
 from .prompts import PRESETS, reload_presets, truncate_text
 
@@ -27,19 +26,6 @@ ROLE_MAX_CHARS = 4000
 EXAMPLES_MAX_CHARS = 2000
 MEMORY_DRAIN_TIMEOUT_SECONDS = 10.0
 SAVE_DEBOUNCE_SECONDS = 0.05
-
-
-class ChattingState(Enum):
-    IDLE = 0
-    BUBBLE = 1
-    ACTIVE = 2
-
-    def __str__(self) -> str:
-        return {
-            ChattingState.IDLE: "潜水状态",
-            ChattingState.BUBBLE: "冒泡状态",
-            ChattingState.ACTIVE: "对话状态",
-        }[self]
 
 
 @dataclass
@@ -54,10 +40,8 @@ class SessionState:
     global_emotion: EmotionState = field(default_factory=EmotionState)
     chat_summary: str = ""
     willingness: float = 0.0
-    chatting_state: ChattingState = ChattingState.IDLE
     last_decay_time: datetime = field(default_factory=datetime.now)
     last_speak_time: datetime = datetime.min
-    engaged: bool = False
     last_consolidated_time: datetime | None = None
     messages_since_consolidation: int = 0
     last_consolidation_attempt: datetime = datetime.min
@@ -161,9 +145,9 @@ class Session:
         self.bump_generation("calm_down")
         self.state.global_emotion = EmotionState()
         self.state.profiles = {}
-        self.state.chatting_state = ChattingState.IDLE
         self.state.willingness = 0.0
-        self.state.engaged = False
+        # 退出对话窗口
+        self.state.last_speak_time = datetime.min
         await self.save_session()
 
     async def reset_emotion(self):
@@ -227,7 +211,8 @@ class Session:
                     "chat_summary": self.state.chat_summary,
                     "last_speak_time": self.state.last_speak_time,
                     "last_consolidated_time": self.state.last_consolidated_time,
-                    "chatting_state": self.state.chatting_state.value,
+                    # 派生值，只为在库里能看到当时的状态；加载时不读
+                    "chatting_state": chatting_state(self.state, datetime.now()).value,
                 },
             )
 
@@ -290,10 +275,7 @@ class Session:
             if len(parts) > 1:
                 self.state.examples = parts[1].strip()
 
-        # 重启后意愿从低值起步，状态一并回到潜水，避免「状态=对话中但意愿=静音」的矛盾
         self.state.willingness = WILLINGNESS_LOAD_VALUE
-        self.state.chatting_state = ChattingState.IDLE
-        self.state.engaged = False
         self.state.profiles = {}
 
         # 恢复用户画像
@@ -389,7 +371,7 @@ class Session:
 名字：{self.state.name}
 设定：{self.state.role}
 意愿值：{self.state.willingness:.2f}
-状态: {self.state.chatting_state}
+状态: {chatting_state(self.state, datetime.now())}
 情绪：V{self.state.global_emotion.valence:.2f} A{self.state.global_emotion.arousal:.2f} D{self.state.global_emotion.dominance:.2f}
 后台任务数: {len(self.runtime.background_tasks)}
 摘要：{self.state.chat_summary}

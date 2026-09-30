@@ -16,6 +16,8 @@ class Message:
     user_id: str = ""
     # 原生多模态输入，仅当前进程短期持有；不序列化、不写数据库。
     image_inputs: list[Any] = field(default_factory=list, repr=False, compare=False)
+    # 是否 @Bot 或回复了 Bot 的消息；只用于本轮相关性判断，不落库
+    to_me: bool = field(default=False, repr=False, compare=False)
     revision: int = field(default=0, repr=False, compare=False)
     _persistence_id: str = field(default="", repr=False, compare=False)
 

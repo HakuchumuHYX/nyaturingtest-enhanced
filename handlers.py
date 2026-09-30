@@ -97,6 +97,21 @@ async def is_private_message(event: Event) -> bool:
     return isinstance(event, PrivateMessageEvent)
 
 
+def _addresses_bot(bot: Bot, event: GroupMessageEvent) -> bool:
+    """@Bot 或回复 Bot 的消息。
+
+    不用 event.to_me：.env 里 NICKNAME=[""] 会让适配器把所有文本开头的消息都判成 to_me。
+    """
+
+    self_id = str(bot.self_id)
+    if event.reply and str(event.reply.sender.user_id) == self_id:
+        return True
+    return any(
+        seg.type == "at" and str(seg.data.get("qq", "")) == self_id
+        for seg in event.original_message
+    )
+
+
 async def _parse_group_id_or_finish(matcher: type[Matcher], raw: str) -> int:
     raw_group_id = raw.strip()
     try:
@@ -395,6 +410,7 @@ async def handle_auto_chat(bot: Bot, event: GroupMessageEvent):
                 id=str(event.message_id),
                 user_id=user_id,
                 image_inputs=image_inputs,
+                to_me=user_id != str(bot.self_id) and _addresses_bot(bot, event),
             )
         )
         state.new_message_signal.set()

@@ -1,33 +1,74 @@
+"""发言意愿与参与判定。
+
+意愿值只由规则维护：随时间衰减、随群聊消息增长、被点名或正在对话时有下限。
+它决定「值不值得调用 Feedback 考虑说话」；真正说不说由 Feedback 的 willing 与它平均后决定
+（见 orchestrator._apply_decision），模型不再直接覆盖意愿值。
+"""
+
 from dataclasses import dataclass
 from datetime import datetime
+from enum import Enum
 
 from ..memory.short_term import Message
 
-# 意愿与参与策略参数
+# 两次发送之间的最小间隔（在发送前等待，不再跳过整轮）
 SPEAK_COOLDOWN_SECONDS = 16.0
-WILLINGNESS_IDLE_AFTER_SECONDS = 300.0
-WILLINGNESS_DECAY_RATE_ACTIVE = 0.04
-WILLINGNESS_DECAY_RATE_IDLE = 0.08
+# 按真实流逝时间衰减：0.6 在约 20 分钟无人理会后归零
+WILLINGNESS_DECAY_PER_MINUTE = 0.03
+# 被动增长：每条消息 × 兴趣系数；被动增长最多涨到上限，插嘴不至于满格
+PASSIVE_GROWTH_PER_MESSAGE = 0.05
+PASSIVE_GROWTH_CAP = 0.7
+INTEREST_MIN_FACTOR = 0.3
+INTEREST_MAX_FACTOR = 1.8
+# 意愿达到该值才调用 Feedback 考虑插嘴
+ENGAGE_THRESHOLD = 0.45
+# 规则意愿与 Feedback willing 平均后达到该值才回复（被点名时不看这个）
+SPEAK_THRESHOLD = 0.5
+# 被点名（名字/别名、@、回复 Bot）时的意愿下限
 RELEVANCE_WILLINGNESS_FLOOR = 0.85
-WILLINGNESS_REPLY_THRESHOLD = 0.47
-INTEREST_TOPIC_WILLINGNESS_FLOOR = 0.34
-SPEAK_WILLINGNESS_RETAIN_FACTOR = 0.35
-WILLINGNESS_LOAD_VALUE = 0.1
-PASSIVE_GROWTH_MIN_FACTOR = 0.25
-PASSIVE_GROWTH_MAX_FACTOR = 1.8
-PASSIVE_WILLINGNESS_GROWTH_LIMIT = 0.6
-PASSIVE_WILLINGNESS_GROWTH_PER_MESSAGE = 0.026
-LOW_WILLINGNESS_SKIP_THRESHOLD = 0.32
-POST_FEEDBACK_SKIP_THRESHOLD = 0.38
-ACTIVE_TO_BUBBLE_THRESHOLD = 0.50
+# Bot 说话后的对话窗口：窗口内每批消息都会交给 Feedback 判断要不要接话
+CONVERSATION_WINDOW_SECONDS = 180.0
+CONVERSATION_WILLINGNESS_FLOOR = 0.55
+# 说话后保留的意愿比例（避免同一话题连续抢话，但不至于掉出对话）
+SPEAK_WILLINGNESS_RETAIN_FACTOR = 0.7
+# 重启后的初始意愿
+WILLINGNESS_LOAD_VALUE = 0.3
+# 意愿高于该值或处于对话中时启用 Rerank
 RERANK_WILLINGNESS_THRESHOLD = 0.68
+
+
+class ChattingState(Enum):
+    """展示与 prompt 用的派生状态，不参与决策。"""
+
+    IDLE = 0
+    BUBBLE = 1
+    ACTIVE = 2
+
+    def __str__(self) -> str:
+        return {
+            ChattingState.IDLE: "潜水状态",
+            ChattingState.BUBBLE: "冒泡状态",
+            ChattingState.ACTIVE: "对话状态",
+        }[self]
+
+
+def in_conversation(state, now: datetime) -> bool:
+    return (now - state.last_speak_time).total_seconds() < CONVERSATION_WINDOW_SECONDS
+
+
+def chatting_state(state, now: datetime) -> ChattingState:
+    if in_conversation(state, now):
+        return ChattingState.ACTIVE
+    if state.willingness >= ENGAGE_THRESHOLD:
+        return ChattingState.BUBBLE
+    return ChattingState.IDLE
 
 
 @dataclass(frozen=True)
 class EngagementDecision:
     relevant: bool
+    in_conversation: bool
     engaged: bool
-    cooldown_remaining: float
 
 
 def evaluate_engagement(
@@ -36,49 +77,29 @@ def evaluate_engagement(
     messages: list[Message],
     now: datetime,
 ) -> EngagementDecision:
-    """意愿值衰减/增长、参与态滞回与发言冷却。"""
+    """意愿值衰减/增长，并判断这批消息要不要交给 Feedback。"""
 
-    last_decay = state.last_decay_time or now
-    elapsed_minutes = max(0.0, (now - last_decay).total_seconds()) / 60.0
-    last_speak = state.last_speak_time
-    if last_speak.tzinfo is not None:
-        last_speak = last_speak.astimezone(None).replace(tzinfo=None)
-    idle = (now - last_speak).total_seconds() >= WILLINGNESS_IDLE_AFTER_SECONDS
-    decay_rate = WILLINGNESS_DECAY_RATE_IDLE if idle else WILLINGNESS_DECAY_RATE_ACTIVE
-    state.willingness = max(0.0, state.willingness - elapsed_minutes * decay_rate)
+    elapsed_minutes = max(0.0, (now - state.last_decay_time).total_seconds()) / 60.0
+    state.willingness = max(
+        0.0, state.willingness - elapsed_minutes * WILLINGNESS_DECAY_PER_MINUTE
+    )
     state.last_decay_time = now
 
     relevant = check_relevance(state.name, state.aliases, messages)
+    conversing = in_conversation(state, now)
     if relevant:
         state.willingness = max(state.willingness, RELEVANCE_WILLINGNESS_FLOOR)
-    elif state.willingness < PASSIVE_WILLINGNESS_GROWTH_LIMIT:
-        interest = score_message_interest(
-            [message.content for message in messages],
-            state.name,
-            state.aliases,
-            lo=PASSIVE_GROWTH_MIN_FACTOR,
-            hi=PASSIVE_GROWTH_MAX_FACTOR,
-        )
-        growth = PASSIVE_WILLINGNESS_GROWTH_PER_MESSAGE * interest * len(messages)
-        state.willingness = min(1.0, state.willingness + growth)
-        if interest >= 1.6:
-            state.willingness = max(state.willingness, INTEREST_TOPIC_WILLINGNESS_FLOOR)
+    elif state.willingness < PASSIVE_GROWTH_CAP:
+        interest = score_message_interest([message.content for message in messages])
+        growth = PASSIVE_GROWTH_PER_MESSAGE * interest * len(messages)
+        state.willingness = min(PASSIVE_GROWTH_CAP, state.willingness + growth)
+    if conversing:
+        state.willingness = max(state.willingness, CONVERSATION_WILLINGNESS_FLOOR)
 
-    if relevant:
-        state.engaged = True
-    elif state.engaged and state.willingness < LOW_WILLINGNESS_SKIP_THRESHOLD:
-        state.engaged = False
-    elif not state.engaged and state.willingness >= WILLINGNESS_REPLY_THRESHOLD:
-        state.engaged = True
-
-    since_speak = (now - last_speak).total_seconds()
-    cooldown_remaining = (
-        0.0 if since_speak < 0 else max(0.0, SPEAK_COOLDOWN_SECONDS - since_speak)
-    )
     return EngagementDecision(
         relevant=relevant,
-        engaged=state.engaged,
-        cooldown_remaining=cooldown_remaining,
+        in_conversation=conversing,
+        engaged=relevant or conversing or state.willingness >= ENGAGE_THRESHOLD,
     )
 
 
@@ -87,9 +108,14 @@ def check_relevance(
     aliases: list[str],
     messages: list[Message],
 ) -> bool:
-    triggers = [bot_name, *(aliases or [])]
+    """@Bot、回复 Bot 的消息，或提到名字/别名（至少 2 个字）。"""
+
+    if any(message.to_me for message in messages):
+        return True
     triggers = [
-        value.strip().lower() for value in triggers if value and len(value.strip()) >= 2
+        value.strip().lower()
+        for value in [bot_name, *aliases]
+        if value and len(value.strip()) >= 2
     ]
     return any(
         trigger in message.content.lower()
@@ -98,33 +124,19 @@ def check_relevance(
     )
 
 
-def score_message_interest(
-    contents,
-    bot_name: str,
-    aliases,
-    *,
-    lo: float,
-    hi: float,
-) -> float:
-    text = " ".join(str(content or "") for content in (contents or []))
-    if not text.strip():
-        return lo
+def score_message_interest(contents: list[str]) -> float:
+    """这批消息有多值得插嘴：提问、有实质内容加分，纯复读/纯表情减分。"""
+
+    text = " ".join(contents).strip()
+    if not text:
+        return INTEREST_MIN_FACTOR
     score = 1.0
     if "?" in text or "？" in text:
         score += 0.6
-    names = [str(bot_name or "").strip()]
-    names.extend(
-        str(alias).strip()
-        for alias in (aliases or [])
-        if alias and len(str(alias).strip()) >= 2
-    )
-    if any(name and name in text for name in names):
-        score += 0.7
-    stripped = text.strip()
-    if len(set(stripped)) <= 2 and len(stripped) >= 3:
-        score -= 0.6
-    if stripped in {"[图片]", "[表情包]"}:
-        score -= 0.5
-    if len(stripped) >= 15:
+    if any(len(content.strip()) >= 15 for content in contents):
         score += 0.2
-    return max(lo, min(hi, score))
+    if len(set(text)) <= 2 and len(text) >= 3:
+        score -= 0.6
+    if all(content.strip() in {"[图片]", "[表情包]"} for content in contents):
+        score -= 0.5
+    return max(INTEREST_MIN_FACTOR, min(INTEREST_MAX_FACTOR, score))

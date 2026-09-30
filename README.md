@@ -10,8 +10,9 @@
 ## 功能
 
 - **自动群聊插话**：启用群后监听群消息，按静默窗口批量取消息，自行判断要不要说话。
-- **拟人化状态**：潜水 / 冒泡 / 对话三态，由意愿值与发言冷却驱动；意愿随真实流逝时间衰减，
-  被点名或命中别名时强制拉高。
+- **拟人化参与**：规则意愿值随时间衰减、随群聊热度增长，决定要不要考虑说话；Feedback 的接话意愿与它平均后
+  决定说不说。被点名（名字/别名、@、回复 Bot）必回；Bot 说话后 3 分钟内处于对话窗口，每批消息都会考虑接话，
+  聊天不会因为说完一句就断掉。潜水 / 冒泡 / 对话三态由意愿值与对话窗口派生，只用于展示和 prompt。
 - **被动固化**：长时间不参与对话时仍会周期性沉淀记忆（情绪、画像、摘要、长期记忆），但不产生回复。
 - **双阶段 LLM**：Feedback（观察者）负责情绪、画像、摘要与记忆提取；Chat（角色）负责生成最终回复。
 - **长期记忆**：每群独立的 ChromaDB 向量库，Embedding 召回 + Rerank 重排 + 时间衰减排序，
@@ -50,7 +51,7 @@ plugins/nyaturingtest/
 │   ├── logic.py         消息入队、防抖取批、OneBot 消息转换、回复切分与发送
 │   ├── orchestrator.py  一轮对话的编排：search / feedback / consolidate / chat 四个 stage
 │   ├── session.py       SessionState + SessionRuntime、持久化协调、记忆读写
-│   ├── engagement.py    意愿值衰减与增长、参与态滞回、冷却、相关性/兴趣打分
+│   ├── engagement.py    意愿值衰减与增长、对话窗口、派生聊天状态、相关性/兴趣打分
 │   ├── llm.py           LLMClient（重试/熔断/指标/Token 记录）与 chat、feedback 两个全局实例、HTTP 池、JSON 解析
 │   ├── prompts.py       Feedback / Chat 提示词模板、字符预算常量、角色预设加载、时间描述
 │   ├── metrics.py       结构化事件日志、运行时计数、Token 落库任务
@@ -90,15 +91,19 @@ plugins/nyaturingtest/
             ├─ 按 local self-sent id 过滤自身回显
             ├─ core.llm.build_turn_calls 生成本轮 chat / feedback 两个调用闭包
             └─ core.orchestrator.ConversationOrchestrator.process_chunk
-       → logic.dispatch_replies：按句切分、最多 2 条、带拟人延迟发送
+       → logic.dispatch_replies：距上次发送不足 16s 先等待 → 按句切分、最多 2 条、带拟人延迟发送 → 记 last_speak_time
 ```
 
 `process_chunk` 的顺序固定，每一步之间都有代际检查：
 
 1. `session.record_incoming` 写入短时记忆，累计固化窗口。
-2. `engagement.evaluate_engagement`：意愿值按真实流逝时间衰减 → 强关联（@Bot / 回复 Bot / 命中名字别名）
-   直接把意愿拉到 `RELEVANCE_WILLINGNESS_FLOOR` → 否则按内容兴趣被动增长 → 更新参与态滞回与发言冷却。
-3. 不参与且不相关时：满足固化条件（`messages_since_consolidation >= 8`，或距上次尝试 180s）
+2. `engagement.evaluate_engagement`：意愿值按真实流逝时间衰减（0.03/分钟）→ 强关联（@Bot / 回复 Bot /
+   命中名字别名）直接把意愿拉到 0.85 → 否则按内容兴趣被动增长（每条 0.05 × 兴趣系数，最多涨到 0.7）
+   → 处于对话窗口（Bot 3 分钟内说过话）时意愿至少 0.55。
+   强关联、对话窗口内、或意愿 ≥ `ENGAGE_THRESHOLD`(0.45) 才算参与。
+   @Bot 与回复 Bot 由 `handlers._addresses_bot` 判断，不用 `event.to_me`
+   （`.env` 的 `NICKNAME=[""]` 会让适配器把几乎所有消息都判成 to_me）。
+3. 不参与时：满足固化条件（`messages_since_consolidation >= 8`，或距上次尝试 180s）
    就走 `consolidate_stage`，静默沉淀记忆，**不产生回复**。
 4. `search_stage`：构造 RAG query → 检索长期记忆 → 预设条目与记忆行分别按字符预算整理成
    `preset_lines` / `memory_lines`，统计写进 `rag_search` 事件日志。
@@ -107,10 +112,11 @@ plugins/nyaturingtest/
      让历史里保留图片线索。
    - `_apply_sediment`：更新全局 VAD 情绪（`parse_feedback` 已校验限幅）→ 逐条消息更新用户印象
      （峰值保持 + 时间衰减）→ 更新话题摘要 → 把 `analyze_result` 交给后台任务写长期记忆。
-   - `_apply_decision`：`need_history` 为真时按时间回溯最多 20 条更早的历史消息 → 更新意愿值
-     （相关时兜底抬到 `RELEVANCE_WILLINGNESS_FLOOR`）→ 潜水/冒泡/对话三态流转。
-6. 意愿仍低于 `POST_FEEDBACK_SKIP_THRESHOLD` 且不相关 → 放弃本轮回复。
-7. `chat_stage`（角色模型，temperature 0.7）生成回复；有回复则意愿乘以 0.35、状态置为「对话状态」。
+   - `_apply_decision`：`need_history` 为真时按时间回溯最多 20 条更早的历史消息 → 规则意愿与模型的
+     `willing` 各占一半（模型不再直接覆盖），相关时兜底到 0.85；记一条 `willingness_decision` 事件。
+6. 不相关且意愿低于 `SPEAK_THRESHOLD`(0.5) → 不接话。对话窗口里规则意愿至少 0.55，模型给到 0.45 以上就会接。
+7. `chat_stage`（角色模型，temperature 0.7）生成回复；有回复则意愿乘以 0.7。
+   发言冷却不再跳过整轮，而是在发送前补足 16s 间隔，对方秒回时对话不会被掐断。
 
 **代际控制**：`Session.bump_generation()` 在 `set_role` / `load_preset` / `reset` / `reset_emotion` /
 `calm_down` 时自增。每轮开始时记下 `generation`，阶段边界和写入点（短时记忆、Feedback 沉淀、长期记忆、发送）
@@ -184,7 +190,7 @@ plugins/nyaturingtest/
 
 下载（content-type 白名单、8MB 上限、2 次重试）→ 按 `fileid`/`file_unique` 缓存原始字节到
 `cache/nyaturingtest/image_cache/raw/`（48 小时过期，每天 03:00 清理）→ 压缩到最大边 1280、
-像素上限 4096²，PNG 保 PNG、GIF 动图原样透传、其余转 JPEG q90 → base64 成 `VisionInput`。
+像素上限 4096²，PNG 保 PNG、动图只取第一帧（上游不接受 GIF）、其余转 JPEG q90 → base64 成 `VisionInput`。
 全局信号量限制 3 个并发。
 
 ### 记忆候选校验（`memory/validation.py`）
@@ -256,7 +262,7 @@ valence 正向半衰期约 14 小时、负向约 5 小时，dominance 约 23 小
 | `/presets` | `/preset` | 列出可用预设 |
 | `/set_preset <文件名>` | `/set_presets` | 加载预设，可省略 `.json` |
 | `/rag_debug <query>` | `/记忆诊断` | 打印检索候选数、回退原因与 top 5 记录的分数明细 |
-| `/calm` | `/冷静` | 重置情绪与画像、意愿归零、回到潜水态 |
+| `/calm` | `/冷静` | 重置情绪与画像、意愿归零、退出对话窗口 |
 | `/reset_emotion` | `/重置情绪` | 只重置 VAD 情绪 |
 | `/reset confirm` | `/重置 confirm` | 先备份，再完全重置本群 |
 | `/token统计 [all]` | `/autochat token统计` | 图片卡片；`all`/`全部`/`历史` 改为统计全部历史模型 |
@@ -326,7 +332,7 @@ config/nyaturingtest/nya_presets/      角色预设
 
 | 模块 | 常量的作用 |
 | --- | --- |
-| `core/engagement.py` | 意愿衰减率（活跃 0.04 / 闲置 0.08 每分钟）、强关联下限 0.85、参与阈值 0.47、被动增长上限 0.6 与每消息 0.026、发言冷却 16s、跳过阈值 0.32 / 0.38、启用 Rerank 的意愿阈值 0.68 |
+| `core/engagement.py` | 衰减 0.03/分钟、每消息被动增长 0.05 × 兴趣（0.3~1.8）且上限 0.7、参与阈值 0.45、接话阈值 0.5、强关联下限 0.85、对话窗口 180s 与下限 0.55、说话后保留 0.7、发送间隔 16s、重启初值 0.3、Rerank 阈值 0.68 |
 | `core/orchestrator.py` | 固化条件（消息数 8、间隔 180s、最多 60 条）、历史回溯条数 20 |
 | `memory/vector.py` | `RAG_FINAL_K=20`、每 query 召回 40、合并候选上限 64、注入字符预算 1500 / 单条 500、事件 TTL 90 天、类型权重/衰减率/作用域权重表 |
 | `core/prompts.py` | 字符预算：摘要 1200、最近消息 1600、历史 2400、回溯历史 1200 字 |

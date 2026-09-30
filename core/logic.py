@@ -4,6 +4,7 @@ import random
 import re
 import traceback
 from dataclasses import dataclass
+from datetime import datetime
 
 from nonebot import logger
 from nonebot.adapters.onebot.v11 import Bot, Event, Message, MessageSegment
@@ -11,6 +12,7 @@ from nonebot.adapters.onebot.v11.exception import ActionFailed
 
 from ..memory.image import fetch_image_input
 from ..memory.short_term import Message as MMessage
+from .engagement import SPEAK_COOLDOWN_SECONDS
 from .llm import VisionInput, build_turn_calls
 from .orchestrator import ConversationOrchestrator
 from .state_manager import SELF_SENT_MSG_IDS, GroupState, is_shutting_down
@@ -132,7 +134,13 @@ async def dispatch_replies(
     event: Event,
     generation: int,
 ) -> int:
-    if not responses or state.session.stale(generation, "pre_send"):
+    if not responses:
+        return 0
+    # 发言冷却在发送前等待，而不是在轮次开头跳过：对方秒回时不会因为冷却把对话掐断
+    since_last = (datetime.now() - state.session.state.last_speak_time).total_seconds()
+    if since_last < SPEAK_COOLDOWN_SECONDS:
+        await asyncio.sleep(SPEAK_COOLDOWN_SECONDS - since_last)
+    if state.session.stale(generation, "pre_send"):
         return 0
 
     total = len(responses)
@@ -171,6 +179,7 @@ async def dispatch_replies(
                 await asyncio.sleep(_delay_seconds(part))
 
     if sent_count:
+        state.session.state.last_speak_time = datetime.now()
         state.session.schedule_save()
     return sent_count
 

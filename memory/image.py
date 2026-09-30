@@ -152,9 +152,8 @@ def _prepare_native_image_payload(
         raw_format = (image.format or "JPEG").lower()
         if raw_format == "jpg":
             raw_format = "jpeg"
-        # 只有 GIF/WebP 这类多帧插件才有 is_animated/n_frames，JPEG 上这两个属性不存在
-        if raw_format == "gif" and getattr(image, "n_frames", 1) > 1:
-            return image_bytes, "gif"
+        # 动图只取第一帧：上游（grok）只接受 JPG/PNG/WebP，原样透传 GIF 会让整轮请求 400。
+        # 只有 GIF/WebP 这类多帧插件才有 is_animated，JPEG 上这个属性不存在
         if getattr(image, "is_animated", False):
             image.seek(0)
 

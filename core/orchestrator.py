@@ -1,5 +1,4 @@
 import math
-import random
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass
@@ -24,12 +23,11 @@ from ..memory.vector import (
     search_memories,
 )
 from .engagement import (
-    ACTIVE_TO_BUBBLE_THRESHOLD,
-    LOW_WILLINGNESS_SKIP_THRESHOLD,
-    POST_FEEDBACK_SKIP_THRESHOLD,
     RELEVANCE_WILLINGNESS_FLOOR,
     RERANK_WILLINGNESS_THRESHOLD,
+    SPEAK_THRESHOLD,
     SPEAK_WILLINGNESS_RETAIN_FACTOR,
+    chatting_state,
     evaluate_engagement,
 )
 from .llm import extract_and_parse_json
@@ -40,7 +38,7 @@ from .prompts import (
     get_feedback_prompt,
     get_time_description,
 )
-from .session import STALE_GENERATION_WRITE, ChattingState, Session
+from .session import STALE_GENERATION_WRITE, Session
 
 LLMCall = Callable[[str], Awaitable[str]]
 
@@ -158,7 +156,7 @@ class ConversationOrchestrator:
             if is_relevant:
                 logger.info("检测到强关联，意愿值提升")
 
-            if not engagement.engaged and not is_relevant:
+            if not engagement.engaged:
                 if self._consolidation_due():
                     pending_messages = session.runtime.short_term_memory.messages_after(
                         state.last_consolidated_time,
@@ -170,17 +168,11 @@ class ConversationOrchestrator:
                 logger.debug(f"未进入参与态 (意愿 {state.willingness:.2f})，跳过响应")
                 return None
 
-            if engagement.cooldown_remaining > 0 and not is_relevant:
-                logger.debug(
-                    f"处于发言冷却期（剩余 {engagement.cooldown_remaining:.1f}s），"
-                    "跳过响应"
-                )
-                return None
-
             search_result = await self.search_stage(
                 messages_chunk,
-                use_rerank=state.willingness > RERANK_WILLINGNESS_THRESHOLD
-                or is_relevant,
+                use_rerank=is_relevant
+                or engagement.in_conversation
+                or state.willingness > RERANK_WILLINGNESS_THRESHOLD,
             )
             if session.stale(generation, "rag_search"):
                 return None
@@ -203,7 +195,8 @@ class ConversationOrchestrator:
             if recalled_history is not None:
                 self._advance_consolidation_watermark(messages_chunk)
 
-            if state.willingness < POST_FEEDBACK_SKIP_THRESHOLD and not is_relevant:
+            if not is_relevant and state.willingness < SPEAK_THRESHOLD:
+                logger.debug(f"Feedback 后不接话 (意愿 {state.willingness:.2f})")
                 return None
 
             reply_messages = await self.chat_stage(
@@ -215,10 +208,7 @@ class ConversationOrchestrator:
             )
             if session.stale(generation, "chat"):
                 return None
-
-            if reply_messages:
-                state.last_speak_time = datetime.now()
-
+            # last_speak_time 在真正发出去之后由 dispatch_replies 更新
             return reply_messages
         finally:
             await session.flush_persistence()
@@ -228,7 +218,6 @@ class ConversationOrchestrator:
         messages_chunk: list[Message],
         *,
         use_rerank: bool,
-        force_retrieve: bool = False,
     ) -> RetrievalResult:
         started_at = time.perf_counter()
         state = self.session.state
@@ -259,8 +248,6 @@ class ConversationOrchestrator:
         records = []
         if not queries:
             rag_stats["skip_reason"] = "no_queries"
-        elif not force_retrieve and state.willingness <= LOW_WILLINGNESS_SKIP_THRESHOLD:
-            rag_stats["skip_reason"] = "low_willingness"
         else:
             logger.debug(f"触发长期记忆检索: {queries[:5]}...")
             retrieval = await search_memories(
@@ -336,7 +323,7 @@ class ConversationOrchestrator:
             bot_name=state.name,
             role=state.role,
             willingness=state.willingness,
-            chat_state_value=state.chatting_state.value,
+            chat_state_value=chatting_state(state, datetime.now()).value,
             summary=state.chat_summary,
             recent_msgs=self._history_context(messages_chunk),
             new_msgs=[
@@ -495,7 +482,7 @@ class ConversationOrchestrator:
         is_relevant: bool,
         generation: int,
     ) -> list[str] | None:
-        """应用 Feedback 的发言决策：历史溯源、意愿、状态。会话已作废时返回 None。"""
+        """应用 Feedback 的发言决策：历史溯源、意愿。会话已作废时返回 None。"""
 
         response = ctx.response
         recalled_history = []
@@ -521,32 +508,23 @@ class ConversationOrchestrator:
         if self.session.stale(generation, "feedback_decision"):
             return None
 
-        # 更新意愿值（强关联时兜底）
+        # 规则意愿与模型的接话意愿各占一半，不再让模型直接覆盖：
+        # 对话窗口里规则意愿至少 0.55，模型给到 0.45 以上就会接话；被点名时直接兜底到 0.85
         state = self.session.state
         try:
-            willing = float(response.get("willing", state.willingness))
+            llm_willing = max(0.0, min(1.0, float(response.get("willing"))))
         except (TypeError, ValueError):
-            willing = state.willingness
-        state.willingness = max(0.0, min(1.0, willing))
+            llm_willing = state.willingness
+        state.willingness = (state.willingness + llm_willing) / 2
         if is_relevant and state.willingness < RELEVANCE_WILLINGNESS_FLOOR:
             state.willingness = RELEVANCE_WILLINGNESS_FLOOR
-            logger.debug(
-                f"[Session {self.session.id}] 强关联强制提升意愿值至 {RELEVANCE_WILLINGNESS_FLOOR:.2f}"
-            )
-
-        # 状态流转
-        random_threshold = random.uniform(0.4, 0.7)
-        if state.willingness < 0.2:
-            state.chatting_state = ChattingState.IDLE
-        elif (
-            state.chatting_state == ChattingState.ACTIVE
-            and state.willingness < ACTIVE_TO_BUBBLE_THRESHOLD
-        ):
-            state.chatting_state = ChattingState.BUBBLE
-        elif state.willingness > random_threshold:
-            if state.chatting_state == ChattingState.IDLE:
-                state.chatting_state = ChattingState.BUBBLE
-
+        log_event(
+            "willingness_decision",
+            session_id=self.session.id,
+            llm_willing=round(llm_willing, 2),
+            willingness=round(state.willingness, 2),
+            relevant=is_relevant,
+        )
         return recalled_history
 
     async def feedback_stage(
@@ -570,10 +548,7 @@ class ConversationOrchestrator:
         self._apply_image_observations(ctx.response, messages_chunk)
         self._apply_sediment(ctx, messages_chunk, generation)
         recalled_history = await self._apply_decision(ctx, is_relevant, generation)
-        state = self.session.state
-        logger.debug(
-            f"<< 反馈结束: 意愿 {state.willingness:.2f}, 状态 {state.chatting_state}"
-        )
+        logger.debug(f"<< 反馈结束: 意愿 {self.session.state.willingness:.2f}")
         return recalled_history
 
     async def consolidate_stage(
@@ -590,9 +565,7 @@ class ConversationOrchestrator:
         logger.debug(
             f"[Session {self.session.id}] >> 记忆固化 (Consolidate) {len(messages_chunk)} 条"
         )
-        search_result = await self.search_stage(
-            messages_chunk, use_rerank=False, force_retrieve=True
-        )
+        search_result = await self.search_stage(messages_chunk, use_rerank=False)
         if self.session.stale(generation, "consolidation_search"):
             return
         ctx = await self._run_feedback_llm(
@@ -842,7 +815,7 @@ class ConversationOrchestrator:
         prompt = get_chat_prompt(
             bot_name=state.name,
             role=chat_role,
-            chat_state_value=state.chatting_state.value,
+            chat_state_value=chatting_state(state, datetime.now()).value,
             summary=state.chat_summary,
             recent_msgs=recent_msgs,
             new_msgs=new_msgs,
@@ -874,10 +847,7 @@ class ConversationOrchestrator:
             return []
 
         if replies:
-            state.willingness = max(
-                0.0, state.willingness * SPEAK_WILLINGNESS_RETAIN_FACTOR
-            )
-            state.chatting_state = ChattingState.ACTIVE
+            state.willingness *= SPEAK_WILLINGNESS_RETAIN_FACTOR
         return replies
 
     def _consolidation_due(self) -> bool:
