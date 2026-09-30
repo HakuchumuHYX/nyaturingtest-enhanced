@@ -25,7 +25,6 @@ from ..memory.vector import (
 from .engagement import (
     RELEVANCE_WILLINGNESS_FLOOR,
     RERANK_WILLINGNESS_THRESHOLD,
-    SPEAK_THRESHOLD,
     SPEAK_WILLINGNESS_RETAIN_FACTOR,
     chatting_state,
     evaluate_engagement,
@@ -92,6 +91,12 @@ class _FeedbackContext:
     existing_related_memories: list[dict]
 
 
+@dataclass(frozen=True)
+class FeedbackDecision:
+    recalled_history: list[str]
+    llm_willing: float
+
+
 def _existing_related_memories(
     records: list[dict],
     active_user_ids: set[str],
@@ -148,9 +153,12 @@ class ConversationOrchestrator:
             session.record_incoming(messages_chunk)
 
             state = session.state
+            recent = session.runtime.short_term_memory.access()
+            self_share = sum(m.user_name == state.name for m in recent) / len(recent)
             engagement = evaluate_engagement(
                 state=state,
                 messages=messages_chunk,
+                self_share=self_share,
                 now=datetime.now(),
             )
             is_relevant = engagement.relevant
@@ -166,7 +174,9 @@ class ConversationOrchestrator:
                     await self.consolidate_stage(
                         pending_messages, feedback_call, generation
                     )
-                logger.debug(f"未进入参与态 (意愿 {state.willingness:.2f})，跳过响应")
+                logger.debug(
+                    f"未进入参与态 (意愿 {state.willingness:.2f}, 自己发言占比 {self_share:.0%})，跳过响应"
+                )
                 return None
 
             search_result = await self.search_stage(
@@ -180,7 +190,7 @@ class ConversationOrchestrator:
 
             logger.debug("启用拟人化串行模式: Feedback -> Check -> Chat")
             try:
-                recalled_history = await self.feedback_stage(
+                decision = await self.feedback_stage(
                     messages_chunk,
                     feedback_call,
                     is_relevant=is_relevant,
@@ -192,18 +202,31 @@ class ConversationOrchestrator:
 
             if session.stale(generation, "feedback"):
                 return None
-            # Feedback 失败不阻断回复，只是不推进固化水位、也没有溯源历史
-            if recalled_history is not None:
+            if decision is not None:
                 self._advance_consolidation_watermark(messages_chunk)
 
-            if not is_relevant and state.willingness < SPEAK_THRESHOLD:
-                logger.debug(f"Feedback 后不接话 (意愿 {state.willingness:.2f})")
+            # Feedback 失败时只有被点名才回
+            speak = is_relevant or (
+                decision is not None
+                and decision.llm_willing >= engagement.speak_threshold
+            )
+            log_event(
+                "speak_decision",
+                session_id=session.id,
+                relevant=is_relevant,
+                in_conversation=engagement.in_conversation,
+                llm_willing=decision.llm_willing if decision else None,
+                threshold=engagement.speak_threshold,
+                self_share=round(self_share, 2),
+                speak=speak,
+            )
+            if not speak:
                 return None
 
             reply_messages = await self.chat_stage(
                 messages_chunk,
                 chat_call,
-                recalled_history=recalled_history or [],
+                recalled_history=decision.recalled_history if decision else [],
                 search_result=search_result,
                 generation=generation,
             )
@@ -482,7 +505,7 @@ class ConversationOrchestrator:
         ctx: _FeedbackContext,
         is_relevant: bool,
         generation: int,
-    ) -> list[str] | None:
+    ) -> FeedbackDecision | None:
         """应用 Feedback 的发言决策：历史溯源、意愿。会话已作废时返回 None。"""
 
         response = ctx.response
@@ -509,24 +532,17 @@ class ConversationOrchestrator:
         if self.session.stale(generation, "feedback_decision"):
             return None
 
-        # 规则意愿与模型的接话意愿各占一半，不再让模型直接覆盖：
-        # 对话窗口里规则意愿至少 0.55，模型给到 0.45 以上就会接话；被点名时直接兜底到 0.85
+        # 说不说由 llm_willing 按场景门槛决定（见 process_chunk）；规则意愿只向它靠拢一半，
+        # 让模型觉得不想说时下一批不必再急着调用 Feedback
         state = self.session.state
         try:
             llm_willing = max(0.0, min(1.0, float(response.get("willing"))))
         except (TypeError, ValueError):
-            llm_willing = state.willingness
+            llm_willing = 0.0
         state.willingness = (state.willingness + llm_willing) / 2
         if is_relevant and state.willingness < RELEVANCE_WILLINGNESS_FLOOR:
             state.willingness = RELEVANCE_WILLINGNESS_FLOOR
-        log_event(
-            "willingness_decision",
-            session_id=self.session.id,
-            llm_willing=round(llm_willing, 2),
-            willingness=round(state.willingness, 2),
-            relevant=is_relevant,
-        )
-        return recalled_history
+        return FeedbackDecision(recalled_history=recalled_history, llm_willing=llm_willing)
 
     async def feedback_stage(
         self,
@@ -536,9 +552,9 @@ class ConversationOrchestrator:
         is_relevant: bool,
         search_result: RetrievalResult,
         generation: int,
-    ) -> list[str] | None:
-        """反馈阶段：分析情绪、提取记忆、更新摘要。
-        返回溯源到的历史消息；Feedback 失败或会话已作废时返回 None。"""
+    ) -> FeedbackDecision | None:
+        """反馈阶段：分析情绪、提取记忆、更新摘要、给出接话意愿。
+        Feedback 失败或会话已作废时返回 None。"""
 
         logger.debug(">> 反馈阶段 (Feedback) 开始")
         ctx = await self._run_feedback_llm(
@@ -548,9 +564,9 @@ class ConversationOrchestrator:
             return None
         self._apply_image_observations(ctx.response, messages_chunk)
         self._apply_sediment(ctx, messages_chunk, generation)
-        recalled_history = await self._apply_decision(ctx, is_relevant, generation)
+        decision = await self._apply_decision(ctx, is_relevant, generation)
         logger.debug(f"<< 反馈结束: 意愿 {self.session.state.willingness:.2f}")
-        return recalled_history
+        return decision
 
     async def consolidate_stage(
         self,
@@ -856,6 +872,12 @@ class ConversationOrchestrator:
 
         if replies:
             state.willingness *= SPEAK_WILLINGNESS_RETAIN_FACTOR
+            # 这批人就是接下来对话窗口里的聊天对象
+            state.conversation_partners = {
+                msg.user_id
+                for msg in messages_chunk
+                if msg.user_id and msg.user_name != state.name
+            }
         return replies
 
     def _consolidation_due(self) -> bool:

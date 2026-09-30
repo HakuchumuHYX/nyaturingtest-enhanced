@@ -42,6 +42,8 @@ class SessionState:
     willingness: float = 0.0
     last_decay_time: datetime = field(default_factory=datetime.now)
     last_speak_time: datetime = datetime.min
+    # 上次接话时那批消息的发言人；只在进程内保持，重启后对话窗口自然失效
+    conversation_partners: set[str] = field(default_factory=set)
     last_consolidated_time: datetime | None = None
     messages_since_consolidation: int = 0
     last_consolidation_attempt: datetime = datetime.min

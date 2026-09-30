@@ -284,8 +284,8 @@ def build_turn_calls(
         return await chat_client.generate(
             prompt,
             session_id=session_id,
-            # 偏高的温度换取用词和句式的变化，格式由 JSON mode 兜住
-            temperature=0.9,
+            # 略高的温度换取用词和句式的变化；0.9 时会开始编造群友说过的话
+            temperature=0.8,
             system_prompt=CHAT_SYSTEM_PROMPT,
             images=images,
         )
