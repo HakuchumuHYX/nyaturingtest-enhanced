@@ -61,7 +61,7 @@ async def delete_session_data(session_id: str):
 
     profile_count = await UserProfileModel.filter(session=session_db).delete()
     await SessionModel.filter(id=session_id).update(
-        group_notes="", notes_summarized_until=None
+        group_notes="", notes_summarized_until=None, episodes_until=None
     )
     msg_count = await GlobalMessageModel.filter(session=session_db).delete()
     logger.info(

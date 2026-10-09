@@ -6,6 +6,7 @@ from tortoise import Tortoise
 from . import handlers  # 导入即注册所有 matcher
 from .backup import setup_backup_job
 from .config import get_data_dir
+from .core.episodes import setup_episode_job
 from .core.initiative import setup_initiative_job
 from .core.state_manager import cleanup_global_resources, init_enabled_groups
 
@@ -30,9 +31,10 @@ async def init_db():
     # 初始化群组列表
     await init_enabled_groups()
 
-    # 注册定时备份任务与主动发起话题检查
+    # 注册定时备份、主动发起话题检查与分段整理
     setup_backup_job()
     setup_initiative_job()
+    setup_episode_job()
 
 
 @driver.on_shutdown

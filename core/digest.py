@@ -1,5 +1,7 @@
 """每日整理：把记忆碎片归纳进用户档案和群志。
 
+用户档案读主体或说话人是此人的事实；群志读全部新碎片，大头是分段整理写的 episode。
+
 碎片只是原料，到期就删；对一个人、一个群的长期认知靠这里原地重写来承载。
 水位是已整理到的最新碎片 created_at，每条碎片只整理一次。
 
@@ -21,6 +23,7 @@ from ..models import MemoryModel, SessionModel, UserProfileModel
 from .llm import extract_and_parse_json, feedback_client
 
 PROFILE_MIN_NEW_MEMORIES = 10
+# 用户档案的整理间隔；群志有新碎片就整理，这一两天的事才进得了群志
 DIGEST_INTERVAL = timedelta(days=7)
 PROFILE_CHUNK_CHARS = 8000
 GROUP_NOTES_CHUNK_CHARS = 12000
@@ -377,7 +380,7 @@ async def digest_user_profiles(
 async def digest_group_notes(
     session_id: str, still_current: Callable[[], bool]
 ) -> str | None:
-    """每周（有更正时当晚）把新碎片合进群志，返回新群志；没到期或失败返回 None。"""
+    """有新碎片就合进群志，返回新群志；没有新碎片或失败返回 None。"""
 
     session_db = await SessionModel.get_or_none(id=session_id)
     if session_db is None:
@@ -387,7 +390,7 @@ async def digest_group_notes(
     if until is not None:
         query = query.filter(created_at__gt=until)
     rows = await query.order_by("created_at").values(*_MEMORY_FIELDS)
-    if not _due(len(rows), until, urgent=any(row["is_correction"] for row in rows)):
+    if not _due(len(rows), until, min_new=1):
         return None
 
     chunks = _chunks(rows, GROUP_NOTES_CHUNK_CHARS)

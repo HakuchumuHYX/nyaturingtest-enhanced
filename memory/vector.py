@@ -23,7 +23,7 @@ RAG_MERGED_CANDIDATE_CAP = 64
 RAG_MEMORY_CHAR_BUDGET = 1500
 RAG_ITEM_CHARS = 500
 
-# 碎片只是原料：长期价值由用户档案/群志承载，所以所有类别都会过期
+# 碎片只是原料：长期价值由用户档案/群志承载，所以所有类别都会过期；episode 按 event 算
 EVENT_TTL_DAYS = 90
 FACT_TTL_DAYS = 180
 
@@ -31,12 +31,14 @@ DEDUP_SIMILARITY_THRESHOLD = 0.9
 EMBEDDING_BATCH_SIZE = 32
 
 MEMORY_TYPE_WEIGHT = {
+    "episode": 1.0,
     "event": 1.0,
     "preference": 1.05,
     "profile": 1.05,
     "relationship": 1.0,
 }
 MEMORY_TYPE_DECAY_RATE = {
+    "episode": 0.02,
     "event": 0.02,
     "preference": 0.003,
     "profile": 0.003,
@@ -127,9 +129,9 @@ def _parse_date(date: int) -> datetime:
 
 
 def memory_expires_at(category: str, date: int, importance: float) -> datetime:
-    """date 之后满 基础TTL×(1+importance) 天的次日删除；event 90 天，其余 180 天。"""
+    """date 之后满 基础TTL×(1+importance) 天的次日删除；event / episode 90 天，其余 180 天。"""
 
-    base_days = EVENT_TTL_DAYS if category == "event" else FACT_TTL_DAYS
+    base_days = EVENT_TTL_DAYS if category in ("event", "episode") else FACT_TTL_DAYS
     ttl_days = int(base_days * (1.0 + importance))
     return _parse_date(date) + timedelta(days=ttl_days + 1)
 
@@ -142,6 +144,7 @@ def _row_metadata(row: MemoryModel) -> dict[str, Any]:
         "subject_user_name": row.subject_user_name,
         "speaker_user_id": row.speaker_user_id,
         "speaker_user_name": row.speaker_user_name,
+        "participant_ids": row.participant_ids,
         "confidence": row.confidence,
         "importance": row.importance,
         "date": row.date,
@@ -226,11 +229,14 @@ class VectorMemory:
         self._matrix = np.empty((0, 0), dtype=np.float32)
         self._subjects = np.empty(0, dtype=object)
         self._categories = np.empty(0, dtype=object)
+        self._participants: list[frozenset[str]] = []
 
     async def _load_locked(self) -> None:
         rows = await MemoryModel.filter(
             session_id=self.session_id, embedding__not_isnull=True
-        ).values_list("id", "embedding", "embedding_model", "subject_user_id", "category")
+        ).values_list(
+            "id", "embedding", "embedding_model", "subject_user_id", "category", "participant_ids"
+        )
         model = get_app_settings().memory.model
         mismatched = {row[2] for row in rows if row[2] != model}
         if mismatched:
@@ -248,6 +254,7 @@ class VectorMemory:
             self._matrix = np.empty((0, 0), dtype=np.float32)
         self._subjects = np.array([row[3] for row in rows], dtype=object)
         self._categories = np.array([row[4] for row in rows], dtype=object)
+        self._participants = [frozenset(row[5].split()) for row in rows]
 
     async def _ensure_loaded(self) -> None:
         if self._ids is not None:
@@ -271,6 +278,7 @@ class VectorMemory:
         self._categories = np.concatenate(
             [self._categories, np.array([row.category for row in rows], dtype=object)]
         )
+        self._participants.extend(frozenset(row.participant_ids.split()) for row in rows)
 
     def drop_cache(self) -> None:
         """表被外部改动（每日维护）后调用，下次使用时重新加载。"""
@@ -300,11 +308,16 @@ class VectorMemory:
         queries: list[str],
         *,
         k: int,
-        subject_ids: set[str] | None,
+        user_ids: set[str] | None,
         use_rerank: bool,
         merged_candidate_cap: int | None,
     ) -> RetrievalResult:
-        """k 既是每条 query 的召回数，也是最终返回上限；rerank 失败或全被过滤时回退到初筛。"""
+        """k 既是每条 query 的召回数，也是最终返回上限；rerank 接口失败时回退到初筛。
+
+        rerank 把候选全筛掉不回退：向量分在闲聊上挤在 0.5 上下分不出好坏，回退只会塞进 k 条无关记忆。
+
+        user_ids 不为 None 时只在参与者含这些人的记忆里找；带 "" 时参与者为空的记忆也算。
+        """
 
         unique_queries = _dedupe_preserve_order([q for q in queries if q.strip()])
         if not unique_queries:
@@ -316,8 +329,18 @@ class VectorMemory:
                 return RetrievalResult([], _retrieval_stats([], []))
 
             scores = await embed_texts(unique_queries) @ self._matrix.T
-            if subject_ids is not None:
-                scores[:, ~np.isin(self._subjects, list(subject_ids))] = -np.inf
+            if user_ids is not None:
+                wanted = frozenset(user_ids)
+                mask = np.fromiter(
+                    (
+                        not wanted.isdisjoint(participants)
+                        or ("" in wanted and not participants)
+                        for participants in self._participants
+                    ),
+                    dtype=bool,
+                    count=len(self._participants),
+                )
+                scores[:, ~mask] = -np.inf
 
             # 第一步：每条 query 取 top-k，多 query 命中同一条取最高分
             top_n = min(max(1, k), len(self._ids))
@@ -392,10 +415,8 @@ class VectorMemory:
                 f"Rerank完成: 初筛{len(candidates)} -> 终选{len(final_results)} (阈值{threshold})"
             )
             if not final_results:
-                fallback = candidates[:k]
                 return RetrievalResult(
-                    fallback,
-                    _retrieval_stats(candidates, fallback, "rerank_all_filtered"),
+                    [], _retrieval_stats(candidates, [], "rerank_all_filtered")
                 )
             return RetrievalResult(
                 final_results, _retrieval_stats(candidates, final_results)
@@ -409,7 +430,7 @@ class VectorMemory:
         self,
         queries: list[str],
         k: int = 5,
-        subject_ids: set[str] | None = None,
+        user_ids: set[str] | None = None,
         use_rerank: bool = True,
         candidate_k: int | None = None,
         merged_candidate_cap: int | None = None,
@@ -422,7 +443,7 @@ class VectorMemory:
         retrieval_result = await self._retrieve(
             queries,
             k=candidate_k or k,
-            subject_ids=subject_ids,
+            user_ids=user_ids,
             use_rerank=use_rerank,
             merged_candidate_cap=merged_candidate_cap,
         )
@@ -495,6 +516,7 @@ class VectorMemory:
 
         同 (subject, category) 内与已有记忆余弦 > 0.9 视为重复，只强化旧记忆的置信度与日期。
         更正条（is_correction）不去重：它和要替换的旧记忆往往高度相似；replaces 指向的旧行在同一事务里删除。
+        episode 也不去重：每天「组队打游戏」写出来很像，但都是不同的事。
         embedding 调用失败时照样落库（embedding 为 NULL、不做去重），由每日维护补算。
         """
 
@@ -527,7 +549,8 @@ class VectorMemory:
             reinforce: dict[str, dict] = {}
             for index, (content, metadata) in enumerate(valid):
                 vector = None if vectors is None else vectors[index]
-                if vector is not None and self._ids and not metadata["is_correction"]:
+                dedup = not metadata["is_correction"] and metadata["category"] != "episode"
+                if vector is not None and self._ids and dedup:
                     scope = (self._subjects == metadata["subject_user_id"]) & (
                         self._categories == metadata["category"]
                     )
@@ -562,6 +585,7 @@ class VectorMemory:
                             metadata["category"], metadata["date"], metadata["importance"]
                         ),
                         source_msg_ids=metadata["source_msg_ids"],
+                        participant_ids=metadata["participant_ids"],
                         is_correction=metadata["is_correction"],
                     )
                 )

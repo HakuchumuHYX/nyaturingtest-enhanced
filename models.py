@@ -22,6 +22,8 @@ class SessionModel(Model):
     # 群志只由每日整理任务写入；水位是已整理到的最新碎片 created_at
     group_notes = fields.TextField(default="")
     notes_summarized_until = fields.DatetimeField(null=True)
+    # 分段整理已读到的最后一条消息时间，只由 core/episodes.py 写入
+    episodes_until = fields.DatetimeField(null=True)
 
     class Meta:
         table = "nyabot_sessions"
@@ -108,6 +110,8 @@ class MemoryModel(Model):
     reaffirm_count = fields.IntField(default=0)
     # 依据的新消息 msg_id，空格分隔；事后核对时据此找回原话（历史行为空）
     source_msg_ids = fields.TextField(default="")
+    # 和这条记忆有关的 QQ 号，空格分隔：事实是主体和说话人，episode 是参与聊天的群友；按人检索只看它
+    participant_ids = fields.TextField(default="")
     # 更正条：替换掉被纠正的旧记忆，整理档案/群志时据此删改旧说法
     is_correction = fields.BooleanField(default=False)
     created_at = fields.DatetimeField(auto_now_add=True)

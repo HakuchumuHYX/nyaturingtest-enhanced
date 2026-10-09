@@ -130,7 +130,7 @@ async def _retrieve(
     interactions: int,
     first_interaction_at: datetime | None,
 ) -> tuple[list[str], list[str]]:
-    """返回 (目标用户的记忆, 未标记主体的背景记忆)，按 RAG 字符预算截断。"""
+    """返回 (和目标有关的记忆, 不挂任何人的背景记忆)，按 RAG 字符预算截断。"""
 
     memory_count = await vector_memory.count_by_user(target_id)
     if first_interaction_at and first_interaction_at.tzinfo is not None:
@@ -146,7 +146,7 @@ async def _retrieve(
             f"{target_name}的性格特点",
         ],
         k=calculate_dynamic_k(interactions, memory_count, days_since_first),
-        subject_ids={target_id, ""},
+        user_ids={target_id, ""},
         use_rerank=True,
         merged_candidate_cap=RAG_MERGED_CANDIDATE_CAP,
         active_user_ids={target_id},
@@ -162,7 +162,7 @@ async def _retrieve(
         seen.add(content)
         content = content[: min(RAG_ITEM_CHARS, remaining)]
         remaining -= len(content)
-        if record["metadata"]["subject_user_id"] == target_id:
+        if target_id in record["metadata"]["participant_ids"].split():
             target_records.append(content)
         else:
             unscoped_records.append(content)
