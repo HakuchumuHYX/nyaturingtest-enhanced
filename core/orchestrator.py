@@ -67,6 +67,34 @@ def _history_without_current_chunk(
     ]
 
 
+def _resolve_user(
+    user_id: str,
+    user_name: str,
+    known_users: dict[str, str],
+    *,
+    fallback_id: str = "",
+    speaker_id: str = "",
+) -> tuple[str, str]:
+    """对齐记忆主体/说话人的 QQ 号与名字，名字一律取上下文里该号的当前群名片。
+
+    「A 说/对 B 怎样」应记成主体 B、说话人 A；模型常把说话人 A 的 id 抄进主体、名字却写 B。
+    说话人已经另记了 A（A 的档案也会读到这条），所以这种情况以名字为准把主体落到 B；
+    其余情况以 id 为准。上下文里找不到的人只留名字、不挂 id。
+    """
+
+    ids_by_name = [uid for uid, name in known_users.items() if name == user_name]
+    by_name = ids_by_name[0] if user_name and len(ids_by_name) == 1 else ""
+    if by_name and speaker_id and user_id == speaker_id and by_name != speaker_id:
+        return by_name, known_users[by_name]
+    if user_id in known_users:
+        return user_id, known_users[user_id]
+    if by_name:
+        return by_name, user_name
+    if not user_name and fallback_id:
+        return fallback_id, known_users.get(fallback_id, "")
+    return "", user_name
+
+
 def _memory_lines(records: list[dict]) -> list[str]:
     """按总字符预算与单条上限把检索结果整理成 prompt 行。"""
 
@@ -428,9 +456,19 @@ class ConversationOrchestrator:
         if isinstance(analyze_result, list) and analyze_result:
             user_ids = {msg.user_id for msg in messages_chunk if msg.user_id}
             default_uid = next(iter(user_ids)) if len(user_ids) == 1 else ""
+            # 上下文里每个 QQ 号的当前群名片，本批消息在后、名字以最新为准
+            known_users = {
+                msg.user_id: msg.user_name
+                for msg in [
+                    *self.session.runtime.short_term_memory.access(),
+                    *messages_chunk,
+                ]
+                if msg.user_id
+            }
             self.session.spawn(
                 self.save_long_term_memory(
                     analyze_result,
+                    known_users=known_users,
                     default_user_id=default_uid,
                     generation=generation,
                 )
@@ -533,8 +571,13 @@ class ConversationOrchestrator:
         self._advance_consolidation_watermark(messages_chunk)
 
     @staticmethod
-    def _parse_memory_candidate(item, default_user_id: str) -> dict | None:
-        """把 LLM 返回的一条候选规范化；ignore / 未知 action / 空内容返回 None。"""
+    def _parse_memory_candidate(
+        item, known_users: dict[str, str], default_user_id: str
+    ) -> dict | None:
+        """把 LLM 返回的一条候选规范化；ignore / 未知 action / 空内容返回 None。
+
+        主体没填名字时才默认记到本批唯一的发言人头上；填了别人的名字就不能这样兜底。
+        """
 
         if isinstance(item, str):
             content = item.strip()
@@ -547,7 +590,7 @@ class ConversationOrchestrator:
                 "confidence": 0.7,
                 "importance": 0.5,
                 "subject_user_id": default_user_id,
-                "subject_user_name": "",
+                "subject_user_name": known_users.get(default_user_id, ""),
                 "speaker_user_id": "",
                 "speaker_user_name": "",
             }
@@ -566,23 +609,35 @@ class ConversationOrchestrator:
             except (TypeError, ValueError):
                 return default
 
+        speaker_user_id, speaker_user_name = _resolve_user(
+            str(item.get("speaker_user_id") or "").strip(),
+            str(item.get("speaker_user_name") or "").strip(),
+            known_users,
+        )
+        subject_user_id, subject_user_name = _resolve_user(
+            str(item.get("subject_user_id") or "").strip(),
+            str(item.get("subject_user_name") or "").strip(),
+            known_users,
+            fallback_id=default_user_id,
+            speaker_id=speaker_user_id,
+        )
         return {
             "action": action,
             "content": str(item.get("content") or "").strip(),
             "category": str(item.get("category") or "event").strip().lower() or "event",
             "confidence": bounded_float(item.get("confidence", 0.7), 0.7),
             "importance": bounded_float(item.get("importance", 0.5), 0.5),
-            "subject_user_id": str(item.get("subject_user_id") or "").strip()
-            or default_user_id,
-            "subject_user_name": str(item.get("subject_user_name") or "").strip(),
-            "speaker_user_id": str(item.get("speaker_user_id") or "").strip(),
-            "speaker_user_name": str(item.get("speaker_user_name") or "").strip(),
+            "subject_user_id": subject_user_id,
+            "subject_user_name": subject_user_name,
+            "speaker_user_id": speaker_user_id,
+            "speaker_user_name": speaker_user_name,
         }
 
     async def save_long_term_memory(
         self,
         analyze_result: list,
         *,
+        known_users: dict[str, str],
         default_user_id: str,
         generation: int,
     ):
@@ -596,7 +651,9 @@ class ConversationOrchestrator:
         pending_memories: list[tuple[str, dict]] = []
 
         for raw_item in analyze_result:
-            candidate = self._parse_memory_candidate(raw_item, default_user_id)
+            candidate = self._parse_memory_candidate(
+                raw_item, known_users, default_user_id
+            )
             if candidate is None:
                 continue
 

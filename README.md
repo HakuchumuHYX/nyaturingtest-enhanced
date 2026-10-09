@@ -151,6 +151,10 @@ TTL 清理会让索引无限膨胀（大群一度 3.5 倍于存活条数），�
 | `expires_at` | `date` 之后 `基础 TTL × (1 + importance)` 天的次日；基础 TTL event 90 天、其余类别 180 天 |
 | `embedding_model` | 生成向量的模型；加载时与配置不一致直接报错，换模型必须先重嵌入 |
 
+主体与说话人（`orchestrator._resolve_user`）：「A 说/对 B 怎样」记成主体 B、说话人 A，名字一律取上下文里该号的当前群名片。
+模型常把说话人 A 的 id 抄进主体、名字却写 B：这时以名字为准把主体落到 B（说话人已记 A）；其余以 id 为准；
+上下文里找不到的人只留名字、不挂 id。整理档案时的称呼取消息记录里的最新群名片（`db.get_latest_user_names`）。
+
 写入路径（`add_memories_with_dedup`）：
 
 - 一批候选只调一次 embedding，去重与写入共用这次结果。
@@ -190,6 +194,8 @@ TTL 清理会让索引无限膨胀（大群一度 3.5 倍于存活条数），�
 | 用户档案 | `nyabot_user_profiles.summary` | 新碎片 ≥ 10 条，或有新碎片且从没整理过 / 水位已满 7 天 | 300 字左右 |
 | 群志 | `nyabot_sessions.group_notes` | 有新碎片且从没整理过 / 水位已满 7 天（即每周） | 800 字左右 |
 
+- **档案的材料**：主体是此人的碎片，加上此人说到别人的碎片（提示词里标「说到别人」，只取能体现此人态度、关系、习惯的部分），
+  所以「A 说 B」会同时进 B 和 A 的档案（`digest.profile_rows_by_user`）。
 - **水位**：`summarized_until` / `notes_summarized_until` 是已整理到的最新碎片 `created_at`，每条碎片只整理一次。
 - **整理**：旧文本 + 新碎片交给 Feedback 模型重写出完整新版本；冲突以新碎片为准，这取代了旧的 supersede 动作。
 - **分块**：新碎片按 `created_at` 升序切块（档案约 8000 字、群志约 12000 字）逐块重写直到追平，不截断、不丢弃。

@@ -16,6 +16,7 @@ from functools import partial
 
 from nonebot import logger
 
+from ..db import get_latest_user_names
 from ..models import MemoryModel, SessionModel, UserProfileModel
 from .llm import extract_and_parse_json, feedback_client
 
@@ -29,6 +30,8 @@ POINTS_CONCURRENCY = 4
 _MEMORY_FIELDS = (
     "subject_user_id",
     "subject_user_name",
+    "speaker_user_id",
+    "speaker_user_name",
     "content",
     "category",
     "date",
@@ -67,7 +70,8 @@ def _format_date(date: int) -> str:
 
 
 def _memory_line(row: dict) -> str:
-    return f"[{_format_date(row['date'])}|{row['category']}] {row['content']}"
+    tag = "|说到别人" if row.get("said_about_others") else ""
+    return f"[{_format_date(row['date'])}|{row['category']}{tag}] {row['content']}"
 
 
 def _span(chunk: list[dict]) -> str:
@@ -174,7 +178,7 @@ def _profile_prompt(name: str, user_id: str, summary: str, material: str) -> str
 2. 取舍：
 {_PROFILE_SELECTION}
 3. 以旧档案为主、小改为主：补上新内容里真正新出现且符合取舍标准的信息，删掉过时的，其余保留。新旧冲突以新内容为准；正在变化的状态写上起始年月，例如「2026-09 起读研」。
-4. 涉及别人的内容，只保留和「{name}」有关的部分。
+4. 涉及别人的内容，只保留和「{name}」有关的部分。标有「说到别人」的碎片是此人对别人的言行，主角是别人，只从中提取能体现此人自己的态度、关系和习惯的部分；纯转述（比如转发别人的签到、战绩）不写。
 5. {_STYLE_RULE}
 6. {_PRIVACY_RULE}
 
@@ -191,6 +195,7 @@ def _profile_points_prompt(name: str, user_id: str, chunk: list[dict]) -> str:
 {lines}
 
 提炼这段时间能刻画此人的要点，写几条短句：身份与状态变化、反复出现的兴趣与偏好、在群里的样子与关系、有后续影响的经历。
+标有「说到别人」的碎片是此人对别人的言行，只从中提取能体现此人自己的态度、关系和习惯的部分；纯转述不写。
 取舍：
 {_PROFILE_SELECTION}
 {_STYLE_RULE}
@@ -268,6 +273,40 @@ async def _save_profile(
         )
 
 
+async def profile_rows_by_user(session_id: str) -> dict[str, list[dict]]:
+    """每个人的档案材料：主体是此人的碎片，加上此人说到别人的碎片（标 said_about_others），按时间排。
+
+    「A 说/对 B 怎样」主体记 B、说话人记 A；只按主体归属的话，A 的档案会缺掉他怎么对待别人。
+    """
+
+    rows_by_user: dict[str, list[dict]] = defaultdict(list)
+    for row in (
+        await MemoryModel.filter(session_id=session_id)
+        .order_by("created_at")
+        .values(*_MEMORY_FIELDS)
+    ):
+        subject, speaker = row["subject_user_id"], row["speaker_user_id"]
+        if subject:
+            rows_by_user[subject].append(row)
+        if speaker and speaker != subject:
+            rows_by_user[speaker].append({**row, "said_about_others": True})
+    return rows_by_user
+
+
+def profile_name(user_id: str, rows: list[dict], latest_names: dict[str, str]) -> str:
+    """称呼以消息记录里的当前群名片为准：碎片里的名字可能过时，也可能被抽取标错。"""
+
+    if latest_names.get(user_id):
+        return latest_names[user_id]
+    for row in reversed(rows):
+        name = row[
+            "speaker_user_name" if row.get("said_about_others") else "subject_user_name"
+        ]
+        if name:
+            return name
+    return user_id
+
+
 async def digest_user_profiles(
     session_id: str, still_current: Callable[[], bool]
 ) -> dict[str, str]:
@@ -280,14 +319,8 @@ async def digest_user_profiles(
         profile.user_id: profile
         for profile in await UserProfileModel.filter(session_id=session_id)
     }
-    rows_by_user: dict[str, list[dict]] = defaultdict(list)
-    for row in (
-        await MemoryModel.filter(session_id=session_id)
-        .exclude(subject_user_id="")
-        .order_by("created_at")
-        .values(*_MEMORY_FIELDS)
-    ):
-        rows_by_user[row["subject_user_id"]].append(row)
+    rows_by_user = await profile_rows_by_user(session_id)
+    latest_names = await get_latest_user_names(session_id)
 
     updated: dict[str, str] = {}
     calls = 0
@@ -298,14 +331,7 @@ async def digest_user_profiles(
         if not _due(len(new_rows), until, min_new=PROFILE_MIN_NEW_MEMORIES):
             continue
 
-        name = next(
-            (
-                row["subject_user_name"]
-                for row in reversed(rows)
-                if row["subject_user_name"]
-            ),
-            user_id,
-        )
+        name = profile_name(user_id, rows, latest_names)
         old_summary = profile.summary if profile else ""
         chunks = _chunks(new_rows, PROFILE_CHUNK_CHARS)
         calls += _calls(chunks)

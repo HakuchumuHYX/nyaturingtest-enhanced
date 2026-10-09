@@ -233,6 +233,7 @@ JSON 需包含以下字段：
    importance 决定这条记忆保留多久：普通偏好或观点约 0.3，有后续影响的经历约 0.5，身份或重大变化约 0.8。
    subject_* 表示事实描述对象；speaker_* 表示说出该事实的新消息发送者。
    如果 B 说了关于 A 的事实，subject_* 填 A，speaker_* 填 B。
+   subject_user_id 和 subject_user_name 必须是同一个人：不知道 A 的 ID 时 subject_user_id 留空、只填名字，不要拿说话人的 ID 顶替。
 2. "willing" (Float): 角色此刻有多想开口 (0.0~1.0)。被叫到或有人在直接回应角色 → 0.8 以上；刚和角色聊的人还在接着聊 → 0.5~0.7；群友之间在聊、没人理角色 → 默认 0.2~0.4，只有话题真的勾起角色兴趣、角色有具体想说的（相关经历、有用的信息、好笑的梗）才给 0.6~0.75；表情包、签到、机器人消息、欢迎新人这类刷屏，或者 recent_msgs 里角色最近已经说了很多 → 0.2 以下。
 3. "new_emotion" (Object): 必须提供。更新后的 VAD 情绪对象，格式: {{"valence": float, "arousal": float, "dominance": float}}。
    - valence (愉悦度): 范围 [-1.0, 1.0]，基于当前值渐进调整

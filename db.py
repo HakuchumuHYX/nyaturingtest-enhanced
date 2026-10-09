@@ -284,6 +284,22 @@ async def get_recent_messages_by_user(
     return [m.content for m in reversed(db_msgs)]
 
 
+async def get_latest_user_names(session_id: str) -> dict[str, str]:
+    """本群每个 QQ 号最近一条消息的发送者名字，即当前群名片。"""
+
+    # SQLite 对 MAX() 聚合会让同一行的裸列取到最大值那一行的值
+    rows = await Tortoise.get_connection("default").execute_query_dict(
+        """
+        SELECT user_id, user_name, MAX(time) AS latest
+        FROM nyabot_global_messages
+        WHERE session_id = ? AND user_id != ''
+        GROUP BY user_id
+        """,
+        [session_id],
+    )
+    return {row["user_id"]: row["user_name"] for row in rows}
+
+
 async def update_user_profiles(session_id: str, profiles: dict):
     """批量更新用户画像"""
 
