@@ -1,38 +1,32 @@
-import json
+import asyncio
 import math
-import os
 import re
-import threading
-import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime
-from typing import Any, List
+from datetime import datetime, timedelta
+from typing import Any
 
-import chromadb
 import httpx
-from chromadb.api.types import Documents, EmbeddingFunction, Embeddings
+import numpy as np
 from nonebot import logger
-from nonebot.utils import run_sync
-from openai import OpenAI
+from openai import AsyncOpenAI
+from tortoise.transactions import in_transaction
 
 from ..config import get_app_settings
+from ..models import MemoryModel
 
-MEMORY_COLLECTION_NAME = "nyabot_memory"
-# 备份打包整个向量目录，写入方用同一把进程级锁串行化
-BACKUP_IO_LOCK = threading.RLock()
+# RAG 检索参数
+RAG_FINAL_K = 20
+RAG_PER_QUERY_RECALL_K = 40
+RAG_MERGED_CANDIDATE_CAP = 64
+RAG_MEMORY_CHAR_BUDGET = 1500
+RAG_ITEM_CHARS = 500
+RAG_DEFAULT_EVENT_TTL_DAYS = 90
 
-MEMORY_WRITE_MAX_RETRIES = 3
-MEMORY_WRITE_RETRY_BASE_DELAY = 0.5
+DEDUP_SIMILARITY_THRESHOLD = 0.9
+EMBEDDING_BATCH_SIZE = 32
 
-MEMORY_COLLECTION_METADATA = {"hnsw:space": "cosine"}
-PRESET_TYPE_WEIGHT = {
-    "bot_self": 0.95,
-    "relationship": 0.90,
-    "legacy_rule": 0.85,
-    "knowledge": 0.82,
-    "event": 0.75,
-}
 MEMORY_TYPE_WEIGHT = {
     "event": 1.0,
     "preference": 1.05,
@@ -61,16 +55,6 @@ class RetrievalResult:
     # 预设条目每轮都一样，与每轮变化的记忆分开送进 Prompt，便于前缀缓存命中
     preset_lines: list[str] = field(default_factory=list)
     memory_lines: list[str] = field(default_factory=list)
-
-
-def _score_from_distance(distance: float | int | None) -> float:
-    if distance is None:
-        return 0.5
-    try:
-        score = 1.0 - float(distance)
-    except (TypeError, ValueError):
-        return 0.5
-    return max(0.0, min(1.0, score))
 
 
 def _retrieval_stats(
@@ -108,170 +92,24 @@ def _score_distribution(values: list[float]) -> dict[str, float | None]:
 
 
 def _dedupe_preserve_order(items: list[str]) -> list[str]:
-    result = []
-    seen = set()
-    for item in items:
-        if item in seen:
-            continue
-        seen.add(item)
-        result.append(item)
-    return result
-
-
-def _memory_operation_id(
-    operation: str,
-    content: str,
-    metadata: dict,
-    target_ref: str = "",
-) -> str:
-    payload = json.dumps(
-        {
-            "operation": operation,
-            "content": content,
-            "metadata": metadata,
-            "target_ref": target_ref,
-        },
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    return str(uuid.uuid5(uuid.NAMESPACE_URL, payload))
-
-
-def where_any(field: str, values: list[Any]) -> dict:
-    cleaned = [value for value in values if value is not None]
-    if not cleaned:
-        return {}
-    if len(cleaned) == 1:
-        return {field: {"$eq": cleaned[0]}}
-    return {"$or": [{field: {"$eq": value}} for value in cleaned]}
-
-
-def where_all(*conditions: dict) -> dict:
-    cleaned = [condition for condition in conditions if condition]
-    if not cleaned:
-        return {}
-    if len(cleaned) == 1:
-        return cleaned[0]
-    return {"$and": cleaned}
-
-
-def _subject_user_where(user_ids: set[str]) -> dict:
-    # where_any 在只有一个用户时返回单条件而不是单元素 $or（Chroma 要求 $or 至少两项）
-    return where_all(
-        {"source": {"$eq": "memory"}},
-        where_any("subject_user_id", sorted(user_ids)),
-    )
-
-
-def _clamp_float(value: Any, default: float, lower: float, upper: float) -> float:
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return default
-    if math.isnan(number):
-        return default
-    return max(lower, min(upper, number))
-
-
-def _clean_metadata_string(value: Any) -> str:
-    return str(value or "").strip()
-
-
-def _normalized_metadata(meta: dict | None) -> dict[str, Any]:
-    data = dict(meta or {})
-    source = str(data.get("source") or "memory")
-    memory_type = str(data.get("type") or "event")
-    subtype = str(
-        data.get("subtype") or ("legacy_rule" if source == "preset" else memory_type)
-    )
-    subject_user_id = _clean_metadata_string(data.get("subject_user_id"))
-    data["source"] = source
-    data["type"] = memory_type
-    data["subtype"] = subtype
-    data["status"] = str(data.get("status") or "active")
-    data["category"] = str(data.get("category") or memory_type)
-    data["confidence"] = _clamp_float(data.get("confidence"), 1.0, 0.0, 1.0)
-    data["importance"] = _clamp_float(data.get("importance"), 0.0, 0.0, 1.0)
-    data["schema_version"] = int(data.get("schema_version") or 2)
-    data["subject_user_id"] = subject_user_id
-    data["subject_user_name"] = _clean_metadata_string(data.get("subject_user_name"))
-    data["speaker_user_id"] = _clean_metadata_string(data.get("speaker_user_id"))
-    data["speaker_user_name"] = _clean_metadata_string(data.get("speaker_user_name"))
-    return data
-
-
-def _dedup_scope_key(meta: dict | None) -> tuple[str, str, str]:
-    metadata = _normalized_metadata(meta)
-    source_class = "preset" if metadata["source"] == "preset" else "memory"
-    subject_user_id = "" if source_class == "preset" else metadata["subject_user_id"]
-    category = _clean_metadata_string(metadata.get("category") or metadata.get("type"))
-    return source_class, subject_user_id, category
-
-
-def _same_dedup_scope(candidate: dict | None, existing: dict | None) -> bool:
-    existing_metadata = _normalized_metadata(existing)
-    if (
-        existing_metadata["source"] == "memory"
-        and _metadata_status(existing_metadata) != "active"
-    ):
-        return False
-    return _dedup_scope_key(candidate) == _dedup_scope_key(existing_metadata)
-
-
-def _dedup_where(metadata: dict) -> dict:
-    source_class, subject_user_id, category = _dedup_scope_key(metadata)
-    conditions = [
-        {"source": {"$eq": source_class}},
-        {
-            "$or": [
-                {"category": {"$eq": category}},
-                {"type": {"$eq": category}},
-            ]
-        },
-    ]
-    if source_class == "memory" and subject_user_id:
-        conditions.append({"subject_user_id": {"$eq": subject_user_id}})
-    return where_all(*conditions)
-
-
-def _source_type_weight(meta: dict) -> float:
-    source = str(meta.get("source") or "memory")
-    memory_type = str(meta.get("type") or "event")
-    subtype = str(
-        meta.get("subtype") or ("legacy_rule" if source == "preset" else memory_type)
-    )
-    if source == "preset":
-        return PRESET_TYPE_WEIGHT.get(subtype, PRESET_TYPE_WEIGHT["legacy_rule"])
-    return MEMORY_TYPE_WEIGHT.get(memory_type, 1.0)
-
-
-def _confidence_weight(meta: dict) -> float:
-    confidence = _clamp_float(meta.get("confidence"), 1.0, 0.0, 1.0)
-    return 0.7 + confidence * 0.3
+    return list(dict.fromkeys(items))
 
 
 def _query_mentions_name(queries: list[str], name: str) -> bool:
-    clean_name = _clean_metadata_string(name)
-    if len(clean_name) < 2:
+    if len(name) < 2:
         return False
-    return any(clean_name in str(query or "") for query in queries or [])
+    return any(name in query for query in queries)
 
 
 def _memory_scope(
     meta: dict, active_scope_ids: set[str], queries: list[str]
 ) -> tuple[str, float]:
-    if meta.get("source") == "preset":
-        return "global", SCOPE_WEIGHT["global"]
-
-    subject_user_id = _clean_metadata_string(meta.get("subject_user_id"))
-    subject_user_name = _clean_metadata_string(meta.get("subject_user_name"))
-    speaker_user_id = _clean_metadata_string(meta.get("speaker_user_id"))
-
+    subject_user_id = meta["subject_user_id"]
     if active_scope_ids and subject_user_id and subject_user_id in active_scope_ids:
         return "active_subject", SCOPE_WEIGHT["active_subject"]
-    if _query_mentions_name(queries, subject_user_name):
+    if _query_mentions_name(queries, meta["subject_user_name"]):
         return "mentioned_subject", SCOPE_WEIGHT["mentioned_subject"]
+    speaker_user_id = meta["speaker_user_id"]
     if active_scope_ids and speaker_user_id and speaker_user_id in active_scope_ids:
         return "active_speaker", SCOPE_WEIGHT["active_speaker"]
     if subject_user_id:
@@ -279,303 +117,178 @@ def _memory_scope(
     return "global", SCOPE_WEIGHT["global"]
 
 
-def _metadata_status(meta: dict | None) -> str:
-    return str((meta or {}).get("status") or "active")
+def _parse_date(date: int) -> datetime:
+    return datetime.strptime(str(date), "%Y%m%d")
 
 
-def _date_days_ago(meta: dict, *, now: datetime) -> int | None:
-    date = meta.get("date")
-    if not date or not isinstance(date, int) or date <= 0:
+def memory_expires_at(category: str, date: int, importance: float) -> datetime | None:
+    """只有 event 过期：date 之后满 90×(1+importance) 天的次日删除。"""
+
+    if category != "event":
         return None
+    ttl_days = int(RAG_DEFAULT_EVENT_TTL_DAYS * (1.0 + importance))
+    return _parse_date(date) + timedelta(days=ttl_days + 1)
+
+
+def _row_metadata(row: MemoryModel) -> dict[str, Any]:
+    return {
+        "memory_ref": row.id,
+        "category": row.category,
+        "subject_user_id": row.subject_user_id,
+        "subject_user_name": row.subject_user_name,
+        "speaker_user_id": row.speaker_user_id,
+        "speaker_user_name": row.speaker_user_name,
+        "confidence": row.confidence,
+        "importance": row.importance,
+        "date": row.date,
+    }
+
+
+# Embedding / Rerank 客户端全进程共享，首次使用时按配置创建
+_embedding_client: AsyncOpenAI | None = None
+_rerank_client: httpx.AsyncClient | None = None
+
+
+async def embed_texts(texts: list[str]) -> np.ndarray:
+    """返回逐行 L2 归一化的 float32 矩阵，余弦相似度直接用点积。"""
+
+    global _embedding_client
+    settings = get_app_settings()
+    if _embedding_client is None:
+        _embedding_client = AsyncOpenAI(
+            api_key=settings.siliconflow_api_key,
+            base_url=settings.memory.base_url,
+            timeout=settings.memory.timeout,
+            max_retries=0,
+        )
+    response = await _embedding_client.embeddings.create(
+        model=settings.memory.model,
+        input=[text.replace("\n", " ") for text in texts],
+        encoding_format="float",
+    )
+    vectors = np.asarray([item.embedding for item in response.data], dtype=np.float32)
+    return vectors / np.linalg.norm(vectors, axis=1, keepdims=True)
+
+
+async def _rerank(query: str, documents: list[str]) -> list[dict[str, Any]]:
+    global _rerank_client
+    settings = get_app_settings()
+    if _rerank_client is None:
+        _rerank_client = httpx.AsyncClient(
+            timeout=settings.memory.rerank_timeout, trust_env=False
+        )
     try:
-        memory_dt = datetime.strptime(str(date), "%Y%m%d")
-    except ValueError:
-        return None
-    return max(0, (now - memory_dt).days)
+        response = await _rerank_client.post(
+            settings.memory.rerank_base_url,
+            headers={"Authorization": f"Bearer {settings.siliconflow_api_key}"},
+            json={
+                "model": settings.rerank_model,
+                "query": query,
+                "documents": documents,
+                "top_n": len(documents),  # 全排，然后本地过滤
+                "return_documents": False,
+            },
+        )
+        response.raise_for_status()
+        return response.json().get("results", [])
+    except Exception as e:
+        logger.error(f"Rerank API Error: {e}")
+        return []
+
+
+async def close_clients() -> None:
+    global _embedding_client, _rerank_client
+    if _embedding_client is not None:
+        await _embedding_client.close()
+        _embedding_client = None
+    if _rerank_client is not None:
+        await _rerank_client.aclose()
+        _rerank_client = None
 
 
 class VectorMemory:
-    """
-    Synchronous vector store wrapper.
+    """一个群的长期记忆。
 
-    Call ChromaDB, embedding, and rerank operations from async code through
-    nonebot.utils.run_sync or another thread-pool adapter.
+    向量存在 nyabot_memories 表；首次使用时把本群有效向量整体读成矩阵，检索是一次矩阵乘法。
+    万级数据下暴力检索只要十几毫秒，而且删除就是真删除，不会像 HNSW 那样留下墓碑。
     """
 
-    def __init__(self, api_key: str, persist_directory: str):
-        self.persist_directory = persist_directory
-        os.makedirs(self.persist_directory, exist_ok=True)
-        app_settings = get_app_settings()
-        memory_settings = app_settings.memory
-        self.emb_fn = SiliconFlowEmbeddingFunction(
-            api_key=api_key,
-            model=memory_settings.model,
-            base_url=memory_settings.base_url,
-            timeout=memory_settings.timeout,
+    def __init__(self, session_id: str):
+        self.session_id = session_id
+        # 加载与写入共用一把锁：否则加载期间提交的新行可能既不在快照里、也追加不进缓存
+        self._lock = asyncio.Lock()
+        self._ids: list[str] | None = None
+        self._matrix = np.empty((0, 0), dtype=np.float32)
+        self._subjects = np.empty(0, dtype=object)
+        self._categories = np.empty(0, dtype=object)
+
+    async def _load_locked(self) -> None:
+        rows = await MemoryModel.filter(
+            session_id=self.session_id, embedding__not_isnull=True
+        ).values_list("id", "embedding", "embedding_model", "subject_user_id", "category")
+        model = get_app_settings().memory.model
+        mismatched = {row[2] for row in rows if row[2] != model}
+        if mismatched:
+            # 不同模型的向量混在一起检索会静默变成噪声，必须先重嵌入
+            raise RuntimeError(
+                f"群 {self.session_id} 的记忆向量来自 {sorted(mismatched)}，"
+                f"与当前 embedding 模型 {model} 不一致，需要重嵌入"
+            )
+        self._ids = [row[0] for row in rows]
+        if rows:
+            self._matrix = np.frombuffer(
+                b"".join(row[1] for row in rows), dtype=np.float32
+            ).reshape(len(rows), -1)
+        else:
+            self._matrix = np.empty((0, 0), dtype=np.float32)
+        self._subjects = np.array([row[3] for row in rows], dtype=object)
+        self._categories = np.array([row[4] for row in rows], dtype=object)
+
+    async def _ensure_loaded(self) -> None:
+        if self._ids is not None:
+            return
+        async with self._lock:
+            if self._ids is None:
+                await self._load_locked()
+
+    def _append_to_cache(self, rows: list[MemoryModel]) -> None:
+        rows = [row for row in rows if row.embedding is not None]
+        if self._ids is None or not rows:
+            return
+        vectors = np.frombuffer(
+            b"".join(row.embedding for row in rows), dtype=np.float32
+        ).reshape(len(rows), -1)
+        self._matrix = vectors if not self._ids else np.vstack([self._matrix, vectors])
+        self._ids.extend(row.id for row in rows)
+        self._subjects = np.concatenate(
+            [self._subjects, np.array([row.subject_user_id for row in rows], dtype=object)]
+        )
+        self._categories = np.concatenate(
+            [self._categories, np.array([row.category for row in rows], dtype=object)]
         )
 
-        self.reranker = None
-        if app_settings.rerank_model:
-            self.reranker = SiliconFlowReranker(
-                api_key=api_key,
-                model=app_settings.rerank_model,
-                api_url=memory_settings.rerank_base_url,
-                timeout=memory_settings.rerank_timeout,
-            )
+    def drop_cache(self) -> None:
+        """表被外部改动（每日维护）后调用，下次使用时重新加载。"""
 
-        self.client = chromadb.PersistentClient(path=self.persist_directory)
-        self.collection = self.client.get_or_create_collection(
-            name=MEMORY_COLLECTION_NAME,
-            embedding_function=self.emb_fn,
-            metadata=MEMORY_COLLECTION_METADATA,
-        )
-        self.replay_pending()
+        self._ids = None
 
-    def _wal_path(self) -> str:
-        return os.path.join(self.persist_directory, "pending_memories.jsonl")
+    async def clear(self) -> None:
+        await MemoryModel.filter(session_id=self.session_id).delete()
+        self._ids = None
 
-    def _append_wal(self, items: list[tuple[str, dict]]) -> bool:
-        operations = []
-        for content, metadata in items:
-            operation_id = str(
-                metadata.get("operation_id") or ""
-            ) or _memory_operation_id(
-                "add",
-                content,
-                metadata,
-            )
-            normalized_metadata = dict(metadata)
-            normalized_metadata["operation_id"] = operation_id
-            operations.append(
-                {
-                    "operation_id": operation_id,
-                    "operation": "add",
-                    "content": content,
-                    "metadata": normalized_metadata,
-                    "target_ref": "",
-                }
-            )
-        return self._append_wal_operations(operations)
+    async def count_by_user(self, user_id: str) -> int:
+        return await MemoryModel.filter(
+            session_id=self.session_id, subject_user_id=user_id
+        ).count()
 
-    def _append_wal_operations(self, operations: list[dict]) -> bool:
-        try:
-            os.makedirs(self.persist_directory, exist_ok=True)
-            with open(self._wal_path(), "a", encoding="utf-8") as handle:
-                for operation in operations:
-                    handle.write(json.dumps(operation, ensure_ascii=False) + "\n")
-            return True
-        except Exception as e:
-            logger.error(f"WAL append failed: {e}")
-            return False
-
-    def replay_pending(self) -> int:
-        path = self._wal_path()
-        if not os.path.exists(path):
-            return 0
-        try:
-            with open(path, encoding="utf-8") as handle:
-                lines = [line for line in handle.read().splitlines() if line.strip()]
-        except Exception as e:
-            logger.error(f"WAL read failed: {e}")
-            return 0
-
-        operations: list[dict] = []
-        for line in lines:
-            try:
-                obj = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            content = str(obj.get("content") or "").strip()
-            if not content:
-                continue
-            metadata = (
-                obj.get("metadata") if isinstance(obj.get("metadata"), dict) else {}
-            )
-            operation = str(obj.get("operation") or "add")
-            operation_id = str(
-                obj.get("operation_id") or metadata.get("operation_id") or ""
-            )
-            if not operation_id:
-                operation_id = _memory_operation_id(
-                    operation,
-                    content,
-                    metadata,
-                    str(obj.get("target_ref") or ""),
-                )
-            operations.append(
-                {
-                    **obj,
-                    "operation": operation,
-                    "operation_id": operation_id,
-                    "content": content,
-                    "metadata": metadata,
-                }
-            )
-
-        if not operations:
-            try:
-                os.remove(path)
-            except OSError:
-                pass
-            return 0
-
-        completed = 0
-        remaining = []
-        for operation in operations:
-            try:
-                if operation["operation"] == "supersede":
-                    result = self.supersede_memory(
-                        operation["content"],
-                        operation["metadata"],
-                        str(operation.get("target_ref") or ""),
-                        reason=str(operation.get("reason") or ""),
-                        operation_id=operation["operation_id"],
-                        queue_on_failure=False,
-                    )
-                    success = bool(result.get("completed"))
-                else:
-                    result = self.add_texts(
-                        [operation["content"]],
-                        metadatas=[
-                            {
-                                **operation["metadata"],
-                                "operation_id": operation["operation_id"],
-                            }
-                        ],
-                        queue_on_failure=False,
-                    )
-                    success = (
-                        int(result.get("confirmed") or result.get("added") or 0) >= 1
-                    )
-                if success:
-                    completed += 1
-                else:
-                    remaining.append(operation)
-            except Exception:
-                remaining.append(operation)
-
-        try:
-            if remaining:
-                with open(path, "w", encoding="utf-8") as handle:
-                    for operation in remaining:
-                        handle.write(json.dumps(operation, ensure_ascii=False) + "\n")
-            else:
-                os.remove(path)
-        except OSError as e:
-            logger.error(f"WAL rewrite failed: {e}")
-            return 0
-        logger.info(f"Replayed {completed} pending memory operations from WAL")
-        return completed
-
-    def add_texts(
+    async def _retrieve(
         self,
-        texts: List[str],
-        metadatas: List[dict] | None = None,
+        queries: list[str],
         *,
-        queue_on_failure: bool = True,
-    ) -> dict[str, Any]:
-        empty_result = {
-            "added": 0,
-            "confirmed": 0,
-            "queued_wal": 0,
-            "failed": 0,
-            "memory_refs": [],
-        }
-        if not texts:
-            return empty_result
-        valid_data = [
-            (t, metadatas[i] if metadatas and i < len(metadatas) else {})
-            for i, t in enumerate(texts)
-            if t and t.strip()
-        ]
-        if not valid_data:
-            return empty_result
-
-        max_retries = MEMORY_WRITE_MAX_RETRIES
-        base_delay = MEMORY_WRITE_RETRY_BASE_DELAY
-        prepared_data = []
-        ids = []
-        for content, metadata in valid_data:
-            # 统一在写入时补全 status/schema_version 等字段：磁盘上的记录形状必须与读取路径一致，
-            # 否则「清理旧格式记录」会误删只有 source/type/subtype 的预设条目
-            prepared_metadata = _normalized_metadata(metadata)
-            operation_id = str(prepared_metadata.get("operation_id") or "")
-            if not operation_id:
-                operation_id = _memory_operation_id("add", content, prepared_metadata)
-            prepared_metadata["operation_id"] = operation_id
-            prepared_data.append((content, prepared_metadata))
-            ids.append(str(uuid.uuid5(uuid.NAMESPACE_URL, operation_id)))
-        for attempt in range(max_retries + 1):
-            try:
-                existing_ids = set()
-                try:
-                    with BACKUP_IO_LOCK:
-                        existing = self.collection.get(ids=ids, include=[])
-                    existing_ids = (
-                        set(existing.get("ids") or [])
-                        if isinstance(existing, dict)
-                        else set()
-                    )
-                except Exception:
-                    existing_ids = set()
-                missing = [
-                    (item_id, data)
-                    for item_id, data in zip(ids, prepared_data)
-                    if item_id not in existing_ids
-                ]
-                if not missing:
-                    return {
-                        "added": 0,
-                        "confirmed": len(prepared_data),
-                        "queued_wal": 0,
-                        "failed": 0,
-                        "memory_refs": ids,
-                    }
-                with BACKUP_IO_LOCK:
-                    self.collection.add(
-                        documents=[data[0] for _, data in missing],
-                        metadatas=[data[1] for _, data in missing],
-                        ids=[item_id for item_id, _ in missing],
-                    )
-                return {
-                    "added": len(missing),
-                    "confirmed": len(prepared_data),
-                    "queued_wal": 0,
-                    "failed": 0,
-                    "memory_refs": ids,
-                }
-            except Exception as e:
-                logger.error(
-                    f"Vector add failed (attempt {attempt + 1}/{max_retries + 1}): {e}"
-                )
-                if attempt < max_retries and base_delay > 0:
-                    time.sleep(base_delay * (2**attempt))
-
-        if queue_on_failure and self._append_wal(prepared_data):
-            logger.warning(
-                f"Vector add exhausted retries, wrote {len(prepared_data)} memories to WAL"
-            )
-            return {
-                **empty_result,
-                "queued_wal": len(prepared_data),
-                "memory_refs": ids,
-            }
-        logger.error(
-            f"Vector add exhausted retries and WAL append failed for {len(prepared_data)} memories"
-        )
-        return {
-            **empty_result,
-            "failed": len(prepared_data),
-            "memory_refs": ids,
-        }
-
-    def retrieve(
-        self,
-        queries: List[str],
-        k: int = 5,
-        where: dict | None = None,
-        use_rerank: bool = True,
-        merged_candidate_cap: int | None = None,
+        k: int,
+        subject_ids: set[str] | None,
+        use_rerank: bool,
+        merged_candidate_cap: int | None,
     ) -> RetrievalResult:
         """k 既是每条 query 的召回数，也是最终返回上限；rerank 失败或全被过滤时回退到初筛。"""
 
@@ -584,30 +297,44 @@ class VectorMemory:
             return RetrievalResult([], _retrieval_stats([], []))
 
         try:
-            results = self.collection.query(
-                query_texts=unique_queries, n_results=max(1, k), where=where
-            )
+            await self._ensure_loaded()
+            if not self._ids:
+                return RetrievalResult([], _retrieval_stats([], []))
 
-            # 第一步：多 query 结果按内容合并，同一内容取最高分
-            candidate_by_content: dict[str, dict[str, Any]] = {}
-            documents = results.get("documents") or []
-            metadatas = results.get("metadatas") or []
-            distances = results.get("distances") or []
-            ids = results.get("ids") or []
-            for i, docs in enumerate(documents):
-                for j, doc in enumerate(docs):
-                    if not doc:
+            scores = await embed_texts(unique_queries) @ self._matrix.T
+            if subject_ids is not None:
+                scores[:, ~np.isin(self._subjects, list(subject_ids))] = -np.inf
+
+            # 第一步：每条 query 取 top-k，多 query 命中同一条取最高分
+            top_n = min(max(1, k), len(self._ids))
+            best_by_index: dict[int, float] = {}
+            for row_scores in scores:
+                for index in np.argpartition(-row_scores, top_n - 1)[:top_n]:
+                    score = float(row_scores[index])
+                    if score == -np.inf:
                         continue
-                    metadata = _normalized_metadata(metadatas[i][j])
-                    metadata["retrieval_score"] = _score_from_distance(distances[i][j])
-                    metadata["memory_ref"] = ids[i][j]
-                    existing = candidate_by_content.get(doc)
-                    if (
-                        existing is None
-                        or metadata["retrieval_score"]
-                        > existing["metadata"]["retrieval_score"]
-                    ):
-                        candidate_by_content[doc] = {"content": doc, "metadata": metadata}
+                    if score > best_by_index.get(index, -np.inf):
+                        best_by_index[index] = score
+            ref_scores = {self._ids[index]: score for index, score in best_by_index.items()}
+            if not ref_scores:
+                return RetrievalResult([], _retrieval_stats([], []))
+            rows = await MemoryModel.filter(id__in=list(ref_scores))
+
+            # 同一正文只留最高分（不同主体可能被抽取出完全相同的句子）
+            candidate_by_content: dict[str, dict[str, Any]] = {}
+            for row in rows:
+                metadata = _row_metadata(row)
+                metadata["retrieval_score"] = max(0.0, min(1.0, ref_scores[row.id]))
+                existing = candidate_by_content.get(row.content)
+                if (
+                    existing is None
+                    or metadata["retrieval_score"]
+                    > existing["metadata"]["retrieval_score"]
+                ):
+                    candidate_by_content[row.content] = {
+                        "content": row.content,
+                        "metadata": metadata,
+                    }
             candidates = sorted(
                 candidate_by_content.values(),
                 key=lambda item: item["metadata"]["retrieval_score"],
@@ -618,17 +345,16 @@ class VectorMemory:
 
             if not candidates:
                 return RetrievalResult([], _retrieval_stats([], []))
-            if not use_rerank or not self.reranker:
+            settings = get_app_settings()
+            if not use_rerank or not settings.rerank_model:
                 fallback = candidates[:k]
                 return RetrievalResult(
                     fallback, _retrieval_stats(candidates, fallback, "rerank_disabled")
                 )
 
             # 第二步：Rerank。search_stage 已把最新有效消息排在第一位；summary/name query 只做补充召回。
-            rerank_results = self.reranker.rerank(
-                query=unique_queries[0],
-                documents=[item["content"] for item in candidates],
-                top_n=len(candidates),  # 全排，然后本地过滤
+            rerank_results = await _rerank(
+                unique_queries[0], [item["content"] for item in candidates]
             )
             if not rerank_results:
                 fallback = candidates[:k]
@@ -636,7 +362,7 @@ class VectorMemory:
                     fallback, _retrieval_stats(candidates, fallback, "rerank_api_empty")
                 )
 
-            threshold = get_app_settings().rerank_threshold
+            threshold = settings.rerank_threshold
             final_results = []
             for res in rerank_results:
                 score = res.get("relevance_score", 0.0)
@@ -665,420 +391,30 @@ class VectorMemory:
             logger.error(f"Vector retrieve failed: {e}")
             return RetrievalResult([], _retrieval_stats([], [], "retrieve_error"))
 
-    def _retrieve_active_subject_records(
-        self,
-        active_user_ids: set[str],
-        *,
-        limit: int = 5,
+    async def _retrieve_active_subject_records(
+        self, active_user_ids: set[str], *, limit: int
     ) -> list[dict[str, Any]]:
         if not active_user_ids:
             return []
-        where = _subject_user_where(active_user_ids)
-        if not where:
-            return []
-        try:
-            with BACKUP_IO_LOCK:
-                result = self.collection.get(
-                    where=where, include=["documents", "metadatas"]
-                )
-        except Exception as e:
-            logger.warning(f"Active subject memory recall failed: {e}")
-            return []
-
-        ids = result.get("ids") or [] if isinstance(result, dict) else []
-        documents = result.get("documents") or [] if isinstance(result, dict) else []
-        metadatas = result.get("metadatas") or [] if isinstance(result, dict) else []
-        records = []
-        for index, document in enumerate(documents):
-            if not document:
-                continue
-            metadata = _normalized_metadata(
-                metadatas[index] if index < len(metadatas) else {}
+        rows = (
+            await MemoryModel.filter(
+                session_id=self.session_id, subject_user_id__in=list(active_user_ids)
             )
-            if (
-                metadata.get("source") != "memory"
-                or _metadata_status(metadata) != "active"
-            ):
-                continue
-            subject_user_id = _clean_metadata_string(metadata.get("subject_user_id"))
-            if subject_user_id not in active_user_ids:
-                continue
-            if index < len(ids):
-                metadata["memory_ref"] = ids[index]
-            metadata["retrieval_score"] = _clamp_float(
-                metadata.get("retrieval_score"), 0.5, 0.0, 1.0
-            )
-            records.append(
-                {
-                    "content": document,
-                    "metadata": metadata,
-                }
-            )
-
-        records.sort(
-            key=lambda item: (
-                _clamp_float(item.get("metadata", {}).get("importance"), 0.0, 0.0, 1.0),
-                int(item.get("metadata", {}).get("date") or 0),
-            ),
-            reverse=True,
+            .order_by("-importance", "-date")
+            .limit(limit)
         )
-        return records[: max(1, int(limit or 1))]
-
-    def get_source_records(self, source: str) -> list[dict[str, Any]]:
-        """按 source 取固定条目（当前只有 preset），不受检索排名与 rerank 影响。"""
-
-        try:
-            with BACKUP_IO_LOCK:
-                result = self.collection.get(
-                    where={"source": {"$eq": source}},
-                    include=["documents", "metadatas"],
-                )
-        except Exception as e:
-            logger.warning(f"Fetch source records failed ({source}): {e}")
-            return []
-
-        documents = result.get("documents") or []
-        metadatas = result.get("metadatas") or []
         records = []
-        for index, document in enumerate(documents):
-            if not document:
-                continue
-            metadata = _normalized_metadata(
-                metadatas[index] if index < len(metadatas) else {}
-            )
-            if _metadata_status(metadata) != "active":
-                continue
-            records.append({"content": document, "metadata": metadata})
+        for row in rows:
+            metadata = _row_metadata(row)
+            metadata["retrieval_score"] = 0.5
+            records.append({"content": row.content, "metadata": metadata})
         return records
 
-    def delete_by_metadata(self, where: dict):
-        """删除指定条件的记忆"""
-        try:
-            with BACKUP_IO_LOCK:
-                self.collection.delete(where=where)
-            logger.info(f"Deleted vectors where {where}")
-        except Exception as e:
-            logger.error(f"Vector delete failed: {e}")
-
-    def cleanup(self, days_retention: int = 90):
-        """生命周期管理：清理过期事件"""
-        try:
-            ids, metadatas = self._get_all_ids_metadatas()
-            now = datetime.now()
-            delete_ids = []
-            for item_id, meta in zip(ids, metadatas):
-                metadata = _normalized_metadata(meta)
-                if metadata.get("source") == "preset":
-                    continue
-                days_ago = _date_days_ago(metadata, now=now)
-                if days_ago is None:
-                    continue
-                status = _metadata_status(metadata)
-                ttl_days = int(metadata.get("ttl_days") or days_retention)
-                importance = _clamp_float(metadata.get("importance"), 0.0, 0.0, 1.0)
-                effective_ttl_days = int(ttl_days * (1.0 + importance))
-                should_delete = (
-                    status in {"archived", "superseded"} and days_ago > days_retention
-                ) or (metadata.get("type") == "event" and days_ago > effective_ttl_days)
-                if should_delete:
-                    delete_ids.append(item_id)
-
-            for start in range(0, len(delete_ids), 200):
-                with BACKUP_IO_LOCK:
-                    self.collection.delete(ids=delete_ids[start : start + 200])
-            logger.info(f"Cleaned up {len(delete_ids)} expired vector memories")
-        except Exception as e:
-            logger.error(f"Cleanup failed: {e}")
-
-    def _get_all_ids_metadatas(self) -> tuple[list[str], list[dict]]:
-        with BACKUP_IO_LOCK:
-            result = self.collection.get(include=["metadatas"])
-        ids = result.get("ids", []) if isinstance(result, dict) else []
-        metadatas = result.get("metadatas", []) if isinstance(result, dict) else []
-        return list(ids or []), [dict(meta or {}) for meta in (metadatas or [])]
-
-    def get_metadata_by_id(self, memory_ref: str) -> dict | None:
-        if not memory_ref:
-            return None
-        with BACKUP_IO_LOCK:
-            result = self.collection.get(ids=[memory_ref], include=["metadatas"])
-        if not isinstance(result, dict):
-            return None
-        metadatas = result.get("metadatas") or []
-        if not metadatas:
-            return None
-        return dict(metadatas[0] or {})
-
-    def update_metadata_by_id(self, memory_ref: str, metadata: dict) -> None:
-        if not memory_ref:
-            return
-        with BACKUP_IO_LOCK:
-            self.collection.update(ids=[memory_ref], metadatas=[dict(metadata or {})])
-
-    def supersede_memory(
+    async def retrieve_with_decay(
         self,
-        content: str,
-        metadata: dict,
-        target_ref: str,
-        *,
-        reason: str = "",
-        operation_id: str = "",
-        queue_on_failure: bool = True,
-    ) -> dict[str, Any]:
-        """Apply an idempotent, repairable supersede operation."""
-
-        target_metadata = self.get_metadata_by_id(target_ref)
-        if not target_metadata:
-            return {"completed": False, "queued_repair": 0, "reason": "target_missing"}
-        normalized_target = _normalized_metadata(target_metadata)
-        if (
-            normalized_target.get("source") != "memory"
-            or normalized_target.get("subtype") == "bot_self"
-        ):
-            return {
-                "completed": False,
-                "queued_repair": 0,
-                "reason": "target_not_supersedable",
-            }
-
-        operation_id = operation_id or _memory_operation_id(
-            "supersede",
-            content,
-            metadata,
-            target_ref,
-        )
-        replacement_metadata = _normalized_metadata(metadata)
-        replacement_metadata.update(
-            {
-                "operation_id": operation_id,
-                "supersede_operation_id": operation_id,
-                "supersedes": target_ref,
-                "status": "pending_supersede",
-            }
-        )
-        replacement_ref = str(uuid.uuid5(uuid.NAMESPACE_URL, operation_id))
-        operation = {
-            "operation_id": operation_id,
-            "operation": "supersede",
-            "content": content,
-            "metadata": replacement_metadata,
-            "target_ref": target_ref,
-            "reason": str(reason or "")[:200],
-        }
-
-        try:
-            add_result = self.add_texts(
-                [content],
-                metadatas=[replacement_metadata],
-                queue_on_failure=False,
-            )
-            if int(add_result.get("confirmed") or 0) < 1:
-                raise RuntimeError("replacement_not_confirmed")
-
-            updated_target = dict(normalized_target)
-            updated_target["status"] = "superseded"
-            updated_target["superseded_at"] = datetime.now().astimezone().isoformat()
-            updated_target["superseded_reason"] = operation["reason"]
-            updated_target["supersede_operation_id"] = operation_id
-            self.update_metadata_by_id(target_ref, updated_target)
-
-            active_replacement = dict(replacement_metadata)
-            active_replacement["status"] = "active"
-            self.update_metadata_by_id(replacement_ref, active_replacement)
-            return {
-                "completed": True,
-                "queued_repair": 0,
-                "operation_id": operation_id,
-                "memory_ref": replacement_ref,
-            }
-        except Exception as e:
-            queued = int(queue_on_failure and self._append_wal_operations([operation]))
-            logger.error(f"Supersede operation failed ({operation_id}): {e}")
-            return {
-                "completed": False,
-                "queued_repair": queued,
-                "operation_id": operation_id,
-                "memory_ref": replacement_ref,
-                "reason": type(e).__name__,
-            }
-
-    def clear(self):
-        try:
-            with BACKUP_IO_LOCK:
-                self.client.delete_collection(MEMORY_COLLECTION_NAME)
-                self.collection = self.client.get_or_create_collection(
-                    name=MEMORY_COLLECTION_NAME,
-                    embedding_function=self.emb_fn,
-                    metadata=MEMORY_COLLECTION_METADATA,
-                )
-        except Exception as e:
-            logger.error(f"Clear failed: {e}")
-
-    def close(self):
-        try:
-            self.emb_fn.close()
-        except Exception as e:
-            logger.warning(f"Close embedding client failed: {e}")
-        if self.reranker:
-            try:
-                self.reranker.close()
-            except Exception as e:
-                logger.warning(f"Close reranker client failed: {e}")
-
-    def count_by_user(self, user_id: str) -> int:
-        """统计某用户的记忆数量"""
-        try:
-            if not user_id or not user_id.strip():
-                return 0
-
-            results = self.collection.get(
-                where={"subject_user_id": {"$eq": user_id}},
-                include=[],  # 不需要实际内容，只需要 ID
-            )
-            return len(results.get("ids", []))
-        except Exception as e:
-            logger.warning(f"统计记忆数量失败: {e}")
-            return 0
-
-    def _reinforce_duplicate_memory(
-        self, memory_ref: str, existing_metadata: dict, new_metadata: dict
-    ) -> bool:
-        if not memory_ref:
-            return False
-        metadata = _normalized_metadata(existing_metadata)
-        if metadata.get("source") != "memory" or _metadata_status(metadata) != "active":
-            return False
-        if metadata.get("subtype") == "bot_self":
-            return False
-        if not _same_dedup_scope(new_metadata, metadata):
-            return False
-
-        old_confidence = _clamp_float(metadata.get("confidence"), 1.0, 0.0, 1.0)
-        metadata["confidence"] = min(1.0, old_confidence + (1.0 - old_confidence) * 0.2)
-        new_date = new_metadata.get("date")
-        if isinstance(new_date, int) and new_date > 0:
-            metadata["date"] = new_date
-        try:
-            reaffirm_count = int(metadata.get("reaffirm_count") or 0)
-        except (TypeError, ValueError):
-            reaffirm_count = 0
-        metadata["reaffirm_count"] = reaffirm_count + 1
-        metadata["last_reaffirmed_at"] = datetime.now().astimezone().isoformat()
-        self.update_metadata_by_id(memory_ref, metadata)
-        return True
-
-    def add_memories_with_dedup(
-        self, memories: list[tuple[str, dict]], threshold: float = 0.9
-    ) -> dict[str, int]:
-        """
-        批量去重并添加长期记忆。
-
-        对同一批候选记忆只做一次 Chroma query 和一次 add，避免逐条 embedding/query/add。
-        """
-        result = {
-            "added": 0,
-            "skipped_empty": 0,
-            "skipped_dedup": 0,
-            "reinforced": 0,
-            "dedup_errors": 0,
-        }
-        valid: list[tuple[str, dict]] = []
-        seen_batch = set()
-        for content, metadata in memories:
-            normalized = (content or "").strip()
-            if not normalized:
-                result["skipped_empty"] += 1
-                continue
-            normalized_metadata = _normalized_metadata(metadata)
-            batch_key = (normalized, _dedup_scope_key(normalized_metadata))
-            if batch_key in seen_batch:
-                result["skipped_dedup"] += 1
-                continue
-            seen_batch.add(batch_key)
-            valid.append((normalized, normalized_metadata))
-
-        if not valid:
-            return result
-
-        try:
-            to_add: list[tuple[str, dict]] = []
-            grouped: dict[tuple[str, str, str], list[tuple[str, dict]]] = {}
-            for item in valid:
-                grouped.setdefault(_dedup_scope_key(item[1]), []).append(item)
-
-            for group in grouped.values():
-                existing = self.collection.query(
-                    query_texts=[content for content, _ in group],
-                    n_results=5,
-                    where=_dedup_where(group[0][1]),
-                )
-                distances = existing.get("distances") or []
-                ids = existing.get("ids") or []
-                metadatas = existing.get("metadatas") or []
-                for idx, (content, metadata) in enumerate(group):
-                    row_distances = distances[idx] if idx < len(distances) else []
-                    row_ids = ids[idx] if idx < len(ids) else []
-                    row_metadatas = metadatas[idx] if idx < len(metadatas) else []
-                    duplicate = None
-                    for candidate_index, distance in enumerate(row_distances):
-                        if distance is None:
-                            continue
-                        existing_metadata = (
-                            row_metadatas[candidate_index]
-                            if candidate_index < len(row_metadatas)
-                            else {}
-                        )
-                        if not _same_dedup_scope(metadata, existing_metadata):
-                            continue
-                        similarity = 1 - distance
-                        if similarity > threshold:
-                            memory_ref = (
-                                str(row_ids[candidate_index] or "").strip()
-                                if candidate_index < len(row_ids)
-                                else ""
-                            )
-                            duplicate = (similarity, memory_ref, existing_metadata)
-                            break
-
-                    if duplicate is None:
-                        to_add.append((content, metadata))
-                        continue
-
-                    similarity, memory_ref, existing_metadata = duplicate
-                    logger.debug(
-                        f"[Memory] 跳过同 scope 重复记忆 "
-                        f"(相似度 {similarity:.2f}): {content[:30]}..."
-                    )
-                    result["skipped_dedup"] += 1
-                    if self._reinforce_duplicate_memory(
-                        memory_ref, existing_metadata, metadata
-                    ):
-                        result["reinforced"] += 1
-
-            if to_add:
-                write_result = self.add_texts(
-                    [content for content, _ in to_add],
-                    metadatas=[metadata for _, metadata in to_add],
-                )
-                if isinstance(write_result, dict):
-                    result["added"] = int(write_result.get("added") or 0)
-                else:
-                    result["added"] = len(to_add)
-            return result
-
-        except Exception as e:
-            logger.error(f"批量去重添加记忆失败: {e}")
-            result["dedup_errors"] += 1
-            result["added"] = 0
-            result["skipped_dedup"] = 0
-            self._append_wal(valid)
-            return result
-
-    def retrieve_with_decay(
-        self,
-        queries: List[str],
+        queries: list[str],
         k: int = 5,
-        where: dict | None = None,
+        subject_ids: set[str] | None = None,
         use_rerank: bool = True,
         candidate_k: int | None = None,
         merged_candidate_cap: int | None = None,
@@ -1088,31 +424,28 @@ class VectorMemory:
         再按衰减/类型/置信度/作用域加权排序取前 k。"""
 
         active_scope_ids = set(active_user_ids)
-        retrieval_result = self.retrieve(
+        retrieval_result = await self._retrieve(
             queries,
             k=candidate_k or k,
-            where=where,
+            subject_ids=subject_ids,
             use_rerank=use_rerank,
             merged_candidate_cap=merged_candidate_cap,
         )
         raw_results = list(retrieval_result.records)
         stats = {"use_rerank": use_rerank, **retrieval_result.stats}
-        subject_results = self._retrieve_active_subject_records(
+        subject_results = await self._retrieve_active_subject_records(
             active_scope_ids, limit=min(5, max(1, k))
         )
         if subject_results:
             merged_results = []
             seen = set()
-            for item in list(raw_results or []) + subject_results:
-                content = str(item.get("content") or "")
-                metadata = item.get("metadata", {}) or {}
-                memory_ref = str(metadata.get("memory_ref") or "").strip()
-                key = f"ref:{memory_ref}" if memory_ref else f"content:{content}"
-                if not content or key in seen:
+            for item in raw_results + subject_results:
+                key = item["metadata"]["memory_ref"]
+                if key in seen:
                     continue
                 seen.add(key)
                 merged_results.append(item)
-            subject_added_count = max(0, len(merged_results) - len(raw_results or []))
+            subject_added_count = len(merged_results) - len(raw_results)
             raw_results = merged_results
             stats["subject_recall_count"] = len(subject_results)
             stats["candidate_count"] = (
@@ -1123,177 +456,188 @@ class VectorMemory:
         if not raw_results:
             return RetrievalResult([], stats)
 
-        # 2. 应用生命周期过滤和时间衰减
+        # 时间衰减与加权
         today_dt = datetime.now()
-        active_results = []
         other_subject_downweighted_count = 0
         scope_counts: dict[str, int] = {}
 
         for item in raw_results:
-            meta = item.get("metadata", {})
-            meta.update(_normalized_metadata(meta))
-            if _metadata_status(meta) != "active":
-                continue
+            meta = item["metadata"]
             scope, scope_weight = _memory_scope(meta, active_scope_ids, queries)
             scope_counts[scope] = scope_counts.get(scope, 0) + 1
             if scope == "other_subject":
                 other_subject_downweighted_count += 1
-            active_results.append(item)
 
-            if meta.get("source") == "preset":
-                days_ago = 0
-                effective_decay_rate = 0.0
-            else:
-                # 没有日期或日期非法的记忆，视为 60 天前
-                days_ago = _date_days_ago(meta, now=today_dt)
-                if days_ago is None:
-                    days_ago = 60
-                effective_decay_rate = MEMORY_TYPE_DECAY_RATE.get(
-                    meta["type"], MEMORY_TYPE_DECAY_RATE["event"]
-                )
-            decay_factor = math.exp(-effective_decay_rate * days_ago)
+            days_ago = max(0, (today_dt - _parse_date(meta["date"])).days)
+            decay_rate = MEMORY_TYPE_DECAY_RATE.get(
+                meta["category"], MEMORY_TYPE_DECAY_RATE["event"]
+            )
+            decay_factor = math.exp(-decay_rate * days_ago)
 
-            # 获取原始分数
             original_score = meta.get("rerank_score")
             if original_score is None:
-                original_score = meta.get("retrieval_score", 0.5)
+                original_score = meta["retrieval_score"]
 
-            # 计算调整后的分数
-            source_type_weight = _source_type_weight(meta)
-            confidence_weight = _confidence_weight(meta)
-            importance_weight = (
-                1.0 + _clamp_float(meta.get("importance"), 0.0, 0.0, 1.0) * 0.15
-            )
-            adjusted_score = (
+            type_weight = MEMORY_TYPE_WEIGHT.get(meta["category"], 1.0)
+            confidence_weight = 0.7 + meta["confidence"] * 0.3
+            importance_weight = 1.0 + meta["importance"] * 0.15
+            meta["adjusted_score"] = (
                 original_score
                 * decay_factor
-                * source_type_weight
+                * type_weight
                 * confidence_weight
                 * importance_weight
                 * scope_weight
             )
-            meta["adjusted_score"] = adjusted_score
             meta["days_ago"] = days_ago
-            meta["decay_rate"] = effective_decay_rate
+            meta["decay_rate"] = decay_rate
             meta["decay_factor"] = decay_factor
-            meta["source_type_weight"] = source_type_weight
+            meta["source_type_weight"] = type_weight
             meta["confidence_weight"] = confidence_weight
             meta["importance_weight"] = importance_weight
             meta["scope"] = scope
             meta["scope_weight"] = scope_weight
 
-        # 3. 重新排序
         sorted_results = sorted(
-            active_results,
-            key=lambda x: x.get("metadata", {}).get("adjusted_score", 0),
-            reverse=True,
+            raw_results, key=lambda x: x["metadata"]["adjusted_score"], reverse=True
         )
-
-        # 4. 截取前 k 个
         final_results = sorted_results[:k]
-        adjusted_scores = [
-            float(item.get("metadata", {}).get("adjusted_score", 0.0))
-            for item in active_results
-        ]
-        stats.update(_score_distribution(adjusted_scores))
+        stats.update(
+            _score_distribution([item["metadata"]["adjusted_score"] for item in raw_results])
+        )
         stats["returned_count"] = len(final_results)
         stats["other_subject_downweighted_count"] = other_subject_downweighted_count
-        stats["scope_counts"] = dict(scope_counts)
+        stats["scope_counts"] = scope_counts
         return RetrievalResult(final_results, stats)
 
-
-class SiliconFlowReranker:
-    """Small synchronous adapter for the configured rerank endpoint."""
-
-    def __init__(
+    async def add_memories_with_dedup(
         self,
-        api_key: str,
-        model: str,
-        api_url: str,
-        timeout: float,
-    ):
-        self.api_key = api_key
-        self.model = model
-        self.api_url = api_url
-        self._client = httpx.Client(timeout=timeout, trust_env=False)
+        memories: list[tuple[str, dict]],
+        *,
+        still_current: Callable[[], bool],
+    ) -> dict[str, int] | None:
+        """批量去重并写入长期记忆；会话在写入前被 reset/set_role 作废则返回 None。
 
-    def rerank(
-        self,
-        query: str,
-        documents: list[str],
-        top_n: int = 5,
-    ) -> list[dict[str, Any]]:
-        if not documents:
-            return []
+        同 (subject, category) 内与已有记忆余弦 > 0.9 视为重复，只强化旧记忆的置信度与日期。
+        embedding 调用失败时照样落库（embedding 为 NULL、不做去重），由每日维护补算。
+        """
+
+        result = {"added": 0, "skipped_dedup": 0, "reinforced": 0}
+        valid: list[tuple[str, dict]] = []
+        seen_batch = set()
+        for content, metadata in memories:
+            content = content.strip()
+            batch_key = (content, metadata["subject_user_id"], metadata["category"])
+            if not content or batch_key in seen_batch:
+                result["skipped_dedup"] += bool(content)
+                continue
+            seen_batch.add(batch_key)
+            valid.append((content, metadata))
+        if not valid:
+            return result
+
         try:
-            response = self._client.post(
-                self.api_url,
-                headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": self.model,
-                    "query": query,
-                    "documents": documents,
-                    "top_n": top_n,
-                    "return_documents": False,
-                },
-            )
-            response.raise_for_status()
-            return response.json().get("results", [])
+            vectors = await embed_texts([content for content, _ in valid])
         except Exception as e:
-            logger.error(f"Rerank API Error: {e}")
-            return []
+            logger.error(f"[Memory] Embedding 失败，记忆先不带向量落库: {e}")
+            vectors = None
 
-    def close(self) -> None:
-        self._client.close()
+        embedding_model = get_app_settings().memory.model
+        async with self._lock:
+            if self._ids is None:
+                await self._load_locked()
+
+            new_rows: list[MemoryModel] = []
+            reinforce: dict[str, dict] = {}
+            for index, (content, metadata) in enumerate(valid):
+                vector = None if vectors is None else vectors[index]
+                if vector is not None and self._ids:
+                    scope = (self._subjects == metadata["subject_user_id"]) & (
+                        self._categories == metadata["category"]
+                    )
+                    if scope.any():
+                        similarities = self._matrix[scope] @ vector
+                        best = int(np.argmax(similarities))
+                        if similarities[best] > DEDUP_SIMILARITY_THRESHOLD:
+                            memory_ref = self._ids[int(np.flatnonzero(scope)[best])]
+                            logger.debug(
+                                f"[Memory] 跳过同 scope 重复记忆 "
+                                f"(相似度 {similarities[best]:.2f}): {content[:30]}..."
+                            )
+                            result["skipped_dedup"] += 1
+                            reinforce[memory_ref] = metadata
+                            continue
+                new_rows.append(
+                    MemoryModel(
+                        id=str(uuid.uuid4()),
+                        session_id=self.session_id,
+                        content=content,
+                        embedding=None if vector is None else vector.tobytes(),
+                        embedding_model="" if vector is None else embedding_model,
+                        category=metadata["category"],
+                        subject_user_id=metadata["subject_user_id"],
+                        subject_user_name=metadata["subject_user_name"],
+                        speaker_user_id=metadata["speaker_user_id"],
+                        speaker_user_name=metadata["speaker_user_name"],
+                        confidence=metadata["confidence"],
+                        importance=metadata["importance"],
+                        date=metadata["date"],
+                        expires_at=memory_expires_at(
+                            metadata["category"], metadata["date"], metadata["importance"]
+                        ),
+                    )
+                )
+
+            async with in_transaction():
+                # 在事务内确认代际：reset 先递增 generation 再删库，所以这里放行的写入一定早于删除
+                if not still_current():
+                    return None
+                reinforce_rows = (
+                    await MemoryModel.filter(id__in=list(reinforce)) if reinforce else []
+                )
+                for row in reinforce_rows:
+                    row.confidence = min(1.0, row.confidence + (1.0 - row.confidence) * 0.2)
+                    row.date = reinforce[row.id]["date"]
+                    row.expires_at = memory_expires_at(row.category, row.date, row.importance)
+                    row.reaffirm_count += 1
+                    await row.save(
+                        update_fields=[
+                            "confidence",
+                            "date",
+                            "expires_at",
+                            "reaffirm_count",
+                            "updated_at",
+                        ]
+                    )
+                    result["reinforced"] += 1
+                if new_rows:
+                    await MemoryModel.bulk_create(new_rows)
+            self._append_to_cache(new_rows)
+
+        result["added"] = len(new_rows)
+        return result
 
 
-class SiliconFlowEmbeddingFunction(EmbeddingFunction):
-    """Chroma embedding adapter with an owned OpenAI-compatible client."""
+async def maintain_memories() -> None:
+    """每日维护：删除过期记忆，补算写入时 embedding 失败的行（补算的行不再去重）。"""
 
-    def __init__(
-        self,
-        api_key: str,
-        model: str,
-        base_url: str,
-        timeout: float,
-    ):
-        self.api_key = api_key
-        self.model = model
-        self._client = OpenAI(
-            api_key=api_key,
-            base_url=base_url,
-            timeout=timeout,
-            max_retries=0,
-        )
-
-    def __call__(self, input: Documents) -> Embeddings:
-        if not input:
-            return []
+    deleted = await MemoryModel.filter(expires_at__lt=datetime.now()).delete()
+    pending = await MemoryModel.filter(embedding__isnull=True)
+    embedding_model = get_app_settings().memory.model
+    filled = 0
+    for start in range(0, len(pending), EMBEDDING_BATCH_SIZE):
+        batch = pending[start : start + EMBEDDING_BATCH_SIZE]
         try:
-            response = self._client.embeddings.create(
-                model=self.model,
-                input=[text.replace("\n", " ") for text in input],
-                encoding_format="float",
-            )
-            return [item.embedding for item in response.data]
+            vectors = await embed_texts([row.content for row in batch])
         except Exception as e:
-            logger.error(f"Embedding API Error: {e}")
-            raise
-
-    def close(self) -> None:
-        self._client.close()
-
-
-# RAG 检索参数
-RAG_FINAL_K = 20
-RAG_PER_QUERY_RECALL_K = 40
-RAG_MERGED_CANDIDATE_CAP = 64
-RAG_MEMORY_CHAR_BUDGET = 1500
-RAG_ITEM_CHARS = 500
-RAG_DEFAULT_EVENT_TTL_DAYS = 90
+            logger.error(f"[Memory] 补算 embedding 失败，明天再试: {e}")
+            break
+        for row, vector in zip(batch, vectors):
+            row.embedding = vector.tobytes()
+            row.embedding_model = embedding_model
+            await row.save(update_fields=["embedding", "embedding_model", "updated_at"])
+        filled += len(batch)
+    logger.info(f"[Memory] 维护完成：删除过期 {deleted} 条，补算向量 {filled}/{len(pending)} 条")
 
 
 # 纯表情/标点（「？？？」「哈哈哈」「233」这类都短于 4 字，长度过滤已覆盖）
@@ -1320,11 +664,3 @@ def build_chat_rag_queries(
         queries.append(chat_summary.strip())
     queries.extend(f"关于{name}" for name in user_names)
     return _dedupe_preserve_order(queries)
-
-
-async def search_memories(
-    long_term_memory, queries: list[str], **kwargs
-) -> RetrievalResult:
-    """异步检索入口：把同步的向量检索放到线程里执行。"""
-
-    return await run_sync(long_term_memory.retrieve_with_decay)(queries, **kwargs)

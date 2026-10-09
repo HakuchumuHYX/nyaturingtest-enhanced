@@ -1,4 +1,3 @@
-import json
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -34,7 +33,6 @@ from .memory.vector import (
     RAG_FINAL_K,
     RAG_MERGED_CANDIDATE_CAP,
     RAG_PER_QUERY_RECALL_K,
-    search_memories,
 )
 from .token_stats import render_token_stats_card
 
@@ -520,9 +518,7 @@ def _format_rag_debug_record(index: int, record: dict) -> str:
     content = str(record.get("content") or "").replace("\n", " ")
     return (
         f"{index}. ref={metadata.get('memory_ref') or '-'} "
-        f"source={metadata.get('source') or '-'} "
-        f"type={metadata.get('type') or '-'} "
-        f"subtype={metadata.get('subtype') or '-'} "
+        f"category={metadata.get('category') or '-'} "
         f"subject={metadata.get('subject_user_id') or '-'} "
         f"speaker={metadata.get('speaker_user_id') or '-'} "
         f"scope={metadata.get('scope') or '-'} "
@@ -547,14 +543,11 @@ async def handle_rag_debug(
         await rag_debug.finish("本群尚未启用 AI 功能。")
         return
 
-    where_filter = {"$or": [{"source": {"$eq": "preset"}}, {"source": {"$eq": "memory"}}]}
     async with state.session_lock:
         await state.session.load_session()
-    result = await search_memories(
-        state.session.runtime.vector_memory,
+    result = await state.session.runtime.vector_memory.retrieve_with_decay(
         [query],
         k=RAG_FINAL_K,
-        where=where_filter,
         use_rerank=True,
         candidate_k=RAG_PER_QUERY_RECALL_K,
         merged_candidate_cap=RAG_MERGED_CANDIDATE_CAP,
@@ -562,7 +555,6 @@ async def handle_rag_debug(
     lines = [
         "RAG debug",
         f"query: {query}",
-        f"where: {json.dumps(where_filter, ensure_ascii=False, sort_keys=True)}",
         f"candidate_count: {result.stats.get('candidate_count', 0)}",
         f"returned_count: {result.stats.get('returned_count', 0)}",
         f"fallback_reason: {result.stats.get('fallback_reason') or 'none'}",

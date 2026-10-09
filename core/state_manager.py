@@ -6,9 +6,9 @@ from nonebot import logger
 from nonebot.adapters.onebot.v11 import Bot, Event
 from tortoise import Tortoise
 
-from ..config import get_app_settings
 from ..db import load_enabled_group_ids
 from ..memory.short_term import Message as MMessage
+from ..memory.vector import close_clients, maintain_memories
 from .llm import close_http_client
 from .metrics import drain_usage_tasks
 from .session import Session
@@ -65,10 +65,7 @@ def ensure_group_state(group_id: int):
     if group_id not in group_states:
         logger.info(f"初始化群 {group_id} 的 GroupState...")
         group_states[group_id] = GroupState(
-            session=Session(
-                id=f"{group_id}",
-                siliconflow_api_key=get_app_settings().siliconflow_api_key,
-            )
+            session=Session(id=f"{group_id}")
         )
 
     # 任务守护：任务挂了或没启动就重启（spawn_state 自己吞异常，done 即退出）
@@ -103,22 +100,17 @@ async def remove_group_state(group_id: int):
         logger.info(f"移除群 {group_id} 的 GroupState...")
         state = group_states.pop(group_id)
         await state.session.drain_background_tasks()
-        state.session.close()
 
 
 async def maintain_vector_memories() -> None:
-    """向量记忆定时维护，避开每轮对话的持久化路径。"""
+    """长期记忆定时维护：一条 SQL 清掉所有群的过期记忆，再让已加载的群下次重新读矩阵。"""
 
-    for group_id, state in list(group_states.items()):
-        if not state.session.state.loaded:
-            continue
-        try:
-            await asyncio.to_thread(
-                state.session.runtime.vector_memory.cleanup,
-                days_retention=90,
-            )
-        except Exception as e:
-            logger.warning(f"群 {group_id} 向量记忆定时维护失败: {e}")
+    try:
+        await maintain_memories()
+    except Exception as e:
+        logger.warning(f"长期记忆定时维护失败: {e}")
+    for state in group_states.values():
+        state.session.runtime.vector_memory.drop_cache()
 
 
 async def cleanup_global_resources():
@@ -162,14 +154,11 @@ async def cleanup_global_resources():
         except Exception as e:
             logger.error(f"关机保存错误: {e}")
 
-    # 3. 所有 worker 和写任务都停止后，才关闭 Session 持有的资源。
-    for state in group_states.values():
-        state.session.close()
-
     await drain_usage_tasks()
 
-    # 5. Provider/usage 都已停止后关闭共享 HTTP，最后关闭数据库。
+    # 3. Provider/usage 都已停止后关闭共享 HTTP，最后关闭数据库。
     await close_http_client()
+    await close_clients()
 
     logger.info("正在关闭数据库连接...")
     await Tortoise.close_connections()

@@ -3,9 +3,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 from nonebot import logger
-from nonebot.utils import run_sync
 
-from ..config import get_vector_dir
 from ..db import (
     delete_session_data,
     load_full_session_data,
@@ -16,7 +14,7 @@ from ..db import (
 )
 from ..domain import EmotionState, PersonProfile
 from ..memory.short_term import Memory, Message
-from ..memory.vector import BACKUP_IO_LOCK, VectorMemory
+from ..memory.vector import VectorMemory
 from .engagement import WILLINGNESS_LOAD_VALUE, chatting_state
 from .metrics import log_event
 from .prompts import PRESETS, reload_presets, truncate_text
@@ -36,6 +34,7 @@ class SessionState:
     role: str = "一个男性人类"
     aliases: list[str] = field(default_factory=list)
     examples: str = ""
+    preset_lines: list[str] = field(default_factory=list)
     profiles: dict[str, PersonProfile] = field(default_factory=dict)
     global_emotion: EmotionState = field(default_factory=EmotionState)
     chat_summary: str = ""
@@ -61,23 +60,17 @@ class SessionRuntime:
     save_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
-STALE_GENERATION_WRITE = object()
-
-
 class Session:
     """
     群聊会话
     """
 
-    def __init__(self, id: str, siliconflow_api_key: str):
+    def __init__(self, id: str):
         self.id = id
         self.state = SessionState()
         self.runtime = SessionRuntime(
             short_term_memory=Memory(),
-            vector_memory=VectorMemory(
-                api_key=siliconflow_api_key,
-                persist_directory=str(get_vector_dir(id)),
-            ),
+            vector_memory=VectorMemory(id),
         )
         # 保存请求去抖 + 单飞：频繁的 schedule_save 合并成一次后台写库
         self._save_pending = False
@@ -107,22 +100,6 @@ class Session:
         )
         return True
 
-    async def run_sync_if_current(
-        self, generation: int, stage: str, func, *args, **kwargs
-    ):
-        """在线程里执行向量写入；与备份共用锁，拿锁后再确认代际。"""
-
-        def guarded():
-            with BACKUP_IO_LOCK:
-                if self.state.generation != generation:
-                    return STALE_GENERATION_WRITE
-                return func(*args, **kwargs)
-
-        result = await run_sync(guarded)()
-        if result is STALE_GENERATION_WRITE:
-            self.stale(generation, stage)
-        return result
-
     async def set_role(self, name: str, role: str):
         self.bump_generation("set_role")
         self.state.role = truncate_text(role, ROLE_MAX_CHARS)
@@ -135,7 +112,7 @@ class Session:
         generation = self.bump_generation("reset")
         self.state = SessionState(loaded=True, generation=generation)
         self.runtime.short_term_memory.clear()
-        self.runtime.vector_memory.clear()
+        await self.runtime.vector_memory.clear()
         # 清理数据库中的所有关联数据，并与后台持久化共用同一把锁：
         # 旧 generation 的后台写入要么已在删除前完成，要么拿锁后被跳过。
         async with self.runtime.save_lock:
@@ -207,6 +184,7 @@ class Session:
                     "name": self.state.name,
                     "role": self.state.role,
                     "aliases": self.state.aliases,
+                    "preset_lines": self.state.preset_lines,
                     "valence": self.state.global_emotion.valence,
                     "arousal": self.state.global_emotion.arousal,
                     "dominance": self.state.global_emotion.dominance,
@@ -260,6 +238,7 @@ class Session:
         self.state.name = session_db.name
         self.state.role = truncate_text(session_db.role, ROLE_MAX_CHARS)
         self.state.aliases = session_db.aliases if session_db.aliases else []
+        self.state.preset_lines = session_db.preset_lines
         self.state.chat_summary = session_db.chat_summary
         self.state.global_emotion.valence = session_db.valence
         self.state.global_emotion.arousal = session_db.arousal
@@ -340,24 +319,15 @@ class Session:
         else:
             self.state.role = truncate_text(base_role, ROLE_MAX_CHARS)
 
-        await run_sync(self.runtime.vector_memory.delete_by_metadata)(
-            {"source": "preset"}
-        )
-
+        # 预设每轮完全相同，排序固定，才能作为不变的前缀参与缓存
         preset_items: list[tuple[str, str]] = []
         preset_items.extend((item, "knowledge") for item in preset.knowledges)
         preset_items.extend((item, "relationship") for item in preset.relationships)
         preset_items.extend((item, "event") for item in preset.events)
         preset_items.extend((item, "bot_self") for item in preset.bot_self)
-        to_add = [item for item, _ in preset_items]
-        if to_add:
-            metadatas = [
-                {"source": "preset", "type": "rule", "subtype": subtype}
-                for _, subtype in preset_items
-            ]
-            await run_sync(self.runtime.vector_memory.add_texts)(
-                to_add, metadatas=metadatas
-            )
+        self.state.preset_lines = sorted(
+            f"【设定/{subtype}】 {item}" for item, subtype in preset_items if item.strip()
+        )
 
         await self.save_session()
         return True
@@ -421,12 +391,6 @@ class Session:
                 if not task.done():
                     task.cancel()
             await asyncio.gather(*pending, return_exceptions=True)
-
-    def close(self):
-        try:
-            self.runtime.vector_memory.close()
-        except Exception as e:
-            logger.warning(f"[Session {self.id}] 关闭向量记忆失败: {e}")
 
     async def save_interaction_logs(
         self, interactions: list[tuple[str, dict]], generation: int

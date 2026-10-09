@@ -33,10 +33,6 @@ def get_data_dir() -> Path:
     return path if path.is_absolute() else WORKSPACE_ROOT / path
 
 
-def get_vector_dir(session_id: str) -> Path:
-    return get_data_dir() / f"vector_index_{session_id}"
-
-
 @dataclass(frozen=True)
 class EndpointSettings:
     api_key: str

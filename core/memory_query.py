@@ -4,7 +4,6 @@ from dataclasses import asdict
 from datetime import datetime
 
 from nonebot import logger
-from nonebot.utils import run_sync
 
 from ..db import get_recent_messages_by_user
 from ..domain import EmotionState, clamp_vad_value
@@ -12,7 +11,6 @@ from ..memory.vector import (
     RAG_ITEM_CHARS,
     RAG_MEMORY_CHAR_BUDGET,
     RAG_MERGED_CANDIDATE_CAP,
-    search_memories,
 )
 from .llm import chat_client, extract_and_parse_json, feedback_client
 from .state_manager import GroupState
@@ -131,14 +129,13 @@ async def _retrieve(
 ) -> tuple[list[str], list[str]]:
     """返回 (目标用户的记忆, 未标记主体的背景记忆)，按 RAG 字符预算截断。"""
 
-    memory_count = await run_sync(vector_memory.count_by_user)(target_id)
+    memory_count = await vector_memory.count_by_user(target_id)
     if first_interaction_at and first_interaction_at.tzinfo is not None:
         first_interaction_at = first_interaction_at.replace(tzinfo=None)
     days_since_first = (
         (datetime.now() - first_interaction_at).days if first_interaction_at else 0
     )
-    result = await search_memories(
-        vector_memory,
+    result = await vector_memory.retrieve_with_decay(
         [
             f"关于{target_name}的记忆",
             f"我对{target_name}的看法",
@@ -146,17 +143,7 @@ async def _retrieve(
             f"{target_name}的性格特点",
         ],
         k=calculate_dynamic_k(interactions, memory_count, days_since_first),
-        where={
-            "$and": [
-                {"source": {"$eq": "memory"}},
-                {
-                    "$or": [
-                        {"subject_user_id": {"$eq": target_id}},
-                        {"subject_user_id": {"$eq": ""}},
-                    ]
-                },
-            ]
-        },
+        subject_ids={target_id, ""},
         use_rerank=True,
         merged_candidate_cap=RAG_MERGED_CANDIDATE_CAP,
         active_user_ids={target_id},

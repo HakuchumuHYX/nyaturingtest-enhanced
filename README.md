@@ -4,7 +4,7 @@
 [`nonebot-plugin-nyaturingtest`](https://github.com/shadow3aaa/nonebot-plugin-nyaturingtest) 二次开发，
 模型推理、Embedding 与 Rerank 全部走云端 API。
 
-插件以**群**为单位维护独立会话：每个启用群有自己的短时上下文、长期向量记忆、角色设定、用户画像、
+插件以**群**为单位维护独立会话：每个启用群有自己的短时上下文、长期记忆、角色设定、用户画像、
 情绪状态、Token 统计与后台任务。
 
 ## 功能
@@ -16,8 +16,8 @@
   潜水 / 冒泡 / 对话三态由意愿值与对话窗口派生，只用于展示和 prompt。
 - **被动固化**：长时间不参与对话时仍会周期性沉淀记忆（情绪、画像、摘要、长期记忆），但不产生回复。
 - **双阶段 LLM**：Feedback（观察者）负责情绪、画像、摘要与记忆提取；Chat（角色）负责生成最终回复。
-- **长期记忆**：每群独立的 ChromaDB 向量库，Embedding 召回 + Rerank 重排 + 时间衰减排序，
-  支持相似度去重、事实更新（supersede）与失败写入的 WAL 重放。
+- **长期记忆**：向量与元数据存在 SQLite，每群加载成 numpy 矩阵做暴力余弦召回 + Rerank 重排 + 时间衰减排序，
+  支持相似度去重。
 - **原生多模态**：图片下载压缩后作为 `image_url` 随请求附带，Feedback 额外返回一句话图片观察写回消息文本。
 - **Token 统计**：记录 prompt / completion / reasoning 与缓存命中（`prompt_tokens_details.cached_tokens`，
   未命中部分由 `prompt_tokens` 减去命中数推出），按模型归并后渲染成卡片。
@@ -30,7 +30,7 @@
 - Python `>=3.10`
 - `nonebot2[fastapi]`、`nonebot-adapter-onebot`、`nonebot-plugin-apscheduler`
 - `tortoise-orm`、`openai`、`httpx`、`json-repair`
-- `chromadb`、`pillow`、`chinese-calendar`
+- `numpy`、`pillow`、`chinese-calendar`
 
 Token 统计卡片复用同级插件目录的公共绘图库 `plugins/utils/draw/plot.py`，
 运行时把 `plugins/` 插入 `sys.path` 后导入，不在依赖中声明。
@@ -42,7 +42,7 @@ plugins/nyaturingtest/
 ├── __init__.py          生命周期入口：连库 → 建表 → 载入启用群 → 注册定时任务
 ├── config.py            config.json 加载、AppSettings、工作区路径常量
 ├── handlers.py          全部 16 个 matcher：管理命令、自动消息入口、/查询记忆、/rag_debug
-├── models.py            7 个 Tortoise ORM 模型
+├── models.py            8 个 Tortoise ORM 模型
 ├── db.py                全部数据库读写（会话/消息/画像/交互/群开关/Token）
 ├── domain.py            EmotionState / PersonProfile（纯领域对象）
 ├── token_stats.py       Token 聚合与模型名归并 + 统计卡片 PNG 渲染
@@ -59,24 +59,20 @@ plugins/nyaturingtest/
 │   └── memory_query.py  /查询记忆：冷却、动态 k、VAD 推断、印象生成
 └── memory/
     ├── short_term.py    短时消息窗口（含增量落库标记）
-    ├── vector.py        VectorMemory（ChromaDB）、Embedding/Rerank 客户端、RAG 检索
+    ├── vector.py        VectorMemory（SQLite + numpy）、共享 Embedding/Rerank 客户端、RAG 检索、每日维护
     ├── image.py         图片下载/缓存/压缩 → 原生多模态输入
     └── validation.py    长期记忆候选的确定性校验
 ```
 
 依赖方向基本单向：`handlers.py` 在顶端（只被 `__init__.py` 导入）→ `core/` → `memory/` → `models.py` / `config.py`；
 `db.py` 与 `token_stats.py` 同层，前者复用后者的 `TOKEN_FIELDS` 与模型名归并函数。
-两处刻意的例外：
-
-- `memory/vector.py` 持有全局 `BACKUP_IO_LOCK`（`threading.RLock`）。备份要打包整个向量目录，
-  必须和向量写入用**同一把**进程级锁；锁定义在向量侧、由 `backup.py` 反向导入，避免循环依赖。
-- `core/orchestrator.py` 从 `core/session.py` 单向导入 `Session` / `ChattingState`；
+一处刻意的例外：
+`core/orchestrator.py` 从 `core/session.py` 单向导入 `Session` / `ChattingState`；
   `core/state_manager.py` 内部局部导入 `logic.spawn_state`（`logic` 反向引用 `GroupState`）。
 
 提示词构造有两条硬约束，都是为了命中上游的前缀缓存（命中部分按缓存价计费）：
 
-- **模板是唯一常量**：不允许按本轮情况分叉（feedback 的 supersede 指令、图片观察要求都写死在模板里，
-  由动态输入里的 `memory_actions_allowed` 与是否有图片决定模型怎么用）。
+- **模板是唯一常量**：不允许按本轮情况分叉（图片观察要求写死在模板里，由是否有图片决定模型怎么用）。
 - **动态输入字段顺序固定为「不变量 → 每轮变化」**：`bot_name` / `role` / `examples_text` / `presets`
   在最前，`related_profiles`、`search_result`、`summary` 居中，`emotion` / `recent_msgs` / `new_msgs` /
   `time_info` 在最后。相邻两轮的公共前缀因此从约 24% 提升到约 48%（chat）、38% 提升到约 59%（feedback）。
@@ -125,7 +121,7 @@ plugins/nyaturingtest/
 **代际控制**：`Session.bump_generation()` 在 `set_role` / `load_preset` / `reset` / `reset_emotion` /
 `calm_down` 时自增。每轮开始时记下 `generation`，阶段边界和写入点（短时记忆、Feedback 沉淀、长期记忆、发送）
 都用 `session.stale(generation, stage)` 检查；过期就丢弃并记一条 `stale_turn_discarded` 事件。
-向量写入走 `run_sync_if_current`，在备份锁内再确认一次代际。
+长期记忆写入在 SQLite 事务内再确认一次代际：`reset` 先自增 generation 再删库，所以放行的写入一定早于删除。
 
 ## 记忆体系
 
@@ -138,57 +134,51 @@ plugins/nyaturingtest/
 
 ### 长期记忆（`memory/vector.py`）
 
-每个群一个 ChromaDB 持久化目录 `data/nyaturingtest/vector_index_<群号>/`，
-集合固定叫 `nyabot_memory`，度量 `cosine`。群之间不共享记忆。
-
-单条记录的 metadata：
+记忆存在 `nyabot.sqlite` 的 `nyabot_memories` 表，向量是归一化后的 float32 字节（`embedding` 列）。
+每个 `VectorMemory` 首次使用时把本群有效向量读成一个 `(n, dim)` 矩阵，检索就是一次矩阵乘法；
+万级数据只要十几毫秒，删除是真删除。之前用 ChromaDB 时 HNSW 删除只打标记、从不回收，
+TTL 清理会让索引无限膨胀（大群一度 3.5 倍于存活条数），这是换掉它的原因。
 
 | 字段 | 含义 |
 | --- | --- |
-| `source` | `memory`（长期记忆）或 `preset`（角色预设写死的设定） |
-| `type` / `subtype` / `category` | 记忆类别；只允许 `event`、`preference`、`profile`、`relationship` |
-| `status` | `active` / `pending_supersede` / `superseded`，检索时只认 `active` |
+| `category` | 记忆类别；只允许 `event`、`preference`、`profile`、`relationship` |
 | `subject_user_id` / `subject_user_name` | 事实描述的对象（「B 说 A 的事」填 A） |
 | `speaker_user_id` / `speaker_user_name` | 说出该事实的人（填 B） |
 | `confidence` / `importance` | 影响去重、衰减与排序权重 |
-| `date` / `ttl_days` | `YYYYMMDD` 整数与事件存活天数（默认 90） |
-| `schema_version` | 当前为 2 |
+| `date` | `YYYYMMDD` 整数，时间衰减按它算 |
+| `expires_at` | event 为 `date` 之后 `90 × (1 + importance)` 天的次日；其余类别为空（不过期） |
+| `embedding_model` | 生成向量的模型；加载时与配置不一致直接报错，换模型必须先重嵌入 |
 
-写入路径：
+写入路径（`add_memories_with_dedup`）：
 
-- **去重**：`add_memories_with_dedup` 先按 `(内容, 去重域)` 在批内去重，再按域分组做一次
-  `collection.query(n_results=5)`；相似度 `1 - distance > 0.9` 视为重复 → 跳过并「强化」已有记录
-  （confidence 向 1.0 靠近 20%、更新 date、`reaffirm_count + 1`），返回
-  `added / skipped_empty / skipped_dedup / reinforced / dedup_errors` 计数。
-- **取代**：Feedback 返回 `supersede` 时必须命中本轮检索给出的 `memory_ref`（否则记
-  `rag_action_hallucination` 事件并丢弃），且目标是 `source=memory` 且非 `bot_self`。
-  新记录先以 `pending_supersede` 写入，旧记录改 `superseded`，最后把新记录翻成 `active`。
-- **WAL**：写失败时把操作追加到 `pending_memories.jsonl`（`add` / `supersede` 两种），
-  启动时 `replay_pending()` 重放；成功的行被丢弃，仍失败的写回文件。
-  记录 id 由 `operation_id` 经 `uuid5` 推导，重复写入是幂等的。
-- **清理**：每天 03:30 的 `cleanup(days_retention=90)` 删除超过保留期的 `superseded` 记录，
-  以及 `type=event` 且超过 `ttl_days * (1 + importance)` 的记录；预设记忆不参与清理。
+- 一批候选只调一次 embedding，去重与写入共用这次结果。
+- **去重**：先按 `(内容, 主体, 类别)` 批内去重，再在同 `(主体, 类别)` 的已有记忆里算余弦；
+  `> 0.9` 视为重复 → 跳过并「强化」已有记录（confidence 向 1.0 靠近 20%、更新 date 与 expires_at、
+  `reaffirm_count + 1`）。
+- embedding 调用失败时照样落库（`embedding` 为空、不做去重），每日维护补算。
+- 写入后增量追加到内存矩阵；加载与写入共用一把 `asyncio.Lock`，避免加载期间提交的行两头落空。
+- **清理**：每天 03:30 的 `maintain_memories()` 一条 `DELETE WHERE expires_at < now` 清掉所有群的过期记忆，
+  补算缺失的向量，然后让已加载的群下次重新读矩阵。
 
-检索路径（`search_memories` → `retrieve_with_decay`，跑在线程池里）：
+检索路径（`retrieve_with_decay`）：
 
 1. `build_chat_rag_queries` 过滤低价值 query（纯标点、`[表情包]`、长度 < 4、纯 emoji 等），
    追加话题摘要与「关于<活跃用户名>」，再去重。
-2. `retrieve` 一次多 query 召回，按 `1 - distance` 取最大分融合，超过 `RAG_MERGED_CANDIDATE_CAP=64`
-   截断，再用 Reranker 以第一条 query 全量重排，低于 `rerank.threshold` 的丢弃。
-3. `_retrieve_active_subject_records` 额外按 `subject_user_id` 做一次结构化召回
+2. 多 query 一次 embedding、一次矩阵乘法，每条 query 取 top-k，按最高分融合，超过
+   `RAG_MERGED_CANDIDATE_CAP=64` 截断，再用 Reranker 以第一条 query 全量重排，低于 `rerank.threshold` 的丢弃。
+3. `_retrieve_active_subject_records` 额外按 `subject_user_id` 做一次 SQL 结构化召回
    （最多 5 条，按 importance、date 排序），补上语义检索漏掉的「活跃主体」记忆。
 4. 打分并排序：
 
    ```text
    adjusted_score = 原始分(rerank_score 优先，否则 retrieval_score)
                   × 时间衰减 exp(-decay_rate × days_ago)
-                  × 来源/类型权重 × (0.7 + 0.3 × confidence)
+                  × 类型权重 × (0.7 + 0.3 × confidence)
                   × (1 + 0.15 × importance) × 主体作用域权重
    ```
 
-   事件半衰期约 35 天（rate 0.02），偏好/画像/关系几乎不衰减（0.003），预设恒定。
+   事件半衰期约 35 天（rate 0.02），偏好/画像/关系几乎不衰减（0.003）。
    作用域权重：活跃主体 1.10、被提到的主体 1.08、活跃发言者 1.04、其他主体 0.5。
-   缺 `date` 的记忆按 60 天前处理。
 
 ### 图片（`memory/image.py`）
 
@@ -208,10 +198,11 @@ SQLite 表（`models.py`，启动时由 `Tortoise.generate_schemas()` 建表）�
 
 | 表 | 内容 |
 | --- | --- |
-| `nyabot_sessions` | 每群一条：人设、别名、VAD 情绪、摘要、最后发言时间、固化水位、聊天状态 |
+| `nyabot_sessions` | 每群一条：人设、别名、预设条目、VAD 情绪、摘要、最后发言时间、固化水位、聊天状态 |
 | `nyabot_user_profiles` | 群内用户画像：VAD、交互次数、首次/最近交互时间 |
 | `nyabot_interactions` | 每次互动的情感增量明细 |
 | `nyabot_global_messages` | 消息明细（`(session, msg_id)` 唯一，含时间与会话索引） |
+| `nyabot_memories` | 长期记忆：正文、向量、主体/说话人、置信度/重要度、日期与过期时间 |
 | `nyabot_enabled_groups` | 启用的群号，**唯一来源** |
 | `nyabot_token_usage` | Token 明细：prompt / completion / cache hit / cache miss / reasoning，其中 cache hit 取 `prompt_tokens_details.cached_tokens` |
 | `nyabot_daily_token_usage` | 按 `(day, session, model)` 聚合的日汇总，卡片统计只读这张表 |
@@ -246,7 +237,7 @@ valence 正向半衰期约 14 小时、负向约 5 小时，dominance 约 23 小
 - `NYATURINGTEST_CONFIG_FILE`：指定其它配置文件路径。
 - `NYATURINGTEST_DATA_DIR`：运行数据目录（独立部署用）；相对路径按工作区根解析。
 
-**改配置需要重启**：插件不监听文件变更，`AppSettings` 与 LLM / Embedding / Rerank 客户端都在启动期构造。
+**改配置需要重启**：插件不监听文件变更，`AppSettings` 在启动期构造，Embedding / Rerank 客户端首次使用时按它创建。
 `/autochat enable|disable` 直接写数据库并立即生效，不需要重启。
 
 运行时策略参数（意愿阈值、RAG 预算、保留期等）不是配置项，见「策略常量在哪」。
@@ -280,7 +271,7 @@ valence 正向半衰期约 14 小时、负向约 5 小时，dominance 约 23 小
 
 重置范围：
 
-| 操作 | 情绪 | 用户画像 | 意愿/状态 | 短时记忆 | 长期向量记忆 | 数据库行 | 人设 |
+| 操作 | 情绪 | 用户画像 | 意愿/状态 | 短时记忆 | 长期记忆 | 数据库行 | 人设 |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `/calm` | 重置 | 内存清空（库行保留） | 重置 | 保留 | 保留 | 保留 | 保留 |
 | `/reset_emotion` | 重置 | 仅重置情绪 | 保留 | 保留 | 保留 | 保留 | 保留 |
@@ -295,16 +286,16 @@ valence 正向半衰期约 14 小时、负向约 5 小时，dominance 约 23 小
 重新扫描目录，新增或修改文件后无需重启。内置一个「喵喵」预设兜底。
 
 字段对应 `core/prompts.RolePreset`：`name`、`role`、`aliases`（强关联检测用）、
-`knowledges` / `relationships` / `events` / `bot_self`（加载时写入向量库，`source=preset`）、
+`knowledges` / `relationships` / `events` / `bot_self`（加载时整理成排序固定的 `【设定/类别】` 行，
+存进 `nyabot_sessions.preset_lines`，每轮原样注入、不参与检索）、
 `examples`（对话样本，拼进 role 文本）、`hidden`（是否从 `/presets` 隐藏）。
-加载预设会先删掉本群所有 `source=preset` 的向量记录再重写。
 
 ## 数据、备份与定时任务
 
 工作区根 = `HakuBot-autochat/`（`config.WORKSPACE_ROOT`）。默认路径：
 
 ```text
-data/nyaturingtest/                     nyabot.sqlite（主库）、vector_index_<群号>/、三个渲染字体
+data/nyaturingtest/                     nyabot.sqlite（主库，含长期记忆）、三个渲染字体
 cache/nyaturingtest/image_cache/raw/   图片原始字节缓存，48 小时过期
 data/nyaturingtest_backups/            nyabot_backup_YYYYMMDD_HHMMSS.zip
 config/nyaturingtest/nya_presets/      角色预设
@@ -315,17 +306,16 @@ config/nyaturingtest/nya_presets/      角色预设
 | 时间 | 任务 | 内容 |
 | --- | --- | --- |
 | 03:00 | 图片缓存清理 | 删除超过 48 小时的缓存原图 |
-| 03:30 | 向量记忆维护 | 对每个已加载的群执行 `cleanup(days_retention=90)` |
+| 03:30 | 长期记忆维护 | 删除所有群的过期记忆，补算缺失的向量 |
 | 04:00 | 数据备份 | 备份 + 原始行保留期清理 |
 
 备份行为：走 `sqlite3` 的 backup API 取一致性快照，`shutil.copy2` 复制数据目录其余内容到临时目录，
 再打成一个 zip。**排除** `nyabot.sqlite` / `-wal` / `-shm`、`__pycache__` 与 `.ttf/.otf/.ttc` 字体
 （每包省约 24MB，恢复后字体需在数据目录中才能渲染卡片）。备份目录是数据目录的兄弟目录，不会自我嵌套。
-保留最近 `7` 个（按 mtime）。整个「复制 + 打包」过程持有 `memory.vector.BACKUP_IO_LOCK`，
-与向量写入互斥。
+保留最近 `7` 个（按 mtime）。长期记忆在 sqlite 里，随 backup API 快照一起拿到一致版本，不需要额外加锁。
 
 每次成功备份后执行保留期清理：消息明细 180 天、画像交互 180 天、Token 明细 90 天。
-**向量记忆与日聚合表不参与清理**，所以 `/token统计 all` 的历史在明细行被删后依然存在。
+**长期记忆与日聚合表不参与清理**，所以 `/token统计 all` 的历史在明细行被删后依然存在。
 
 备份包含聊天内容、用户 ID、画像与长期记忆，属敏感数据：请加密保存并定期离机复制。
 三个字体文件（`SourceHanSansCN-{Regular,Bold,Heavy}.ttf`）需放在数据目录下。

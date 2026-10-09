@@ -76,6 +76,7 @@ async def save_session_state(session_id: str, data: dict):
             "name": sanitize_text(data.get("name", "")),
             "role": sanitize_text(data.get("role", "")),
             "aliases": data.get("aliases", []),
+            "preset_lines": data.get("preset_lines", []),
             "valence": data.get("valence", 0.0),
             "arousal": data.get("arousal", 0.0),
             "dominance": data.get("dominance", 0.0),

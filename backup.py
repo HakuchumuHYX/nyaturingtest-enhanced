@@ -16,7 +16,6 @@ from nonebot_plugin_apscheduler import scheduler  # noqa: E402  必须在 requir
 
 from .config import BACKUP_DIR, get_data_dir
 from .core.state_manager import maintain_vector_memories
-from .memory.vector import BACKUP_IO_LOCK
 from .models import GlobalMessageModel, InteractionLogModel, TokenUsageModel
 
 # 原始明细保留天数
@@ -36,7 +35,7 @@ async def _delete_older_than(model, field_name: str, days: int) -> int:
 async def cleanup_raw_data_retention() -> dict[str, int]:
     """按保留期清理原始数据库行。
 
-    刻意不触碰长期向量记忆：语义记忆的生命周期由向量库清理路径负责。
+    刻意不触碰长期记忆：它的生命周期由 03:30 的记忆维护负责。
     """
 
     try:
@@ -108,19 +107,18 @@ def _backup_data_sync() -> bool:
     logger.info(f"开始备份 NyaTuringTest 数据到: {backup_filepath}")
 
     try:
-        with BACKUP_IO_LOCK:
-            with TemporaryDirectory(prefix="nyaturingtest_backup_") as tmp:
-                staging_dir = Path(tmp) / "data"
-                staging_dir.mkdir(parents=True, exist_ok=True)
-                _copy_data_to_staging(data_dir, staging_dir)
+        with TemporaryDirectory(prefix="nyaturingtest_backup_") as tmp:
+            staging_dir = Path(tmp) / "data"
+            staging_dir.mkdir(parents=True, exist_ok=True)
+            _copy_data_to_staging(data_dir, staging_dir)
 
-                with zipfile.ZipFile(
-                    backup_filepath, "w", zipfile.ZIP_DEFLATED
-                ) as zipf:
-                    for root, _, files in os.walk(staging_dir):
-                        for file in files:
-                            file_path = Path(root) / file
-                            zipf.write(file_path, file_path.relative_to(staging_dir))
+            with zipfile.ZipFile(
+                backup_filepath, "w", zipfile.ZIP_DEFLATED
+            ) as zipf:
+                for root, _, files in os.walk(staging_dir):
+                    for file in files:
+                        file_path = Path(root) / file
+                        zipf.write(file_path, file_path.relative_to(staging_dir))
         logger.info(f"备份完成: {backup_filepath}")
     except Exception as e:
         logger.error(f"备份过程发生异常: {e}")
@@ -169,7 +167,7 @@ async def backup_task() -> bool:
 
 
 def setup_backup_job():
-    """注册定时备份与向量记忆维护任务"""
+    """注册定时备份与长期记忆维护任务"""
 
     scheduler.add_job(
         backup_task,

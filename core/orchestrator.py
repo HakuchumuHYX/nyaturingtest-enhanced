@@ -5,14 +5,12 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 
 from nonebot import logger
-from nonebot.utils import run_sync
 
 from ..db import get_history_before
 from ..domain import EmotionState, PersonProfile
 from ..memory.short_term import Message
 from ..memory.validation import validate_memory_candidate
 from ..memory.vector import (
-    RAG_DEFAULT_EVENT_TTL_DAYS,
     RAG_FINAL_K,
     RAG_ITEM_CHARS,
     RAG_MEMORY_CHAR_BUDGET,
@@ -20,7 +18,6 @@ from ..memory.vector import (
     RAG_PER_QUERY_RECALL_K,
     RetrievalResult,
     build_chat_rag_queries,
-    search_memories,
 )
 from .engagement import (
     RELEVANCE_WILLINGNESS_FLOOR,
@@ -37,7 +34,7 @@ from .prompts import (
     get_feedback_prompt,
     get_time_description,
 )
-from .session import STALE_GENERATION_WRITE, Session
+from .session import Session
 
 LLMCall = Callable[[str], Awaitable[str]]
 
@@ -85,52 +82,10 @@ def _memory_lines(records: list[dict]) -> list[str]:
     return lines
 
 
-@dataclass
-class _FeedbackContext:
-    response: dict
-    existing_related_memories: list[dict]
-
-
 @dataclass(frozen=True)
 class FeedbackDecision:
     recalled_history: list[str]
     llm_willing: float
-
-
-def _existing_related_memories(
-    records: list[dict],
-    active_user_ids: set[str],
-    *,
-    limit: int = 5,
-) -> list[dict]:
-    """本轮检索到的、可被 supersede 的旧记忆候选（检索结果的 metadata 已规范化）。"""
-
-    related = []
-    for item in records:
-        meta = item["metadata"]
-        if meta["source"] != "memory" or meta["status"] != "active":
-            continue
-        subject_user_id = meta["subject_user_id"]
-        if subject_user_id and subject_user_id not in active_user_ids:
-            continue
-        related.append(
-            {
-                "content_preview": item["content"][:80],
-                "source": meta["source"],
-                "type": meta["type"],
-                "subtype": meta["subtype"],
-                "category": meta["category"],
-                "confidence": meta["confidence"],
-                "subject_user_id": subject_user_id,
-                "subject_user_name": meta["subject_user_name"],
-                "speaker_user_id": meta["speaker_user_id"],
-                "speaker_user_name": meta["speaker_user_name"],
-                "memory_ref": meta["memory_ref"],
-            }
-        )
-        if len(related) >= limit:
-            break
-    return related
 
 
 class ConversationOrchestrator:
@@ -263,22 +218,16 @@ class ConversationOrchestrator:
             "skip_reason": "none",
         }
 
-        # 预设每轮完全相同，排序固定，才能作为不变的前缀参与缓存
-        preset_lines = sorted(
-            f"【设定/{record['metadata']['subtype']}】 {record['content']}"
-            for record in await run_sync(vector_memory.get_source_records)("preset")
-        )
+        preset_lines = state.preset_lines
 
         records = []
         if not queries:
             rag_stats["skip_reason"] = "no_queries"
         else:
             logger.debug(f"触发长期记忆检索: {queries[:5]}...")
-            retrieval = await search_memories(
-                vector_memory,
+            retrieval = await vector_memory.retrieve_with_decay(
                 queries,
                 k=RAG_FINAL_K,
-                where={"source": {"$eq": "memory"}},
                 use_rerank=use_rerank,
                 candidate_k=RAG_PER_QUERY_RECALL_K,
                 merged_candidate_cap=RAG_MERGED_CANDIDATE_CAP,
@@ -332,17 +281,13 @@ class ConversationOrchestrator:
         llm_call: LLMCall,
         is_relevant: bool,
         search_result: RetrievalResult,
-    ) -> _FeedbackContext | None:
-        """运行 Feedback LLM 并返回可复用的分析上下文；失败返回 None。"""
+    ) -> dict | None:
+        """运行 Feedback LLM 并返回校验过的输出；失败返回 None。"""
 
         state = self.session.state
         for uid in dict.fromkeys(_user_key(msg) for msg in messages_chunk):
             state.profiles.setdefault(uid, PersonProfile(user_id=uid))
 
-        active_user_ids = {msg.user_id for msg in messages_chunk if msg.user_id}
-        existing_related_memories = _existing_related_memories(
-            search_result.records, active_user_ids
-        )
         prompt = get_feedback_prompt(
             bot_name=state.name,
             role=state.role,
@@ -360,7 +305,6 @@ class ConversationOrchestrator:
             is_relevant=is_relevant,
             time_info=get_time_description(datetime.now()),
             presets=search_result.preset_lines,
-            existing_related_memories=existing_related_memories,
             new_msg_speakers=[
                 {"index": index, "user_id": msg.user_id, "user_name": msg.user_name}
                 for index, msg in enumerate(messages_chunk)
@@ -395,10 +339,7 @@ class ConversationOrchestrator:
                 response_keys=sorted(str(key) for key in response),
             )
 
-        return _FeedbackContext(
-            response=response,
-            existing_related_memories=existing_related_memories,
-        )
+        return response
 
     def _apply_image_observations(
         self,
@@ -439,14 +380,13 @@ class ConversationOrchestrator:
 
     def _apply_sediment(
         self,
-        ctx: _FeedbackContext,
+        response: dict,
         messages_chunk: list[Message],
         generation: int,
     ) -> None:
         """应用 Feedback 的沉淀结果：情绪、画像、摘要、长期记忆。"""
 
         state = self.session.state
-        response = ctx.response
 
         # 1. 情绪：parse_feedback 已校验并限幅
         state.global_emotion = EmotionState(**response["new_emotion"])
@@ -495,20 +435,18 @@ class ConversationOrchestrator:
                 self.save_long_term_memory(
                     analyze_result,
                     default_user_id=default_uid,
-                    supersede_candidates=ctx.existing_related_memories,
                     generation=generation,
                 )
             )
 
     async def _apply_decision(
         self,
-        ctx: _FeedbackContext,
+        response: dict,
         is_relevant: bool,
         generation: int,
     ) -> FeedbackDecision | None:
         """应用 Feedback 的发言决策：历史溯源、意愿。会话已作废时返回 None。"""
 
-        response = ctx.response
         recalled_history = []
 
         # 主动历史溯源 (Historical Recall)
@@ -557,14 +495,14 @@ class ConversationOrchestrator:
         Feedback 失败或会话已作废时返回 None。"""
 
         logger.debug(">> 反馈阶段 (Feedback) 开始")
-        ctx = await self._run_feedback_llm(
+        response = await self._run_feedback_llm(
             messages_chunk, llm_call, is_relevant, search_result
         )
-        if ctx is None or self.session.stale(generation, "feedback_sediment"):
+        if response is None or self.session.stale(generation, "feedback_sediment"):
             return None
-        self._apply_image_observations(ctx.response, messages_chunk)
-        self._apply_sediment(ctx, messages_chunk, generation)
-        decision = await self._apply_decision(ctx, is_relevant, generation)
+        self._apply_image_observations(response, messages_chunk)
+        self._apply_sediment(response, messages_chunk, generation)
+        decision = await self._apply_decision(response, is_relevant, generation)
         logger.debug(f"<< 反馈结束: 意愿 {self.session.state.willingness:.2f}")
         return decision
 
@@ -585,16 +523,16 @@ class ConversationOrchestrator:
         search_result = await self.search_stage(messages_chunk, use_rerank=False)
         if self.session.stale(generation, "consolidation_search"):
             return
-        ctx = await self._run_feedback_llm(
+        response = await self._run_feedback_llm(
             messages_chunk, feedback_call, False, search_result
         )
-        if ctx is None:
+        if response is None:
             self.session.schedule_save()
             return
         if self.session.stale(generation, "consolidation_sediment"):
             return
-        self._apply_image_observations(ctx.response, messages_chunk)
-        self._apply_sediment(ctx, messages_chunk, generation)
+        self._apply_image_observations(response, messages_chunk)
+        self._apply_sediment(response, messages_chunk, generation)
         self._advance_consolidation_watermark(messages_chunk)
 
     @staticmethod
@@ -615,15 +553,13 @@ class ConversationOrchestrator:
                 "subject_user_name": "",
                 "speaker_user_id": "",
                 "speaker_user_name": "",
-                "target_ref": "",
-                "reason": "",
             }
 
         if not isinstance(item, dict):
             return None
 
         action = str(item.get("action") or "add").strip().lower()
-        if action not in {"add", "supersede"}:
+        if action != "add":
             logger.debug(f"[Memory] 暂不处理的记忆 action: {action}")
             return None
 
@@ -644,80 +580,30 @@ class ConversationOrchestrator:
             "subject_user_name": str(item.get("subject_user_name") or "").strip(),
             "speaker_user_id": str(item.get("speaker_user_id") or "").strip(),
             "speaker_user_name": str(item.get("speaker_user_name") or "").strip(),
-            "target_ref": str(item.get("target_ref") or "").strip(),
-            "reason": str(item.get("reason") or ""),
         }
-
-    async def _supersede_target_allowed(self, target_ref: str, candidate: dict) -> bool:
-        """确认 supersede 目标存在且可替换，否则记一条拒绝事件。"""
-
-        metadata = await run_sync(
-            self.session.runtime.vector_memory.get_metadata_by_id
-        )(target_ref)
-        if not metadata:
-            log_event(
-                "rag_action_hallucination",
-                session_id=self.session.id,
-                action="supersede",
-                target_ref=target_ref,
-                reason="target_ref_missing_in_vector_store",
-            )
-            return False
-
-        source = str(metadata.get("source") or candidate.get("source") or "memory")
-        memory_type = str(metadata.get("type") or candidate.get("type") or "event")
-        subtype = str(
-            metadata.get("subtype") or candidate.get("subtype") or memory_type
-        )
-        category = str(
-            metadata.get("category") or candidate.get("category") or memory_type
-        )
-        allowed_types = {"event", "preference", "profile", "relationship"}
-        if (
-            source != "memory"
-            or subtype == "bot_self"
-            or (memory_type not in allowed_types and category not in allowed_types)
-        ):
-            log_event(
-                "rag_action_rejected",
-                session_id=self.session.id,
-                action="supersede",
-                target_ref=target_ref,
-                source=source,
-                type=memory_type,
-                subtype=subtype,
-                category=category,
-                reason="target_not_supersedable",
-            )
-            return False
-        return True
 
     async def save_long_term_memory(
         self,
         analyze_result: list,
         *,
         default_user_id: str,
-        supersede_candidates: list[dict],
         generation: int,
     ):
-        """后台任务：把 Feedback 提取的候选落进向量库（质量过滤 + 去重）。"""
+        """后台任务：把 Feedback 提取的候选落进记忆库（质量过滤 + 去重）。"""
 
         if self.session.stale(generation, "long_term_memory"):
             return
 
-        vector_memory = self.session.runtime.vector_memory
         today = int(datetime.now().strftime("%Y%m%d"))
         skipped_quality = 0
-        superseded_count = 0
         pending_memories: list[tuple[str, dict]] = []
-        allowed_supersede_refs = {item["memory_ref"]: item for item in supersede_candidates}
 
         for raw_item in analyze_result:
             candidate = self._parse_memory_candidate(raw_item, default_user_id)
             if candidate is None:
                 continue
 
-            # 质量过滤：长度 + 类别/置信度/主体边界（先过滤，避免为废候选查库）
+            # 质量过滤：长度 + 类别/置信度/主体边界（先过滤，避免为废候选调 embedding）
             reason = validate_memory_candidate(candidate)
             if reason:
                 skipped_quality += 1
@@ -733,81 +619,37 @@ class ConversationOrchestrator:
                 )
                 continue
 
-            if candidate["action"] == "supersede":
-                target_ref = candidate["target_ref"]
-                if target_ref not in allowed_supersede_refs:
-                    log_event(
-                        "rag_action_hallucination",
-                        session_id=self.session.id,
-                        action="supersede",
-                        target_ref=target_ref,
-                        reason="target_ref_not_in_current_candidates",
-                    )
-                    continue
-                if not await self._supersede_target_allowed(
-                    target_ref, allowed_supersede_refs[target_ref]
-                ):
-                    continue
-
-            metadata = {
-                "schema_version": 2,
-                "source": "memory",
-                "type": candidate["category"],
-                "date": today,
-                "subject_user_id": candidate["subject_user_id"],
-                "subject_user_name": candidate["subject_user_name"],
-                "speaker_user_id": candidate["speaker_user_id"],
-                "speaker_user_name": candidate["speaker_user_name"],
-                "status": "active",
-                "category": candidate["category"],
-                "confidence": candidate["confidence"],
-                "importance": candidate["importance"],
-                "ttl_days": RAG_DEFAULT_EVENT_TTL_DAYS,
-            }
-
-            if candidate["action"] != "supersede":
-                pending_memories.append((candidate["content"], metadata))
-                continue
-
-            operation_result = await self.session.run_sync_if_current(
-                generation,
-                "long_term_memory_supersede",
-                vector_memory.supersede_memory,
-                candidate["content"],
-                metadata,
-                candidate["target_ref"],
-                reason=candidate["reason"],
-            )
-            if operation_result is STALE_GENERATION_WRITE:
-                return
-            if not operation_result["completed"]:
-                log_event(
-                    "rag_action_rejected",
-                    session_id=self.session.id,
-                    action="supersede",
-                    target_ref=candidate["target_ref"],
-                    reason="supersede_queued_for_repair",
-                    queued_repair=operation_result["queued_repair"],
+            pending_memories.append(
+                (
+                    candidate["content"],
+                    {
+                        "category": candidate["category"],
+                        "date": today,
+                        "subject_user_id": candidate["subject_user_id"],
+                        "subject_user_name": candidate["subject_user_name"],
+                        "speaker_user_id": candidate["speaker_user_id"],
+                        "speaker_user_name": candidate["speaker_user_name"],
+                        "confidence": candidate["confidence"],
+                        "importance": candidate["importance"],
+                    },
                 )
-                continue
-            superseded_count += 1
+            )
 
         store_result = {"added": 0, "skipped_dedup": 0}
         if pending_memories:
-            store_result = await self.session.run_sync_if_current(
-                generation,
-                "long_term_memory_bulk",
-                vector_memory.add_memories_with_dedup,
+            store_result = await self.session.runtime.vector_memory.add_memories_with_dedup(
                 pending_memories,
+                still_current=lambda: self.session.state.generation == generation,
             )
-            if store_result is STALE_GENERATION_WRITE:
+            if store_result is None:
+                self.session.stale(generation, "long_term_memory_bulk")
                 return
 
         saved_count = store_result["added"]
         skipped_dedup = store_result["skipped_dedup"]
-        if saved_count or skipped_quality or skipped_dedup or superseded_count:
+        if saved_count or skipped_quality or skipped_dedup:
             logger.info(
-                f"[Memory] 存储结果: 成功 {saved_count}, 替换 {superseded_count}, 质量过滤 {skipped_quality}, 去重跳过 {skipped_dedup}"
+                f"[Memory] 存储结果: 成功 {saved_count}, 质量过滤 {skipped_quality}, 去重跳过 {skipped_dedup}"
             )
 
     async def chat_stage(

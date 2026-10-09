@@ -17,6 +17,8 @@ class SessionModel(Model):
     last_speak_time = fields.DatetimeField(null=True)
     last_consolidated_time = fields.DatetimeField(null=True)
     chatting_state = fields.IntField(default=0)
+    # 预设条目每轮原样注入，不参与检索，所以不进记忆表
+    preset_lines = fields.JSONField(default=list)
 
     class Meta:
         table = "nyabot_sessions"
@@ -75,6 +77,39 @@ class GlobalMessageModel(Model):
                 fields=("session_id", "user_id", "time"),
                 name="idx_messages_session_user_time",
             ),
+        )
+
+
+class MemoryModel(Model):
+    """长期记忆碎片；向量与元数据同表，检索时整群加载成矩阵做暴力余弦。"""
+
+    id = fields.CharField(pk=True, max_length=36)
+    session = fields.ForeignKeyField("models.SessionModel", related_name="memories")
+    content = fields.TextField()
+    # 归一化后的 float32 字节；NULL 表示 embedding 调用失败，由每日维护补算
+    embedding = fields.BinaryField(null=True)
+    embedding_model = fields.CharField(max_length=255, default="")
+    category = fields.CharField(max_length=32)
+    subject_user_id = fields.CharField(max_length=255, default="")
+    subject_user_name = fields.CharField(max_length=255, default="")
+    speaker_user_id = fields.CharField(max_length=255, default="")
+    speaker_user_name = fields.CharField(max_length=255, default="")
+    confidence = fields.FloatField(default=1.0)
+    importance = fields.FloatField(default=0.0)
+    date = fields.IntField()  # YYYYMMDD，检索衰减按它算
+    expires_at = fields.DatetimeField(null=True)  # NULL 表示不过期
+    reaffirm_count = fields.IntField(default=0)
+    created_at = fields.DatetimeField(auto_now_add=True)
+    updated_at = fields.DatetimeField(auto_now=True)
+
+    class Meta:
+        table = "nyabot_memories"
+        indexes = (
+            Index(
+                fields=("session_id", "subject_user_id"),
+                name="idx_memories_session_subject",
+            ),
+            Index(fields=("expires_at",), name="idx_memories_expires_at"),
         )
 
 
