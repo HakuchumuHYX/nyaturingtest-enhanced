@@ -58,6 +58,8 @@ class RetrievalResult:
     # 预设条目每轮都一样，与每轮变化的记忆分开送进 Prompt，便于前缀缓存命中
     preset_lines: list[str] = field(default_factory=list)
     memory_lines: list[str] = field(default_factory=list)
+    # 行里的编号 m1、m2… → 记忆 id，Feedback 用 correct 动作指认要替换的那条
+    refs: dict[str, str] = field(default_factory=dict)
 
 
 def _retrieval_stats(
@@ -143,6 +145,7 @@ def _row_metadata(row: MemoryModel) -> dict[str, Any]:
         "confidence": row.confidence,
         "importance": row.importance,
         "date": row.date,
+        "is_correction": row.is_correction,
     }
 
 
@@ -482,10 +485,11 @@ class VectorMemory:
         """批量去重并写入长期记忆；会话在写入前被 reset/set_role 作废则返回 None。
 
         同 (subject, category) 内与已有记忆余弦 > 0.9 视为重复，只强化旧记忆的置信度与日期。
+        更正条（is_correction）不去重：它和要替换的旧记忆往往高度相似；replaces 指向的旧行在同一事务里删除。
         embedding 调用失败时照样落库（embedding 为 NULL、不做去重），由每日维护补算。
         """
 
-        result = {"added": 0, "skipped_dedup": 0, "reinforced": 0}
+        result = {"added": 0, "skipped_dedup": 0, "reinforced": 0, "corrected": 0}
         valid: list[tuple[str, dict]] = []
         seen_batch = set()
         for content, metadata in memories:
@@ -514,7 +518,7 @@ class VectorMemory:
             reinforce: dict[str, dict] = {}
             for index, (content, metadata) in enumerate(valid):
                 vector = None if vectors is None else vectors[index]
-                if vector is not None and self._ids:
+                if vector is not None and self._ids and not metadata["is_correction"]:
                     scope = (self._subjects == metadata["subject_user_id"]) & (
                         self._categories == metadata["category"]
                     )
@@ -548,8 +552,15 @@ class VectorMemory:
                         expires_at=memory_expires_at(
                             metadata["category"], metadata["date"], metadata["importance"]
                         ),
+                        source_msg_ids=metadata["source_msg_ids"],
+                        is_correction=metadata["is_correction"],
                     )
                 )
+            replaces = {
+                metadata["replaces"]: content
+                for content, metadata in valid
+                if metadata["replaces"]
+            }
 
             async with in_transaction():
                 # 在事务内确认代际：reset 先递增 generation 再删库，所以这里放行的写入一定早于删除
@@ -573,9 +584,22 @@ class VectorMemory:
                         ]
                     )
                     result["reinforced"] += 1
+                replaced_rows = (
+                    await MemoryModel.filter(session_id=self.session_id, id__in=list(replaces))
+                    if replaces
+                    else []
+                )
+                for row in replaced_rows:
+                    logger.info(f"[Memory] 更正替换: 旧「{row.content}」→ 新「{replaces[row.id]}」")
+                    await row.delete()
+                result["corrected"] = len(replaced_rows)
                 if new_rows:
                     await MemoryModel.bulk_create(new_rows)
-            self._append_to_cache(new_rows)
+            if replaced_rows:
+                # 更正很少发生：整体丢掉矩阵缓存，下次检索重新加载，不维护增量删除
+                self.drop_cache()
+            else:
+                self._append_to_cache(new_rows)
 
         result["added"] = len(new_rows)
         return result

@@ -106,6 +106,10 @@ class MemoryModel(Model):
     date = fields.IntField()  # YYYYMMDD，检索衰减按它算
     expires_at = fields.DatetimeField()
     reaffirm_count = fields.IntField(default=0)
+    # 依据的新消息 msg_id，空格分隔；事后核对时据此找回原话（历史行为空）
+    source_msg_ids = fields.TextField(default="")
+    # 更正条：替换掉被纠正的旧记忆，整理档案/群志时据此删改旧说法
+    is_correction = fields.BooleanField(default=False)
     created_at = fields.DatetimeField(auto_now_add=True)
     updated_at = fields.DatetimeField(auto_now=True)
 

@@ -6,7 +6,7 @@ from datetime import datetime
 
 from nonebot import logger
 
-from ..db import get_history_before
+from ..db import get_history_before, message_final_id
 from ..domain import EmotionState, PersonProfile
 from ..memory.short_term import Message
 from ..memory.validation import validate_memory_candidate
@@ -95,19 +95,30 @@ def _resolve_user(
     return "", user_name
 
 
-def _memory_lines(records: list[dict]) -> list[str]:
-    """按总字符预算与单条上限把检索结果整理成 prompt 行。"""
+def _memory_lines(records: list[dict]) -> tuple[list[str], dict[str, str]]:
+    """按总字符预算与单条上限把检索结果整理成 prompt 行，返回行与「编号 → 记忆 id」。
+
+    行里带编号和主体：模型能看出一条记忆挂在谁身上，也能用编号指认要更正的那条。
+    """
 
     lines = []
+    refs = {}
     remaining = RAG_MEMORY_CHAR_BUDGET
     for item in records:
         if remaining <= 0:
             break
-        line = f"【记忆/d:{item['metadata'].get('date', '')}】 {item['content']}"
+        meta = item["metadata"]
+        ref = f"m{len(lines) + 1}"
+        tag = "更正|" if meta["is_correction"] else ""
+        line = (
+            f"【{tag}{ref}|主体:{meta['subject_user_name'] or '无'}|d:{meta['date']}】"
+            f"{item['content']}"
+        )
         line = line[: min(remaining, RAG_ITEM_CHARS)].rstrip()
         lines.append(line)
+        refs[ref] = meta["memory_ref"]
         remaining -= len(line)
-    return lines
+    return lines, refs
 
 
 @dataclass(frozen=True)
@@ -259,7 +270,7 @@ class ConversationOrchestrator:
             records = retrieval.records
             rag_stats.update(retrieval.stats)
 
-        memory_lines = _memory_lines(records)
+        memory_lines, refs = _memory_lines(records)
         rag_stats["injected_count"] = len(preset_lines) + len(memory_lines)
         rag_stats["injected_chars"] = sum(len(line) for line in preset_lines + memory_lines)
         rag_stats["elapsed_ms"] = int((time.perf_counter() - started_at) * 1000)
@@ -269,6 +280,7 @@ class ConversationOrchestrator:
             stats=rag_stats,
             preset_lines=preset_lines,
             memory_lines=memory_lines,
+            refs=refs,
         )
 
     def _history_context(self, messages_chunk: list[Message]) -> list[dict]:
@@ -408,8 +420,9 @@ class ConversationOrchestrator:
         response: dict,
         messages_chunk: list[Message],
         generation: int,
+        refs: dict[str, str],
     ) -> None:
-        """应用 Feedback 的沉淀结果：情绪、画像、摘要、长期记忆。"""
+        """应用 Feedback 的沉淀结果：情绪、画像、摘要、长期记忆。refs 是本轮检索行编号 → 记忆 id。"""
 
         state = self.session.state
 
@@ -454,22 +467,16 @@ class ConversationOrchestrator:
         # 4. 长期记忆提取（后台写入）
         analyze_result = response.get("analyze_result", [])
         if isinstance(analyze_result, list) and analyze_result:
-            user_ids = {msg.user_id for msg in messages_chunk if msg.user_id}
-            default_uid = next(iter(user_ids)) if len(user_ids) == 1 else ""
-            # 上下文里每个 QQ 号的当前群名片，本批消息在后、名字以最新为准
-            known_users = {
-                msg.user_id: msg.user_name
-                for msg in [
-                    *self.session.runtime.short_term_memory.access(),
-                    *messages_chunk,
-                ]
-                if msg.user_id
-            }
+            # 上下文里每个 QQ 号的当前群名片：先放被 @/被回复的人，再放发言人（本批在后、以最新为准）
+            context = [*self.session.runtime.short_term_memory.access(), *messages_chunk]
+            known_users = {uid: name for msg in context for uid, name in msg.mentions.items()}
+            known_users.update({msg.user_id: msg.user_name for msg in context if msg.user_id})
             self.session.spawn(
                 self.save_long_term_memory(
                     analyze_result,
+                    messages_chunk=messages_chunk,
                     known_users=known_users,
-                    default_user_id=default_uid,
+                    refs=refs,
                     generation=generation,
                 )
             )
@@ -536,7 +543,7 @@ class ConversationOrchestrator:
         if response is None or self.session.stale(generation, "feedback_sediment"):
             return None
         self._apply_image_observations(response, messages_chunk)
-        self._apply_sediment(response, messages_chunk, generation)
+        self._apply_sediment(response, messages_chunk, generation, search_result.refs)
         decision = await self._apply_decision(response, is_relevant, generation)
         logger.debug(f"<< 反馈结束: 意愿 {self.session.state.willingness:.2f}")
         return decision
@@ -567,40 +574,28 @@ class ConversationOrchestrator:
         if self.session.stale(generation, "consolidation_sediment"):
             return
         self._apply_image_observations(response, messages_chunk)
-        self._apply_sediment(response, messages_chunk, generation)
+        self._apply_sediment(response, messages_chunk, generation, search_result.refs)
         self._advance_consolidation_watermark(messages_chunk)
 
     @staticmethod
     def _parse_memory_candidate(
-        item, known_users: dict[str, str], default_user_id: str
+        item,
+        messages_chunk: list[Message],
+        known_users: dict[str, str],
+        refs: dict[str, str],
     ) -> dict | None:
-        """把 LLM 返回的一条候选规范化；ignore / 未知 action / 空内容返回 None。
+        """把 LLM 返回的一条 add/correct 候选规范化；ignore、未知 action、非对象返回 None。
 
-        主体没填名字时才默认记到本批唯一的发言人头上；填了别人的名字就不能这样兜底。
+        说话人由代码按 source 指向的第一条新消息定，不信模型自报；source 缺失时来源为空，由校验拒绝。
+        主体没填名字时才默认记到说话人头上；填了别人的名字就不能这样兜底。
         """
-
-        if isinstance(item, str):
-            content = item.strip()
-            if not content:
-                return None
-            return {
-                "action": "add",
-                "content": content,
-                "category": "event",
-                "confidence": 0.7,
-                "importance": 0.5,
-                "subject_user_id": default_user_id,
-                "subject_user_name": known_users.get(default_user_id, ""),
-                "speaker_user_id": "",
-                "speaker_user_name": "",
-            }
 
         if not isinstance(item, dict):
             return None
-
         action = str(item.get("action") or "add").strip().lower()
-        if action != "add":
-            logger.debug(f"[Memory] 暂不处理的记忆 action: {action}")
+        if action not in ("add", "correct"):
+            if action != "ignore":
+                logger.debug(f"[Memory] 暂不处理的记忆 action: {action}")
             return None
 
         def bounded_float(value, default: float) -> float:
@@ -609,16 +604,19 @@ class ConversationOrchestrator:
             except (TypeError, ValueError):
                 return default
 
-        speaker_user_id, speaker_user_name = _resolve_user(
-            str(item.get("speaker_user_id") or "").strip(),
-            str(item.get("speaker_user_name") or "").strip(),
-            known_users,
-        )
+        source = item.get("source")
+        sources = [
+            messages_chunk[index]
+            for index in (source if isinstance(source, list) else [])
+            if isinstance(index, int) and 0 <= index < len(messages_chunk)
+        ]
+        speaker_user_id = sources[0].user_id if sources else ""
+        speaker_user_name = known_users.get(speaker_user_id, "") if sources else ""
         subject_user_id, subject_user_name = _resolve_user(
             str(item.get("subject_user_id") or "").strip(),
             str(item.get("subject_user_name") or "").strip(),
             known_users,
-            fallback_id=default_user_id,
+            fallback_id=speaker_user_id,
             speaker_id=speaker_user_id,
         )
         return {
@@ -631,14 +629,21 @@ class ConversationOrchestrator:
             "subject_user_name": subject_user_name,
             "speaker_user_id": speaker_user_id,
             "speaker_user_name": speaker_user_name,
+            "source_msg_ids": " ".join(dict.fromkeys(message_final_id(m) for m in sources)),
+            "is_correction": action == "correct",
+            # 编号只在本轮有效；查不到就当没指认，只写一条更正
+            "replaces": refs.get(str(item.get("target") or "").strip(), "")
+            if action == "correct"
+            else "",
         }
 
     async def save_long_term_memory(
         self,
         analyze_result: list,
         *,
+        messages_chunk: list[Message],
         known_users: dict[str, str],
-        default_user_id: str,
+        refs: dict[str, str],
         generation: int,
     ):
         """后台任务：把 Feedback 提取的候选落进记忆库（质量过滤 + 去重）。"""
@@ -652,7 +657,7 @@ class ConversationOrchestrator:
 
         for raw_item in analyze_result:
             candidate = self._parse_memory_candidate(
-                raw_item, known_users, default_user_id
+                raw_item, messages_chunk, known_users, refs
             )
             if candidate is None:
                 continue
@@ -685,11 +690,14 @@ class ConversationOrchestrator:
                         "speaker_user_name": candidate["speaker_user_name"],
                         "confidence": candidate["confidence"],
                         "importance": candidate["importance"],
+                        "source_msg_ids": candidate["source_msg_ids"],
+                        "is_correction": candidate["is_correction"],
+                        "replaces": candidate["replaces"],
                     },
                 )
             )
 
-        store_result = {"added": 0, "skipped_dedup": 0}
+        store_result = {"added": 0, "skipped_dedup": 0, "corrected": 0}
         if pending_memories:
             store_result = await self.session.runtime.vector_memory.add_memories_with_dedup(
                 pending_memories,
@@ -701,9 +709,11 @@ class ConversationOrchestrator:
 
         saved_count = store_result["added"]
         skipped_dedup = store_result["skipped_dedup"]
+        corrected = store_result["corrected"]
         if saved_count or skipped_quality or skipped_dedup:
             logger.info(
-                f"[Memory] 存储结果: 成功 {saved_count}, 质量过滤 {skipped_quality}, 去重跳过 {skipped_dedup}"
+                f"[Memory] 存储结果: 成功 {saved_count}, 质量过滤 {skipped_quality}, "
+                f"去重跳过 {skipped_dedup}, 更正替换 {corrected}"
             )
 
     async def chat_stage(

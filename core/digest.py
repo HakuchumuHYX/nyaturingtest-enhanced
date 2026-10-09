@@ -36,6 +36,7 @@ _MEMORY_FIELDS = (
     "category",
     "date",
     "created_at",
+    "is_correction",
 )
 
 _SAFETY_RULE = (
@@ -52,7 +53,7 @@ _PROFILE_SELECTION = """- 只写能长期刻画这个人的信息：身份（学
 - 同类事物只举最有代表性的两三个，不罗列（例如玩过的游戏、吃过的东西）。"""
 _GROUP_SELECTION = """- 只收两类内容：多个群友参与的事，或者在不同日子反复出现的事。只出现过一次的事件、某个人的观点、偏好和个人行程不写（那属于个人档案），除非它已经成了全群的梗或话题。
 - 同类事物只举最有代表性的两三个，不罗列。
-- 外号和梗的含义必须在资料里有直接依据，拿不准就不收。"""
+- 外号和梗的含义必须在资料里有直接依据，拿不准就不收。群名片和名片里的后缀不算外号；称呼要有人实际这样叫过对方才收，字形、读音相近或别人名片里含有这几个字都不算。"""
 _GROUP_PURPOSE = (
     "「群志」是写给群聊角色自己看的群介绍：让它在群里聊天时像个老群友，知道这是什么群、"
     "平时聊什么、谁被叫什么、哪些梗能接、最近大家在忙什么。群友也可能直接阅读，所以要通顺好读。"
@@ -61,6 +62,12 @@ _GROUP_FORMAT = """【群像】1–2 句：这是个什么群、成员大致是�
 【日常】最核心的 2–3 项共同活动，每项一句话说清大家怎么玩、怎么聊。
 【称呼与梗】最多 10 条，每条一行「外号或梗：含义或来历」。只收流传广、反复出现的。
 【近期】最多 5 条，每条一行「YYYY-MM 群内动态或大事」，只写全群参与或引起全群讨论的事。过了一两个月、不再被提起的删掉。"""
+# 更正条替换了被纠正的旧碎片，但旧档案/群志里可能还写着旧说法，要靠整理时删改
+_CORRECTION_RULE = (
+    "标有「更正」的碎片（分段要点里写作「更正：…」）说明之前的说法有误或已过时："
+    "以它为准，删掉或改正旧内容里与之冲突的部分。"
+)
+_CORRECTION_POINTS_RULE = "标有「更正」的碎片单独写成一条「更正：…」，不要省略或合并。"
 _STYLE_RULE = "用连贯的短句，不用斜杠或顿号串起一长串名词。只依据资料，不推测、不评价。"
 
 
@@ -71,6 +78,7 @@ def _format_date(date: int) -> str:
 
 def _memory_line(row: dict) -> str:
     tag = "|说到别人" if row.get("said_about_others") else ""
+    tag += "|更正" if row["is_correction"] else ""
     return f"[{_format_date(row['date'])}|{row['category']}{tag}] {row['content']}"
 
 
@@ -109,12 +117,18 @@ def _points_material(segments: list[tuple[str, str]]) -> str:
     return f"[新增要点]（新碎片较多，已按时间分段提炼，越靠后越新）\n{body}"
 
 
-def _due(new_count: int, until: datetime | None, *, min_new: int | None = None) -> bool:
-    """有新碎片且（从没整理过 / 攒够 min_new 条 / 水位已满 7 天）。"""
+def _due(
+    new_count: int,
+    until: datetime | None,
+    *,
+    min_new: int | None = None,
+    urgent: bool = False,
+) -> bool:
+    """有新碎片且（有更正 / 从没整理过 / 攒够 min_new 条 / 水位已满 7 天）。"""
 
     if new_count == 0:
         return False
-    if until is None or (min_new is not None and new_count >= min_new):
+    if urgent or until is None or (min_new is not None and new_count >= min_new):
         return True
     return datetime.now() - until >= DIGEST_INTERVAL
 
@@ -179,8 +193,9 @@ def _profile_prompt(name: str, user_id: str, summary: str, material: str) -> str
 {_PROFILE_SELECTION}
 3. 以旧档案为主、小改为主：补上新内容里真正新出现且符合取舍标准的信息，删掉过时的，其余保留。新旧冲突以新内容为准；正在变化的状态写上起始年月，例如「2026-09 起读研」。
 4. 涉及别人的内容，只保留和「{name}」有关的部分。标有「说到别人」的碎片是此人对别人的言行，主角是别人，只从中提取能体现此人自己的态度、关系和习惯的部分；纯转述（比如转发别人的签到、战绩）不写。
-5. {_STYLE_RULE}
-6. {_PRIVACY_RULE}
+5. {_CORRECTION_RULE}
+6. {_STYLE_RULE}
+7. {_PRIVACY_RULE}
 
 只输出 JSON：{{"summary":"完整档案"}}
 """
@@ -196,6 +211,7 @@ def _profile_points_prompt(name: str, user_id: str, chunk: list[dict]) -> str:
 
 提炼这段时间能刻画此人的要点，写几条短句：身份与状态变化、反复出现的兴趣与偏好、在群里的样子与关系、有后续影响的经历。
 标有「说到别人」的碎片是此人对别人的言行，只从中提取能体现此人自己的态度、关系和习惯的部分；纯转述不写。
+{_CORRECTION_POINTS_RULE}
 取舍：
 {_PROFILE_SELECTION}
 {_STYLE_RULE}
@@ -225,6 +241,7 @@ def _group_notes_prompt(notes: str, material: str) -> str:
 - 新内容分了多段时，跨多段反复出现的优先；【近期】只取最后一两个月的内容。
 
 更新方式：以旧群志为主、小改为主。在对应段落补上真正新出现、且符合取舍标准的内容，删掉过时的，其余原样保留；没有值得写的新内容时，原样输出旧群志。
+{_CORRECTION_RULE}
 
 文风：{_STYLE_RULE}梗必须带解释。
 {_PRIVACY_RULE}
@@ -247,6 +264,7 @@ def _group_points_prompt(chunk: list[dict]) -> str:
 - 日常：反复出现的共同活动
 - 称呼与梗：外号或梗及其含义
 - 大事：全群参与或引起全群讨论的事件，写上年月
+{_CORRECTION_POINTS_RULE}
 
 取舍：
 {_GROUP_SELECTION}
@@ -312,7 +330,7 @@ async def digest_user_profiles(
 ) -> dict[str, str]:
     """整理到期的用户档案，返回 {user_id: 新档案}。
 
-    到期条件：新碎片 ≥10 条，或有新碎片且从没整理过 / 水位已满 7 天。
+    到期条件：新碎片 ≥10 条，或有新碎片且有更正 / 从没整理过 / 水位已满 7 天。
     """
 
     profiles = {
@@ -328,7 +346,8 @@ async def digest_user_profiles(
         profile = profiles.get(user_id)
         until = profile.summarized_until if profile else None
         new_rows = [row for row in rows if until is None or row["created_at"] > until]
-        if not _due(len(new_rows), until, min_new=PROFILE_MIN_NEW_MEMORIES):
+        urgent = any(row["is_correction"] for row in new_rows)
+        if not _due(len(new_rows), until, min_new=PROFILE_MIN_NEW_MEMORIES, urgent=urgent):
             continue
 
         name = profile_name(user_id, rows, latest_names)
@@ -358,7 +377,7 @@ async def digest_user_profiles(
 async def digest_group_notes(
     session_id: str, still_current: Callable[[], bool]
 ) -> str | None:
-    """每周把新碎片合进群志，返回新群志；没到期或失败返回 None。"""
+    """每周（有更正时当晚）把新碎片合进群志，返回新群志；没到期或失败返回 None。"""
 
     session_db = await SessionModel.get_or_none(id=session_id)
     if session_db is None:
@@ -368,7 +387,7 @@ async def digest_group_notes(
     if until is not None:
         query = query.filter(created_at__gt=until)
     rows = await query.order_by("created_at").values(*_MEMORY_FIELDS)
-    if not _due(len(rows), until):
+    if not _due(len(rows), until, urgent=any(row["is_correction"] for row in rows)):
         return None
 
     chunks = _chunks(rows, GROUP_NOTES_CHUNK_CHARS)

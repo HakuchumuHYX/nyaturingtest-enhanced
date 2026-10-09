@@ -404,7 +404,7 @@ async def handle_auto_chat(bot: Bot, event: GroupMessageEvent):
     if is_shutting_down():
         return
 
-    message_content, image_inputs = await message2BotMessage(
+    message_content, image_inputs, mentions = await message2BotMessage(
         bot_name=bot_name,
         group_id=group_id,
         message=event.original_message,
@@ -435,6 +435,7 @@ async def handle_auto_chat(bot: Bot, event: GroupMessageEvent):
                 id=str(event.message_id),
                 user_id=user_id,
                 image_inputs=image_inputs,
+                mentions=mentions,
                 to_me=user_id != str(bot.self_id) and _addresses_bot(bot, event),
             )
         )

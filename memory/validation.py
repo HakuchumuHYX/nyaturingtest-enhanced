@@ -13,6 +13,8 @@ MIN_CONTENT_CHARS = 10
 def validate_memory_candidate(candidate: dict) -> str:
     """返回拒绝原因；空串表示可存。candidate 已由 _parse_memory_candidate 规范化。"""
 
+    if not candidate["source_msg_ids"]:
+        return "missing_source"
     if len(candidate["content"]) < MIN_CONTENT_CHARS:
         return "too_short"
     if candidate["category"] not in ALLOWED_MEMORY_CATEGORIES:

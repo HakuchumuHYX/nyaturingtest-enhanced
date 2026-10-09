@@ -224,8 +224,10 @@ async def message2BotMessage(
     bot: Bot,
     *,
     message_scope: str = "",
-) -> tuple[str, list[VisionInput]]:
-    """把 OneBot 消息转成可读文本，并收集原生图片输入。"""
+) -> tuple[str, list[VisionInput], dict[str, str]]:
+    """把 OneBot 消息转成可读文本，并收集原生图片输入与被 @/被回复的人（QQ 号 -> 群名片）。"""
+
+    mentions: dict[str, str] = {}
 
     async def process_segment(
         seg: MessageSegment,
@@ -261,6 +263,7 @@ async def message2BotMessage(
                 nickname = (
                     user_info.get("card") or user_info.get("nickname") or str(target)
                 )
+                mentions[str(target)] = nickname
                 return (f" @{nickname} ", [])
             except Exception:
                 return (f" @{target} ", [])
@@ -271,7 +274,11 @@ async def message2BotMessage(
                 return ("", [])
             try:
                 source_msg = await bot.get_msg(message_id=int(reply_id))
-                sender = source_msg.get("sender", {}).get("nickname", "未知")
+                # 优先群名片，与 @ 和发言人名字保持同一套称呼，否则模型会把昵称当成另一个人
+                sender_info = source_msg.get("sender", {})
+                sender = sender_info.get("card") or sender_info.get("nickname", "未知")
+                if sender_info.get("user_id"):
+                    mentions[str(sender_info["user_id"])] = sender
                 content_data = source_msg.get("message", [])
                 source_text = ""
                 image_inputs: list[VisionInput] = []
@@ -319,7 +326,7 @@ async def message2BotMessage(
 
     content = "".join(result[0] for result in results).strip()
     image_inputs = [item for result in results for item in result[1]]
-    return (content, image_inputs)
+    return (content, image_inputs, mentions)
 
 
 async def _process_inbox_batch(state: GroupState, batch: InboxBatch) -> None:

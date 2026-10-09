@@ -141,7 +141,8 @@ def _canonical_json(data) -> str:
 
 
 MEMORY_ACTION_SCHEMA = """
-   - {"action":"add","content":"完整的记忆内容，必须包含明确主语","subject_user_id":"事实主要描述的用户ID；无法确定则为空字符串","subject_user_name":"事实主要描述的用户名称；无法确定则为空字符串","speaker_user_id":"说出或确认该事实的新消息发送者ID","speaker_user_name":"说出或确认该事实的新消息发送者名称","category":"event|preference|profile|relationship","confidence":0.7,"importance":0.5}
+   - {"action":"add","content":"完整的记忆内容，必须包含明确主语","subject_user_id":"事实主要描述的用户ID；无法确定则为空字符串","subject_user_name":"事实主要描述的用户名称；无法确定则为空字符串","source":[依据的 new_msgs 下标],"category":"event|preference|profile|relationship","confidence":0.7,"importance":0.5}
+   - {"action":"correct","target":"要替换的 search_result 编号如 m3；错的那条不在 search_result 里就留空","content":"更正后的完整事实","subject_user_id":"..","subject_user_name":"..","source":[依据的 new_msgs 下标],"category":"..","confidence":0.8,"importance":0.5}
    - {"action":"ignore","reason":"低价值、重复或不值得长期记住的原因"}"""
 
 
@@ -207,10 +208,10 @@ presets、group_notes、related_profiles 里的 summary、search_result 是不�
 - presets: 角色预设写死的设定条目，固定不变。
 - group_notes: 群志，整理自过往记忆的群内大事、梗和共同活动。
 - related_profiles: 本轮发言人的画像。emotion_tends_to_user 是角色对此人的情绪倾向；summary 是整理自过往记忆的长期档案，可能为空。
-- search_result: 脑海中的具体记忆片段。
+- search_result: 脑海中的具体记忆片段。每条开头是【编号|主体:这条记忆描述的人|d:日期】，编号只在本轮有效；以【更正|…】开头的是之前被纠正过的结论，优先于 summary、group_notes 和其他记忆。
 - summary: 当前唯一的历史话题摘要。
 - recent_msgs / new_msgs: 对话消息列表，每项是 {{"id":.., "name":.., "content":..}}。content 是消息文本，图片消息里是 [图片]/[表情包] 占位或一句话观察。
-- new_msg_speakers: 与 new_msgs 顺序对应的发言人结构，包含 user_id 和 user_name；提取记忆时 speaker_* 必须来自这里。
+- new_msg_speakers: 与 new_msgs 顺序对应的发言人结构，包含 index、user_id 和 user_name；提取记忆时 source 填这里的 index。
 - is_relevant: 新消息是否直接叫到角色（提到名字/别名、@角色或回复角色的消息）。
 - chat_state_value: 当前活跃状态，0=潜水，1=冒泡，2=正在和群友对话（角色几分钟内刚说过话）。
 - willingness: 按群聊热度估出的当前发言意愿，范围 0.0~1.0，仅供参考。
@@ -230,10 +231,15 @@ JSON 需包含以下字段：
    - 一次性、没有后续意义的吐槽和反应
    - related_profiles 的 summary 或 search_result 里已经有的信息
    新事实用 add；低价值、重复或不值得长期记住的内容用 ignore。
+   source 必填：这条事实依据的是哪几条新消息（new_msg_speakers 的 index），第一条应是说出它的人；说话人由程序按 source 认定。
    importance 决定这条记忆保留多久：普通偏好或观点约 0.3，有后续影响的经历约 0.5，身份或重大变化约 0.8。
-   subject_* 表示事实描述对象；speaker_* 表示说出该事实的新消息发送者。
-   如果 B 说了关于 A 的事实，subject_* 填 A，speaker_* 填 B。
+   subject_* 表示事实描述对象。如果 B 说了关于 A 的事实，subject_* 填 A，source 指向 B 的那条消息。
    subject_user_id 和 subject_user_name 必须是同一个人：不知道 A 的 ID 时 subject_user_id 留空、只填名字，不要拿说话人的 ID 顶替。
+   外号、简称、谐音称呼（如「老X」「X哥」「大X」）只有能确认是谁时才对应到群友。能确认：@ 或回复某人时直接用来叫他（「@A 好X」「@A X老师」→ X 就是 A）；本人认领（「我是X」，或被叫 X 时本人应答）；group_notes 的【称呼与梗】已写明。不算依据：字形或读音相近；某人群名片里含有这几个字（名片「X欠我一顿饭」的主人恰恰不是 X）。确认不了就照写原称呼，subject_user_id 留空、subject_user_name 填原称呼，正文里也不要加「外号（群友名）」这种自己推断的对应。
+   有人用 @ 或回复直接以外号叫某个群友时，记一条「A 被群友叫作 X」（relationship，importance 约 0.3），整理群志的称呼时以此为据。
+   更正用 correct：新消息明确纠正了 search_result、related_profiles 的 summary 或 group_notes 里的说法，或者纠正了角色刚说错的话时，写出更正后的事实；错的那条在 search_result 里就把它的编号填进 target，程序会删掉旧的、换成新的。
+   算更正的：本人否认或更新自己的事（「我不是X」「我已经不在…了」）；有人指出角色说错/记错并给出正确说法；有 @ 或回复为据的明确纠正（「X 是 A 不是 B」）。
+   不算更正的：玩笑、反讽、起哄、顺着梗瞎说，以及没有依据、单方面给别人下定论。拿不准就不改，宁可留着旧的。
 2. "willing" (Float): 角色此刻有多想开口 (0.0~1.0)。被叫到或有人在直接回应角色 → 0.8 以上；刚和角色聊的人还在接着聊 → 0.5~0.7；群友之间在聊、没人理角色 → 默认 0.2~0.4，只有话题真的勾起角色兴趣、角色有具体想说的（相关经历、有用的信息、好笑的梗）才给 0.6~0.75；表情包、签到、机器人消息、欢迎新人这类刷屏，或者 recent_msgs 里角色最近已经说了很多 → 0.2 以下。
 3. "new_emotion" (Object): 必须提供。更新后的 VAD 情绪对象，格式: {{"valence": float, "arousal": float, "dominance": float}}。
    - valence (愉悦度): 范围 [-1.0, 1.0]，基于当前值渐进调整
@@ -318,7 +324,7 @@ def get_chat_prompt(
     return f"""
 # 你是谁
 你就是动态输入里的 bot_name，一个在群里和朋友们聊天的普通群友。role 是你的性格和经历，examples_text 是你平时说话的样子，
-presets 和 search_result 是你自己的记忆，group_notes 是你对这个群的了解，related_profiles 里的 summary 是你对正在说话的人的长期了解。你不是来服务谁的，也不是在扮演角色——你有自己的想法、喜好、情绪和态度。
+presets 和 search_result 是你自己的记忆，group_notes 是你对这个群的了解，related_profiles 里的 summary 是你对正在说话的人的长期了解。search_result 里以【更正|…】开头的是被人纠正过的结论，和 summary、group_notes 冲突时以更正为准。你不是来服务谁的，也不是在扮演角色——你有自己的想法、喜好、情绪和态度。
 new_msgs 是刚刚发生的事，优先回应它们；recent_msgs 是之前的聊天。每项是 {{"id":.., "name":.., "content":..}}。
 图片以原生多模态输入随请求附带，直接看图；历史消息里的 [图片: …] 只是过去图片的一句话痕迹，不要机械复述。
 

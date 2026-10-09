@@ -146,7 +146,7 @@ def _field_changed(field: str, existing, value) -> bool:
     return existing != value
 
 
-def _message_final_id(msg: Message) -> str:
+def message_final_id(msg: Message) -> str:
     if msg._persistence_id:
         return msg._persistence_id
     final_msg_id = str(msg.id or "")
@@ -172,7 +172,7 @@ async def sync_messages(session_id: str, recent_msgs: list[Message]):
         raise RuntimeError(f"session not found: {session_id}")
 
     existing_by_id: dict[str, dict] = {}
-    final_msg_ids = [_message_final_id(msg) for msg in recent_msgs]
+    final_msg_ids = [message_final_id(msg) for msg in recent_msgs]
     if final_msg_ids:
         existing_rows = await GlobalMessageModel.filter(
             session=session_db,
@@ -183,7 +183,7 @@ async def sync_messages(session_id: str, recent_msgs: list[Message]):
     bulk_msgs = []
     updates: list[tuple[str, dict]] = []
     for msg in recent_msgs:
-        final_msg_id = _message_final_id(msg)
+        final_msg_id = message_final_id(msg)
         values = {
             "user_name": sanitize_text(msg.user_name),
             "user_id": str(msg.user_id) if msg.user_id else "",
