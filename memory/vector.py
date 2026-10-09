@@ -281,6 +281,15 @@ class VectorMemory:
         await MemoryModel.filter(session_id=self.session_id).delete()
         self._ids = None
 
+    async def recent(self, limit: int) -> list[MemoryModel]:
+        """最近写入的记忆，新的在前；主动发起话题时当素材，不需要 query。"""
+
+        return (
+            await MemoryModel.filter(session_id=self.session_id)
+            .order_by("-created_at")
+            .limit(limit)
+        )
+
     async def count_by_user(self, user_id: str) -> int:
         return await MemoryModel.filter(
             session_id=self.session_id, subject_user_id=user_id

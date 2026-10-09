@@ -43,6 +43,7 @@ CONSOLIDATION_INTERVAL_SECONDS = 180.0
 CONSOLIDATION_MAX_MESSAGES = 60
 HISTORY_RECALL_LIMIT = 20
 MY_RECENT_REPLIES_LIMIT = 6
+GROUP_HEAT_SECONDS = 600
 
 
 def _user_key(message: Message) -> str:
@@ -54,6 +55,18 @@ def _format_history(messages: list[Message]) -> list[dict]:
         {"time": m.time.strftime("%H:%M"), "name": m.user_name, "content": m.content}
         for m in messages
     ]
+
+
+def _group_heat(messages: list[Message], bot_name: str, now: datetime) -> str:
+    """近 10 分钟群友的消息数和发言人数，给 Feedback 判断群里聊得热不热。"""
+
+    recent = [
+        m
+        for m in messages
+        if m.user_name != bot_name and (now - m.time).total_seconds() <= GROUP_HEAT_SECONDS
+    ]
+    speakers = {_user_key(m) for m in recent}
+    return f"近10分钟 {len(recent)} 条、{len(speakers)} 人在说话"
 
 
 def _history_without_current_chunk(
@@ -324,11 +337,11 @@ class ConversationOrchestrator:
         for uid in dict.fromkeys(_user_key(msg) for msg in messages_chunk):
             state.profiles.setdefault(uid, PersonProfile(user_id=uid))
 
+        now = datetime.now()
         prompt = get_feedback_prompt(
             bot_name=state.name,
             role=state.role,
-            willingness=state.willingness,
-            chat_state_value=chatting_state(state, datetime.now()).value,
+            chat_state_value=chatting_state(state, now).value,
             summary=state.chat_summary,
             recent_msgs=self._history_context(messages_chunk),
             new_msgs=[
@@ -339,13 +352,16 @@ class ConversationOrchestrator:
             related_profiles=self._related_profiles(messages_chunk),
             search_result=search_result.memory_lines,
             is_relevant=is_relevant,
-            time_info=get_time_description(datetime.now()),
+            time_info=get_time_description(now),
             presets=search_result.preset_lines,
             group_notes=state.group_notes,
             new_msg_speakers=[
                 {"index": index, "user_id": msg.user_id, "user_name": msg.user_name}
                 for index, msg in enumerate(messages_chunk)
             ],
+            group_heat=_group_heat(
+                self.session.runtime.short_term_memory.access(), state.name, now
+            ),
         )
 
         response, failure_reason = parse_feedback(
