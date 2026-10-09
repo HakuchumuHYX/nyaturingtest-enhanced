@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<style>
+:root {
+  --paper: #edf1ef;
+  --ink: #1e2932;
+  --muted: #5b6b70;
+  --faint: #8d9ea1;
+  --rule: #c5d0cd;
+  --seal: #b0392c;
+  --seal-ink: #f7ebe6;
+  --serif: "Noto Serif CJK SC", "Noto Color Emoji", serif;
+  --sans: "Noto Sans CJK SC", "Noto Color Emoji", sans-serif;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { background: var(--paper); }
+body {
+  width: 520px;
+  color: var(--ink);
+  font-family: var(--sans);
+  -webkit-font-smoothing: antialiased;
+  line-break: strict;
+  text-wrap: pretty;
+}
+main { padding: 40px 32px 30px; }
+
+header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 24px;
+  padding-bottom: 24px;
+  border-bottom: 2px solid var(--ink);
+}
+h1 {
+  font-family: var(--serif);
+  font-weight: 700;
+  font-size: 30px;
+  line-height: 1.3;
+  letter-spacing: 0.03em;
+  overflow-wrap: anywhere;
+}
+.date { margin-top: 10px; font-size: 13px; color: var(--muted); letter-spacing: 0.04em; }
+.seal {
+  flex: none;
+  width: 54px;
+  height: 54px;
+  margin-top: 2px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--seal);
+  border-radius: 4px;
+  box-shadow: inset 0 0 0 3px var(--seal), inset 0 0 0 4.5px var(--seal-ink);
+  transform: rotate(-4deg);
+  color: var(--seal-ink);
+  font-family: var(--serif);
+  font-weight: 700;
+  font-size: 19px;
+  line-height: 1.05;
+  writing-mode: vertical-rl;
+}
+
+section {
+  display: grid;
+  grid-template-columns: 22px 1fr;
+  column-gap: 20px;
+  padding: 24px 0;
+  border-bottom: 1px solid var(--rule);
+}
+section:last-child { border-bottom: none; padding-bottom: 6px; }
+h2 {
+  writing-mode: vertical-rl;
+  font-family: var(--serif);
+  font-weight: 700;
+  font-size: 15px;
+  letter-spacing: 0.35em;
+  color: var(--muted);
+}
+.body > * + * { margin-top: 10px; }
+
+.lead { font-family: var(--serif); font-size: 18px; line-height: 1.95; text-align: justify; }
+.text { font-size: 15px; line-height: 1.9; text-align: justify; }
+.empty { font-size: 14px; color: var(--faint); }
+
+.terms {
+  display: grid;
+  grid-template-columns: fit-content(7.5em) 1fr;
+  column-gap: 16px;
+  row-gap: 11px;
+  align-items: baseline;
+}
+.terms dt {
+  font-family: var(--serif);
+  font-weight: 700;
+  font-size: 15.5px;
+  line-height: 1.6;
+}
+.terms dt span { display: inline-block; }
+.terms dd { font-size: 14px; line-height: 1.7; color: var(--muted); }
+
+.month {
+  display: grid;
+  grid-template-columns: 44px 1fr;
+  column-gap: 14px;
+}
+.month + .month { margin-top: 16px; }
+.month-label { padding-top: 1px; }
+.month-label b { display: block; font-family: var(--serif); font-size: 16px; line-height: 1.5; }
+.month-label small { display: block; font-size: 11px; color: var(--faint); letter-spacing: 0.04em; }
+.month ul { list-style: none; border-left: 2px solid var(--rule); padding-left: 14px; }
+.month li { font-size: 15px; line-height: 1.75; }
+.month li + li { margin-top: 8px; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <div>
+      <h1>{{title}}</h1>
+      <p class="date">{{date}}</p>
+    </div>
+    <div class="seal">群志</div>
+  </header>
+  {{sections}}
+</main>
+</body>
+</html>

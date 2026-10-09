@@ -110,6 +110,21 @@ def _generation(group_id: int) -> int:
     return group_state.session.state.generation if group_state else 0
 
 
+async def refresh_group_notes(group_id: int, *, min_new: int = 1) -> str | None:
+    """把新碎片整理进群志；群志不随 save_session 回写，已加载的群同步内存副本。"""
+
+    generation = _generation(group_id)
+
+    def still_current() -> bool:
+        return _generation(group_id) == generation
+
+    notes = await digest_group_notes(str(group_id), still_current, min_new=min_new)
+    group_state = group_states.get(group_id)
+    if notes is not None and group_state is not None and still_current():
+        group_state.session.state.group_notes = notes
+    return notes
+
+
 async def maintain_long_term_memory() -> None:
     """长期记忆每日维护：先把新碎片整理进档案与群志，再删过期碎片，
     这样即将过期的碎片一定先被归纳过；最后让已加载的群下次重新读矩阵。"""
@@ -123,16 +138,14 @@ async def maintain_long_term_memory() -> None:
 
         try:
             summaries = await digest_user_profiles(session_id, still_current)
-            group_notes = await digest_group_notes(session_id, still_current)
+            await refresh_group_notes(group_id)
         except Exception as e:
             logger.warning(f"群 {group_id} 档案/群志整理失败: {e}")
             continue
-        # 档案与群志不随 save_session 回写，已加载的群要同步内存副本
+        # 档案不随 save_session 回写，已加载的群要同步内存副本
         group_state = group_states.get(group_id)
         if group_state is not None and still_current():
             group_state.session.state.user_summaries.update(summaries)
-            if group_notes is not None:
-                group_state.session.state.group_notes = group_notes
 
     try:
         await maintain_memories()

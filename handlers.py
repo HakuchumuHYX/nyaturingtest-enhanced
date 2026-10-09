@@ -21,9 +21,11 @@ from .core.llm import chat_client, feedback_client
 from .core.logic import message2BotMessage
 from .core.memory_query import acquire_query_slot, query_memory_profile
 from .core.metrics import metrics
+from .core.digest import GROUP_NOTES_REFRESH_MIN_NEW, count_new_group_fragments
 from .core.state_manager import (
     ensure_group_state,
     is_shutting_down,
+    refresh_group_notes,
     remove_group_state,
     runtime_enabled_groups,
 )
@@ -321,6 +323,14 @@ async def _do_reset(matcher: type[Matcher], group_id: int, args: str):
 
 async def _do_group_notes(matcher: type[Matcher], group_id: int, _args: str):
     await _group_state_or_finish(matcher, group_id)
+    pending = await count_new_group_fragments(str(group_id))
+    if pending >= GROUP_NOTES_REFRESH_MIN_NEW:
+        await matcher.send(f"有 {pending} 条新记忆还没整理进群志，正在整理，稍等一下")
+        try:
+            await refresh_group_notes(group_id, min_new=GROUP_NOTES_REFRESH_MIN_NEW)
+        except Exception as e:
+            # 整理失败照常发旧群志，水位没动，下次查看或夜里再整理
+            logger.warning(f"群 {group_id} 手动整理群志失败: {e}")
     # 读库而不是内存副本：要带上整理水位做日期
     session_db = await SessionModel.get_or_none(id=str(group_id))
     if session_db is None or not session_db.group_notes:

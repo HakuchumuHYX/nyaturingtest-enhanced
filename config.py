@@ -60,6 +60,7 @@ class AppSettings:
     rerank_threshold: float
     memory: MemoryEndpointSettings
     siliconflow_api_key: str
+    playwright_browsers_path: str
 
 
 DEFAULT_CONFIG: dict[str, Any] = {
@@ -91,6 +92,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "timeout": 10,
         "threshold": 0.1,
     },
+    # 群志卡片截图用的 Chromium 目录；留空用 playwright 默认位置
+    "playwright_browsers_path": "",
 }
 
 
@@ -140,6 +143,7 @@ def build_settings(config: dict[str, Any]) -> AppSettings:
             rerank_timeout=float(rerank["timeout"]),
         ),
         siliconflow_api_key=str(cfg["siliconflow_api_key"] or ""),
+        playwright_browsers_path=str(cfg["playwright_browsers_path"] or ""),
     )
 
 

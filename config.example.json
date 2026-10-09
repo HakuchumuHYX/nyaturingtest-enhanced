@@ -26,5 +26,6 @@
         "base_url": "https://api.siliconflow.cn/v1/rerank",
         "timeout": 10,
         "threshold": 0.1
-    }
+    },
+    "playwright_browsers_path": ""
 }

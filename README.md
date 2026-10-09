@@ -52,10 +52,13 @@
 - Python 3.10+
 - `nonebot2[fastapi]`、`nonebot-adapter-onebot`、`nonebot-plugin-apscheduler`
 - `tortoise-orm`、`openai`、`httpx`、`json-repair`
-- `numpy`、`pillow`、`chinese-calendar`
+- `numpy`、`pillow`、`chinese-calendar`、`playwright`
 
 Token 统计卡片用到同级目录下的公共绘图库 `plugins/utils/draw/plot.py`。
 卡片需要的三个字体文件 `SourceHanSansCN-{Regular,Bold,Heavy}.ttf` 要放在数据目录 `data/nyaturingtest/` 下。
+
+群志卡片是网页截图，需要 playwright 的 Chromium（`playwright install chromium`），
+以及系统字体思源宋体、思源黑体（Debian 系装 `fonts-noto-cjk`）。
 
 ## 配置
 
@@ -68,6 +71,7 @@ Token 统计卡片用到同级目录下的公共绘图库 `plugins/utils/draw/pl
 | `siliconflow_api_key` | Embedding 和 Rerank 共用的 Key |
 | `embedding` | 记忆检索用的向量模型 |
 | `rerank` | 检索结果重排，`threshold` 以下的结果丢弃 |
+| `playwright_browsers_path` | 群志卡片用的 Chromium 所在目录，留空用 playwright 默认位置 |
 
 `chat` 和 `feedback` 的 `base_url`、`model` 必填，其余缺省有默认值。改配置后要重启。
 也可以用环境变量 `NYATURINGTEST_CONFIG_FILE` 指定别的配置文件，用 `NYATURINGTEST_DATA_DIR` 指定数据目录。
@@ -83,7 +87,7 @@ Token 统计卡片用到同级目录下的公共绘图库 `plugins/utils/draw/pl
 | --- | --- | --- |
 | `/autochat enable` / `disable` | | 在本群启用或停用 |
 | `/查询记忆 [@某人]` | `/memory` | 看看它对某人的印象，**所有群员都能用** |
-| `/群志` | `/group_notes` `/查看群志` | 把本群群志做成图片发出来 |
+| `/群志` | `/group_notes` `/查看群志` | 把本群群志做成图片发出来；新记忆攒够 10 条会先整理一遍 |
 | `/status` | `/状态` | 当前状态、意愿值、队列和模型调用情况 |
 | `/role` | `/当前角色` | 查看当前人设 |
 | `/set_role <名字> <设定>` | `/设置角色` | 修改人设 |

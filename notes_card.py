@@ -1,33 +1,24 @@
-"""群志卡片：按【段名】切段，每段一张圆角卡片，称呼与梗、近期各有专门排版。"""
+"""群志卡片：群志按【段名】切段，填进 notes_card.html，用 Chromium 截图。
 
+查看群志不常用，内存又紧，所以每次现开浏览器、截完就关，不常驻。
+"""
+
+import os
 import re
-import sys
 from datetime import datetime
-from io import BytesIO
+from html import escape
 from pathlib import Path
 
-from PIL import ImageFont
+from playwright.async_api import async_playwright
 
-from .config import get_data_dir
+from .config import get_app_settings
 
-CARD_WIDTH = 750
+_TEMPLATE = Path(__file__).with_name("notes_card.html")
 _SECTION_RE = re.compile(r"^【(.+?)】\s*(.*)$")
 _BULLET_RE = re.compile(r"^[-•·*]\s*")
-_DATE_RE = re.compile(r"^(\d{4}-\d{2}\S*)\s+(.+)$")
-
-_TEXT = (30, 40, 50, 255)
-_SUB = (90, 105, 120, 255)
-_MUTED = (140, 155, 170, 255)
-_WHITE = (255, 255, 255, 255)
-_ACCENTS = {
-    "群像": (88, 101, 242),
-    "日常": (16, 150, 130),
-    "称呼与梗": (226, 120, 30),
-    "近期": (219, 68, 98),
-}
-_DEFAULT_ACCENT = (100, 116, 139)
-# 不能出现在行首的标点：绘图库逐字换行，句号常被单独挤到下一行
-_NO_LINE_START = set("，。、；：？！）」』】》…—,.;:?!)")
+_DATE_RE = re.compile(r"^(\d{4})-(\d{2})\S*\s+(.+)$")
+_ALIAS_SPLIT_RE = re.compile(r"(?<=[／/、])")
+_MONTHS = "一二三四五六七八九十"
 
 
 def parse_sections(notes: str) -> list[tuple[str, list[str]]]:
@@ -50,204 +41,91 @@ def parse_sections(notes: str) -> list[tuple[str, list[str]]]:
     return sections
 
 
-def _wrap(content: str, font: ImageFont.FreeTypeFont, width: int) -> str:
-    """按宽度预先断行：禁则标点不放行首（带上一行末字下来），英文单词不从中间拆开。"""
-
-    lines = []
-    for paragraph in content.split("\n"):
-        line = ""
-        for char in paragraph:
-            if not line or font.getlength(line + char) <= width:
-                line += char
-                continue
-            if char in _NO_LINE_START and len(line) > 1:
-                cut = len(line) - 1
-            elif _is_word_char(char) and _is_word_char(line[-1]):
-                cut = len(line)
-                while cut > 0 and _is_word_char(line[cut - 1]):
-                    cut -= 1
-                # 整行就是一个超长单词时只能硬拆
-                cut = cut or len(line)
-            else:
-                cut = len(line)
-            lines.append(line[:cut])
-            line = line[cut:] + char
-        lines.append(line)
-    return "\n".join(lines)
+def _month_name(month: int) -> str:
+    if month <= 10:
+        return f"{_MONTHS[month - 1]}月"
+    return f"十{_MONTHS[month - 11]}月"
 
 
-def _is_word_char(char: str) -> bool:
-    return char.isascii() and (char.isalnum() or char in "-_'./")
+def _terms_html(lines: list[str]) -> str:
+    rows = []
+    for line in lines:
+        term, _, meaning = line.replace(":", "：").partition("：")
+        # 一条常列好几个别名：每个别名连同后面的分隔符成块，只在块之间换行
+        aliases = "".join(
+            f"<span>{escape(alias)}</span>"
+            for alias in _ALIAS_SPLIT_RE.split(term.strip())
+            if alias
+        )
+        rows.append(f"<dt>{aliases}</dt><dd>{escape(meaning.strip())}</dd>")
+    return f'<dl class="terms">{"".join(rows)}</dl>'
 
 
-def _tint(accent: tuple[int, int, int], ratio: float) -> tuple[int, int, int, int]:
-    return (*(round(255 - (255 - c) * ratio) for c in accent), 255)
+def _recent_html(lines: list[str]) -> str:
+    """同一个月的事并到一组，月份只写一次；没写日期的行单独成组。"""
+
+    groups: list[tuple[str, str, list[str]]] = []
+    for line in lines:
+        match = _DATE_RE.match(line)
+        year, month, event = (
+            (match[1], _month_name(int(match[2])), match[3]) if match else ("", "", line)
+        )
+        if groups and groups[-1][:2] == (year, month):
+            groups[-1][2].append(event)
+        else:
+            groups.append((year, month, [event]))
+    return "".join(
+        f'<div class="month"><div class="month-label"><b>{month}</b><small>{year}</small></div>'
+        f'<ul>{"".join(f"<li>{escape(event)}</li>" for event in events)}</ul></div>'
+        for year, month, events in groups
+    )
+
+
+def _section_html(title: str, lines: list[str]) -> str:
+    if lines == ["暂无"]:
+        body = '<p class="empty">暂无</p>'
+    elif title == "群像":
+        body = "".join(f'<p class="lead">{escape(line)}</p>' for line in lines)
+    elif title == "称呼与梗":
+        body = _terms_html(lines)
+    elif title == "近期":
+        body = _recent_html(lines)
+    else:
+        body = "".join(f'<p class="text">{escape(line)}</p>' for line in lines)
+    return f'<section><h2>{escape(title)}</h2><div class="body">{body}</div></section>'
 
 
 async def render_group_notes_card(
     *, notes: str, group_name: str, updated_at: datetime | None
 ) -> bytes:
-    # plugins/ 目录，utils.draw 是同级插件目录下的公共绘图库
-    plugins_dir = Path(__file__).resolve().parents[1]
-    if str(plugins_dir) not in sys.path:
-        sys.path.insert(0, str(plugins_dir))
-    from utils.draw.plot import (
-        Canvas,
-        FillBg,
-        HSplit,
-        RoundRectBg,
-        Spacer,
-        TextBox,
-        TextStyle,
-        VSplit,
+    date = (
+        f"整理至 {updated_at.year} 年 {updated_at.month} 月 {updated_at.day} 日 "
+        f"{updated_at:%H:%M}"
+        if updated_at
+        else ""
+    )
+    html = (
+        _TEMPLATE.read_text(encoding="utf-8")
+        .replace("{{title}}", escape(group_name))
+        .replace("{{date}}", date)
+        .replace(
+            "{{sections}}",
+            "".join(_section_html(title, lines) for title, lines in parse_sections(notes)),
+        )
     )
 
-    font_dir = get_data_dir()
-
-    def style(weight: str, size: int, color: tuple) -> TextStyle:
-        return TextStyle(
-            font=str(font_dir / f"SourceHanSansCN-{weight}.ttf"), size=size, color=color
-        )
-
-    def text(content: str, text_style: TextStyle, width: int) -> TextBox:
-        font = ImageFont.truetype(text_style.font, text_style.size)
-        # 预留 2px：库内测宽与这里可能有亚像素差，避免它再按自己的规则折一次
-        return (
-            TextBox(
-                _wrap(content, font, width - 2),
-                style=text_style,
-                use_real_line_count=True,
-                line_sep=7,
+    # 和 HakuBot 共用同一份 Chromium（playwright 版本一致），不用再下载
+    browsers_path = get_app_settings().playwright_browsers_path
+    if browsers_path:
+        os.environ["PLAYWRIGHT_BROWSERS_PATH"] = browsers_path
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(args=["--no-sandbox"])
+        try:
+            page = await browser.new_page(
+                viewport={"width": 520, "height": 200}, device_scale_factor=2
             )
-            .set_w(width)
-            .set_padding(0)
-        )
-
-    outer_margin = 24
-    card_padding = 26
-    section_padding = 20
-    content_width = CARD_WIDTH - outer_margin * 2 - card_padding * 2
-    inner_width = content_width - section_padding * 2
-
-    body_style = style("Regular", 19, _TEXT)
-
-    def section_items(title: str, lines: list[str], accent: tuple) -> list:
-        accent_dark = (*(round(c * 0.8) for c in accent), 255)
-        if title == "群像":
-            return [
-                text(line, style("Regular", 21, _TEXT), inner_width) for line in lines
-            ]
-        if title == "称呼与梗":
-            items = []
-            for line in lines:
-                term, sep, meaning = line.replace(":", "：").partition("：")
-                entry = [
-                    text(term.strip(), style("Bold", 20, accent_dark), inner_width)
-                ]
-                if sep and meaning.strip():
-                    entry.append(
-                        text(
-                            meaning.strip(),
-                            style("Regular", 17, _SUB),
-                            inner_width - 18,
-                        ).set_margin((18, 0))
-                    )
-                items.append(VSplit(items=entry, sep=3, item_align="lt"))
-            return items
-        if title == "近期":
-            items = []
-            badge_width = 104
-            for line in lines:
-                match = _DATE_RE.match(line)
-                if not match:
-                    items.append(text(line, body_style, inner_width))
-                    continue
-                badge = (
-                    TextBox(match[1], style=style("Bold", 15, _WHITE))
-                    .set_w(badge_width)
-                    .set_content_align("c")
-                    .set_padding((0, 4))
-                    .set_bg(RoundRectBg(fill=(*accent, 255), radius=10))
-                )
-                items.append(
-                    HSplit(
-                        items=[
-                            badge,
-                            text(match[2], body_style, inner_width - badge_width - 14),
-                        ],
-                        sep=14,
-                        item_align="lt",
-                    )
-                )
-            return items
-        bullet_width = 24
-        return [
-            HSplit(
-                items=[
-                    TextBox("•", style=style("Heavy", 19, accent_dark), overflow="clip")
-                    .set_w(bullet_width)
-                    .set_padding(0),
-                    text(line, body_style, inner_width - bullet_width - 4),
-                ],
-                sep=4,
-                item_align="lt",
-            )
-            for line in lines
-        ]
-
-    def section(title: str, lines: list[str]):
-        accent = _ACCENTS.get(title, _DEFAULT_ACCENT)
-        items = []
-        if title:
-            items.append(
-                TextBox(title, style=style("Bold", 17, _WHITE))
-                .set_padding((14, 5))
-                .set_bg(RoundRectBg(fill=(*accent, 255), radius=14))
-            )
-            items.append(Spacer(1, 4))
-        items.extend(section_items(title, lines, accent))
-        return (
-            VSplit(items=items, sep=12, item_align="lt")
-            .set_w(content_width)
-            .set_padding(section_padding)
-            .set_bg(
-                RoundRectBg(
-                    fill=_tint(accent, 0.06),
-                    radius=18,
-                    stroke=_tint(accent, 0.22),
-                    stroke_width=2,
-                )
-            )
-        )
-
-    subtitle = group_name
-    if updated_at is not None:
-        subtitle += f" · 整理至 {updated_at:%Y-%m-%d}"
-    items = [
-        text("群志", style("Heavy", 38, _TEXT), content_width),
-        text(subtitle, style("Regular", 17, _MUTED), content_width),
-        Spacer(1, 10),
-        *(section(title, lines) for title, lines in parse_sections(notes)),
-        Spacer(1, 4),
-        TextBox("Generated by HakuBot", style=style("Regular", 14, _MUTED))
-        .set_w(content_width)
-        .set_content_align("r")
-        .set_padding(0),
-    ]
-    card = (
-        VSplit(items=items, sep=12, item_align="lt")
-        .set_w(CARD_WIDTH - outer_margin * 2)
-        .set_padding(card_padding)
-        .set_margin(outer_margin)
-        .set_bg(
-            RoundRectBg(
-                fill=_WHITE, radius=26, stroke=(200, 215, 230, 255), stroke_width=2
-            )
-        )
-    )
-    canvas = Canvas(w=CARD_WIDTH, h=None, bg=FillBg((240, 245, 250, 255)))
-    canvas.set_items([card]).set_content_align("c")
-    image = await canvas.get_img()
-    buffer = BytesIO()
-    image.save(buffer, format="PNG")
-    return buffer.getvalue()
+            await page.set_content(html)
+            await page.evaluate("document.fonts.ready")
+            return await page.screenshot(full_page=True)
+        finally:
+            await browser.close()
