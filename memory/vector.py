@@ -27,8 +27,12 @@ RAG_ITEM_CHARS = 500
 EVENT_TTL_DAYS = 90
 FACT_TTL_DAYS = 180
 
-DEDUP_SIMILARITY_THRESHOLD = 0.9
 EMBEDDING_BATCH_SIZE = 32
+# Qwen3-Embedding 只给查询加任务指令、记忆正文不加；探针里加了比不加 AUC 高一截
+QUERY_INSTRUCTION = (
+    "Instruct: Given a group chat message, retrieve memories about the chat members "
+    "that are relevant to it\nQuery: "
+)
 
 MEMORY_TYPE_WEIGHT = {
     "episode": 1.0,
@@ -157,7 +161,7 @@ _embedding_client: AsyncOpenAI | None = None
 _rerank_client: httpx.AsyncClient | None = None
 
 
-async def embed_texts(texts: list[str]) -> np.ndarray:
+async def embed_texts(texts: list[str], *, query: bool = False) -> np.ndarray:
     """返回逐行 L2 归一化的 float32 矩阵，余弦相似度直接用点积。"""
 
     global _embedding_client
@@ -171,7 +175,9 @@ async def embed_texts(texts: list[str]) -> np.ndarray:
         )
     response = await _embedding_client.embeddings.create(
         model=settings.memory.model,
-        input=[text.replace("\n", " ") for text in texts],
+        input=[
+            (QUERY_INSTRUCTION if query else "") + text.replace("\n", " ") for text in texts
+        ],
         encoding_format="float",
     )
     vectors = np.asarray([item.embedding for item in response.data], dtype=np.float32)
@@ -227,15 +233,13 @@ class VectorMemory:
         self._lock = asyncio.Lock()
         self._ids: list[str] | None = None
         self._matrix = np.empty((0, 0), dtype=np.float32)
-        self._subjects = np.empty(0, dtype=object)
-        self._categories = np.empty(0, dtype=object)
         self._participants: list[frozenset[str]] = []
 
     async def _load_locked(self) -> None:
         rows = await MemoryModel.filter(
             session_id=self.session_id, embedding__not_isnull=True
         ).values_list(
-            "id", "embedding", "embedding_model", "subject_user_id", "category", "participant_ids"
+            "id", "embedding", "embedding_model", "participant_ids"
         )
         model = get_app_settings().memory.model
         mismatched = {row[2] for row in rows if row[2] != model}
@@ -252,9 +256,7 @@ class VectorMemory:
             ).reshape(len(rows), -1)
         else:
             self._matrix = np.empty((0, 0), dtype=np.float32)
-        self._subjects = np.array([row[3] for row in rows], dtype=object)
-        self._categories = np.array([row[4] for row in rows], dtype=object)
-        self._participants = [frozenset(row[5].split()) for row in rows]
+        self._participants = [frozenset(row[3].split()) for row in rows]
 
     async def _ensure_loaded(self) -> None:
         if self._ids is not None:
@@ -272,12 +274,6 @@ class VectorMemory:
         ).reshape(len(rows), -1)
         self._matrix = vectors if not self._ids else np.vstack([self._matrix, vectors])
         self._ids.extend(row.id for row in rows)
-        self._subjects = np.concatenate(
-            [self._subjects, np.array([row.subject_user_id for row in rows], dtype=object)]
-        )
-        self._categories = np.concatenate(
-            [self._categories, np.array([row.category for row in rows], dtype=object)]
-        )
         self._participants.extend(frozenset(row.participant_ids.split()) for row in rows)
 
     def drop_cache(self) -> None:
@@ -328,7 +324,7 @@ class VectorMemory:
             if not self._ids:
                 return RetrievalResult([], _retrieval_stats([], []))
 
-            scores = await embed_texts(unique_queries) @ self._matrix.T
+            scores = await embed_texts(unique_queries, query=True) @ self._matrix.T
             if user_ids is not None:
                 wanted = frozenset(user_ids)
                 mask = np.fromiter(
@@ -506,21 +502,21 @@ class VectorMemory:
         stats["scope_counts"] = scope_counts
         return RetrievalResult(final_results, stats)
 
-    async def add_memories_with_dedup(
+    async def add_memories(
         self,
         memories: list[tuple[str, dict]],
         *,
         still_current: Callable[[], bool],
     ) -> dict[str, int] | None:
-        """批量去重并写入长期记忆；会话在写入前被 reset/set_role 作废则返回 None。
+        """批量写入长期记忆；会话在写入前被 reset/set_role 作废则返回 None。
 
-        同 (subject, category) 内与已有记忆余弦 > 0.9 视为重复，只强化旧记忆的置信度与日期。
-        更正条（is_correction）不去重：它和要替换的旧记忆往往高度相似；replaces 指向的旧行在同一事务里删除。
-        episode 也不去重：每天「组队打游戏」写出来很像，但都是不同的事。
-        embedding 调用失败时照样落库（embedding 为 NULL、不做去重），由每日维护补算。
+        只去掉同一批里正文完全相同的条目，不和已有记忆比向量：Qwen3-Embedding 比两条记忆时
+        主要看开头人名，同一人不相干甚至相反的两件事余弦也有 0.97，找不到能分开真重复的阈值。
+        更正条的 replaces 指向的旧行在同一事务里删除。
+        embedding 调用失败时照样落库（embedding 为 NULL），由每日维护补算。
         """
 
-        result = {"added": 0, "skipped_dedup": 0, "reinforced": 0, "corrected": 0}
+        result = {"added": 0, "skipped_dedup": 0, "corrected": 0}
         valid: list[tuple[str, dict]] = []
         seen_batch = set()
         for content, metadata in memories:
@@ -542,30 +538,9 @@ class VectorMemory:
 
         embedding_model = get_app_settings().memory.model
         async with self._lock:
-            if self._ids is None:
-                await self._load_locked()
-
             new_rows: list[MemoryModel] = []
-            reinforce: dict[str, dict] = {}
             for index, (content, metadata) in enumerate(valid):
                 vector = None if vectors is None else vectors[index]
-                dedup = not metadata["is_correction"] and metadata["category"] != "episode"
-                if vector is not None and self._ids and dedup:
-                    scope = (self._subjects == metadata["subject_user_id"]) & (
-                        self._categories == metadata["category"]
-                    )
-                    if scope.any():
-                        similarities = self._matrix[scope] @ vector
-                        best = int(np.argmax(similarities))
-                        if similarities[best] > DEDUP_SIMILARITY_THRESHOLD:
-                            memory_ref = self._ids[int(np.flatnonzero(scope)[best])]
-                            logger.debug(
-                                f"[Memory] 跳过同 scope 重复记忆 "
-                                f"(相似度 {similarities[best]:.2f}): {content[:30]}..."
-                            )
-                            result["skipped_dedup"] += 1
-                            reinforce[memory_ref] = metadata
-                            continue
                 new_rows.append(
                     MemoryModel(
                         id=str(uuid.uuid4()),
@@ -599,24 +574,6 @@ class VectorMemory:
                 # 在事务内确认代际：reset 先递增 generation 再删库，所以这里放行的写入一定早于删除
                 if not still_current():
                     return None
-                reinforce_rows = (
-                    await MemoryModel.filter(id__in=list(reinforce)) if reinforce else []
-                )
-                for row in reinforce_rows:
-                    row.confidence = min(1.0, row.confidence + (1.0 - row.confidence) * 0.2)
-                    row.date = reinforce[row.id]["date"]
-                    row.expires_at = memory_expires_at(row.category, row.date, row.importance)
-                    row.reaffirm_count += 1
-                    await row.save(
-                        update_fields=[
-                            "confidence",
-                            "date",
-                            "expires_at",
-                            "reaffirm_count",
-                            "updated_at",
-                        ]
-                    )
-                    result["reinforced"] += 1
                 replaced_rows = (
                     await MemoryModel.filter(session_id=self.session_id, id__in=list(replaces))
                     if replaces
@@ -639,7 +596,7 @@ class VectorMemory:
 
 
 async def maintain_memories() -> None:
-    """每日维护：删除过期记忆，补算写入时 embedding 失败的行（补算的行不再去重）。"""
+    """每日维护：删除过期记忆，补算写入时 embedding 失败的行。"""
 
     deleted = await MemoryModel.filter(expires_at__lt=datetime.now()).delete()
     pending = await MemoryModel.filter(embedding__isnull=True)

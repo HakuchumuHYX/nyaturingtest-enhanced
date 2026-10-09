@@ -261,7 +261,7 @@ async def save_memory_candidates(
 
     store_result = {"added": 0, "skipped_dedup": 0, "corrected": 0}
     if pending_memories:
-        store_result = await session.runtime.vector_memory.add_memories_with_dedup(
+        store_result = await session.runtime.vector_memory.add_memories(
             pending_memories,
             still_current=lambda: session.state.generation == generation,
         )

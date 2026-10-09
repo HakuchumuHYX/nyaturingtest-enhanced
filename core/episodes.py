@@ -184,7 +184,7 @@ async def _digest_batch(
         date = int(rows[-1].time.strftime("%Y%m%d"))
         episodes = _episode_memories(parsed.get("episodes"), messages, bot_name, date)
         if episodes:
-            stored = await session.runtime.vector_memory.add_memories_with_dedup(
+            stored = await session.runtime.vector_memory.add_memories(
                 episodes,
                 still_current=lambda: session_state.generation == generation,
             )

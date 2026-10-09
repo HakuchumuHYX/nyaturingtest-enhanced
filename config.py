@@ -81,7 +81,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "siliconflow_api_key": "",
     "embedding": {
-        "model": "BAAI/bge-m3",
+        "model": "Qwen/Qwen3-Embedding-0.6B",
         "base_url": "https://api.siliconflow.cn/v1",
         "timeout": 30,
     },
