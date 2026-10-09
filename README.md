@@ -16,8 +16,8 @@
   潜水 / 冒泡 / 对话三态由意愿值与对话窗口派生，只用于展示和 prompt。
 - **被动固化**：长时间不参与对话时仍会周期性沉淀记忆（情绪、画像、摘要、长期记忆），但不产生回复。
 - **双阶段 LLM**：Feedback（观察者）负责情绪、画像、摘要与记忆提取；Chat（角色）负责生成最终回复。
-- **长期记忆**：向量与元数据存在 SQLite，每群加载成 numpy 矩阵做暴力余弦召回 + Rerank 重排 + 时间衰减排序，
-  支持相似度去重。
+- **长期记忆**：两层。记忆碎片（向量与元数据存在 SQLite，每群加载成 numpy 矩阵做暴力余弦召回 + Rerank 重排 +
+  时间衰减排序，相似度去重，全部有 TTL）是原料；用户档案与群志由每日整理任务从碎片原地重写，永久保留。
 - **原生多模态**：图片下载压缩后作为 `image_url` 随请求附带，Feedback 额外返回一句话图片观察写回消息文本。
 - **Token 统计**：记录 prompt / completion / reasoning 与缓存命中（`prompt_tokens_details.cached_tokens`，
   未命中部分由 `prompt_tokens` 减去命中数推出），按模型归并后渲染成卡片。
@@ -41,11 +41,12 @@ Token 统计卡片复用同级插件目录的公共绘图库 `plugins/utils/draw
 plugins/nyaturingtest/
 ├── __init__.py          生命周期入口：连库 → 建表 → 载入启用群 → 注册定时任务
 ├── config.py            config.json 加载、AppSettings、工作区路径常量
-├── handlers.py          全部 16 个 matcher：管理命令、自动消息入口、/查询记忆、/rag_debug
+├── handlers.py          全部 17 个 matcher：管理命令、自动消息入口、/查询记忆、/rag_debug
 ├── models.py            8 个 Tortoise ORM 模型
 ├── db.py                全部数据库读写（会话/消息/画像/交互/群开关/Token）
 ├── domain.py            EmotionState / PersonProfile（纯领域对象）
 ├── token_stats.py       Token 聚合与模型名归并 + 统计卡片 PNG 渲染
+├── notes_card.py        群志卡片 PNG 渲染：按【段名】分段，称呼与梗、近期专门排版，自带标点禁则断行
 ├── backup.py            备份、保留期清理、定时任务注册
 ├── core/
 │   ├── state_manager.py 每群 GroupState、worker 守护、资源清理
@@ -56,6 +57,7 @@ plugins/nyaturingtest/
 │   ├── llm.py           LLMClient（重试/熔断/指标/Token 记录）与 chat、feedback 两个全局实例、HTTP 池、JSON 解析
 │   ├── prompts.py       Feedback / Chat 提示词模板、字符预算常量、角色预设加载、时间描述
 │   ├── metrics.py       结构化事件日志、运行时计数、Token 落库任务
+│   ├── digest.py        每日整理：记忆碎片 → 用户档案 / 群志
 │   └── memory_query.py  /查询记忆：冷却、动态 k、VAD 推断、印象生成
 └── memory/
     ├── short_term.py    短时消息窗口（含增量落库标记）
@@ -146,7 +148,7 @@ TTL 清理会让索引无限膨胀（大群一度 3.5 倍于存活条数），�
 | `speaker_user_id` / `speaker_user_name` | 说出该事实的人（填 B） |
 | `confidence` / `importance` | 影响去重、衰减与排序权重 |
 | `date` | `YYYYMMDD` 整数，时间衰减按它算 |
-| `expires_at` | event 为 `date` 之后 `90 × (1 + importance)` 天的次日；其余类别为空（不过期） |
+| `expires_at` | `date` 之后 `基础 TTL × (1 + importance)` 天的次日；基础 TTL event 90 天、其余类别 180 天 |
 | `embedding_model` | 生成向量的模型；加载时与配置不一致直接报错，换模型必须先重嵌入 |
 
 写入路径（`add_memories_with_dedup`）：
@@ -157,18 +159,17 @@ TTL 清理会让索引无限膨胀（大群一度 3.5 倍于存活条数），�
   `reaffirm_count + 1`）。
 - embedding 调用失败时照样落库（`embedding` 为空、不做去重），每日维护补算。
 - 写入后增量追加到内存矩阵；加载与写入共用一把 `asyncio.Lock`，避免加载期间提交的行两头落空。
-- **清理**：每天 03:30 的 `maintain_memories()` 一条 `DELETE WHERE expires_at < now` 清掉所有群的过期记忆，
-  补算缺失的向量，然后让已加载的群下次重新读矩阵。
+- **清理**：每天 03:30 先整理档案与群志（见下节），再由 `maintain_memories()` 一条 `DELETE WHERE expires_at < now`
+  清掉所有群的过期记忆、补算缺失的向量，然后让已加载的群下次重新读矩阵。先整理后删除，
+  所以碎片到期前一定已经被归纳进档案。
 
 检索路径（`retrieve_with_decay`）：
 
 1. `build_chat_rag_queries` 过滤低价值 query（纯标点、`[表情包]`、长度 < 4、纯 emoji 等），
-   追加话题摘要与「关于<活跃用户名>」，再去重。
+   追加话题摘要，再去重。「关于当前说话人」由档案每轮直接注入，不再靠检索。
 2. 多 query 一次 embedding、一次矩阵乘法，每条 query 取 top-k，按最高分融合，超过
    `RAG_MERGED_CANDIDATE_CAP=64` 截断，再用 Reranker 以第一条 query 全量重排，低于 `rerank.threshold` 的丢弃。
-3. `_retrieve_active_subject_records` 额外按 `subject_user_id` 做一次 SQL 结构化召回
-   （最多 5 条，按 importance、date 排序），补上语义检索漏掉的「活跃主体」记忆。
-4. 打分并排序：
+3. 打分并排序：
 
    ```text
    adjusted_score = 原始分(rerank_score 优先，否则 retrieval_score)
@@ -179,6 +180,27 @@ TTL 清理会让索引无限膨胀（大群一度 3.5 倍于存活条数），�
 
    事件半衰期约 35 天（rate 0.02），偏好/画像/关系几乎不衰减（0.003）。
    作用域权重：活跃主体 1.10、被提到的主体 1.08、活跃发言者 1.04、其他主体 0.5。
+
+### 用户档案与群志（`core/digest.py`）
+
+碎片只是原料、到期就删；对一个人、一个群的长期认知由这两段文字承载，条数等于人数，不会无限增长。
+
+| | 存放 | 整理时机 | 篇幅（提示词要求，不硬截断） |
+| --- | --- | --- | --- |
+| 用户档案 | `nyabot_user_profiles.summary` | 新碎片 ≥ 10 条，或有新碎片且从没整理过 / 水位已满 7 天 | 300 字左右 |
+| 群志 | `nyabot_sessions.group_notes` | 有新碎片且从没整理过 / 水位已满 7 天（即每周） | 800 字左右 |
+
+- **水位**：`summarized_until` / `notes_summarized_until` 是已整理到的最新碎片 `created_at`，每条碎片只整理一次。
+- **整理**：旧文本 + 新碎片交给 Feedback 模型重写出完整新版本；冲突以新碎片为准，这取代了旧的 supersede 动作。
+- **分块**：新碎片按 `created_at` 升序切块（档案约 8000 字、群志约 12000 字）逐块重写直到追平，不截断、不丢弃。
+  同一批写入的碎片 `created_at` 相同，切口只落在时间变化处，否则水位停在半批中间，剩下半批永远整理不到。
+- **失败**：某块调用失败就停在该块，水位不动，下一晚重试。代际变化（reset 等）后立即放弃写入。
+- **读路径**：本轮发言人的档案随 `related_profiles[].summary` 注入，群志作为 `group_notes` 跟在预设后面
+  （每天只变一次，利于前缀缓存）。两者在 `SessionState` 里是只读副本，**不随 `save_session` 回写**，
+  只由整理任务写库并同步已加载群的内存；`reset` 一并清空。
+- `/查询记忆` 把档案作为最高优先级资料生成印象，但不展示档案原文：群里所有人都看得到输出。
+- 整理提示词要求完整重写（不追加）、归纳不罗列，并排除隐私（真实姓名、健康、住址、家人、金额、账号等），
+  因为档案每轮注入，`/查询记忆` 也会展示。
 
 ### 图片（`memory/image.py`）
 
@@ -198,8 +220,8 @@ SQLite 表（`models.py`，启动时由 `Tortoise.generate_schemas()` 建表）�
 
 | 表 | 内容 |
 | --- | --- |
-| `nyabot_sessions` | 每群一条：人设、别名、预设条目、VAD 情绪、摘要、最后发言时间、固化水位、聊天状态 |
-| `nyabot_user_profiles` | 群内用户画像：VAD、交互次数、首次/最近交互时间 |
+| `nyabot_sessions` | 每群一条：人设、别名、预设条目、VAD 情绪、摘要、最后发言时间、固化水位、聊天状态、群志及其水位 |
+| `nyabot_user_profiles` | 群内用户画像：VAD、交互次数、首次/最近交互时间、长期档案及其水位 |
 | `nyabot_interactions` | 每次互动的情感增量明细 |
 | `nyabot_global_messages` | 消息明细（`(session, msg_id)` 唯一，含时间与会话索引） |
 | `nyabot_memories` | 长期记忆：正文、向量、主体/说话人、置信度/重要度、日期与过期时间 |
@@ -257,6 +279,7 @@ valence 正向半衰期约 14 小时、负向约 5 小时，dominance 约 23 小
 | `/presets` | `/preset` | 列出可用预设 |
 | `/set_preset <文件名>` | `/set_presets` | 加载预设，可省略 `.json` |
 | `/rag_debug <query>` | `/记忆诊断` | 打印检索候选数、回退原因与 top 5 记录的分数明细 |
+| `/group_notes` | `/群志` `/查看群志` | 把本群群志渲染成卡片图片发出（渲染失败退回纯文字）；私聊用 `group_notes <群号>` |
 | `/calm` | `/冷静` | 重置情绪与画像、意愿归零、退出对话窗口 |
 | `/reset_emotion` | `/重置情绪` | 只重置 VAD 情绪 |
 | `/reset confirm` | `/重置 confirm` | 先备份，再完全重置本群 |
@@ -264,7 +287,7 @@ valence 正向半衰期约 14 小时、负向约 5 小时，dominance 约 23 小
 | `/backup_data` | `/备份数据` | 手动触发一次备份 |
 | `/查询记忆 [@用户]` | `/memory` | **普通群员可用**：生成 Bot 对目标用户的印象档案 |
 
-私聊支持 `help`、`list_groups`、`backup_data` 与 8 个通用管理命令；通用命令在私聊下要把群号
+私聊支持 `help`、`list_groups`、`backup_data` 与 9 个通用管理命令；通用命令在私聊下要把群号
 作为第一个参数（`/status 123456`、`/reset 123456 confirm` …），群号非数字时直接提示。
 `/autochat`、`/token统计`、`/rag_debug`、`/查询记忆` 仅限群聊。
 群聊与私聊共用同一个 matcher（`handlers._dual_command`），避免 nonebot 的「Duplicated prefix rule」告警。
@@ -306,7 +329,7 @@ config/nyaturingtest/nya_presets/      角色预设
 | 时间 | 任务 | 内容 |
 | --- | --- | --- |
 | 03:00 | 图片缓存清理 | 删除超过 48 小时的缓存原图 |
-| 03:30 | 长期记忆维护 | 删除所有群的过期记忆，补算缺失的向量 |
+| 03:30 | 长期记忆维护 | 整理到期的用户档案与群志，再删除所有群的过期记忆、补算缺失的向量 |
 | 04:00 | 数据备份 | 备份 + 原始行保留期清理 |
 
 备份行为：走 `sqlite3` 的 backup API 取一致性快照，`shutil.copy2` 复制数据目录其余内容到临时目录，
@@ -328,13 +351,14 @@ config/nyaturingtest/nya_presets/      角色预设
 | --- | --- |
 | `core/engagement.py` | 衰减 0.03/分钟、每消息被动增长 0.05 × 兴趣（0.3~1.8）且上限 0.7、参与阈值 0.45、发言占比上限 20%、接话门槛（聊天对象 0.45 / 插嘴 0.6）、强关联下限 0.85、对话窗口 180s、说话后保留 0.7、发送间隔 16s、重启初值 0.3、Rerank 阈值 0.68 |
 | `core/orchestrator.py` | 固化条件（消息数 8、间隔 180s、最多 60 条）、历史回溯条数 20 |
-| `memory/vector.py` | `RAG_FINAL_K=20`、每 query 召回 40、合并候选上限 64、注入字符预算 1500 / 单条 500、事件 TTL 90 天、类型权重/衰减率/作用域权重表 |
+| `memory/vector.py` | `RAG_FINAL_K=20`、每 query 召回 40、合并候选上限 64、注入字符预算 1500 / 单条 500、基础 TTL（event 90 天、其余 180 天）、类型权重/衰减率/作用域权重表 |
 | `core/prompts.py` | 字符预算：摘要 1200、最近消息 1600、历史 2400、回溯历史 1200 字 |
 | `memory/short_term.py` | 上下文窗口 20 条、缓冲上限 200 条 |
 | `core/logic.py` | 防抖 2s、单轮最多发 2 条、拟人延迟 1.0 + 0.1×字数（封顶 5s） |
 | `core/state_manager.py` | 消息队列上限 200 |
 | `core/session.py` | role 4000 字 / examples 2000 字上限、后台任务排空超时 10s、保存去抖 50ms |
 | `core/memory_query.py` | `/查询记忆` 冷却（同用户 30s、同群 3s）、动态 k 的计算规则 |
+| `core/digest.py` | 档案触发阈值（新碎片 10 条 / 7 天）、分块字数（档案 8000、群志 12000）、整理温度 0.2 |
 | `memory/image.py` | 8MB / 4096² 像素上限、最大边 1280、并发 3、缓存 48 小时 |
 | `memory/validation.py` | 允许的记忆类别、最低置信度 0.6、最短 10 字 |
 | `backup.py` | 备份保留 7 个、消息/交互 180 天、Token 明细 90 天 |

@@ -22,7 +22,10 @@ RAG_PER_QUERY_RECALL_K = 40
 RAG_MERGED_CANDIDATE_CAP = 64
 RAG_MEMORY_CHAR_BUDGET = 1500
 RAG_ITEM_CHARS = 500
-RAG_DEFAULT_EVENT_TTL_DAYS = 90
+
+# 碎片只是原料：长期价值由用户档案/群志承载，所以所有类别都会过期
+EVENT_TTL_DAYS = 90
+FACT_TTL_DAYS = 180
 
 DEDUP_SIMILARITY_THRESHOLD = 0.9
 EMBEDDING_BATCH_SIZE = 32
@@ -121,12 +124,11 @@ def _parse_date(date: int) -> datetime:
     return datetime.strptime(str(date), "%Y%m%d")
 
 
-def memory_expires_at(category: str, date: int, importance: float) -> datetime | None:
-    """只有 event 过期：date 之后满 90×(1+importance) 天的次日删除。"""
+def memory_expires_at(category: str, date: int, importance: float) -> datetime:
+    """date 之后满 基础TTL×(1+importance) 天的次日删除；event 90 天，其余 180 天。"""
 
-    if category != "event":
-        return None
-    ttl_days = int(RAG_DEFAULT_EVENT_TTL_DAYS * (1.0 + importance))
+    base_days = EVENT_TTL_DAYS if category == "event" else FACT_TTL_DAYS
+    ttl_days = int(base_days * (1.0 + importance))
     return _parse_date(date) + timedelta(days=ttl_days + 1)
 
 
@@ -352,7 +354,7 @@ class VectorMemory:
                     fallback, _retrieval_stats(candidates, fallback, "rerank_disabled")
                 )
 
-            # 第二步：Rerank。search_stage 已把最新有效消息排在第一位；summary/name query 只做补充召回。
+            # 第二步：Rerank。search_stage 已把最新有效消息排在第一位；summary query 只做补充召回。
             rerank_results = await _rerank(
                 unique_queries[0], [item["content"] for item in candidates]
             )
@@ -391,25 +393,6 @@ class VectorMemory:
             logger.error(f"Vector retrieve failed: {e}")
             return RetrievalResult([], _retrieval_stats([], [], "retrieve_error"))
 
-    async def _retrieve_active_subject_records(
-        self, active_user_ids: set[str], *, limit: int
-    ) -> list[dict[str, Any]]:
-        if not active_user_ids:
-            return []
-        rows = (
-            await MemoryModel.filter(
-                session_id=self.session_id, subject_user_id__in=list(active_user_ids)
-            )
-            .order_by("-importance", "-date")
-            .limit(limit)
-        )
-        records = []
-        for row in rows:
-            metadata = _row_metadata(row)
-            metadata["retrieval_score"] = 0.5
-            records.append({"content": row.content, "metadata": metadata})
-        return records
-
     async def retrieve_with_decay(
         self,
         queries: list[str],
@@ -420,7 +403,7 @@ class VectorMemory:
         merged_candidate_cap: int | None = None,
         active_user_ids: set[str] = frozenset(),
     ) -> RetrievalResult:
-        """带时间衰减的检索：语义召回（每条 query 取 candidate_k）+ 活跃主体结构化召回，
+        """带时间衰减的检索：语义召回（每条 query 取 candidate_k），
         再按衰减/类型/置信度/作用域加权排序取前 k。"""
 
         active_scope_ids = set(active_user_ids)
@@ -433,26 +416,6 @@ class VectorMemory:
         )
         raw_results = list(retrieval_result.records)
         stats = {"use_rerank": use_rerank, **retrieval_result.stats}
-        subject_results = await self._retrieve_active_subject_records(
-            active_scope_ids, limit=min(5, max(1, k))
-        )
-        if subject_results:
-            merged_results = []
-            seen = set()
-            for item in raw_results + subject_results:
-                key = item["metadata"]["memory_ref"]
-                if key in seen:
-                    continue
-                seen.add(key)
-                merged_results.append(item)
-            subject_added_count = len(merged_results) - len(raw_results)
-            raw_results = merged_results
-            stats["subject_recall_count"] = len(subject_results)
-            stats["candidate_count"] = (
-                int(stats.get("candidate_count") or len(raw_results))
-                + subject_added_count
-            )
-
         if not raw_results:
             return RetrievalResult([], stats)
 
@@ -657,10 +620,8 @@ def build_chat_rag_queries(
     raw_queries: list[str],
     *,
     chat_summary: str,
-    user_names: list[str],
 ) -> list[str]:
     queries = [query.strip() for query in raw_queries if not is_low_value_rag_query(query)]
     if chat_summary.strip():
         queries.append(chat_summary.strip())
-    queries.extend(f"关于{name}" for name in user_names)
     return _dedupe_preserve_order(queries)

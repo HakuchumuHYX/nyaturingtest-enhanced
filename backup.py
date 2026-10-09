@@ -15,7 +15,7 @@ require("nonebot_plugin_apscheduler")
 from nonebot_plugin_apscheduler import scheduler  # noqa: E402  必须在 require 之后导入
 
 from .config import BACKUP_DIR, get_data_dir
-from .core.state_manager import maintain_vector_memories
+from .core.state_manager import maintain_long_term_memory
 from .models import GlobalMessageModel, InteractionLogModel, TokenUsageModel
 
 # 原始明细保留天数
@@ -179,7 +179,7 @@ def setup_backup_job():
         replace_existing=True,
     )
     scheduler.add_job(
-        maintain_vector_memories,
+        maintain_long_term_memory,
         "cron",
         hour=3,
         minute=30,

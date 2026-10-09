@@ -19,6 +19,9 @@ class SessionModel(Model):
     chatting_state = fields.IntField(default=0)
     # 预设条目每轮原样注入，不参与检索，所以不进记忆表
     preset_lines = fields.JSONField(default=list)
+    # 群志只由每日整理任务写入；水位是已整理到的最新碎片 created_at
+    group_notes = fields.TextField(default="")
+    notes_summarized_until = fields.DatetimeField(null=True)
 
     class Meta:
         table = "nyabot_sessions"
@@ -37,6 +40,10 @@ class UserProfileModel(Model):
     interaction_count = fields.IntField(default=0)
     first_interaction_at = fields.DatetimeField(null=True)
     last_interaction_at = fields.DatetimeField(null=True)
+
+    # 长期档案只由每日整理任务写入；水位是已整理到的最新碎片 created_at
+    summary = fields.TextField(default="")
+    summarized_until = fields.DatetimeField(null=True)
 
     class Meta:
         table = "nyabot_user_profiles"
@@ -97,7 +104,7 @@ class MemoryModel(Model):
     confidence = fields.FloatField(default=1.0)
     importance = fields.FloatField(default=0.0)
     date = fields.IntField()  # YYYYMMDD，检索衰减按它算
-    expires_at = fields.DatetimeField(null=True)  # NULL 表示不过期
+    expires_at = fields.DatetimeField()
     reaffirm_count = fields.IntField(default=0)
     created_at = fields.DatetimeField(auto_now_add=True)
     updated_at = fields.DatetimeField(auto_now=True)

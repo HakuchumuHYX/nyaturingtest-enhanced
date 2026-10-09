@@ -45,7 +45,7 @@ async def disable_group(group_id: int):
 
 
 async def delete_session_data(session_id: str):
-    """删除会话的所有关联数据（消息、用户画像、交互日志），不删除会话本身"""
+    """删除会话的所有关联数据（消息、用户画像与档案、交互日志、群志），不删除会话本身"""
 
     session_db = await SessionModel.get_or_none(id=session_id)
     if not session_db:
@@ -60,6 +60,9 @@ async def delete_session_data(session_id: str):
             )
 
     profile_count = await UserProfileModel.filter(session=session_db).delete()
+    await SessionModel.filter(id=session_id).update(
+        group_notes="", notes_summarized_until=None
+    )
     msg_count = await GlobalMessageModel.filter(session=session_db).delete()
     logger.info(
         f"[Repo] 会话 {session_id} 数据已清除: "
@@ -105,6 +108,7 @@ async def load_full_session_data(session_id: str):
             "interaction_count": user_db.interaction_count,
             "first_interaction_at": user_db.first_interaction_at,
             "last_interaction_at": user_db.last_interaction_at,
+            "summary": user_db.summary,
         }
         for user_db in await UserProfileModel.filter(session=session_db)
     ]

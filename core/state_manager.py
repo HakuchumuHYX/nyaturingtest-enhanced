@@ -9,6 +9,7 @@ from tortoise import Tortoise
 from ..db import load_enabled_group_ids
 from ..memory.short_term import Message as MMessage
 from ..memory.vector import close_clients, maintain_memories
+from .digest import digest_group_notes, digest_user_profiles
 from .llm import close_http_client
 from .metrics import drain_usage_tasks
 from .session import Session
@@ -102,8 +103,36 @@ async def remove_group_state(group_id: int):
         await state.session.drain_background_tasks()
 
 
-async def maintain_vector_memories() -> None:
-    """长期记忆定时维护：一条 SQL 清掉所有群的过期记忆，再让已加载的群下次重新读矩阵。"""
+def _generation(group_id: int) -> int:
+    """未加载的群按 0 算：加载不改 generation，只有 reset/set_role 等会递增。"""
+
+    group_state = group_states.get(group_id)
+    return group_state.session.state.generation if group_state else 0
+
+
+async def maintain_long_term_memory() -> None:
+    """长期记忆每日维护：先把新碎片整理进档案与群志，再删过期碎片，
+    这样即将过期的碎片一定先被归纳过；最后让已加载的群下次重新读矩阵。"""
+
+    for group_id in list(runtime_enabled_groups):
+        session_id = str(group_id)
+        generation = _generation(group_id)
+
+        def still_current(group_id: int = group_id, generation: int = generation) -> bool:
+            return _generation(group_id) == generation
+
+        try:
+            summaries = await digest_user_profiles(session_id, still_current)
+            group_notes = await digest_group_notes(session_id, still_current)
+        except Exception as e:
+            logger.warning(f"群 {group_id} 档案/群志整理失败: {e}")
+            continue
+        # 档案与群志不随 save_session 回写，已加载的群要同步内存副本
+        group_state = group_states.get(group_id)
+        if group_state is not None and still_current():
+            group_state.session.state.user_summaries.update(summaries)
+            if group_notes is not None:
+                group_state.session.state.group_notes = group_notes
 
     try:
         await maintain_memories()

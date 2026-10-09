@@ -204,12 +204,7 @@ class ConversationOrchestrator:
 
         # Reranker 使用第一条 query 作为主 query，因此必须最新消息优先。
         raw_queries = [msg.content for msg in reversed(messages_chunk[-3:])]
-        user_names = list(
-            dict.fromkeys(msg.user_name for msg in messages_chunk if msg.user_name)
-        )
-        queries = build_chat_rag_queries(
-            raw_queries, chat_summary=state.chat_summary, user_names=user_names
-        )
+        queries = build_chat_rag_queries(raw_queries, chat_summary=state.chat_summary)
         rag_stats = {
             "session_id": self.session.id,
             "query_count": len(queries),
@@ -255,13 +250,14 @@ class ConversationOrchestrator:
         return _format_history(_history_without_current_chunk(all_messages, messages_chunk))
 
     def _related_profiles(self, messages_chunk: list[Message]) -> list[dict]:
-        profiles = self.session.state.profiles
+        state = self.session.state
         return [
             {
                 "user_id": uid,
                 "emotion_tends_to_user": asdict(
-                    profiles.get(uid, PersonProfile(user_id=uid)).emotion
+                    state.profiles.get(uid, PersonProfile(user_id=uid)).emotion
                 ),
+                "summary": state.user_summaries.get(uid, ""),
             }
             for uid in dict.fromkeys(_user_key(msg) for msg in messages_chunk)
         ]
@@ -305,6 +301,7 @@ class ConversationOrchestrator:
             is_relevant=is_relevant,
             time_info=get_time_description(datetime.now()),
             presets=search_result.preset_lines,
+            group_notes=state.group_notes,
             new_msg_speakers=[
                 {"index": index, "user_id": msg.user_id, "user_name": msg.user_name}
                 for index, msg in enumerate(messages_chunk)
@@ -675,6 +672,7 @@ class ConversationOrchestrator:
             if m.user_name == state.name
         ][-MY_RECENT_REPLIES_LIMIT:]
         recalled_str = "\n".join(recalled_history) or "无"
+        related_profiles = self._related_profiles(messages_chunk)
         # role 里可能带 [对话样本] 后缀（examples 的持久化位置），单独用 examples_text 传
         chat_role = state.role.split("[对话样本]")[0].strip()
         prompt = get_chat_prompt(
@@ -685,10 +683,11 @@ class ConversationOrchestrator:
             recent_msgs=recent_msgs,
             new_msgs=new_msgs,
             emotion=asdict(state.global_emotion),
-            related_profiles=self._related_profiles(messages_chunk),
+            related_profiles=related_profiles,
             search_result=search_result.memory_lines,
             examples_text=state.examples,
             presets=search_result.preset_lines,
+            group_notes=state.group_notes,
             recalled_history=recalled_str,
             my_recent_replies=my_recent_replies,
             time_info=get_time_description(datetime.now()),
@@ -701,6 +700,8 @@ class ConversationOrchestrator:
             rag_injected_chars=sum(len(item) for item in search_result.memory_lines),
             preset_injected_count=len(search_result.preset_lines),
             preset_injected_chars=sum(len(item) for item in search_result.preset_lines),
+            group_notes_chars=len(state.group_notes),
+            profile_summary_chars=sum(len(item["summary"]) for item in related_profiles),
             history_chars=len(state.chat_summary)
             + sum(len(item["content"]) for item in recent_msgs),
             recent_chars=sum(len(item["content"]) for item in new_msgs),

@@ -36,6 +36,9 @@ class SessionState:
     examples: str = ""
     preset_lines: list[str] = field(default_factory=list)
     profiles: dict[str, PersonProfile] = field(default_factory=dict)
+    # 档案与群志只由每日整理任务写库，这里是只读副本，不随 save_session 回写
+    user_summaries: dict[str, str] = field(default_factory=dict)
+    group_notes: str = ""
     global_emotion: EmotionState = field(default_factory=EmotionState)
     chat_summary: str = ""
     willingness: float = 0.0
@@ -239,6 +242,7 @@ class Session:
         self.state.role = truncate_text(session_db.role, ROLE_MAX_CHARS)
         self.state.aliases = session_db.aliases if session_db.aliases else []
         self.state.preset_lines = session_db.preset_lines
+        self.state.group_notes = session_db.group_notes
         self.state.chat_summary = session_db.chat_summary
         self.state.global_emotion.valence = session_db.valence
         self.state.global_emotion.arousal = session_db.arousal
@@ -258,6 +262,11 @@ class Session:
 
         self.state.willingness = WILLINGNESS_LOAD_VALUE
         self.state.profiles = {}
+        self.state.user_summaries = {
+            user_data["user_id"]: user_data["summary"]
+            for user_data in data["users"]
+            if user_data["summary"]
+        }
 
         # 恢复用户画像
         for user_data in data["users"]:

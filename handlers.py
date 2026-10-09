@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from datetime import datetime
 
-from nonebot import logger, on_command, on_message
+from nonebot import get_bot, logger, on_command, on_message
 from nonebot.adapters.onebot.v11 import (
     Bot,
     Event,
@@ -29,6 +29,8 @@ from .core.state_manager import (
 )
 from .db import disable_group, enable_group, get_token_stats
 from .memory.short_term import Message as MMessage
+from .models import SessionModel
+from .notes_card import render_group_notes_card
 from .memory.vector import (
     RAG_FINAL_K,
     RAG_MERGED_CANDIDATE_CAP,
@@ -58,6 +60,7 @@ COMMANDS: tuple[CommandMeta, ...] = (
     CommandMeta("presets", "查看可用预设", "presets <群号>"),
     CommandMeta("set_preset <文件名>", "加载预设", "set_preset <群号> <文件名>"),
     CommandMeta("rag_debug <query>", "诊断 RAG 记忆检索"),
+    CommandMeta("group_notes", "查看本群群志原文", "group_notes <群号>"),
     CommandMeta("calm", "冷静并重置短期状态", "calm <群号>"),
     CommandMeta("reset_emotion", "仅重置 VAD 情绪", "reset_emotion <群号>"),
     CommandMeta("reset confirm", "先备份再完全重置本群", "reset <群号> confirm"),
@@ -316,6 +319,29 @@ async def _do_reset(matcher: type[Matcher], group_id: int, args: str):
     await matcher.finish("已重置会话")
 
 
+async def _do_group_notes(matcher: type[Matcher], group_id: int, _args: str):
+    await _group_state_or_finish(matcher, group_id)
+    # 读库而不是内存副本：要带上整理水位做日期
+    session_db = await SessionModel.get_or_none(id=str(group_id))
+    if session_db is None or not session_db.group_notes:
+        await matcher.finish("本群还没有群志（每天 03:30 整理）")
+    try:
+        group_info = await get_bot().get_group_info(group_id=group_id)
+        group_name = group_info.get("group_name") or f"群 {group_id}"
+    except Exception:
+        group_name = f"群 {group_id}"
+    try:
+        image = await render_group_notes_card(
+            notes=session_db.group_notes,
+            group_name=group_name,
+            updated_at=session_db.notes_summarized_until,
+        )
+    except Exception as e:
+        logger.error(f"渲染群志卡片失败: {e}")
+        await matcher.finish(f"群志：\n{session_db.group_notes}")
+    await matcher.finish(MessageSegment.image(image))
+
+
 async def _do_status(matcher: type[Matcher], group_id: int, _args: str):
     state = await _group_state_or_finish(matcher, group_id)
     await matcher.finish(await describe_status(state))
@@ -329,6 +355,7 @@ calm_down = _dual_command("calm", {"冷静"}, _do_calm_down)
 reset_emotion = _dual_command("reset_emotion", {"重置情绪"}, _do_reset_emotion)
 reset = _dual_command("reset", {"重置"}, _do_reset)
 get_status = _dual_command("status", {"状态"}, _do_status)
+get_group_notes = _dual_command("group_notes", {"群志", "查看群志"}, _do_group_notes)
 
 
 @help_cmd.handle()
