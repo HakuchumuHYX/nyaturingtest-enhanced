@@ -7,7 +7,7 @@ from nonebot import logger
 from nonebot.adapters.onebot.v11 import Bot, Event
 from tortoise import Tortoise
 
-from ..db import load_enabled_group_ids
+from ..storage.db import load_enabled_group_ids
 from ..memory.short_term import Message as MMessage
 from ..memory.vector import close_clients, maintain_memories
 from .digest import digest_group_notes, digest_user_profiles

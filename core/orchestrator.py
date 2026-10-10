@@ -6,8 +6,8 @@ from datetime import datetime
 
 from nonebot import logger
 
-from ..db import get_history_before, message_final_id
-from ..domain import EmotionState, PersonProfile
+from ..storage.db import get_history_before, message_final_id
+from .domain import EmotionState, PersonProfile
 from ..memory.short_term import Message
 from ..memory.validation import validate_memory_candidate
 from ..memory.vector import (

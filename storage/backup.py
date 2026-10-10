@@ -14,8 +14,8 @@ from nonebot import logger, require
 require("nonebot_plugin_apscheduler")
 from nonebot_plugin_apscheduler import scheduler  # noqa: E402  必须在 require 之后导入
 
-from .config import BACKUP_DIR, get_data_dir
-from .core.state_manager import maintain_long_term_memory
+from ..config import BACKUP_DIR, get_data_dir
+from ..core.state_manager import maintain_long_term_memory
 from .models import GlobalMessageModel, InteractionLogModel, TokenUsageModel
 
 # 原始明细保留天数

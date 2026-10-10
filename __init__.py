@@ -4,7 +4,7 @@ from nonebot import get_driver, logger
 from tortoise import Tortoise
 
 from . import handlers  # 导入即注册所有 matcher
-from .backup import setup_backup_job
+from .storage.backup import setup_backup_job
 from .config import get_data_dir
 from .core.episodes import setup_episode_job
 from .core.initiative import setup_initiative_job
@@ -20,7 +20,7 @@ async def init_db():
     db_path = data_dir / "nyabot.sqlite"
     await Tortoise.init(
         db_url=f"sqlite://{db_path}",
-        modules={"models": [f"{__package__}.models"]},
+        modules={"models": [f"{__package__}.storage.models"]},
         use_tz=False,
         _create_db=True,
         _enable_global_fallback=True,

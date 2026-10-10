@@ -1,19 +1,13 @@
-"""群志卡片：群志按【段名】切段，填进 notes_card.html，用 Chromium 截图。
+"""群志卡片：群志按【段名】切段，填进 notes.html，用 Chromium 截图。"""
 
-查看群志不常用，内存又紧，所以每次现开浏览器、截完就关，不常驻。
-"""
-
-import os
 import re
 from datetime import datetime
 from html import escape
 from pathlib import Path
 
-from playwright.async_api import async_playwright
+from .browser import screenshot
 
-from .config import get_app_settings
-
-_TEMPLATE = Path(__file__).with_name("notes_card.html")
+_TEMPLATE = Path(__file__).with_name("notes.html")
 _SECTION_RE = re.compile(r"^【(.+?)】\s*(.*)$")
 _BULLET_RE = re.compile(r"^[-•·*]\s*")
 _DATE_RE = re.compile(r"^(\d{4})-(\d{2})\S*\s+(.+)$")
@@ -114,18 +108,4 @@ async def render_group_notes_card(
         )
     )
 
-    # 和 HakuBot 共用同一份 Chromium（playwright 版本一致），不用再下载
-    browsers_path = get_app_settings().playwright_browsers_path
-    if browsers_path:
-        os.environ["PLAYWRIGHT_BROWSERS_PATH"] = browsers_path
-    async with async_playwright() as playwright:
-        browser = await playwright.chromium.launch(args=["--no-sandbox"])
-        try:
-            page = await browser.new_page(
-                viewport={"width": 520, "height": 200}, device_scale_factor=2
-            )
-            await page.set_content(html)
-            await page.evaluate("document.fonts.ready")
-            return await page.screenshot(full_page=True)
-        finally:
-            await browser.close()
+    return await screenshot(html, 520)

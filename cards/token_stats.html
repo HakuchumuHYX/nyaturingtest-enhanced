@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<style>
+:root {
+  --paper: #edf1ef;
+  --ink: #1e2932;
+  --muted: #5b6b70;
+  --faint: #8d9ea1;
+  --rule: #c5d0cd;
+  --track: #d9e1de;
+  --seal: #b0392c;
+  --seal-ink: #f7ebe6;
+  --serif: "Noto Serif CJK SC", "Noto Color Emoji", serif;
+  --sans: "Noto Sans CJK SC", "Noto Color Emoji", sans-serif;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { background: var(--paper); }
+body {
+  width: 520px;
+  color: var(--ink);
+  font-family: var(--sans);
+  -webkit-font-smoothing: antialiased;
+  font-variant-numeric: tabular-nums;
+}
+main { padding: 40px 32px 30px; }
+
+header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 24px;
+  padding-bottom: 24px;
+  border-bottom: 2px solid var(--ink);
+}
+h1 {
+  font-family: var(--serif);
+  font-weight: 700;
+  font-size: 30px;
+  line-height: 1.3;
+  letter-spacing: 0.03em;
+}
+.date { margin-top: 10px; font-size: 13px; color: var(--muted); letter-spacing: 0.04em; }
+.seal {
+  flex: none;
+  width: 54px;
+  height: 54px;
+  margin-top: 2px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--seal);
+  border-radius: 4px;
+  box-shadow: inset 0 0 0 3px var(--seal), inset 0 0 0 4.5px var(--seal-ink);
+  transform: rotate(-4deg);
+  color: var(--seal-ink);
+  font-family: var(--serif);
+  font-weight: 700;
+  font-size: 19px;
+  line-height: 1.05;
+  writing-mode: vertical-rl;
+}
+
+section {
+  display: grid;
+  grid-template-columns: 22px 1fr;
+  column-gap: 20px;
+  padding: 24px 0;
+  border-bottom: 1px solid var(--rule);
+}
+section:last-child { border-bottom: none; padding-bottom: 6px; }
+h2 {
+  writing-mode: vertical-rl;
+  font-family: var(--serif);
+  font-weight: 700;
+  font-size: 15px;
+  letter-spacing: 0.35em;
+  color: var(--muted);
+}
+
+.scope {
+  display: grid;
+  grid-template-columns: 44px 1fr;
+  column-gap: 14px;
+}
+.scope + .scope { margin-top: 18px; }
+.scope-label b { display: block; font-family: var(--serif); font-size: 16px; line-height: 1.6; }
+.scope-label small { display: block; font-size: 11px; color: var(--faint); letter-spacing: 0.04em; }
+.models { border-left: 2px solid var(--rule); padding-left: 14px; }
+.model + .model { margin-top: 12px; }
+.headline {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+}
+.name { font-size: 14px; color: var(--muted); overflow-wrap: anywhere; }
+.total {
+  flex: none;
+  font-family: var(--serif);
+  font-weight: 700;
+  font-size: 24px;
+  line-height: 1.3;
+}
+.total small { margin-left: 2px; font-size: 13px; font-weight: 400; color: var(--muted); }
+.split {
+  display: flex;
+  height: 5px;
+  margin: 6px 0 7px;
+  border-radius: 3px;
+  overflow: hidden;
+  background: var(--track);
+}
+.split i:first-child { background: var(--ink); }
+.split i:last-child { background: var(--seal); }
+.detail {
+  display: flex;
+  flex-wrap: wrap;
+  column-gap: 14px;
+  font-size: 12.5px;
+  line-height: 1.7;
+  color: var(--muted);
+}
+.detail span { white-space: nowrap; }
+.detail .in::before, .detail .out::before {
+  content: "";
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  margin-right: 5px;
+  border-radius: 50%;
+  vertical-align: 1px;
+}
+.detail .in::before { background: var(--ink); }
+.detail .out::before { background: var(--seal); }
+.empty { font-size: 14px; line-height: 1.6; color: var(--faint); }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <div>
+      <h1>Token 用量</h1>
+      <p class="date">{{date}}</p>
+    </div>
+    <div class="seal">账目</div>
+  </header>
+  {{sections}}
+</main>
+</body>
+</html>

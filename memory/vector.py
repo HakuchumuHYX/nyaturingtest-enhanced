@@ -14,7 +14,7 @@ from openai import AsyncOpenAI
 from tortoise.transactions import in_transaction
 
 from ..config import get_app_settings
-from ..models import MemoryModel
+from ..storage.models import MemoryModel
 
 # RAG 检索参数
 RAG_FINAL_K = 20

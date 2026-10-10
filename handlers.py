@@ -13,19 +13,19 @@ from nonebot.adapters.onebot.v11 import (
     PokeNotifyEvent,
     PrivateMessageEvent,
 )
-from nonebot.exception import FinishedException
 from nonebot.matcher import Matcher
 from nonebot.params import CommandArg
 from nonebot.permission import SUPERUSER
 
-from .backup import backup_task
+from .cards.notes import render_group_notes_card
+from .cards.token_stats import render_token_stats_card
 from .config import get_app_settings, get_token_stats_model_names
+from .core.digest import GROUP_NOTES_REFRESH_MIN_NEW, count_new_group_fragments
+from .core.faces import ensure_faces, face_name
 from .core.llm import chat_client, feedback_client
 from .core.logic import message2BotMessage
 from .core.memory_query import acquire_query_slot, query_memory_profile
 from .core.metrics import metrics
-from .core.digest import GROUP_NOTES_REFRESH_MIN_NEW, count_new_group_fragments
-from .core.faces import ensure_faces, face_name
 from .core.state_manager import (
     ensure_group_state,
     is_shutting_down,
@@ -33,16 +33,15 @@ from .core.state_manager import (
     remove_group_state,
     runtime_enabled_groups,
 )
-from .db import disable_group, enable_group, get_token_stats
 from .memory.short_term import Message as MMessage
-from .models import SessionModel
-from .notes_card import render_group_notes_card
 from .memory.vector import (
     RAG_FINAL_K,
     RAG_MERGED_CANDIDATE_CAP,
     RAG_PER_QUERY_RECALL_K,
 )
-from .token_stats import render_token_stats_card
+from .storage.backup import backup_task
+from .storage.db import disable_group, enable_group, get_token_stats
+from .storage.models import SessionModel
 
 
 @dataclass(frozen=True)
@@ -70,7 +69,7 @@ COMMANDS: tuple[CommandMeta, ...] = (
     CommandMeta("calm", "冷静并重置短期状态", "calm <群号>"),
     CommandMeta("reset_emotion", "仅重置 VAD 情绪", "reset_emotion <群号>"),
     CommandMeta("reset confirm", "先备份再完全重置本群", "reset <群号> confirm"),
-    CommandMeta("token统计", "查看全部模型 Token 与 DeepSeek cache 统计"),
+    CommandMeta("token统计", "查看当前 chat / feedback 模型的 Token 用量"),
     CommandMeta("backup_data", "手动触发数据备份", "backup_data"),
     CommandMeta("help", "显示帮助", "help"),
 )
@@ -614,39 +613,19 @@ async def handle_manage_autochat(
 
 
 @token_stats.handle()
-async def handle_token_stats(
-    bot: Bot, event: GroupMessageEvent, args: Message = CommandArg()
-):
-    group_id = event.group_id
-    arg = args.extract_plain_text().strip().lower()
-    token_stats_scope_all = arg in {"all", "全部", "历史", "history", "historical"}
-    stats_model_names = get_token_stats_model_names()
-    if token_stats_scope_all:
-        stats_model_names = None
-    stats = await get_token_stats(
-        group_id,
-        model_names=stats_model_names,
-    )
-    scope_label = "全部历史模型" if token_stats_scope_all else "当前模型"
-
+async def handle_token_stats(event: GroupMessageEvent):
+    stats = await get_token_stats(event.group_id, get_token_stats_model_names())
     try:
-        img_bytes = await render_token_stats_card(
-            stats=stats,
-            scope_label=scope_label,
-        )
-
-        # 发送图片消息
-        await token_stats.finish(MessageSegment.image(img_bytes))
-    except FinishedException:
-        # FinishedException 是 NoneBot 的流程控制异常，必须重新抛出
-        raise
+        image = await render_token_stats_card(stats)
     except Exception as e:
-        logger.error(f"渲染 Token 统计图片失败: {e}")
-        # 降级：发送文本消息
-        text_msg = f"Token 统计（{scope_label}）\n\n"
-        text_msg += f"24h本群: {stats.get('1d_local', [])}\n"
-        text_msg += f"24h全局: {stats.get('1d_global', [])}\n"
-        await token_stats.finish(text_msg)
+        logger.error(f"渲染 Token 统计卡片失败: {e}")
+        lines = [
+            f"{label} {item['model']}: {item['total']:,}"
+            for label, view in (("今日本群", "1d_local"), ("今日全部", "1d_global"))
+            for item in stats[view]
+        ]
+        await token_stats.finish("Token 统计\n" + ("\n".join(lines) or "今日暂无"))
+    await token_stats.finish(MessageSegment.image(image))
 
 
 query_memory = on_command(

@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 from nonebot import logger
 
-from ..db import log_token_usage
+from ..storage.db import log_token_usage
 
 
 def log_event(event: str, **fields):

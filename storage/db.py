@@ -1,12 +1,12 @@
+import unicodedata
 import uuid
-from collections import defaultdict
 from datetime import date, datetime, timedelta
 
 from nonebot import logger
 from tortoise import Tortoise
 from tortoise.transactions import in_transaction
 
-from .memory.short_term import SHORT_TERM_BUFFER_SIZE, Message
+from ..memory.short_term import SHORT_TERM_BUFFER_SIZE, Message
 from .models import (
     DailyTokenUsageModel,
     EnabledGroupModel,
@@ -16,7 +16,6 @@ from .models import (
     TokenUsageModel,
     UserProfileModel,
 )
-from .token_stats import TOKEN_FIELDS, merge_token_stats_by_model
 
 
 def sanitize_text(text: str) -> str:
@@ -380,6 +379,21 @@ async def log_interactions(session_id: str, interactions: list[tuple[str, dict]]
     )
 
 
+TOKEN_FIELDS = (
+    "prompt_tokens",
+    "completion_tokens",
+    "prompt_cache_hit_tokens",
+    "prompt_cache_miss_tokens",
+    "reasoning_tokens",
+)
+
+
+def _model_key(name: str) -> str:
+    """同一个模型在不同上游的写法不同：大小写、带不带厂商前缀（deepseek-ai/DeepSeek-V4-Flash）。"""
+
+    return unicodedata.normalize("NFKC", name).strip().casefold().rpartition("/")[2]
+
+
 async def log_token_usage(session_id: str, model_name: str, usage: dict):
     """同一事务里追加一条明细，并原子累加当日汇总。"""
 
@@ -417,43 +431,34 @@ async def log_token_usage(session_id: str, model_name: str, usage: dict):
         logger.error(f"[Repo] 记录 Token 消耗失败: {e}")
 
 
-async def get_token_stats(
-    group_id: str | int,
-    model_names: list[str] | None = None,
-) -> dict:
-    """Read all five views from one compact daily-aggregate query."""
+async def get_token_stats(group_id: str | int, model_names: list[str]) -> dict:
+    """今日 / 近七日 / 累计用量，只算 model_names 里的模型。
+    同一模型的不同写法并成一条，用 model_names 里的名字显示。"""
 
-    result = {
-        "1d_local": [],
-        "1d_global": [],
-        "7d_local": [],
-        "7d_global": [],
-        "all_global": [],
+    names = {_model_key(name): name for name in model_names}
+    views: dict[str, dict[str, dict]] = {
+        view: {} for view in ("1d_local", "1d_global", "7d_local", "7d_global", "all_global")
     }
     group_id_str = str(group_id)
     today = date.today()
     seven_day_cutoff = today - timedelta(days=6)
     try:
-        query = DailyTokenUsageModel.all()
-        if model_names:
-            query = query.filter(model_name__in=model_names)
-        rows = await query.values(
+        rows = await DailyTokenUsageModel.all().values(
             "day",
             "session_id",
             "model_name",
-            *TOKEN_FIELDS,
+            "prompt_tokens",
+            "completion_tokens",
+            "reasoning_tokens",
         )
-
-        buckets = {
-            name: defaultdict(lambda: {field: 0 for field in TOKEN_FIELDS})
-            for name in result
-        }
         for row in rows:
+            name = names.get(_model_key(row["model_name"]))
+            if name is None:
+                continue
             row_day = row["day"]
             if isinstance(row_day, str):
                 row_day = date.fromisoformat(row_day)
-            key = str(row.get("model_name") or "")
-            is_local = str(row.get("session_id") or "") == group_id_str
+            is_local = row["session_id"] == group_id_str
             targets = ["all_global"]
             if row_day >= seven_day_cutoff:
                 targets.append("7d_global")
@@ -463,12 +468,19 @@ async def get_token_stats(
                 targets.append("1d_global")
                 if is_local:
                     targets.append("1d_local")
-            for bucket in targets:
-                for field in TOKEN_FIELDS:
-                    buckets[bucket][key][field] += int(row.get(field, 0) or 0)
-
-        for name in result:
-            result[name] = merge_token_stats_by_model(buckets[name])
+            for view in targets:
+                entry = views[view].setdefault(
+                    name, {"model": name, "prompt": 0, "completion": 0, "reasoning": 0}
+                )
+                entry["prompt"] += row["prompt_tokens"]
+                entry["completion"] += row["completion_tokens"]
+                entry["reasoning"] += row["reasoning_tokens"]
     except Exception as e:
         logger.error(f"[Repo] 查询 Token 统计失败: {e}")
-    return result
+    return {
+        view: [
+            {**entry, "total": entry["prompt"] + entry["completion"]}
+            for entry in entries.values()
+        ]
+        for view, entries in views.items()
+    }

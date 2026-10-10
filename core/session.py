@@ -4,7 +4,7 @@ from datetime import datetime
 
 from nonebot import logger
 
-from ..db import (
+from ..storage.db import (
     delete_session_data,
     load_full_session_data,
     log_interactions,
@@ -12,7 +12,7 @@ from ..db import (
     sync_messages,
     update_user_profiles,
 )
-from ..domain import EmotionState, PersonProfile
+from .domain import EmotionState, PersonProfile
 from ..memory.short_term import Memory, Message
 from ..memory.vector import VectorMemory
 from .engagement import WILLINGNESS_LOAD_VALUE, chatting_state

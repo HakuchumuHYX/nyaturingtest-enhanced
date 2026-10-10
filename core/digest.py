@@ -18,8 +18,8 @@ from functools import partial
 
 from nonebot import logger
 
-from ..db import get_latest_user_names
-from ..models import MemoryModel, SessionModel, UserProfileModel
+from ..storage.db import get_latest_user_names
+from ..storage.models import MemoryModel, SessionModel, UserProfileModel
 from .llm import extract_and_parse_json, feedback_client
 
 PROFILE_MIN_NEW_MEMORIES = 10

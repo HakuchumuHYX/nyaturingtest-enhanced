@@ -11,9 +11,9 @@ from nonebot import logger, require
 require("nonebot_plugin_apscheduler")
 from nonebot_plugin_apscheduler import scheduler  # noqa: E402  必须在 require 之后导入
 
-from ..db import get_latest_user_names, message_final_id  # noqa: E402
+from ..storage.db import get_latest_user_names, message_final_id  # noqa: E402
 from ..memory.short_term import Message  # noqa: E402
-from ..models import GlobalMessageModel, MemoryModel, SessionModel  # noqa: E402
+from ..storage.models import GlobalMessageModel, MemoryModel, SessionModel  # noqa: E402
 from .llm import extract_and_parse_json, feedback_client  # noqa: E402
 from .metrics import log_event  # noqa: E402
 from .orchestrator import save_memory_candidates  # noqa: E402
