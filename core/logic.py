@@ -13,12 +13,17 @@ from nonebot.adapters.onebot.v11.exception import ActionFailed
 from ..memory.image import fetch_image_input
 from ..memory.short_term import Message as MMessage
 from .engagement import SPEAK_COOLDOWN_SECONDS
+from .faces import Reaction, ensure_faces, face_name, sendable_face
 from .llm import VisionInput, build_turn_calls
-from .orchestrator import ConversationOrchestrator
+from .metrics import log_event
+from .orchestrator import ConversationOrchestrator, Poke
 from .state_manager import SELF_SENT_MSG_IDS, GroupState, is_shutting_down
 
 DEBOUNCE_SECONDS = 2.0
 MAX_REPLY_MESSAGES = 2
+REACT_COOLDOWN_SECONDS = 60
+# 戳一戳会给对方弹提醒，比贴表情打扰人，间隔放长些
+POKE_COOLDOWN_SECONDS = 120
 
 _SPLIT_PATTERN = re.compile(
     r"(?<=[。！？!?~\n])\s*|(?<!\.)\.(?!\.)(?=\s|$|[\u4e00-\u9fff])\s*"
@@ -76,15 +81,16 @@ async def next_inbox_batch(state: GroupState) -> InboxBatch | None:
         return batch
 
 
-def _response_content(response) -> tuple[str, object | None]:
+def _response_content(response) -> tuple[str, object | None, str]:
     if isinstance(response, str):
-        return response, None
+        return response, None, ""
     if isinstance(response, dict):
         return (
             str(response.get("content") or ""),
             response.get("target_id") or response.get("reply_to"),
+            str(response.get("face") or ""),
         )
-    return "", None
+    return "", None, ""
 
 
 def _delay_seconds(part: str) -> float:
@@ -97,11 +103,11 @@ async def send_one(
     bot: Bot,
     event: Event,
     message: Message,
+    memory_text: str,
     generation: int,
 ) -> bool:
     try:
         result = await bot.send(message=message, event=event)
-        sent_content = message.extract_plain_text() or str(message)
         message_id = ""
         if isinstance(result, dict) and "message_id" in result:
             message_id = str(result["message_id"])
@@ -110,7 +116,7 @@ async def send_one(
         # 同步写入短时记忆，中间没有 await，不需要再拿 session_lock
         if not state.session.stale(generation, "append_self_message"):
             state.session.append_self_message(
-                sent_content,
+                memory_text,
                 message_id,
                 str(bot.self_id),
             )
@@ -148,16 +154,30 @@ async def dispatch_replies(
     for response_index, response in enumerate(responses):
         if sent_count >= MAX_REPLY_MESSAGES:
             break
-        raw_content, reply_id = _response_content(response)
-        if not raw_content:
-            continue
-        parts = build_send_parts(raw_content, MAX_REPLY_MESSAGES - sent_count)
-        for part_index, part in enumerate(parts):
+        raw_content, reply_id, face_text = _response_content(response)
+        face = sendable_face(face_text) if face_text else None
+        if face_text and face is None:
+            logger.debug(f"表情不在目录里，丢弃: {face_text}")
+        # (消息, 写进短期记忆的文本, 这条带的表情)；模型写的文字一律按纯文本发，不解析 CQ 码
+        outgoing = [
+            (Message(MessageSegment.text(part)), part, None)
+            for part in build_send_parts(raw_content, MAX_REPLY_MESSAGES - sent_count)
+        ]
+        if face is not None:
+            face_seg = MessageSegment.face(int(face.id))
+            face_mark = f"[表情:{face.name}]"
+            # 大动画表情和文字混发的显示效果没验证过，单独发一条
+            if outgoing and not face.big:
+                message, text, _ = outgoing[-1]
+                outgoing[-1] = (message + face_seg, text + face_mark, face)
+            else:
+                outgoing.append((Message(face_seg), face_mark, face))
+
+        for part_index, (message, memory_text, sent_face) in enumerate(outgoing):
             if sent_count >= MAX_REPLY_MESSAGES:
                 break
             if state.session.stale(generation, "send_loop"):
                 break
-            message = Message(part)
             if reply_id and response_index == 0 and part_index == 0:
                 try:
                     message.insert(0, MessageSegment.reply(int(reply_id)))
@@ -169,14 +189,22 @@ async def dispatch_replies(
                 bot=bot,
                 event=event,
                 message=message,
+                memory_text=memory_text,
                 generation=generation,
             )
             if sent:
                 sent_count += 1
+                if sent_face is not None:
+                    log_event(
+                        "face_sent",
+                        session_id=state.session.id,
+                        name=sent_face.name,
+                        big=sent_face.big,
+                    )
 
-            has_more = part_index < len(parts) - 1 or response_index < total - 1
+            has_more = part_index < len(outgoing) - 1 or response_index < total - 1
             if has_more:
-                await asyncio.sleep(_delay_seconds(part))
+                await asyncio.sleep(_delay_seconds(memory_text))
 
     if sent_count:
         state.session.state.last_speak_time = datetime.now()
@@ -186,6 +214,26 @@ async def dispatch_replies(
 
 def _is_sticker_segment_data(data: dict) -> bool:
     return str(data.get("sub_type", "")) == "1"
+
+
+def _face_text(seg_type: str, data: dict) -> str | None:
+    """QQ 自带表情转成 [表情:名字]；不是表情返回 None。
+
+    商城表情是带 emoji_id 的 image 段，summary 就是名字（如 [狗头]），不下载、不给视觉模型。
+    """
+
+    if seg_type == "face":
+        name = face_name(str(data.get("id", "")))
+        return f"[表情:{name}]" if name else "[表情]"
+    if seg_type == "dice":
+        return "[表情:骰子]"
+    if seg_type == "rps":
+        return "[表情:包剪锤]"
+    if seg_type in ("image", "mface") and data.get("emoji_id"):
+        summary = str(data.get("summary") or "").strip("[] ")
+        if summary:
+            return f"[表情:{summary}]"
+    return None
 
 
 def _build_image_ref(
@@ -228,6 +276,7 @@ async def message2BotMessage(
     """把 OneBot 消息转成可读文本，并收集原生图片输入与被 @/被回复的人（QQ 号 -> 群名片）。"""
 
     mentions: dict[str, str] = {}
+    await ensure_faces(bot)
 
     async def process_segment(
         seg: MessageSegment,
@@ -235,6 +284,10 @@ async def message2BotMessage(
     ) -> tuple[str, list[VisionInput]]:
         if seg.type == "text":
             return (f"{seg.data.get('text', '')}", [])
+
+        face_text = _face_text(seg.type, seg.data)
+        if face_text is not None:
+            return (face_text, [])
 
         if seg.type == "image":
             url = seg.data.get("url", "")
@@ -289,7 +342,10 @@ async def message2BotMessage(
                     for reply_index, segment in enumerate(content_data):
                         msg_type = segment.get("type")
                         data = segment.get("data", {})
-                        if msg_type == "text":
+                        face_text = _face_text(msg_type, data)
+                        if face_text is not None:
+                            source_text += face_text
+                        elif msg_type == "text":
                             source_text += data.get("text", "")
                         elif msg_type == "image":
                             img_url = data.get("url", "")
@@ -309,8 +365,6 @@ async def message2BotMessage(
                             source_text += img_text
                             if vision_input:
                                 image_inputs.append(vision_input)
-                        elif msg_type == "face":
-                            source_text += "[表情]"
 
                 if len(source_text) > 800:
                     source_text = source_text[:800] + "..."
@@ -327,6 +381,72 @@ async def message2BotMessage(
     content = "".join(result[0] for result in results).strip()
     image_inputs = [item for result in results for item in result[1]]
     return (content, image_inputs, mentions)
+
+
+async def _send_reaction(
+    state: GroupState, bot: Bot, react: Reaction, generation: int
+) -> None:
+    """贴表情不等发言冷却；同一个群两次之间至少隔 REACT_COOLDOWN_SECONDS。"""
+
+    now = datetime.now()
+    if (now - state.last_react_time).total_seconds() < REACT_COOLDOWN_SECONDS:
+        outcome = "cooldown"
+    elif state.session.stale(generation, "react"):
+        return
+    else:
+        state.last_react_time = now
+        try:
+            await bot.call_api(
+                "set_msg_emoji_like",
+                message_id=int(react.target_id),
+                emoji_id=react.emoji_id,
+                set=True,
+            )
+            outcome = "ok"
+        except ActionFailed as e:
+            logger.warning(f"贴表情失败: {e}")
+            outcome = "failed"
+    log_event(
+        "react",
+        session_id=state.session.id,
+        target_id=react.target_id,
+        emoji=react.name,
+        emoji_id=react.emoji_id,
+        outcome=outcome,
+    )
+
+
+async def _send_poke(
+    state: GroupState, bot: Bot, event: Event, target: Poke, generation: int
+) -> None:
+    """戳一戳不等发言冷却；同一个群两次之间至少隔 POKE_COOLDOWN_SECONDS。
+
+    自己戳的那条记录不在这里写：SnowLuma 会上报 bot 自己的戳一戳通知，由 handlers 按通知原文写进短期记忆。
+    """
+
+    now = datetime.now()
+    if target.user_id == str(bot.self_id):
+        return
+    if (now - state.last_poke_time).total_seconds() < POKE_COOLDOWN_SECONDS:
+        outcome = "cooldown"
+    elif state.session.stale(generation, "poke"):
+        return
+    else:
+        state.last_poke_time = now
+        try:
+            await bot.call_api(
+                "group_poke", group_id=event.group_id, user_id=int(target.user_id)
+            )
+            outcome = "ok"
+        except ActionFailed as e:
+            logger.warning(f"戳一戳失败: {e}")
+            outcome = "failed"
+    log_event(
+        "poke",
+        session_id=state.session.id,
+        user_id=target.user_id,
+        outcome=outcome,
+    )
 
 
 async def _process_inbox_batch(state: GroupState, batch: InboxBatch) -> None:
@@ -351,16 +471,22 @@ async def _process_inbox_batch(state: GroupState, batch: InboxBatch) -> None:
     images = [item for message in current_chunk for item in message.image_inputs]
     chat_call, feedback_call = build_turn_calls(session_id, images)
     try:
-        responses = await ConversationOrchestrator(state.session).process_chunk(
+        turn = await ConversationOrchestrator(state.session).process_chunk(
             current_chunk, chat_call, feedback_call, generation
         )
     finally:
         for message in current_chunk:
             message.image_inputs.clear()
+    if turn is None:
+        return
 
+    if turn.react is not None:
+        await _send_reaction(state, batch.bot, turn.react, generation)
+    if turn.poke is not None:
+        await _send_poke(state, batch.bot, batch.event, turn.poke, generation)
     await dispatch_replies(
         state=state,
-        responses=responses or [],
+        responses=turn.replies,
         bot=batch.bot,
         event=batch.event,
         generation=generation,

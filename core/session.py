@@ -376,6 +376,18 @@ class Session:
         )
         self.runtime.short_term_memory.update([msg])
 
+    def record_reaction(self, msg: Message) -> None:
+        """群友给 bot 的消息贴了表情：只进短期记忆，不进固化计数，也不触发新一轮对话。
+
+        一条消息常被好几个人贴同一个表情，已有相同记录就跳过，免得挤满上下文窗口。
+        """
+
+        memory = self.runtime.short_term_memory
+        if any(m.content == msg.content for m in memory.access()):
+            return
+        memory.update([msg])
+        self.schedule_save()
+
     def record_incoming(self, messages_chunk: list[Message]) -> None:
         """写入短时记忆并累计固化窗口。"""
 

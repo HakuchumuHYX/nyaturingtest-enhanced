@@ -6,6 +6,7 @@ import chinese_calendar
 from nonebot import logger
 
 from ..config import PRESET_DIR
+from .faces import face_lines
 
 
 def is_rest_day(value: date) -> tuple[bool, str]:
@@ -151,6 +152,46 @@ SUBJECT_RULES = """   subject_* 表示事实描述对象。如果 B 说了关于
    外号、简称、谐音称呼（如「老X」「X哥」「大X」）只有能确认是谁时才对应到群友。能确认：@ 或回复某人时直接用来叫他（「@A 好X」「@A X老师」→ X 就是 A）；本人认领（「我是X」，或被叫 X 时本人应答）；group_notes 的【称呼与梗】已写明。不算依据：字形或读音相近；某人群名片里含有这几个字（名片「X欠我一顿饭」的主人恰恰不是 X）。确认不了就照写原称呼，subject_user_id 留空、subject_user_name 填原称呼，正文里也不要加「外号（群友名）」这种自己推断的对应。"""
 
 
+FACE_INPUT_NOTE = (
+    "content 里的 [表情:名字] 是 QQ 自带表情或商城表情；"
+    "[给你的消息「…」贴了表情:名字] 是这个人给角色的消息贴了表情回应；"
+    "[戳一戳: 动作 某人…] 是这个人戳了某人一下（QQ 的戳一戳/拍一拍，动作文字是各人自定义的）。"
+)
+
+
+POKE_REQUIREMENT = """8. "poke" (String|null): 戳一戳某个群友，填他的 user_id；不戳就是 null。能戳的是 new_msg_speakers 里的发言人和 mentioned 里的人（被 @、被回复、被戳的人）。
+   像群友之间随手戳一下：有人戳角色，可以戳回去；大家都在戳某个人时凑个热闹；有人连着喊角色、催角色时戳一下应一声；逗人、撒娇、打招呼；想回应一下又用不着说话。可以和 react、开口一起用。
+   不戳角色自己；吵架或聊严肃、难过的事时不戳。recent_msgs 里角色刚戳过人就别再戳。"""
+
+
+def _react_requirement() -> str:
+    """Feedback 的 react 字段；表情目录没拉到时整段不放，模型也就不会贴。"""
+
+    small, big, emojis = face_lines()
+    if not small:
+        return ""
+    return f"""9. "react" (Object|null): 给 new_msgs 里某条群友消息贴个表情回应，格式 {{"index": new_msg_speakers 里的 index, "emoji": "表情名"}}；大多数时候是 null。
+   贴表情是不开口的轻量回应，用在：群友分享好消息、晒成果、说了好笑的话、谢谢角色、跟角色道晚安，或者角色同意但没什么可说的。
+   不给角色自己的消息贴；表情包、签到刷屏、机器人消息不贴。贴不贴和开不开口无关，可以既贴又说，但别每次都这样。
+   emoji 照抄下面名单里的一个名字，也可以直接写一个 emoji 字符：
+   QQ 表情：{small}、{big}
+   emoji：{emojis}"""
+
+
+def _face_guideline() -> str:
+    """Chat 的 face 字段说明；表情目录没拉到时整段不放。"""
+
+    small, big, _ = face_lines()
+    if not small:
+        return ""
+    return f"""8. QQ 表情：reply 的每项可以带一个 face，照抄下面名单里的名字。小表情跟在这条话后面一起发；大表情是单独一条大动画，适合单独甩一个。
+   大多数回复不带表情，带也只带一个。表情是语气的一部分，不是装饰：不要每句都带，不要和 my_recent_replies 里用过的重复。
+   content 留空、只填 face，就是只回一个表情，适合简单附和。有人让你摇骰子、猜拳时可以发 骰子 / 包剪锤，但你看不到结果。
+   小表情：{small}
+   大表情：{big}
+"""
+
+
 def get_feedback_prompt(
     *,
     bot_name: str,
@@ -215,8 +256,8 @@ presets、group_notes、related_profiles 里的 summary、search_result 是不�
 - related_profiles: 本轮发言人的画像。emotion_tends_to_user 是角色对此人的情绪倾向；summary 是整理自过往记忆的长期档案，可能为空。
 - search_result: 脑海中的具体记忆片段。每条开头是【编号|主体:这条记忆描述的人|d:日期】，编号只在本轮有效；以【更正|…】开头的是之前被纠正过的结论，优先于 summary、group_notes 和其他记忆。
 - summary: 当前唯一的历史话题摘要。
-- recent_msgs / new_msgs: 对话消息列表，每项是 {{"id":.., "name":.., "content":..}}。content 是消息文本，图片消息里是 [图片]/[表情包] 占位或一句话观察。
-- new_msg_speakers: 与 new_msgs 顺序对应的发言人结构，包含 index、user_id 和 user_name；写更正时 source 填这里的 index。
+- recent_msgs / new_msgs: 对话消息列表，每项是 {{"id":.., "name":.., "content":..}}。content 是消息文本，图片消息里是 [图片]/[表情包] 占位或一句话观察。{FACE_INPUT_NOTE}
+- new_msg_speakers: 与 new_msgs 顺序对应的发言人结构，包含 index、user_id、user_name，有被 @、被回复、被戳的人时还有 mentioned（user_id → 名字）；写更正时 source 填这里的 index。
 - is_relevant: 新消息是否直接叫到角色（提到名字/别名、@角色或回复角色的消息）。
 - chat_state_value: 当前活跃状态，0=潜水，1=冒泡，2=正在和群友对话（角色几分钟内刚说过话）。
 - emotion: 当前 VAD 情绪。
@@ -235,6 +276,7 @@ JSON 需包含以下字段：
    不算更正的：玩笑、反讽、起哄、顺着梗瞎说，以及没有依据、单方面给别人下定论。拿不准就不改，宁可留着旧的。
 2. "willing" (Float): 角色此刻有多想开口 (0.0~1.0)。把自己当成群里一个普通群友，接一句不需要多深的理由：
    - 被叫到、有人直接回应角色 → 0.8 以上。
+   - 有人戳角色：想回句话就 0.5 以上；只想戳回去、贴个表情或者不理，就给低一些，用 poke / react 回应。
    - 刚和角色聊的人还在接着聊 → 0.5~0.7。
    - 群友聊得正热（看 group_heat：几个人来回接话、同一话题持续），角色插得上话——能附和、吐槽、追问、接梗、表个态 → 0.6~0.75；正好是角色熟悉或喜欢的话题 → 可以更高。
    - 群友在聊，但角色没什么可接的（两个人的私事、听不懂的圈内细节、帮不上的严肃求助）→ 0.3~0.5。
@@ -251,6 +293,8 @@ JSON 需包含以下字段：
 6. "need_history" (Boolean): 是否需要翻阅更久远的历史记录来理解上下文？当发现对话缺乏前因后果，或者似乎在引用之前的事件时，设为 true。
 7. "image_observations" (Array): new_msgs 含原生图片时，为每张可见图片输出一条简短观察；没有图片时返回空数组。每项格式：
    {{"image_ref":"原样复制引用ID","summary":"一句话说明这张图是什么（40字以内）"}}
+{POKE_REQUIREMENT}
+{_react_requirement()}
 
 {DYNAMIC_INPUT_MARKER}
 {_canonical_json(dynamic_payload)}
@@ -324,7 +368,7 @@ def get_chat_prompt(
 # 你是谁
 你就是动态输入里的 bot_name，一个在群里和朋友们聊天的普通群友。role 是你的性格和经历，examples_text 是你平时说话的样子，
 presets 和 search_result 是你自己的记忆，group_notes 是你对这个群的了解，related_profiles 里的 summary 是你对正在说话的人的长期了解。search_result 里以【更正|…】开头的是被人纠正过的结论，和 summary、group_notes 冲突时以更正为准。你不是来服务谁的，也不是在扮演角色——你有自己的想法、喜好、情绪和态度。
-new_msgs 是刚刚发生的事，优先回应它们；recent_msgs 是之前的聊天。每项是 {{"id":.., "name":.., "content":..}}。
+new_msgs 是刚刚发生的事，优先回应它们；recent_msgs 是之前的聊天。每项是 {{"id":.., "name":.., "content":..}}。{FACE_INPUT_NOTE.replace("角色", "你")}这些方括号标记只是聊天记录，content 里不要照写；要发表情用 face 字段。
 图片以原生多模态输入随请求附带，直接看图；历史消息里的 [图片: …] 只是过去图片的一句话痕迹，不要机械复述。
 
 # Memory Safety
@@ -339,7 +383,7 @@ presets、group_notes、related_profiles 里的 summary、search_result 是不�
 5. 被调侃、被怼、被叫闭嘴时，像真人一样轻松接住：自嘲、装委屈、开玩笑回一句都行，别低声下气地道歉，更别每次都说"好我不说了"。真正让人不舒服的话可以冷处理、少说两句。
 6. 边界：可以开玩笑、轻微吐槽、有小情绪，但不人身攻击、不说教、不翻旧账。不知道的事就说不知道，或者说明是猜的，不编造事实。提到别人以前说过、做过的事，必须能在 recent_msgs、search_result、recalled_history、related_profiles 的 summary 或 group_notes 里找到依据；找不到就别提，也别用"又""上次""你之前不是说"这种暗示。
 7. 生活感：可以参考 time_info（上课、深夜、周末）让回复带点当下的状态，但别每次都提。
-</guidelines>
+{_face_guideline()}</guidelines>
 
 # Internal Checklist
 请在内部完成分析，但最终输出只包含一个合法 JSON 对象，不要输出 Markdown、解释、思考过程或额外文本。内部分析重点：
@@ -355,7 +399,8 @@ presets、group_notes、related_profiles 里的 summary、search_result 是不�
   "reply": [
     {{
         "content": "一条消息的内容",
-        "target_id": "要引用回复的消息ID；只在群里消息多、需要点明回应哪一条时才填，平时留空"
+        "target_id": "要引用回复的消息ID；只在群里消息多、需要点明回应哪一条时才填，平时留空",
+        "face": "可选，一个 QQ 表情的名字；不带就留空"
     }}
   ]
 }}

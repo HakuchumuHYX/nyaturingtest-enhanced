@@ -3,7 +3,7 @@
 两层决策：
 1. 规则层（本模块）决定这批消息「值不值得调用 Feedback 考虑说话」：被点名、聊天对象在接话、
    或意愿值够高且自己最近没说太多。
-2. Feedback 的 willing 决定「说不说」，门槛按场景区分（被点名必回、聊天对象接话 0.45、主动插嘴 0.6）。
+2. Feedback 的 willing 决定「说不说」，门槛按场景区分（被点名必回、聊天对象接话或被戳 0.45、主动插嘴 0.6）。
 """
 
 from dataclasses import dataclass
@@ -69,13 +69,14 @@ def chatting_state(state, now: datetime) -> ChattingState:
 class EngagementDecision:
     relevant: bool
     in_conversation: bool
+    poked: bool
     engaged: bool
 
     @property
     def speak_threshold(self) -> float:
         if self.relevant:
             return 0.0
-        if self.in_conversation:
+        if self.in_conversation or self.poked:
             return SPEAK_THRESHOLD_CONVERSATION
         return SPEAK_THRESHOLD_PASSIVE
 
@@ -113,10 +114,12 @@ def evaluate_engagement(
     wants_to_chime_in = (
         state.willingness >= ENGAGE_THRESHOLD and self_share < SELF_SHARE_LIMIT
     )
+    poked = any(message.poke and message.to_me for message in messages)
     return EngagementDecision(
         relevant=relevant,
         in_conversation=conversing,
-        engaged=relevant or conversing or wants_to_chime_in,
+        poked=poked,
+        engaged=relevant or conversing or poked or wants_to_chime_in,
     )
 
 
@@ -125,8 +128,12 @@ def check_relevance(
     aliases: list[str],
     messages: list[Message],
 ) -> bool:
-    """@Bot、回复 Bot 的消息，或提到名字/别名（至少 2 个字）。"""
+    """@Bot、回复 Bot 的消息，或提到名字/别名（至少 2 个字）。
 
+    戳一戳记录不算：被戳了回不回话交给 Feedback，不必回。
+    """
+
+    messages = [message for message in messages if not message.poke]
     if any(message.to_me for message in messages):
         return True
     triggers = [

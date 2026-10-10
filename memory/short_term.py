@@ -20,6 +20,8 @@ class Message:
     mentions: dict[str, str] = field(default_factory=dict, repr=False, compare=False)
     # 是否 @Bot 或回复了 Bot 的消息；只用于本轮相关性判断，不落库
     to_me: bool = field(default=False, repr=False, compare=False)
+    # 戳一戳通知转成的记录；被戳不算点名，只让 bot 看一眼、自己决定理不理。不落库
+    poke: bool = field(default=False, repr=False, compare=False)
     revision: int = field(default=0, repr=False, compare=False)
     _persistence_id: str = field(default="", repr=False, compare=False)
 

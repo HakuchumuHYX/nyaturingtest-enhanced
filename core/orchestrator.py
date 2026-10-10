@@ -25,6 +25,7 @@ from .engagement import (
     chatting_state,
     evaluate_engagement,
 )
+from .faces import Reaction, reaction_emoji
 from .llm import extract_and_parse_json
 from .metrics import log_event
 from .prompts import (
@@ -279,9 +280,60 @@ async def save_memory_candidates(
 
 
 @dataclass(frozen=True)
+class Poke:
+    user_id: str
+    user_name: str
+
+
+@dataclass(frozen=True)
 class FeedbackDecision:
     recalled_history: list[str]
     llm_willing: float
+    react: Reaction | None
+    poke: Poke | None
+
+
+@dataclass(frozen=True)
+class TurnResult:
+    replies: list
+    react: Reaction | None
+    poke: Poke | None
+
+
+def _parse_poke(
+    response: dict, messages_chunk: list[Message], bot_name: str
+) -> Poke | None:
+    """Feedback 的 poke 是 QQ 号：只能戳这批里说话的人，或被 @、被回复、被戳的人。"""
+
+    user_id = str(response.get("poke") or "").strip()
+    candidates = {msg.user_id: msg.user_name for msg in messages_chunk if msg.user_id}
+    for msg in messages_chunk:
+        candidates.update(msg.mentions)
+    name = candidates.get(user_id)
+    if not user_id or name is None or name == bot_name:
+        return None
+    return Poke(user_id=user_id, user_name=name)
+
+
+def _parse_reaction(
+    response: dict, messages_chunk: list[Message], bot_name: str
+) -> Reaction | None:
+    """Feedback 的 react：只能贴这批新消息里群友的消息，表情要在目录里。"""
+
+    raw = response.get("react")
+    if not isinstance(raw, dict):
+        return None
+    index = raw.get("index")
+    if not isinstance(index, int) or not 0 <= index < len(messages_chunk):
+        return None
+    target = messages_chunk[index]
+    if not target.id or target.user_name == bot_name:
+        return None
+    emoji = reaction_emoji(str(raw.get("emoji") or ""))
+    if emoji is None:
+        logger.debug(f"贴表情不在目录里，丢弃: {raw.get('emoji')}")
+        return None
+    return Reaction(target_id=target.id, emoji_id=emoji[0], name=emoji[1])
 
 
 class ConversationOrchestrator:
@@ -296,7 +348,7 @@ class ConversationOrchestrator:
         chat_call: LLMCall,
         feedback_call: LLMCall,
         generation: int,
-    ) -> list | None:
+    ) -> TurnResult | None:
         session = self.session
         try:
             if session.stale(generation, "process_start"):
@@ -367,8 +419,10 @@ class ConversationOrchestrator:
                 self_share=round(self_share, 2),
                 speak=speak,
             )
+            react = decision.react if decision else None
+            poke = decision.poke if decision else None
             if not speak:
-                return None
+                return TurnResult(replies=[], react=react, poke=poke)
 
             reply_messages = await self.chat_stage(
                 messages_chunk,
@@ -380,7 +434,7 @@ class ConversationOrchestrator:
             if session.stale(generation, "chat"):
                 return None
             # last_speak_time 在真正发出去之后由 dispatch_replies 更新
-            return reply_messages
+            return TurnResult(replies=reply_messages, react=react, poke=poke)
         finally:
             await session.flush_persistence()
 
@@ -503,7 +557,12 @@ class ConversationOrchestrator:
             presets=search_result.preset_lines,
             group_notes=state.group_notes,
             new_msg_speakers=[
-                {"index": index, "user_id": msg.user_id, "user_name": msg.user_name}
+                {
+                    "index": index,
+                    "user_id": msg.user_id,
+                    "user_name": msg.user_name,
+                    **({"mentioned": msg.mentions} if msg.mentions else {}),
+                }
                 for index, msg in enumerate(messages_chunk)
             ],
             group_heat=_group_heat(
@@ -648,10 +707,11 @@ class ConversationOrchestrator:
     async def _apply_decision(
         self,
         response: dict,
+        messages_chunk: list[Message],
         is_relevant: bool,
         generation: int,
     ) -> FeedbackDecision | None:
-        """应用 Feedback 的发言决策：历史溯源、意愿。会话已作废时返回 None。"""
+        """应用 Feedback 的发言决策：历史溯源、意愿、贴表情、戳一戳。会话已作废时返回 None。"""
 
         recalled_history = []
 
@@ -686,7 +746,12 @@ class ConversationOrchestrator:
         state.willingness = (state.willingness + llm_willing) / 2
         if is_relevant and state.willingness < RELEVANCE_WILLINGNESS_FLOOR:
             state.willingness = RELEVANCE_WILLINGNESS_FLOOR
-        return FeedbackDecision(recalled_history=recalled_history, llm_willing=llm_willing)
+        return FeedbackDecision(
+            recalled_history=recalled_history,
+            llm_willing=llm_willing,
+            react=_parse_reaction(response, messages_chunk, state.name),
+            poke=_parse_poke(response, messages_chunk, state.name),
+        )
 
     async def feedback_stage(
         self,
@@ -708,7 +773,9 @@ class ConversationOrchestrator:
             return None
         self._apply_image_observations(response, messages_chunk)
         self._apply_sediment(response, messages_chunk, generation, search_result.refs)
-        decision = await self._apply_decision(response, is_relevant, generation)
+        decision = await self._apply_decision(
+            response, messages_chunk, is_relevant, generation
+        )
         logger.debug(f"<< 反馈结束: 意愿 {self.session.state.willingness:.2f}")
         return decision
 

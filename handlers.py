@@ -1,13 +1,16 @@
+import asyncio
 from dataclasses import dataclass
 from datetime import datetime
 
-from nonebot import get_bot, logger, on_command, on_message
+from nonebot import get_bot, logger, on_command, on_message, on_notice
 from nonebot.adapters.onebot.v11 import (
     Bot,
     Event,
     GroupMessageEvent,
     Message,
     MessageSegment,
+    NoticeEvent,
+    PokeNotifyEvent,
     PrivateMessageEvent,
 )
 from nonebot.exception import FinishedException
@@ -22,6 +25,7 @@ from .core.logic import message2BotMessage
 from .core.memory_query import acquire_query_slot, query_memory_profile
 from .core.metrics import metrics
 from .core.digest import GROUP_NOTES_REFRESH_MIN_NEW, count_new_group_fragments
+from .core.faces import ensure_faces, face_name
 from .core.state_manager import (
     ensure_group_state,
     is_shutting_down,
@@ -211,6 +215,25 @@ token_stats = on_command(
     block=True,
 )
 auto_chat = on_message(rule=is_group_message, priority=99, block=False)
+
+
+async def is_emoji_like_added(event: Event) -> bool:
+    # OneBot 适配器没有这个 notice 的模型，落到通用 NoticeEvent，额外字段在 model_dump 里
+    return (
+        isinstance(event, NoticeEvent)
+        and event.notice_type == "group_msg_emoji_like"
+        and event.model_dump().get("sub_type") == "add"
+    )
+
+
+emoji_like = on_notice(rule=is_emoji_like_added, priority=99, block=False)
+
+
+async def is_group_poke(event: Event) -> bool:
+    return isinstance(event, PokeNotifyEvent) and event.group_id is not None
+
+
+group_poke = on_notice(rule=is_group_poke, priority=99, block=False)
 
 
 def _dual_command(cmd: str, aliases: set[str], handler):
@@ -447,6 +470,106 @@ async def handle_auto_chat(bot: Bot, event: GroupMessageEvent):
                 image_inputs=image_inputs,
                 mentions=mentions,
                 to_me=user_id != str(bot.self_id) and _addresses_bot(bot, event),
+            )
+        )
+        state.new_message_signal.set()
+
+
+@emoji_like.handle()
+async def handle_emoji_like(bot: Bot, event: NoticeEvent):
+    data = event.model_dump()
+    user_id = str(data["user_id"])
+    # 自己贴的表情也会上报
+    if user_id == str(bot.self_id) or is_shutting_down():
+        return
+    state = ensure_group_state(int(data["group_id"]))
+    if not state:
+        return
+
+    async with state.session_lock:
+        await state.session.load_session()
+    session = state.session
+    message_id = str(data["message_id"])
+    # 只关心 bot 自己的消息；群友互相贴的、太旧不在短期记忆里的都不管
+    target = next(
+        (
+            m
+            for m in session.runtime.short_term_memory.access()
+            if m.id == message_id and m.user_name == session.state.name
+        ),
+        None,
+    )
+    if target is None or not data.get("likes"):
+        return
+
+    await ensure_faces(bot)
+    emoji = face_name(str(data["likes"][0]["emoji_id"]))
+    try:
+        info = await bot.get_group_member_info(
+            group_id=int(data["group_id"]), user_id=int(user_id)
+        )
+        nickname = info.get("card") or info.get("nickname") or user_id
+    except Exception:
+        nickname = user_id
+    session.record_reaction(
+        MMessage(
+            time=datetime.now(),
+            user_name=nickname,
+            content=f"[给你的消息「{target.content[:20]}」贴了表情:{emoji or '未知'}]",
+            user_id=user_id,
+        )
+    )
+
+
+@group_poke.handle()
+async def handle_group_poke(bot: Bot, event: PokeNotifyEvent):
+    """群里所有戳一戳都当成一条消息进队列：群友凑热闹戳某人时，bot 要不要跟着戳由 Feedback 判断。"""
+
+    if is_shutting_down():
+        return
+    state = ensure_group_state(event.group_id)
+    if not state:
+        return
+    async with state.session_lock:
+        await state.session.load_session()
+        bot_name = state.session.state.name
+
+    self_id = str(bot.self_id)
+    poker_id, target_id = str(event.user_id), str(event.target_id)
+
+    async def display_name(user_id: str) -> str:
+        if user_id == self_id:
+            return bot_name
+        try:
+            info = await bot.get_group_member_info(
+                group_id=event.group_id, user_id=int(user_id)
+            )
+            return info.get("card") or info.get("nickname") or user_id
+        except Exception:
+            return user_id
+
+    poker, target = await asyncio.gather(display_name(poker_id), display_name(target_id))
+    # 动作文字各人自定义（戳了戳、拍了拍、捏了捏…），照通知里的 action / suffix 原样拼
+    data = event.model_dump()
+    content = f"[戳一戳: {data.get('action') or '戳了戳'} {target}{data.get('suffix') or ''}]"
+    if poker_id == self_id:
+        # bot 自己戳的：和自己发的消息一样直接进短期记忆，不触发新一轮
+        state.session.append_self_message(content, "", self_id)
+        return
+
+    async with state.data_lock:
+        state.event = event
+        state.bot = bot
+        state.messages_chunk.append(
+            MMessage(
+                time=datetime.now(),
+                user_name=poker,
+                content=content,
+                user_id=poker_id,
+                # 被戳的人记进 mentions，Feedback 才能跟着戳他
+                mentions={} if target_id == self_id else {target_id: target},
+                to_me=target_id == self_id,
+                poke=True,
             )
         )
         state.new_message_signal.set()
