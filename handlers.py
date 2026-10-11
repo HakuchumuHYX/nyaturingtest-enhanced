@@ -17,6 +17,7 @@ from nonebot.matcher import Matcher
 from nonebot.params import CommandArg
 from nonebot.permission import SUPERUSER
 
+from .cards.impression import render_impression_card
 from .cards.notes import render_group_notes_card
 from .cards.token_stats import render_token_stats_card
 from .config import get_app_settings, get_token_stats_model_names
@@ -24,7 +25,7 @@ from .core.digest import GROUP_NOTES_REFRESH_MIN_NEW, count_new_group_fragments
 from .core.faces import ensure_faces, face_name
 from .core.llm import chat_client, feedback_client
 from .core.logic import message2BotMessage
-from .core.memory_query import acquire_query_slot, query_memory_profile
+from .core.memory_query import acquire_query_slot, impression_text, query_memory_profile
 from .core.metrics import metrics
 from .core.state_manager import (
     ensure_group_state,
@@ -755,7 +756,7 @@ async def handle_query_memory(
     await query_memory.send("正在回溯记忆深处...")
 
     try:
-        message = await query_memory_profile(
+        page = await query_memory_profile(
             state,
             target_id=target_id,
             target_name=target_name,
@@ -764,4 +765,11 @@ async def handle_query_memory(
     except Exception as e:
         logger.error(f"查询记忆失败: {e}")
         await query_memory.finish("大脑处理过载，记忆读取失败，请稍后再试。")
-    await query_memory.finish(message)
+    if isinstance(page, str):
+        await query_memory.finish(page)
+    try:
+        image = await render_impression_card(page)
+    except Exception as e:
+        logger.error(f"渲染印象卡片失败: {e}")
+        await query_memory.finish(impression_text(page))
+    await query_memory.finish(MessageSegment.image(image))

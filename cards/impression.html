@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<style>
+:root {
+  --paper: #f7f8f6;
+  --grid: #e3e8ea;
+  --ink: #243045;
+  --ink-soft: #5a6478;
+  --print: #8a97a3;
+  --memo: #eaf3fa;
+  --memo-line: #cddeea;
+  --tape: rgba(204, 184, 146, 0.58);
+  --hl: {{highlight}};
+  --hand: "LXGW WenKai", "Noto Serif CJK SC", serif;
+  --sans: "Noto Sans CJK SC", sans-serif;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { background: var(--paper); }
+body {
+  width: 680px;
+  height: 962px;
+  overflow: hidden;
+  color: var(--ink);
+  -webkit-font-smoothing: antialiased;
+  line-break: strict;
+  text-wrap: pretty;
+}
+
+/*
+ * 一日一页手账，A4 比例。字号固定，段落之间是有上下限的弹性间距：内容少就松一点、多就紧一点。
+ * 每块的行数上限加起来按最坏情况算过放得下一页，超出只截断那一块，不会挤坏版式。
+ */
+.page {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  width: 680px;
+  height: 962px;
+  overflow: hidden;
+  padding: 40px 48px 64px;
+  background-image:
+    linear-gradient(var(--grid) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid) 1px, transparent 1px);
+  background-size: 16px 16px;
+  background-position: -1px -1px;
+}
+.gap { flex: 1 1 0; min-height: 18px; max-height: 52px; }
+
+header { position: relative; flex: none; }
+.has-photo header { min-height: 150px; }
+.title {
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--print);
+}
+.has-photo .title { padding-right: 170px; }
+.date {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  color: var(--print);
+  font-family: var(--sans);
+}
+.date b { font-size: 42px; font-weight: 300; line-height: 1; letter-spacing: 0.02em; }
+.date span { font-size: 15px; }
+.date small { font-size: 13px; }
+.about {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  margin-top: 14px;
+}
+.about .label { flex: none; font-family: var(--sans); font-size: 15px; color: var(--print); }
+.about .name {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+  font-family: var(--hand);
+  font-weight: 500;
+  font-size: 28px;
+  line-height: 38px;
+  overflow-wrap: anywhere;
+}
+
+/* 打印出来的小相片，用一条纸胶带贴在右上角，压住页眉的线 */
+.photo {
+  position: absolute;
+  top: -8px;
+  right: -6px;
+  width: 140px;
+  padding: 8px 8px 26px;
+  background: #fff;
+  transform: rotate(3deg);
+  box-shadow: 0 1px 2px rgba(36, 48, 69, 0.16), 0 4px 10px rgba(36, 48, 69, 0.07);
+}
+.photo img { display: block; width: 124px; height: 124px; object-fit: cover; }
+.photo::before {
+  content: "";
+  position: absolute;
+  top: -12px;
+  left: 50%;
+  width: 80px;
+  height: 24px;
+  margin-left: -40px;
+  background: var(--tape);
+  transform: rotate(-7deg);
+  clip-path: polygon(0 8%, 4% 0, 8% 10%, 12% 0, 88% 0, 92% 10%, 96% 0, 100% 8%,
+                     100% 92%, 96% 100%, 92% 90%, 88% 100%, 12% 100%, 8% 90%, 4% 100%, 0 92%);
+}
+
+/* 一句话印象：荧光笔的颜色就是关系档位 */
+.headline {
+  flex: none;
+  margin-top: 14px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-family: var(--hand);
+  font-weight: 500;
+  font-size: 27px;
+  line-height: 46px;
+}
+.headline span {
+  padding: 0 4px;
+  background: linear-gradient(transparent 50%, var(--hl) 50%, var(--hl) 88%, transparent 88%);
+}
+.status {
+  flex: none;
+  display: flex;
+  flex-wrap: wrap;
+  column-gap: 20px;
+  font-family: var(--hand);
+  font-size: 16px;
+  line-height: 30px;
+  color: var(--ink-soft);
+}
+
+.impression {
+  flex: none;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 6;
+  overflow: hidden;
+  font-family: var(--hand);
+  font-size: 19px;
+  line-height: 34px;
+}
+
+.memories { flex: none; }
+.memories h2 {
+  font-family: var(--hand);
+  font-weight: 500;
+  font-size: 19px;
+  line-height: 34px;
+}
+.memories ul { list-style: none; }
+.memories li {
+  position: relative;
+  padding-left: 22px;
+  font-family: var(--hand);
+  font-size: 18px;
+  line-height: 32px;
+}
+.memories li span {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+}
+.memories li::before { content: "・"; position: absolute; left: 0; color: var(--ink-soft); }
+
+.bottom {
+  flex: none;
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 28px;
+}
+.tags {
+  display: flex;
+  flex-wrap: wrap;
+  column-gap: 16px;
+  max-height: 70px;
+  overflow: hidden;
+  padding-top: 6px;
+  font-family: var(--hand);
+  font-size: 18px;
+  line-height: 32px;
+  color: var(--ink-soft);
+}
+
+/* 贴上去的横线便签，写最近的事 */
+.memo {
+  flex: none;
+  width: 270px;
+  padding: 10px 16px 12px;
+  background-color: var(--memo);
+  background-image: repeating-linear-gradient(transparent 0 29px, var(--memo-line) 29px 30px);
+  background-position: 0 10px;
+  transform: rotate(-2deg);
+  box-shadow: 0 1px 2px rgba(36, 48, 69, 0.14), 0 3px 8px rgba(36, 48, 69, 0.06);
+  font-family: var(--hand);
+  font-size: 17px;
+  line-height: 30px;
+}
+.memo p {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  overflow: hidden;
+}
+.memo b { font-weight: 500; }
+
+.sign {
+  position: absolute;
+  right: 52px;
+  bottom: 26px;
+  font-family: var(--hand);
+  font-weight: 500;
+  font-size: 24px;
+  transform: rotate(-4deg);
+}
+</style>
+</head>
+<body>
+<main class="page {{page_class}}">
+  <header>
+    <div class="title">
+      <div class="date"><b>{{date}}</b><span>{{weekday}}</span><small>{{year}}</small></div>
+      <div class="about"><span class="label">关于</span><span class="name">{{name}}</span></div>
+    </div>
+    {{photo}}
+  </header>
+  <p class="headline"><span>{{headline}}</span></p>
+  <p class="status">{{status}}</p>
+  <div class="gap"></div>
+  <p class="impression">{{impression}}</p>
+  {{memories}}
+  <div class="gap"></div>
+  <div class="bottom">
+    <p class="tags">{{tags}}</p>
+    {{memo}}
+  </div>
+  <div class="sign">{{bot_name}}</div>
+</main>
+</body>
+</html>

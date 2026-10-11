@@ -10,7 +10,7 @@ from playwright.async_api import async_playwright
 from ..config import get_app_settings
 
 
-async def screenshot(html: str, width: int) -> bytes:
+async def screenshot(html: str, width: int, scale: int = 2) -> bytes:
     # 和 HakuBot 共用同一份 Chromium（playwright 版本一致），不用再下载
     browsers_path = get_app_settings().playwright_browsers_path
     if browsers_path:
@@ -19,7 +19,7 @@ async def screenshot(html: str, width: int) -> bytes:
         browser = await playwright.chromium.launch(args=["--no-sandbox"])
         try:
             page = await browser.new_page(
-                viewport={"width": width, "height": 200}, device_scale_factor=2
+                viewport={"width": width, "height": 200}, device_scale_factor=scale
             )
             await page.set_content(html)
             await page.evaluate("document.fonts.ready")
