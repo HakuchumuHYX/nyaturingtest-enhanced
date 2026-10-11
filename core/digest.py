@@ -286,17 +286,11 @@ def _group_points_prompt(chunk: list[dict]) -> str:
 async def _save_profile(
     session_id: str, user_id: str, summary: str, until: datetime
 ) -> None:
-    # 用 queryset update：实例 save 会触发 auto_now 改掉 last_update_time，而 VAD 衰减依赖它
-    updated = await UserProfileModel.filter(
-        session_id=session_id, user_id=user_id
-    ).update(summary=summary, summarized_until=until)
-    if not updated:
-        await UserProfileModel.create(
-            session_id=session_id,
-            user_id=user_id,
-            summary=summary,
-            summarized_until=until,
-        )
+    await UserProfileModel.update_or_create(
+        session_id=session_id,
+        user_id=user_id,
+        defaults={"summary": summary, "summarized_until": until},
+    )
 
 
 async def profile_rows_by_user(session_id: str) -> dict[str, list[dict]]:

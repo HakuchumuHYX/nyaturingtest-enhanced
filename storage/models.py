@@ -1,3 +1,5 @@
+from datetime import datetime
+
 from tortoise import fields
 from tortoise.indexes import Index
 from tortoise.models import Model
@@ -9,9 +11,11 @@ class SessionModel(Model):
     role = fields.TextField(default="一个普通的AI助手")
     aliases = fields.JSONField(default=list)
 
+    # 角色在群里的心情；读取前按 emotion_updated_at 结算回落，见 core/domain.py
     valence = fields.FloatField(default=0.0)
-    arousal = fields.FloatField(default=0.0)
+    arousal = fields.FloatField(default=0.3)
     dominance = fields.FloatField(default=0.0)
+    emotion_updated_at = fields.DatetimeField(default=datetime.now)
 
     chat_summary = fields.TextField(default="")
     last_speak_time = fields.DatetimeField(null=True)
@@ -34,11 +38,9 @@ class UserProfileModel(Model):
     session = fields.ForeignKeyField("models.SessionModel", related_name="users")
     user_id = fields.CharField(max_length=255)
 
-    valence = fields.FloatField(default=0.0)
-    arousal = fields.FloatField(default=0.0)
-    dominance = fields.FloatField(default=0.0)
-
-    last_update_time = fields.DatetimeField(auto_now=True)
+    # 长期好感度 -100～100；负值读取前按 affinity_updated_at 结算回升
+    affinity = fields.FloatField(default=0.0)
+    affinity_updated_at = fields.DatetimeField(default=datetime.now)
     interaction_count = fields.IntField(default=0)
     first_interaction_at = fields.DatetimeField(null=True)
     last_interaction_at = fields.DatetimeField(null=True)
@@ -50,21 +52,6 @@ class UserProfileModel(Model):
     class Meta:
         table = "nyabot_user_profiles"
         unique_together = (("session", "user_id"),)
-
-
-class InteractionLogModel(Model):
-    id = fields.IntField(pk=True)
-    user = fields.ForeignKeyField(
-        "models.UserProfileModel", related_name="interactions"
-    )
-    timestamp = fields.DatetimeField()
-    delta_valence = fields.FloatField()
-    delta_arousal = fields.FloatField()
-    delta_dominance = fields.FloatField()
-
-    class Meta:
-        table = "nyabot_interactions"
-        indexes = (Index(fields=("timestamp",), name="idx_interactions_timestamp"),)
 
 
 class GlobalMessageModel(Model):

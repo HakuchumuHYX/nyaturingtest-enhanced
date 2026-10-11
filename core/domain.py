@@ -2,119 +2,100 @@ import math
 from dataclasses import dataclass, field
 from datetime import datetime
 
+# 心情回落速率（每小时）：几个小时内平复，睡一夜基本回到基线
+AROUSAL_BASELINE = 0.3
+VALENCE_DECAY_PER_HOUR = 0.3
+AROUSAL_DECAY_PER_HOUR = 0.5
+DOMINANCE_DECAY_PER_HOUR = 0.25
+# Feedback 每轮最多把心情的一个轴推动这么多
+MOOD_STEP_LIMIT = 0.3
 
-def clamp_vad_value(value, lower: float, upper: float, default: float = 0.0) -> float:
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return default
-    if number != number:
-        return default
-    return max(lower, min(upper, number))
+# 好感度：正值只累积不回落；负值随时间回升，免得「讨厌 → 吵架 → 更讨厌」越滚越僵
+AFFINITY_LIMIT = 100
+AFFINITY_STEP_LIMIT = 5
+NEGATIVE_AFFINITY_HALF_LIFE_HOURS = 72.0
+
+
+def _clamp(value: float, lower: float, upper: float) -> float:
+    return max(lower, min(upper, value))
+
+
+def _hours_between(start: datetime, end: datetime) -> float:
+    return max(0.0, (end - start).total_seconds() / 3600.0)
 
 
 @dataclass
 class EmotionState:
-    """情感状态（VAD）：valence [-1,1]、arousal [0,1]、dominance [-1,1]。"""
+    """角色在群里当下的心情（VAD）：valence [-1,1]、arousal [0,1]、dominance [-1,1]。默认值就是回落基线。"""
 
     valence: float = 0.0
-    arousal: float = 0.0
+    arousal: float = AROUSAL_BASELINE
     dominance: float = 0.0
+    updated_at: datetime = field(default_factory=datetime.now)
+
+    def settle(self, now: datetime | None = None) -> None:
+        """结算 updated_at 以来的回落。指数回落与结算时机无关，结算后不存盘也不会算错。"""
+
+        now = now or datetime.now()
+        hours = _hours_between(self.updated_at, now)
+        self.valence *= math.exp(-VALENCE_DECAY_PER_HOUR * hours)
+        arousal_keep = math.exp(-AROUSAL_DECAY_PER_HOUR * hours)
+        self.arousal = self.arousal * arousal_keep + AROUSAL_BASELINE * (1 - arousal_keep)
+        self.dominance *= math.exp(-DOMINANCE_DECAY_PER_HOUR * hours)
+        self.updated_at = now
+
+    def apply(self, target: dict) -> None:
+        """朝 Feedback 给的目标心情移动，每个轴每轮最多 MOOD_STEP_LIMIT。"""
+
+        self.settle()
+        for name, lower in (("valence", -1.0), ("arousal", 0.0), ("dominance", -1.0)):
+            current = getattr(self, name)
+            step = _clamp(target[name] - current, -MOOD_STEP_LIMIT, MOOD_STEP_LIMIT)
+            setattr(self, name, _clamp(current + step, lower, 1.0))
+
+    def vad(self) -> dict:
+        return {
+            "valence": round(self.valence, 2),
+            "arousal": round(self.arousal, 2),
+            "dominance": round(self.dominance, 2),
+        }
 
 
 @dataclass
 class PersonProfile:
-    """对人物的记忆与情感"""
+    """角色对某个群友的长期好感度与互动计数"""
 
     user_id: str
-    emotion: EmotionState = field(default_factory=EmotionState)
-    last_update_time: datetime = field(
-        default_factory=lambda: datetime.now().astimezone()
-    )
+    # 库里存浮点：负值每轮只回升一点点，存整数会被四舍五入吃掉；对外一律用 level()
+    affinity: float = 0.0
+    affinity_updated_at: datetime = field(default_factory=datetime.now)
     interaction_count: int = 0
     first_interaction_at: datetime | None = None
     last_interaction_at: datetime | None = None
     dirty: bool = field(default=True, repr=False, compare=False)
 
-    def push_interaction(self, delta: dict):
-        """
-        记一次互动的情感增量 (O(1) 版本的峰值保持模式)
-        """
-        # 1. 关键步骤：先结算时间衰减
-        self.update_emotion_tends()
+    def settle(self, now: datetime | None = None) -> None:
+        """负好感按半衰期向 0 回升；正好感不动。"""
 
-        # 2. 获取新消息的情感输入
-        new_val = delta.get("valence", 0.0)
-        new_aro = delta.get("arousal", 0.0)
-        new_dom = delta.get("dominance", 0.0)
+        now = now or datetime.now()
+        if self.affinity < 0:
+            hours = _hours_between(self.affinity_updated_at, now)
+            self.affinity *= 0.5 ** (hours / NEGATIVE_AFFINITY_HALF_LIFE_HOURS)
+        self.affinity_updated_at = now
 
-        # 3. 应用峰值保持逻辑 (Peak Hold Logic)
+    def level(self) -> int:
+        self.settle()
+        return round(self.affinity)
 
-        # --- Valence (愉悦度) ---
-        if (self.emotion.valence >= 0 and new_val >= 0) or (
-            self.emotion.valence < 0 and new_val < 0
-        ):
-            if abs(new_val) > abs(self.emotion.valence):
-                self.emotion.valence = new_val
-        else:
-            self.emotion.valence += new_val
-        self.emotion.valence = max(-1.0, min(1.0, self.emotion.valence))
+    def add_affinity(self, delta: int) -> None:
+        self.settle()
+        step = _clamp(delta, -AFFINITY_STEP_LIMIT, AFFINITY_STEP_LIMIT)
+        self.affinity = _clamp(self.affinity + step, -AFFINITY_LIMIT, AFFINITY_LIMIT)
+        self.dirty = True
 
-        # --- Arousal (唤醒度) ---
-        self.emotion.arousal = max(self.emotion.arousal, new_aro)
-        self.emotion.arousal = max(0.0, min(1.0, self.emotion.arousal))
-
-        # --- Dominance (支配度) ---
-        if (self.emotion.dominance >= 0 and new_dom >= 0) or (
-            self.emotion.dominance < 0 and new_dom < 0
-        ):
-            if abs(new_dom) > abs(self.emotion.dominance):
-                self.emotion.dominance = new_dom
-        else:
-            self.emotion.dominance += new_dom
-        self.emotion.dominance = max(-1.0, min(1.0, self.emotion.dominance))
-
-        now = datetime.now().astimezone()
+    def record_interaction(self, now: datetime) -> None:
         self.interaction_count += 1
         if self.first_interaction_at is None:
             self.first_interaction_at = now
         self.last_interaction_at = now
         self.dirty = True
-
-    def update_emotion_tends(self):
-        """
-        随时间流逝衰减情感 (增量更新 - 衰减)
-        """
-        # 统一使用带时区的时间
-        now = datetime.now().astimezone()
-
-        if self.last_update_time.tzinfo is None:
-            # 如果之前的记录没有时区，强制转换为带时区
-            self.last_update_time = self.last_update_time.astimezone()
-
-        # 计算距离上次更新经过了多少小时
-        elapsed_hours = (now - self.last_update_time).total_seconds() / 3600.0
-
-        # 更新时间戳
-        self.last_update_time = now
-
-        # 如果时间极短，跳过计算节省资源
-        if elapsed_hours < 0.001:
-            return
-
-        # 对当前情感状态应用时间衰减：valence 正向慢、负向快；arousal 回到 0.3；dominance 回到 0
-        old_state = (self.emotion.valence, self.emotion.arousal, self.emotion.dominance)
-        valence, arousal, dominance = old_state
-        if valence > 0:
-            self.emotion.valence = valence * math.exp(-0.05 * elapsed_hours)
-        elif valence < 0:
-            self.emotion.valence = valence * math.exp(-0.15 * elapsed_hours)
-        else:
-            self.emotion.valence = 0.0
-        arousal_decay = math.exp(-0.2 * elapsed_hours)
-        self.emotion.arousal = arousal * arousal_decay + 0.3 * (1 - arousal_decay)
-        self.emotion.dominance = dominance * math.exp(-0.03 * elapsed_hours)
-
-        new_state = (self.emotion.valence, self.emotion.arousal, self.emotion.dominance)
-        if new_state != old_state:
-            self.dirty = True

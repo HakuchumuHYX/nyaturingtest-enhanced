@@ -11,7 +11,6 @@ from .models import (
     DailyTokenUsageModel,
     EnabledGroupModel,
     GlobalMessageModel,
-    InteractionLogModel,
     SessionModel,
     TokenUsageModel,
     UserProfileModel,
@@ -44,19 +43,11 @@ async def disable_group(group_id: int):
 
 
 async def delete_session_data(session_id: str):
-    """删除会话的所有关联数据（消息、用户画像与档案、交互日志、群志），不删除会话本身"""
+    """删除会话的所有关联数据（消息、用户画像与档案、群志），不删除会话本身"""
 
     session_db = await SessionModel.get_or_none(id=session_id)
     if not session_db:
         return
-
-    users = await UserProfileModel.filter(session=session_db).all()
-    for user in users:
-        deleted_count = await InteractionLogModel.filter(user=user).delete()
-        if deleted_count:
-            logger.debug(
-                f"[Repo] 删除用户 {user.user_id} 的 {deleted_count} 条交互日志"
-            )
 
     profile_count = await UserProfileModel.filter(session=session_db).delete()
     await SessionModel.filter(id=session_id).update(
@@ -82,6 +73,7 @@ async def save_session_state(session_id: str, data: dict):
             "valence": data.get("valence", 0.0),
             "arousal": data.get("arousal", 0.0),
             "dominance": data.get("dominance", 0.0),
+            "emotion_updated_at": data["emotion_updated_at"],
             "chat_summary": sanitize_text(data.get("chat_summary", "")),
             "last_speak_time": data.get("last_speak_time"),
             "last_consolidated_time": data.get("last_consolidated_time"),
@@ -100,10 +92,8 @@ async def load_full_session_data(session_id: str):
     users_data = [
         {
             "user_id": user_db.user_id,
-            "valence": user_db.valence,
-            "arousal": user_db.arousal,
-            "dominance": user_db.dominance,
-            "last_update_time": user_db.last_update_time,
+            "affinity": user_db.affinity,
+            "affinity_updated_at": user_db.affinity_updated_at,
             "interaction_count": user_db.interaction_count,
             "first_interaction_at": user_db.first_interaction_at,
             "last_interaction_at": user_db.last_interaction_at,
@@ -311,72 +301,13 @@ async def update_user_profiles(session_id: str, profiles: dict):
             session=session_db,
             user_id=str(user_id),
             defaults={
-                "valence": profile.emotion.valence,
-                "arousal": profile.emotion.arousal,
-                "dominance": profile.emotion.dominance,
+                "affinity": profile.affinity,
+                "affinity_updated_at": profile.affinity_updated_at,
+                "interaction_count": profile.interaction_count,
+                "first_interaction_at": profile.first_interaction_at,
+                "last_interaction_at": profile.last_interaction_at,
             },
         )
-
-
-async def log_interactions(session_id: str, interactions: list[tuple[str, dict]]):
-    """批量记录交互日志"""
-
-    session_db = await SessionModel.get_or_none(id=session_id)
-    if not session_db or not interactions:
-        return
-
-    user_ids = [str(user_id) for user_id, _ in interactions]
-    existing_users = await UserProfileModel.filter(
-        session=session_db, user_id__in=user_ids
-    )
-    user_map = {user.user_id: user for user in existing_users}
-
-    missing_ids = [user_id for user_id in user_ids if user_id not in user_map]
-    if missing_ids:
-        await UserProfileModel.bulk_create(
-            [
-                UserProfileModel(session=session_db, user_id=user_id)
-                for user_id in set(missing_ids)
-            ],
-            ignore_conflicts=True,
-        )
-        existing_users = await UserProfileModel.filter(
-            session=session_db, user_id__in=user_ids
-        )
-        user_map = {user.user_id: user for user in existing_users}
-
-    now = datetime.now()
-    rows = []
-    increments: dict[int, int] = {}
-    for user_id, delta in interactions:
-        user_db = user_map.get(str(user_id))
-        if not user_db:
-            continue
-        increments[user_db.id] = increments.get(user_db.id, 0) + 1
-        rows.append(
-            InteractionLogModel(
-                user=user_db,
-                delta_valence=delta.get("valence", 0.0),
-                delta_arousal=delta.get("arousal", 0.0),
-                delta_dominance=delta.get("dominance", 0.0),
-                timestamp=now,
-            )
-        )
-    if not rows:
-        return
-
-    await InteractionLogModel.bulk_create(rows)
-    conn = Tortoise.get_connection("default")
-    await conn.execute_many(
-        """
-        UPDATE nyabot_user_profiles
-        SET interaction_count = interaction_count + ?,
-            first_interaction_at = COALESCE(first_interaction_at, ?),
-            last_interaction_at = ?
-        WHERE id = ?
-        """,
-        [[count, now, now, user_pk] for user_pk, count in increments.items()],
-    )
 
 
 TOKEN_FIELDS = (

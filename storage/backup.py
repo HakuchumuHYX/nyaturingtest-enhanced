@@ -16,11 +16,10 @@ from nonebot_plugin_apscheduler import scheduler  # noqa: E402  必须在 requir
 
 from ..config import BACKUP_DIR, get_data_dir
 from ..core.state_manager import maintain_long_term_memory
-from .models import GlobalMessageModel, InteractionLogModel, TokenUsageModel
+from .models import GlobalMessageModel, TokenUsageModel
 
 # 原始明细保留天数
 RAW_MESSAGE_RETENTION_DAYS = 180
-RAW_INTERACTION_RETENTION_DAYS = 180
 TOKEN_USAGE_RETENTION_DAYS = 90
 
 DEFAULT_BACKUP_RETENTION_COUNT = 3
@@ -42,9 +41,6 @@ async def cleanup_raw_data_retention() -> dict[str, int]:
         result = {
             "messages": await _delete_older_than(
                 GlobalMessageModel, "time", RAW_MESSAGE_RETENTION_DAYS
-            ),
-            "interactions": await _delete_older_than(
-                InteractionLogModel, "timestamp", RAW_INTERACTION_RETENTION_DAYS
             ),
             "token_usage": await _delete_older_than(
                 TokenUsageModel, "timestamp", TOKEN_USAGE_RETENTION_DAYS

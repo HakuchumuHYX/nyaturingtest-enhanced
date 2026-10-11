@@ -7,7 +7,6 @@ from nonebot import logger
 from ..storage.db import (
     delete_session_data,
     load_full_session_data,
-    log_interactions,
     save_session_state,
     sync_messages,
     update_user_profiles,
@@ -126,21 +125,16 @@ class Session:
     async def calm_down(self):
         self.bump_generation("calm_down")
         self.state.global_emotion = EmotionState()
-        self.state.profiles = {}
         self.state.willingness = 0.0
         # 退出对话窗口
         self.state.last_speak_time = datetime.min
         await self.save_session()
 
     async def reset_emotion(self):
-        """仅重置情绪状态（VAD），不影响意愿值、聊天状态、记忆等"""
+        """仅把心情重置回基线；好感度是长期养成的，不在这里清"""
         self.bump_generation("reset_emotion")
         self.state.global_emotion = EmotionState()
-        # 同时重置所有用户画像的情绪
-        for profile in self.state.profiles.values():
-            profile.emotion = EmotionState()
-            profile.dirty = True
-        logger.info(f"[Session {self.id}] 情绪已初始化 (VAD -> 0, 0, 0)")
+        logger.info(f"[Session {self.id}] 心情已重置")
         await self.save_session()
 
     def spawn(self, coro) -> asyncio.Task:
@@ -191,6 +185,7 @@ class Session:
                     "valence": self.state.global_emotion.valence,
                     "arousal": self.state.global_emotion.arousal,
                     "dominance": self.state.global_emotion.dominance,
+                    "emotion_updated_at": self.state.global_emotion.updated_at,
                     "chat_summary": self.state.chat_summary,
                     "last_speak_time": self.state.last_speak_time,
                     "last_consolidated_time": self.state.last_consolidated_time,
@@ -244,9 +239,12 @@ class Session:
         self.state.preset_lines = session_db.preset_lines
         self.state.group_notes = session_db.group_notes
         self.state.chat_summary = session_db.chat_summary
-        self.state.global_emotion.valence = session_db.valence
-        self.state.global_emotion.arousal = session_db.arousal
-        self.state.global_emotion.dominance = session_db.dominance
+        self.state.global_emotion = EmotionState(
+            valence=session_db.valence,
+            arousal=session_db.arousal,
+            dominance=session_db.dominance,
+            updated_at=session_db.emotion_updated_at,
+        )
 
         if session_db.last_speak_time:
             t = session_db.last_speak_time
@@ -270,18 +268,15 @@ class Session:
 
         # 恢复用户画像
         for user_data in data["users"]:
-            user_id = user_data["user_id"]
-            profile = PersonProfile(user_id=user_id)
-            profile.emotion.valence = user_data["valence"]
-            profile.emotion.arousal = user_data["arousal"]
-            profile.emotion.dominance = user_data["dominance"]
-            profile.last_update_time = user_data["last_update_time"]
-            profile.interaction_count = int(user_data.get("interaction_count") or 0)
-            profile.first_interaction_at = user_data.get("first_interaction_at")
-            profile.last_interaction_at = user_data.get("last_interaction_at")
-
-            profile.dirty = False
-            self.state.profiles[user_id] = profile
+            self.state.profiles[user_data["user_id"]] = PersonProfile(
+                user_id=user_data["user_id"],
+                affinity=user_data["affinity"],
+                affinity_updated_at=user_data["affinity_updated_at"],
+                interaction_count=user_data["interaction_count"],
+                first_interaction_at=user_data["first_interaction_at"],
+                last_interaction_at=user_data["last_interaction_at"],
+                dirty=False,
+            )
 
         self.runtime.short_term_memory = Memory(messages=data["messages"])
 
@@ -342,6 +337,7 @@ class Session:
         return True
 
     def status(self) -> str:
+        self.state.global_emotion.settle()
         recent_messages = self.runtime.short_term_memory.access()
         recent_str = (
             "\n".join([f"{m.user_name}: {m.content}" for m in recent_messages])
@@ -353,7 +349,7 @@ class Session:
 设定：{self.state.role}
 意愿值：{self.state.willingness:.2f}
 状态: {chatting_state(self.state, datetime.now())}
-情绪：V{self.state.global_emotion.valence:.2f} A{self.state.global_emotion.arousal:.2f} D{self.state.global_emotion.dominance:.2f}
+心情：V{self.state.global_emotion.valence:.2f} A{self.state.global_emotion.arousal:.2f} D{self.state.global_emotion.dominance:.2f}
 后台任务数: {len(self.runtime.background_tasks)}
 摘要：{self.state.chat_summary}
 最近消息：
@@ -412,11 +408,3 @@ class Session:
                 if not task.done():
                     task.cancel()
             await asyncio.gather(*pending, return_exceptions=True)
-
-    async def save_interaction_logs(
-        self, interactions: list[tuple[str, dict]], generation: int
-    ):
-        async with self.runtime.save_lock:
-            if self.stale(generation, "interaction_log"):
-                return
-            await log_interactions(self.id, interactions)

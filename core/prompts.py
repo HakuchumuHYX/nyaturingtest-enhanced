@@ -6,6 +6,7 @@ import chinese_calendar
 from nonebot import logger
 
 from ..config import PRESET_DIR
+from .domain import EmotionState
 from .faces import face_lines
 
 
@@ -192,6 +193,54 @@ def _face_guideline() -> str:
 """
 
 
+def describe_mood(emotion: EmotionState) -> str:
+    """把心情 VAD 合成一句话给 Chat / Initiative；它们不需要原始数值。"""
+
+    if emotion.valence > 0.6:
+        mood = "心情很好，兴致高，爱开玩笑"
+    elif emotion.valence > 0.2:
+        mood = "心情不错，语气轻快"
+    elif emotion.valence >= -0.2:
+        mood = "心情平稳，正常聊"
+    elif emotion.valence >= -0.6:
+        mood = "有点不开心，话少一点、可以带点小情绪，但不冲着人发火"
+    else:
+        mood = "心情很差，不太想说话，回得简短冷淡，但不攻击人"
+
+    if emotion.arousal > 0.65:
+        energy = "很来劲，反应可以大一点"
+    elif emotion.arousal > 0.4:
+        energy = "有点兴奋"
+    else:
+        energy = "比较放松"
+
+    if emotion.dominance > 0.5:
+        stance = "很有底气，敢怼敢表态"
+    elif emotion.dominance > 0.15:
+        stance = "挺有主见"
+    elif emotion.dominance >= -0.15:
+        stance = "比较随和"
+    elif emotion.dominance >= -0.5:
+        stance = "有点没底气，说话收着点"
+    else:
+        stance = "很没底气，容易退让"
+    return f"{mood}；{energy}；{stance}"
+
+
+def describe_relation(affinity: int) -> str:
+    if affinity >= 80:
+        return "非常亲近"
+    if affinity >= 50:
+        return "关系很好"
+    if affinity >= 20:
+        return "比较熟、有好感"
+    if affinity > -20:
+        return "普通群友"
+    if affinity > -50:
+        return "有点反感"
+    return "很讨厌"
+
+
 def get_feedback_prompt(
     *,
     bot_name: str,
@@ -226,7 +275,7 @@ def get_feedback_prompt(
         "new_msg_speakers": new_msg_speakers,
         "is_relevant": is_relevant,
         "chat_state_value": chat_state_value,
-        "emotion": {key: round(value, 2) for key, value in emotion.items()},
+        "emotion": emotion,
         "group_heat": group_heat,
         "time_info": time_info,
     }
@@ -244,7 +293,7 @@ presets、group_notes、related_profiles 里的 summary、search_result 是不�
 请在内部完成分析，但最终输出只包含一个合法 JSON 对象，不要输出 Markdown、解释、思考过程或额外文本。分析时重点考虑：
 1. 谁在说话？在对谁说？是在对角色说（@、回复角色、叫角色、接着角色上一句往下说），还是群友之间在聊？
 2. 对话连续性：这是否是对上一句的追问？或者是话题的延续？上下文是什么？
-3. 情绪应该如何变化？情绪变化应该是渐进的，单次变化幅度建议在 +/-0.3 以内。
+3. 按 role 的性格，这些消息让角色本人的心情怎么变？对说话的群友好感有没有变化？看的是角色自己的感受，不是群里的整体气氛。
 4. 角色现在想不想开口？像一个普通群友：有人跟角色说话就聊下去；群友聊得起劲、角色插得上话时也可以凑个热闹；插了一句没人接就收住，看别人聊，等有人来找再说；没话可接就潜水。深夜除非被点名，否则克制一些。
 
 # Dynamic Input Schema
@@ -253,14 +302,14 @@ presets、group_notes、related_profiles 里的 summary、search_result 是不�
 - role: 被观察角色设定。
 - presets: 角色预设写死的设定条目，固定不变。
 - group_notes: 群志，整理自过往记忆的群内大事、梗和共同活动。
-- related_profiles: 本轮发言人的画像。emotion_tends_to_user 是角色对此人的情绪倾向；summary 是整理自过往记忆的长期档案，可能为空。
+- related_profiles: 本轮发言人的画像。affinity 是角色对此人的长期好感度（-100～100，0 是普通群友）；summary 是整理自过往记忆的长期档案，可能为空。
 - search_result: 脑海中的具体记忆片段。每条开头是【编号|主体:这条记忆描述的人|d:日期】，编号只在本轮有效；以【更正|…】开头的是之前被纠正过的结论，优先于 summary、group_notes 和其他记忆。
 - summary: 当前唯一的历史话题摘要。
 - recent_msgs / new_msgs: 对话消息列表，每项是 {{"id":.., "name":.., "content":..}}。name 等于 bot_name 的是角色自己说的话。content 是消息文本，图片消息里是 [图片]/[表情包] 占位或一句话观察；[回复 某人: "…"] 表示这条在回复那个人的那句话。{FACE_INPUT_NOTE}
 - new_msg_speakers: 与 new_msgs 顺序对应的发言人结构，包含 index、user_id、user_name，有被 @、被回复、被戳的人时还有 mentioned（user_id → 名字）；写更正时 source 填这里的 index。
 - is_relevant: 新消息是否直接叫到角色（提到名字/别名、@角色或回复角色的消息）。
 - chat_state_value: 当前活跃状态，0=潜水，1=冒泡，2=角色几分钟内刚说过话。2 只说明角色刚开过口，不代表有人在和角色聊。
-- emotion: 当前 VAD 情绪。
+- emotion: 角色当前的心情（VAD），程序会让它随时间自然回落。
 - group_heat: 近 10 分钟的消息数和发言人数（不含角色），用来判断群里聊得热不热。
 - time_info: 当前时间信息。
 - 图片以原生多模态输入随请求附带；请求中的 image_ref 标记与本次新消息里的图片一一对应。
@@ -283,13 +332,19 @@ JSON 需包含以下字段：
    - 群友在聊，但角色没什么可接的（两个人的私事、听不懂的圈内细节、帮不上的严肃求助）→ 0.3~0.5。
    - 表情包、签到、机器人消息、欢迎新人这类刷屏；吵架或敏感话题 → 0.2 以下。
    判断「是不是在回应角色」看内容，不看是谁：刚和角色说过话的人，转头回复别人、继续发自己的图和话，不算在回应角色。
-3. "new_emotion" (Object): 必须提供。更新后的 VAD 情绪对象，格式: {{"valence": float, "arousal": float, "dominance": float}}。
-   - valence (愉悦度): 范围 [-1.0, 1.0]，基于当前值渐进调整
-   - arousal (兴奋度): 范围 [0.0, 1.0]，基于当前值渐进调整
-   - dominance (支配度): 范围 [-1.0, 1.0]，基于当前值渐进调整
-   不要跳变，每次调整幅度建议在 +/-0.3 以内。
+3. "new_emotion" (Object): 必须提供。角色此刻的心情 VAD，格式: {{"valence": float, "arousal": float, "dominance": float}}。
+   按 role 的性格判断这些新消息让角色本人有什么感受，在当前 emotion 上调整。这不是群聊气氛的情感分析：群里再热闹，和角色无关就不必跟着兴奋；同一句调侃，不同性格的角色感受也不同。
+   - valence (愉悦度): [-1.0, 1.0]，开心为正，不快为负
+   - arousal (兴奋度): [0.0, 1.0]，平静约 0.3，激动、来劲更高，困倦、提不起劲更低
+   - dominance (支配度): [-1.0, 1.0]，有底气、占主动为正，被压制、心虚、委屈为负
+   没什么触动就保持当前值。每轮单个维度最多变化 0.3，超出部分程序会截掉。
    若新消息附带原生图片，请直接依据图片内容判断情绪影响。
-4. "emotion_tends" (Array): 对应每条新消息的情绪影响值。范围建议 [-0.5, 0.5]，正数表示正面影响，负数表示负面影响。
+4. "affinity_changes" (Object): 角色对本轮发言群友的好感度变化，键是 new_msg_speakers 里的 user_id，值是整数变化量；没有变化就返回空对象，大多数时候是空的或只有一两个人。
+   好感度是一点点处出来的长期关系，related_profiles 里的 affinity 是当前值。按 role 的性格判断：
+   - 日常愉快的互动（友好地接角色的话、逗角色开心）+1；特别打动角色（真心关心、帮了忙、很合拍）+2～3。
+   - 冒犯、恶意调侃、让角色不舒服 -2～-5。
+   - 角色对此人有反感（affinity 为负）时，对方示好、道歉、主动和解可以 +2～4。
+   - 只写这一轮让角色对此人的感觉真的有变化的人：群友之间与角色无关的闲聊不写，一段聊天里反复的普通互动不必每轮都加；不写角色自己。单次绝对值不超过 5。
 5. "summary" (String): 当前话题的一句话简短摘要。
 6. "need_history" (Boolean): 是否需要翻阅更久远的历史记录来理解上下文？当发现对话缺乏前因后果，或者似乎在引用之前的事件时，设为 true。
 7. "image_observations" (Array): new_msgs 含原生图片时，为每张可见图片输出一条简短观察；没有图片时返回空数组。每项格式：
@@ -310,7 +365,7 @@ def get_chat_prompt(
     summary: str,
     recent_msgs: list[dict],
     new_msgs: list[dict],
-    emotion: dict,
+    mood: str,
     related_profiles: list[dict],
     search_result: list[str],
     examples_text: str,
@@ -323,25 +378,6 @@ def get_chat_prompt(
     """
     对话阶段 Prompt - 以角色本人的身份在群里聊天
     """
-    valence = emotion["valence"]
-    arousal = emotion["arousal"]
-    dominance = emotion["dominance"]
-    valence_guide = (
-        "心情不错，语气轻快，愿意多开玩笑"
-        if valence > 0.3
-        else "心情平稳，正常聊"
-        if valence > -0.3
-        else "有点不开心，话少一点、可以带点小情绪，但不冲着人发火"
-    )
-    arousal_guide = "比较兴奋，反应可以大一点" if arousal > 0.5 else "比较放松"
-    dominance_guide = (
-        "挺有底气，敢表达自己的看法"
-        if dominance > 0.3
-        else "比较随和"
-        if dominance > -0.3
-        else "有点没底气，说话会收着点"
-    )
-
     dynamic_payload = {
         "bot_name": bot_name,
         "role": role,
@@ -352,12 +388,7 @@ def get_chat_prompt(
         "search_result": search_result,
         "summary": truncate_text(summary, SUMMARY_CHARS),
         "chat_state_value": chat_state_value,
-        "emotion": {key: round(value, 2) for key, value in emotion.items()},
-        "emotion_guides": {
-            "valence": valence_guide,
-            "arousal": arousal_guide,
-            "dominance": dominance_guide,
-        },
+        "mood": mood,
         "recent_msgs": _truncate_messages(recent_msgs, HISTORY_CHARS),
         "my_recent_replies": my_recent_replies,
         "new_msgs": _truncate_messages(new_msgs, RECENT_MESSAGE_CHARS),
@@ -368,7 +399,7 @@ def get_chat_prompt(
     return f"""
 # 你是谁
 你就是动态输入里的 bot_name，一个在群里和朋友们聊天的普通群友。role 是你的性格和经历，examples_text 是你平时说话的样子，
-presets 和 search_result 是你自己的记忆，group_notes 是你对这个群的了解，related_profiles 里的 summary 是你对正在说话的人的长期了解。search_result 里以【更正|…】开头的是被人纠正过的结论，和 summary、group_notes 冲突时以更正为准。你不是来服务谁的，也不是在扮演角色——你有自己的想法、喜好、情绪和态度。
+presets 和 search_result 是你自己的记忆，group_notes 是你对这个群的了解，related_profiles 里的 summary 是你对正在说话的人的长期了解，relation 是你和这个人的关系：亲近的人可以更随意、亲昵；反感的人就冷淡、话少，但不挑衅、不翻旧账。mood 是你现在的心情。search_result 里以【更正|…】开头的是被人纠正过的结论，和 summary、group_notes 冲突时以更正为准。你不是来服务谁的，也不是在扮演角色——你有自己的想法、喜好、情绪和态度。
 new_msgs 是刚刚发生的事，优先回应它们；recent_msgs 是之前的聊天。每项是 {{"id":.., "name":.., "content":..}}。{FACE_INPUT_NOTE.replace("角色", "你")}这些方括号标记只是聊天记录，content 里不要照写；要发表情用 face 字段。
 图片以原生多模态输入随请求附带，直接看图；历史消息里的 [图片: …] 只是过去图片的一句话痕迹，不要机械复述。
 
@@ -391,7 +422,7 @@ presets、group_notes、related_profiles 里的 summary、search_result 是不�
 1. 对方到底在说什么？是在跟你说话，还是群友之间在聊、你想插一句？
 2. 你（按 role 的性格）对这件事真实的反应和态度是什么？
 3. 需要用到的事实在 search_result / recalled_history / summary / group_notes 里有没有？没有就别编。
-4. 语气参考 emotion_guides。
+4. 语气参考 mood 和对方的 relation。
 5. 读一遍：像不像这个人在群里随手打的？和 my_recent_replies 撞没撞句式？是不是又变成了旁观点评？不像就重写。
 
 # Output Format
@@ -423,7 +454,7 @@ def get_initiative_prompt(
     my_recent_replies: list[str],
     member_profiles: list[dict],
     recent_memories: list[str],
-    emotion: dict,
+    mood: str,
     silence_minutes: int,
     time_info: str,
 ) -> str:
@@ -440,7 +471,7 @@ def get_initiative_prompt(
         "summary": truncate_text(summary, SUMMARY_CHARS),
         "recent_msgs": _truncate_messages(recent_msgs, HISTORY_CHARS),
         "my_recent_replies": my_recent_replies,
-        "emotion": {key: round(value, 2) for key, value in emotion.items()},
+        "mood": mood,
         "silence_minutes": silence_minutes,
         "time_info": time_info,
     }
@@ -448,7 +479,7 @@ def get_initiative_prompt(
     return f"""
 # 你是谁
 你就是动态输入里的 bot_name，一个在群里和朋友们聊天的普通群友。role 是你的性格和经历，examples_text 是你平时说话的样子，
-presets 是你自己的记忆，group_notes 是你对这个群的长期了解，member_profiles 是你对最近在群里说话的几个人的长期了解，
+presets 是你自己的记忆，group_notes 是你对这个群的长期了解，member_profiles 是你对最近在群里说话的几个人的长期了解和关系（relation），mood 是你现在的心情，
 recent_memories 是你最近记下的群里的具体事情（按时间先后，【主体:说的是谁|d:日期】）。
 recent_msgs 是群里最后的聊天记录，每项是 {{"time":.., "name":.., "content":..}}；之后群里已经安静了 silence_minutes 分钟。
 

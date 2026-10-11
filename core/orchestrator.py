@@ -1,7 +1,7 @@
 import math
 import time
 from collections.abc import Awaitable, Callable
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import datetime
 
 from nonebot import logger
@@ -30,6 +30,8 @@ from .llm import extract_and_parse_json
 from .metrics import log_event
 from .prompts import (
     SUMMARY_CHARS,
+    describe_mood,
+    describe_relation,
     get_chat_prompt,
     get_feedback_prompt,
     get_time_description,
@@ -315,6 +317,23 @@ def _parse_poke(
     return Poke(user_id=user_id, user_name=name)
 
 
+def _parse_affinity_changes(response: dict, speaker_ids: set[str]) -> dict[str, int]:
+    """Feedback 的 affinity_changes：只收本轮发言群友（不含角色自己）的整数变化量。"""
+
+    raw = response.get("affinity_changes")
+    if not isinstance(raw, dict):
+        return {}
+    changes = {}
+    for user_id, value in raw.items():
+        if str(user_id) not in speaker_ids:
+            continue
+        try:
+            changes[str(user_id)] = int(value)
+        except (TypeError, ValueError):
+            continue
+    return changes
+
+
 def _parse_reaction(
     response: dict, messages_chunk: list[Message], bot_name: str
 ) -> Reaction | None:
@@ -503,18 +522,35 @@ class ConversationOrchestrator:
         all_messages = self.session.runtime.short_term_memory.access()
         return _format_history(_history_without_current_chunk(all_messages, messages_chunk))
 
-    def _related_profiles(self, messages_chunk: list[Message]) -> list[dict]:
+    def _speaker_ids(self, messages_chunk: list[Message]) -> list[str]:
+        """本轮发言的群友，不含角色自己。"""
+
+        name = self.session.state.name
+        return list(
+            dict.fromkeys(_user_key(msg) for msg in messages_chunk if msg.user_name != name)
+        )
+
+    def _related_profiles(
+        self, messages_chunk: list[Message], *, for_chat: bool
+    ) -> list[dict]:
+        """Feedback 要在当前好感度上打分，给数值；Chat 只需要知道关系，给文字。"""
+
         state = self.session.state
-        return [
-            {
-                "user_id": uid,
-                "emotion_tends_to_user": asdict(
-                    state.profiles.get(uid, PersonProfile(user_id=uid)).emotion
-                ),
-                "summary": state.user_summaries.get(uid, ""),
-            }
-            for uid in dict.fromkeys(_user_key(msg) for msg in messages_chunk)
-        ]
+        profiles = []
+        for uid in self._speaker_ids(messages_chunk):
+            affinity = state.profiles.get(uid, PersonProfile(user_id=uid)).level()
+            profiles.append(
+                {
+                    "user_id": uid,
+                    **(
+                        {"relation": describe_relation(affinity)}
+                        if for_chat
+                        else {"affinity": affinity}
+                    ),
+                    "summary": state.user_summaries.get(uid, ""),
+                }
+            )
+        return profiles
 
     def _advance_consolidation_watermark(self, messages_chunk: list[Message]) -> None:
         state = self.session.state
@@ -535,10 +571,11 @@ class ConversationOrchestrator:
         """运行 Feedback LLM 并返回校验过的输出；失败返回 None。"""
 
         state = self.session.state
-        for uid in dict.fromkeys(_user_key(msg) for msg in messages_chunk):
+        for uid in self._speaker_ids(messages_chunk):
             state.profiles.setdefault(uid, PersonProfile(user_id=uid))
 
         now = datetime.now()
+        state.global_emotion.settle(now)
         prompt = get_feedback_prompt(
             bot_name=state.name,
             role=state.role,
@@ -549,8 +586,8 @@ class ConversationOrchestrator:
                 {"id": msg.user_id, "name": msg.user_name, "content": msg.content}
                 for msg in messages_chunk
             ],
-            emotion=asdict(state.global_emotion),
-            related_profiles=self._related_profiles(messages_chunk),
+            emotion=state.global_emotion.vad(),
+            related_profiles=self._related_profiles(messages_chunk, for_chat=False),
             search_result=search_result.memory_lines,
             is_relevant=is_relevant,
             time_info=get_time_description(now),
@@ -585,7 +622,7 @@ class ConversationOrchestrator:
             "corrections",
             "willing",
             "new_emotion",
-            "emotion_tends",
+            "affinity_changes",
             "summary",
             "need_history",
         ]
@@ -648,38 +685,17 @@ class ConversationOrchestrator:
 
         state = self.session.state
 
-        # 1. 情绪：parse_feedback 已校验并限幅
-        state.global_emotion = EmotionState(**response["new_emotion"])
+        # 1. 心情：parse_feedback 已校验范围，apply 再限制每轮步长
+        state.global_emotion.apply(response["new_emotion"])
 
-        # 2. 用户印象：emotion_tends 与新消息逐条对应
-        emo_tends = response.get("emotion_tends", [])
-        interaction_updates: list[tuple[str, dict]] = []
-        if isinstance(emo_tends, list):
-            for msg, raw_delta in zip(messages_chunk, emo_tends):
-                if isinstance(raw_delta, (int, float)):
-                    delta = {
-                        "valence": float(raw_delta),
-                        "arousal": abs(float(raw_delta)) * 0.5,
-                        "dominance": 0.0,
-                    }
-                elif isinstance(raw_delta, dict) and raw_delta:
-                    delta = raw_delta
-                else:
-                    continue
-                uid = _user_key(msg)
-                profile = state.profiles.get(uid)
-                if profile is None:
-                    continue
-                profile.push_interaction(delta)
-                interaction_updates.append((uid, delta))
-
-        if interaction_updates:
-            self.session.spawn(
-                self.session.save_interaction_logs(interaction_updates, generation)
-            )
-
-        for profile in state.profiles.values():
-            profile.update_emotion_tends()
+        # 2. 互动计数按消息记；好感度只改 Feedback 点名的人。画像已在 _run_feedback_llm 里建好
+        now = datetime.now()
+        for msg in messages_chunk:
+            if msg.user_name != state.name:
+                state.profiles[_user_key(msg)].record_interaction(now)
+        speaker_ids = set(self._speaker_ids(messages_chunk))
+        for uid, delta in _parse_affinity_changes(response, speaker_ids).items():
+            state.profiles[uid].add_affinity(delta)
 
         # 3. 摘要
         summary = response.get("summary")
@@ -831,7 +847,8 @@ class ConversationOrchestrator:
             if m.user_name == state.name
         ][-MY_RECENT_REPLIES_LIMIT:]
         recalled_str = "\n".join(recalled_history) or "无"
-        related_profiles = self._related_profiles(messages_chunk)
+        related_profiles = self._related_profiles(messages_chunk, for_chat=True)
+        state.global_emotion.settle()
         # role 里可能带 [对话样本] 后缀（examples 的持久化位置），单独用 examples_text 传
         chat_role = state.role.split("[对话样本]")[0].strip()
         prompt = get_chat_prompt(
@@ -841,7 +858,7 @@ class ConversationOrchestrator:
             summary=state.chat_summary,
             recent_msgs=recent_msgs,
             new_msgs=new_msgs,
-            emotion=asdict(state.global_emotion),
+            mood=describe_mood(state.global_emotion),
             related_profiles=related_profiles,
             search_result=search_result.memory_lines,
             examples_text=state.examples,

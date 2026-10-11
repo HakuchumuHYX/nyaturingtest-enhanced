@@ -67,7 +67,7 @@ COMMANDS: tuple[CommandMeta, ...] = (
     CommandMeta("rag_debug <query>", "诊断 RAG 记忆检索"),
     CommandMeta("group_notes", "查看本群群志原文", "group_notes <群号>"),
     CommandMeta("calm", "冷静并重置短期状态", "calm <群号>"),
-    CommandMeta("reset_emotion", "仅重置 VAD 情绪", "reset_emotion <群号>"),
+    CommandMeta("reset_emotion", "仅重置心情（不动好感度）", "reset_emotion <群号>"),
     CommandMeta("reset confirm", "先备份再完全重置本群", "reset <群号> confirm"),
     CommandMeta("token统计", "查看当前 chat / feedback 模型的 Token 用量"),
     CommandMeta("backup_data", "手动触发数据备份", "backup_data"),
@@ -327,7 +327,7 @@ async def _do_reset_emotion(matcher: type[Matcher], group_id: int, _args: str):
     async with state.session_lock:
         await state.session.load_session()
         await state.session.reset_emotion()
-    await matcher.finish("情绪已初始化 (VAD -> 0, 0, 0)")
+    await matcher.finish("心情已重置")
 
 
 async def _do_reset(matcher: type[Matcher], group_id: int, args: str):

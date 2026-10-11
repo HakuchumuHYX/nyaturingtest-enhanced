@@ -4,7 +4,6 @@
 """
 
 import random
-from dataclasses import asdict
 from datetime import datetime, time, timedelta
 
 from nonebot import logger, require
@@ -12,11 +11,18 @@ from nonebot import logger, require
 require("nonebot_plugin_apscheduler")
 from nonebot_plugin_apscheduler import scheduler  # noqa: E402  必须在 require 之后导入
 
+from .domain import PersonProfile  # noqa: E402
 from .llm import build_turn_calls, extract_and_parse_json  # noqa: E402
 from .logic import dispatch_replies  # noqa: E402
 from .metrics import log_event  # noqa: E402
 from .orchestrator import MY_RECENT_REPLIES_LIMIT, _format_history  # noqa: E402
-from .prompts import get_initiative_prompt, get_time_description, is_rest_day  # noqa: E402
+from .prompts import (  # noqa: E402
+    describe_mood,
+    describe_relation,
+    get_initiative_prompt,
+    get_time_description,
+    is_rest_day,
+)
 from .state_manager import (  # noqa: E402
     GroupState,
     group_states,
@@ -108,7 +114,13 @@ async def _initiate(state: GroupState, silence: int) -> None:
         )
     )
     member_profiles = [
-        {"name": names[uid], "summary": session_state.user_summaries[uid]}
+        {
+            "name": names[uid],
+            "relation": describe_relation(
+                session_state.profiles.get(uid, PersonProfile(user_id=uid)).level()
+            ),
+            "summary": session_state.user_summaries[uid],
+        }
         for uid in members
         if session_state.user_summaries.get(uid)
     ][:MEMBER_PROFILE_LIMIT]
@@ -121,6 +133,7 @@ async def _initiate(state: GroupState, silence: int) -> None:
         m.content for m in messages if m.user_name == session_state.name
     ][-MY_RECENT_REPLIES_LIMIT:]
 
+    session_state.global_emotion.settle()
     prompt = get_initiative_prompt(
         bot_name=session_state.name,
         role=session_state.role.split("[对话样本]")[0].strip(),
@@ -132,7 +145,7 @@ async def _initiate(state: GroupState, silence: int) -> None:
         my_recent_replies=my_recent_replies,
         member_profiles=member_profiles,
         recent_memories=recent_memories,
-        emotion=asdict(session_state.global_emotion),
+        mood=describe_mood(session_state.global_emotion),
         silence_minutes=silence,
         time_info=get_time_description(datetime.now()),
     )
