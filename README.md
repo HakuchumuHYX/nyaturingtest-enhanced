@@ -162,8 +162,13 @@
 
 备份里有聊天内容、QQ 号和对群友的记忆，属于敏感数据，请妥善保存。
 
-## 致谢
+## 致谢与许可
 
 感谢原项目作者 [shadow3aaa](https://github.com/shadow3aaa/)。
 
-本项目以 MIT 许可证发布。
+本项目衍生自 [nonebot-plugin-nyaturingtest](https://github.com/shadow3aaa/nonebot-plugin-nyaturingtest)
+（Copyright © 2025 shadow3aaa），在其基础上做了大量修改和重写，按原项目的许可证
+[GNU AGPL-3.0](LICENSE) 发布。修改记录见 git 历史。
+
+AGPL 要求通过网络使用本插件的用户也能拿到源码：部署改过的版本时，请公开你的修改，
+并让群友能找到源码地址（本仓库：<https://github.com/HakuchumuHYX/nyaturingtest-enhanced>）。
