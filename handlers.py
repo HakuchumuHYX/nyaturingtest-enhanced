@@ -16,6 +16,7 @@ from nonebot.adapters.onebot.v11 import (
 from nonebot.matcher import Matcher
 from nonebot.params import CommandArg
 from nonebot.permission import SUPERUSER
+from tortoise.expressions import Q
 
 from .cards.impression import render_impression_card
 from .cards.notes import render_group_notes_card
@@ -42,7 +43,10 @@ from .memory.vector import (
 )
 from .storage.backup import backup_task
 from .storage.db import disable_group, enable_group, get_token_stats
-from .storage.models import SessionModel
+from .storage.models import PersonaHistoryModel, SessionModel
+
+# persona 命令列出的最近改动条数（人生线和本群合计）
+PERSONA_HISTORY_LIMIT = 6
 
 
 @dataclass(frozen=True)
@@ -57,14 +61,9 @@ COMMANDS: tuple[CommandMeta, ...] = (
     CommandMeta(
         "status", "查看 Bot 状态、provider 错误和基础 metrics", "status <群号>"
     ),
-    CommandMeta("role", "查看当前角色", "role <群号>"),
-    CommandMeta(
-        "set_role <角色名> <角色设定>",
-        "设置角色，设定可包含空格",
-        "set_role <群号> <角色名> <角色设定>",
-    ),
     CommandMeta("presets", "查看可用预设", "presets <群号>"),
     CommandMeta("set_preset <文件名>", "加载预设", "set_preset <群号> <文件名>"),
+    CommandMeta("persona", "查看人生线、本群的她和最近的改动", "persona <群号>"),
     CommandMeta("rag_debug <query>", "诊断 RAG 记忆检索"),
     CommandMeta("group_notes", "查看本群群志原文", "group_notes <群号>"),
     CommandMeta("calm", "冷静并重置短期状态", "calm <群号>"),
@@ -295,24 +294,29 @@ async def _do_set_presets(matcher: type[Matcher], group_id: int, args: str):
     await matcher.finish(f"预设已加载: {args}" if loaded else f"不存在的预设: {args}")
 
 
-async def _do_set_role(matcher: type[Matcher], group_id: int, args: str):
-    parts = args.split(" ", 1)
-    if len(parts) != 2:
-        await matcher.finish("请提供<角色名> <角色设定>")
-    state = await _group_state_or_finish(matcher, group_id)
-    async with state.session_lock:
-        await state.session.load_session()
-        await state.session.set_role(name=parts[0], role=parts[1])
-    await matcher.finish(f"角色已设为: {parts[0]}\n设定: {parts[1]}")
-
-
-async def _do_get_role(matcher: type[Matcher], group_id: int, _args: str):
+async def _do_persona(matcher: type[Matcher], group_id: int, _args: str):
     state = await _group_state_or_finish(matcher, group_id)
     async with state.session_lock:
         await state.session.load_session()
         session_state = state.session.state
-        role = f"{session_state.name}（{session_state.role}）"
-    await matcher.finish(f"当前角色: {role}")
+        preset, name = session_state.preset, session_state.name
+        self_life, self_in_group = session_state.self_life, session_state.self_in_group
+    if not name:
+        await matcher.finish("本群还没设人设（或预设文件不在），先 set_preset")
+
+    history = await PersonaHistoryModel.filter(
+        Q(scope="life", key=preset) | Q(scope="group", key=f"{group_id}:{preset}")
+    ).order_by("-date", "-id").limit(PERSONA_HISTORY_LIMIT)
+    changes = "\n".join(
+        f"- {row.date:%m-%d} {'人生线' if row.scope == 'life' else '本群'}：{row.changes}"
+        for row in history
+    )
+    await matcher.finish(
+        f"人设：{preset}（{name}）\n\n"
+        f"[人生线]\n{self_life or '还没整理过（每天 03:30 整理）'}\n\n"
+        f"[本群的她]\n{self_in_group or '还没整理过'}\n\n"
+        f"[最近的改动]\n{changes or '无'}"
+    )
 
 
 async def _do_calm_down(matcher: type[Matcher], group_id: int, _args: str):
@@ -382,8 +386,7 @@ async def _do_status(matcher: type[Matcher], group_id: int, _args: str):
 
 get_presets = _dual_command("presets", {"preset"}, _do_get_presets)
 set_presets = _dual_command("set_preset", {"set_presets"}, _do_set_presets)
-get_role = _dual_command("role", {"当前角色"}, _do_get_role)
-set_role = _dual_command("set_role", {"设置角色"}, _do_set_role)
+get_persona = _dual_command("persona", {"人设"}, _do_persona)
 calm_down = _dual_command("calm", {"冷静"}, _do_calm_down)
 reset_emotion = _dual_command("reset_emotion", {"重置情绪"}, _do_reset_emotion)
 reset = _dual_command("reset", {"重置"}, _do_reset)

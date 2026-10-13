@@ -13,6 +13,7 @@ from ..memory.vector import close_clients, maintain_memories
 from .digest import digest_group_notes, digest_user_profiles
 from .llm import close_http_client
 from .metrics import drain_usage_tasks
+from .persona import maintain_personas
 from .session import Session
 
 QUEUE_MAX_SIZE = 200
@@ -108,7 +109,7 @@ async def remove_group_state(group_id: int):
 
 
 def _generation(group_id: int) -> int:
-    """未加载的群按 0 算：加载不改 generation，只有 reset/set_role 等会递增。"""
+    """未加载的群按 0 算：加载不改 generation，只有 reset/load_preset 等会递增。"""
 
     group_state = group_states.get(group_id)
     return group_state.session.state.generation if group_state else 0
@@ -130,7 +131,7 @@ async def refresh_group_notes(group_id: int, *, min_new: int = 1) -> str | None:
 
 
 async def maintain_long_term_memory() -> None:
-    """长期记忆每日维护：先把新碎片整理进档案与群志，再删过期碎片，
+    """长期记忆每日维护：先把新碎片整理进档案与群志，再整理人设成长，最后删过期碎片，
     这样即将过期的碎片一定先被归纳过；最后让已加载的群下次重新读矩阵。"""
 
     for group_id in list(runtime_enabled_groups):
@@ -151,12 +152,38 @@ async def maintain_long_term_memory() -> None:
         if group_state is not None and still_current():
             group_state.session.state.user_summaries.update(summaries)
 
+    await _maintain_personas()
+
     try:
         await maintain_memories()
     except Exception as e:
         logger.warning(f"长期记忆定时维护失败: {e}")
     for state in group_states.values():
         state.session.runtime.vector_memory.drop_cache()
+
+
+async def _maintain_personas() -> None:
+    group_ids = list(runtime_enabled_groups)
+    generations = {str(group_id): _generation(group_id) for group_id in group_ids}
+
+    def still_current(session_id: str) -> bool:
+        return _generation(int(session_id)) == generations[session_id]
+
+    try:
+        lives, groups = await maintain_personas(group_ids, still_current)
+    except Exception as e:
+        logger.warning(f"人设成长整理失败: {e}")
+        return
+    # 人生线和群层不随 save_session 回写，已加载的群要同步内存副本
+    for group_id in group_ids:
+        group_state = group_states.get(group_id)
+        if group_state is None or not still_current(str(group_id)):
+            continue
+        state = group_state.session.state
+        if state.preset in lives:
+            state.self_life = lives[state.preset]
+        if str(group_id) in groups:
+            state.self_in_group = groups[str(group_id)]
 
 
 async def cleanup_global_resources():

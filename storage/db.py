@@ -11,6 +11,8 @@ from .models import (
     DailyTokenUsageModel,
     EnabledGroupModel,
     GlobalMessageModel,
+    PersonaGroupModel,
+    PersonaLifeModel,
     SessionModel,
     TokenUsageModel,
     UserProfileModel,
@@ -43,7 +45,7 @@ async def disable_group(group_id: int):
 
 
 async def delete_session_data(session_id: str):
-    """删除会话的所有关联数据（消息、用户画像与档案、群志），不删除会话本身"""
+    """删除会话的所有关联数据（消息、用户画像与档案、群志、群层），不删除会话本身；人生线各群共享，不动"""
 
     session_db = await SessionModel.get_or_none(id=session_id)
     if not session_db:
@@ -54,9 +56,10 @@ async def delete_session_data(session_id: str):
         group_notes="", notes_summarized_until=None, episodes_until=None
     )
     msg_count = await GlobalMessageModel.filter(session=session_db).delete()
+    persona_count = await PersonaGroupModel.filter(session=session_db).delete()
     logger.info(
         f"[Repo] 会话 {session_id} 数据已清除: "
-        f"profiles={profile_count}, messages={msg_count}"
+        f"profiles={profile_count}, messages={msg_count}, persona_groups={persona_count}"
     )
 
 
@@ -66,10 +69,7 @@ async def save_session_state(session_id: str, data: dict):
     await SessionModel.update_or_create(
         id=session_id,
         defaults={
-            "name": sanitize_text(data.get("name", "")),
-            "role": sanitize_text(data.get("role", "")),
-            "aliases": data.get("aliases", []),
-            "preset_lines": data.get("preset_lines", []),
+            "preset": data["preset"],
             "valence": data.get("valence", 0.0),
             "arousal": data.get("arousal", 0.0),
             "dominance": data.get("dominance", 0.0),
@@ -80,6 +80,23 @@ async def save_session_state(session_id: str, data: dict):
             "chatting_state": data.get("chatting_state", 0),
         },
     )
+
+
+async def load_persona_texts(session_id: str, preset: str) -> tuple[str, str]:
+    """（人生线, 本群群层）；还没整理过的是空串。"""
+
+    life = await PersonaLifeModel.get_or_none(preset=preset)
+    group = await PersonaGroupModel.get_or_none(session_id=session_id, preset=preset)
+    return (life.text if life else "", group.text if group else "")
+
+
+async def skip_persona_absence(session_id: str, preset: str) -> None:
+    """切回以前用过的预设：换走期间说话的是别的人设，那段聊天不是 ta 的经历，整理进度直接跳到昨天。"""
+
+    yesterday = date.today() - timedelta(days=1)
+    await PersonaGroupModel.filter(
+        session_id=session_id, preset=preset, digested_until__lt=yesterday
+    ).update(digested_until=yesterday)
 
 
 async def load_full_session_data(session_id: str):

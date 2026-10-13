@@ -403,6 +403,9 @@ class ConversationOrchestrator:
             session.record_incoming(messages_chunk)
 
             state = session.state
+            # 没设人设（或预设文件不在）：消息照常记，不判断、不说话
+            if not state.name:
+                return None
             recent = session.runtime.short_term_memory.access()
             self_share = sum(m.user_name == state.name for m in recent) / len(recent)
             engagement = evaluate_engagement(
@@ -606,7 +609,8 @@ class ConversationOrchestrator:
         state.global_emotion.settle(now)
         prompt = get_feedback_prompt(
             bot_name=state.name,
-            role=state.role,
+            self_life=state.self_life,
+            self_in_group=state.self_in_group,
             chat_state_value=chatting_state(state, now).value,
             summary=state.chat_summary,
             recent_msgs=self._history_context(messages_chunk),
@@ -881,11 +885,12 @@ class ConversationOrchestrator:
         recalled_str = "\n".join(recalled_history) or "无"
         related_profiles = self._related_profiles(messages_chunk, for_chat=True)
         state.global_emotion.settle()
-        # role 里可能带 [对话样本] 后缀（examples 的持久化位置），单独用 examples_text 传
-        chat_role = state.role.split("[对话样本]")[0].strip()
         prompt = get_chat_prompt(
             bot_name=state.name,
-            role=chat_role,
+            profile=state.profile,
+            bottom_lines=state.bottom_lines,
+            self_life=state.self_life,
+            self_in_group=state.self_in_group,
             chat_state_value=chatting_state(state, datetime.now()).value,
             summary=state.chat_summary,
             recent_msgs=recent_msgs,
@@ -893,7 +898,6 @@ class ConversationOrchestrator:
             mood=describe_mood(state.global_emotion),
             related_profiles=related_profiles,
             search_result=search_result.memory_lines,
-            examples_text=state.examples,
             presets=search_result.preset_lines,
             group_notes=state.group_notes,
             recalled_history=recalled_str,
@@ -914,7 +918,7 @@ class ConversationOrchestrator:
             + sum(len(item["content"]) for item in recent_msgs),
             recent_chars=sum(len(item["content"]) for item in new_msgs),
             recalled_history_chars=len(recalled_str),
-            examples_chars=len(state.examples),
+            persona_chars=len(state.self_life) + len(state.self_in_group),
         )
 
         replies = parse_reply(await llm_call(prompt))

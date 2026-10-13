@@ -82,6 +82,7 @@ async def scan_groups() -> None:
             or state.bot is None
             or state.event is None
             or not state.session.state.loaded
+            or not state.session.state.name  # 没设人设不说话
         ):
             continue
         silence = _silence_minutes(state, now)
@@ -136,8 +137,10 @@ async def _initiate(state: GroupState, silence: int) -> None:
     session_state.global_emotion.settle()
     prompt = get_initiative_prompt(
         bot_name=session_state.name,
-        role=session_state.role.split("[对话样本]")[0].strip(),
-        examples_text=session_state.examples,
+        profile=session_state.profile,
+        bottom_lines=session_state.bottom_lines,
+        self_life=session_state.self_life,
+        self_in_group=session_state.self_in_group,
         presets=session_state.preset_lines,
         group_notes=session_state.group_notes,
         summary=session_state.chat_summary,

@@ -7,7 +7,9 @@ from nonebot import logger
 from ..storage.db import (
     delete_session_data,
     load_full_session_data,
+    load_persona_texts,
     save_session_state,
+    skip_persona_absence,
     sync_messages,
     update_user_profiles,
 )
@@ -16,11 +18,9 @@ from ..memory.short_term import Memory, Message
 from ..memory.vector import VectorMemory
 from .engagement import WILLINGNESS_LOAD_VALUE, chatting_state
 from .metrics import log_event
-from .prompts import PRESETS, reload_presets, truncate_text
+from .prompts import PRESETS, reload_presets
 
-# 角色与摘要文本上限、后台任务排空超时、保存去抖
-ROLE_MAX_CHARS = 4000
-EXAMPLES_MAX_CHARS = 2000
+# 后台任务排空超时、保存去抖
 MEMORY_DRAIN_TIMEOUT_SECONDS = 10.0
 SAVE_DEBOUNCE_SECONDS = 0.05
 
@@ -29,11 +29,16 @@ SAVE_DEBOUNCE_SECONDS = 0.05
 class SessionState:
     """纯领域状态：不持有数据库、HTTP 或向量资源。"""
 
-    name: str = "terminus"
-    role: str = "一个男性人类"
+    preset: str = ""
+    # 以下由 _apply_preset 从预设和每日整理结果填，只读，不随 save_session 回写；
+    # name 为空说明没设人设或预设文件不在，这个群不说话
+    name: str = ""
     aliases: list[str] = field(default_factory=list)
-    examples: str = ""
+    profile: list[str] = field(default_factory=list)
+    bottom_lines: list[str] = field(default_factory=list)
     preset_lines: list[str] = field(default_factory=list)
+    self_life: str = ""
+    self_in_group: str = ""
     profiles: dict[str, PersonProfile] = field(default_factory=dict)
     # 档案与群志只由每日整理任务写库，这里是只读副本，不随 save_session 回写
     user_summaries: dict[str, str] = field(default_factory=dict)
@@ -89,7 +94,7 @@ class Session:
         return self.state.generation
 
     def stale(self, generation: int, stage: str) -> bool:
-        """本轮开始后会话被 reset/set_role 等作废过，就丢弃这一步并记一条事件。"""
+        """本轮开始后会话被 reset/load_preset 等作废过，就丢弃这一步并记一条事件。"""
 
         if self.state.generation == generation:
             return False
@@ -102,17 +107,10 @@ class Session:
         )
         return True
 
-    async def set_role(self, name: str, role: str):
-        self.bump_generation("set_role")
-        self.state.role = truncate_text(role, ROLE_MAX_CHARS)
-        self.state.name = name
-        self.state.aliases = []
-        self.state.examples = ""
-        await self.save_session()
-
     async def reset(self):
         generation = self.bump_generation("reset")
-        self.state = SessionState(loaded=True, generation=generation)
+        # 重置的是本群的数据，不是换人：人设留着，群层随 delete_session_data 清掉
+        self.state = SessionState(loaded=True, generation=generation, preset=self.state.preset)
         self.runtime.short_term_memory.clear()
         await self.runtime.vector_memory.clear()
         # 清理数据库中的所有关联数据，并与后台持久化共用同一把锁：
@@ -120,6 +118,7 @@ class Session:
         async with self.runtime.save_lock:
             await delete_session_data(self.id)
             await self._save_session_locked()
+        await self._apply_preset()
         logger.info(f"[Session {self.id}] 已完全重置（含数据库清理）")
 
     async def calm_down(self):
@@ -178,10 +177,7 @@ class Session:
             await save_session_state(
                 self.id,
                 {
-                    "name": self.state.name,
-                    "role": self.state.role,
-                    "aliases": self.state.aliases,
-                    "preset_lines": self.state.preset_lines,
+                    "preset": self.state.preset,
                     "valence": self.state.global_emotion.valence,
                     "arousal": self.state.global_emotion.arousal,
                     "dominance": self.state.global_emotion.dominance,
@@ -233,10 +229,8 @@ class Session:
 
         session_db = data["session"]
 
-        self.state.name = session_db.name
-        self.state.role = truncate_text(session_db.role, ROLE_MAX_CHARS)
-        self.state.aliases = session_db.aliases if session_db.aliases else []
-        self.state.preset_lines = session_db.preset_lines
+        self.state.preset = session_db.preset
+        await self._apply_preset()
         self.state.group_notes = session_db.group_notes
         self.state.chat_summary = session_db.chat_summary
         self.state.global_emotion = EmotionState(
@@ -252,11 +246,6 @@ class Session:
                 t = t.astimezone(None).replace(tzinfo=None)
             self.state.last_speak_time = t
         self.state.last_consolidated_time = session_db.last_consolidated_time
-
-        if "[对话样本]" in self.state.role:
-            parts = self.state.role.split("[对话样本]")
-            if len(parts) > 1:
-                self.state.examples = parts[1].strip()
 
         self.state.willingness = WILLINGNESS_LOAD_VALUE
         self.state.profiles = {}
@@ -286,7 +275,7 @@ class Session:
     def presets(self) -> list[str]:
         reload_presets()
         return [
-            f"{filename}: {preset.name} {preset.role}"
+            f"{filename}: {preset.name} {preset.seed.split('。')[0]}"
             for filename, preset in PRESETS.items()
             if not preset.hidden
         ]
@@ -299,42 +288,41 @@ class Session:
             return False
 
         self.bump_generation("load_preset")
-        preset = PRESETS[filename]
-        base_role = preset.role
-        self.state.name = preset.name
-        self.state.aliases = preset.aliases
-
-        if preset.examples:
-            ex_lines = []
-            for ex in preset.examples:
-                u = ex.get("user", "")
-                b = ex.get("bot", "")
-                if u and b:
-                    ex_lines.append(f"用户: {u}\n{preset.name}: {b}")
-            self.state.examples = truncate_text("\n".join(ex_lines), EXAMPLES_MAX_CHARS)
-        else:
-            self.state.examples = ""
-
-        if self.state.examples:
-            self.state.role = truncate_text(
-                f"{base_role}\n\n[对话样本]\n{self.state.examples}",
-                ROLE_MAX_CHARS,
-            )
-        else:
-            self.state.role = truncate_text(base_role, ROLE_MAX_CHARS)
-
-        # 预设每轮完全相同，排序固定，才能作为不变的前缀参与缓存
-        preset_items: list[tuple[str, str]] = []
-        preset_items.extend((item, "knowledge") for item in preset.knowledges)
-        preset_items.extend((item, "relationship") for item in preset.relationships)
-        preset_items.extend((item, "event") for item in preset.events)
-        preset_items.extend((item, "bot_self") for item in preset.bot_self)
-        self.state.preset_lines = sorted(
-            f"【设定/{subtype}】 {item}" for item, subtype in preset_items if item.strip()
-        )
-
+        if filename != self.state.preset:
+            await skip_persona_absence(self.id, filename)
+        self.state.preset = filename
+        await self._apply_preset()
         await self.save_session()
         return True
+
+    async def _apply_preset(self) -> None:
+        """按预设文件名填名字、别名、静态常识，再读每日整理出的人生线和本群群层。"""
+
+        preset = PRESETS.get(self.state.preset)
+        if preset is None:
+            # 文件名留着，可能只是 json 暂时写坏了；名字为空就不说话
+            if self.state.preset:
+                logger.warning(f"[Session {self.id}] 预设 {self.state.preset} 不存在，按没设人设处理")
+            self.state.name = ""
+            self.state.aliases = []
+            self.state.profile = []
+            self.state.bottom_lines = []
+            self.state.preset_lines = []
+            self.state.self_life = ""
+            self.state.self_in_group = ""
+            return
+
+        self.state.name = preset.name
+        self.state.aliases = preset.aliases
+        self.state.profile = preset.profile
+        self.state.bottom_lines = preset.bottom_lines
+        # 预设每轮完全相同，排序固定
+        self.state.preset_lines = sorted(
+            f"【设定/knowledge】 {item}" for item in preset.knowledges if item.strip()
+        )
+        life, self.state.self_in_group = await load_persona_texts(self.id, self.state.preset)
+        # 新人设第一次整理要等到当晚，这之前拿出发点顶上，不然这一天没有性格
+        self.state.self_life = life or preset.seed
 
     def status(self) -> str:
         self.state.global_emotion.settle()
@@ -345,8 +333,7 @@ class Session:
             else "无"
         )
         return f"""
-名字：{self.state.name}
-设定：{self.state.role}
+人设：{self.state.preset or "未设（不说话）"}
 意愿值：{self.state.willingness:.2f}
 状态: {chatting_state(self.state, datetime.now())}
 心情：V{self.state.global_emotion.valence:.2f} A{self.state.global_emotion.arousal:.2f} D{self.state.global_emotion.dominance:.2f}

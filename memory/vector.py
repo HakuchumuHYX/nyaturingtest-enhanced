@@ -508,7 +508,7 @@ class VectorMemory:
         *,
         still_current: Callable[[], bool],
     ) -> dict[str, int] | None:
-        """批量写入长期记忆；会话在写入前被 reset/set_role 作废则返回 None。
+        """批量写入长期记忆；会话在写入前被 reset/load_preset 作废则返回 None。
 
         只去掉同一批里正文完全相同的条目，不和已有记忆比向量：Qwen3-Embedding 比两条记忆时
         主要看开头人名，同一人不相干甚至相反的两件事余弦也有 0.97，找不到能分开真重复的阈值。

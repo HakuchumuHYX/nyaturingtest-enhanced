@@ -1,4 +1,4 @@
-"""印象卡片：ATRI 手账里关于某个群友的一页，填进 impression.html，用 Chromium 截图。"""
+"""印象卡片：bot 手账里关于某个群友的一页，填进 impression.html，用 Chromium 截图。"""
 
 import base64
 from datetime import datetime

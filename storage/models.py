@@ -7,9 +7,8 @@ from tortoise.models import Model
 
 class SessionModel(Model):
     id = fields.CharField(pk=True, max_length=255)
-    name = fields.CharField(max_length=255, default="terminus")
-    role = fields.TextField(default="一个普通的AI助手")
-    aliases = fields.JSONField(default=list)
+    # 预设文件名，空串是没设人设（不说话）；名字、别名等运行时从预设读，不存快照，免得改了 json 不同步
+    preset = fields.CharField(max_length=255, default="")
 
     # 角色在群里的心情；读取前按 emotion_updated_at 结算回落，见 core/domain.py
     valence = fields.FloatField(default=0.0)
@@ -21,8 +20,6 @@ class SessionModel(Model):
     last_speak_time = fields.DatetimeField(null=True)
     last_consolidated_time = fields.DatetimeField(null=True)
     chatting_state = fields.IntField(default=0)
-    # 预设条目每轮原样注入，不参与检索，所以不进记忆表
-    preset_lines = fields.JSONField(default=list)
     # 群志只由每日整理任务写入；水位是已整理到的最新碎片 created_at
     group_notes = fields.TextField(default="")
     notes_summarized_until = fields.DatetimeField(null=True)
@@ -112,6 +109,51 @@ class MemoryModel(Model):
             ),
             Index(fields=("expires_at",), name="idx_memories_expires_at"),
         )
+
+
+class PersonaLifeModel(Model):
+    """人生线：每个预设一份，各群共享，只由每日整理写入（core/persona.py）。"""
+
+    preset = fields.CharField(pk=True, max_length=255)
+    text = fields.TextField(default="")
+    last_digest = fields.DateField(null=True)
+    # 各群抽出、还没整理进人生线的自我陈述；人生线整理失败时留到下次
+    pending_facts = fields.JSONField(default=list)
+
+    class Meta:
+        table = "nyabot_persona_life"
+
+
+class PersonaGroupModel(Model):
+    """群里的她：每个（群, 预设）一份，切走预设再切回来还在。"""
+
+    id = fields.IntField(pk=True)
+    session = fields.ForeignKeyField("models.SessionModel", related_name="persona_groups")
+    preset = fields.CharField(max_length=255)
+    text = fields.TextField(default="")
+    # 最近几天的观察日记，跨天反复出现的才收进群层
+    journal = fields.JSONField(default=list)
+    # 已整理到的最后一个自然日
+    digested_until = fields.DateField(null=True)
+
+    class Meta:
+        table = "nyabot_persona_group"
+        unique_together = (("session", "preset"),)
+
+
+class PersonaHistoryModel(Model):
+    """人生线和群层的每次重写，只追加，用于回看和回滚。"""
+
+    id = fields.IntField(pk=True)
+    scope = fields.CharField(max_length=16)  # life / group
+    key = fields.CharField(max_length=255)  # 预设文件名，或「群号:预设文件名」
+    date = fields.DateField()
+    text = fields.TextField()
+    changes = fields.TextField(default="")
+
+    class Meta:
+        table = "nyabot_persona_history"
+        indexes = (Index(fields=("scope", "key", "date"), name="idx_persona_history_key"),)
 
 
 class EnabledGroupModel(Model):

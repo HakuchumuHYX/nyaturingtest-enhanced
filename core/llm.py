@@ -13,6 +13,7 @@ from openai import APIConnectionError, APITimeoutError, AsyncOpenAI
 
 from ..config import EndpointSettings, get_app_settings
 from .metrics import log_event, metrics, record_token_usage
+from .prompts import CHAT_SYSTEM_PROMPT, FEEDBACK_SYSTEM_PROMPT, JSON_SYSTEM_PROMPT
 
 
 @dataclass(frozen=True)
@@ -85,7 +86,7 @@ class ProviderStatus:
 LLM_MAX_ATTEMPTS = 3
 LLM_RETRY_BASE_DELAY = 2.0
 RATE_LIMIT_CIRCUIT_SECONDS = 30.0
-JSON_SYSTEM_PROMPT = "You are an intelligent agent. Output only valid JSON."
+
 
 
 def _usage_to_dict(usage: Any, finish_reason: str) -> dict[str, int | str]:
@@ -251,24 +252,6 @@ class LLMClient:
                 await asyncio.sleep(0.2)
         return ""
 
-
-CHAT_SYSTEM_PROMPT = (
-    "你就是动态输入里的那个角色本人，正在群聊里用手机和朋友们聊天。"
-    "role 是你的性格与经历，examples_text 是你的说话习惯，search_result 是你的记忆，"
-    "把它们当作自己的东西，不是别人给你的说明书。"
-    "不要以 AI、助手、模型或角色扮演引擎的身份说话，不要解释设定。"
-    "你有自己的看法、情绪和小脾气，说话短、口语、有来有回，像真人随手打字。"
-    "请在内部完成分析，但最终输出只包含一个合法 JSON 对象，不要输出 Markdown、解释或思考过程。"
-)
-
-FEEDBACK_SYSTEM_PROMPT = (
-    "你是一个对话分析引擎。你的输入是群聊消息日志和可选的群聊图片，"
-    "输出是结构化的角色心理状态 JSON。"
-    "这是一个纯数据处理任务：读取文本和图片 → 按角色设定推断角色的心情与对群友的好感变化 → 输出 JSON。"
-    "你不需要参与对话，也不需要扮演任何角色，只需要站在旁观者的角度分析。"
-    "你的输出必须包含 new_emotion 对象（含 valence、arousal、dominance 三个浮点数字段）。"
-    "请在内部完成分析，但最终输出只包含一个合法 JSON 对象，不要输出 Markdown、解释或思考过程。"
-)
 
 # 所有群共用：限流与熔断本来就是按 API key 算的
 chat_client = LLMClient(get_app_settings().chat)
