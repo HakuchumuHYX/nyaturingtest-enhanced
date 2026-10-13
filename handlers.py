@@ -20,6 +20,8 @@ from tortoise.expressions import Q
 
 from .cards.impression import render_impression_card
 from .cards.notes import render_group_notes_card
+from .cards.persona import Change as PersonaChange
+from .cards.persona import render_persona_card
 from .cards.token_stats import render_token_stats_card
 from .config import get_app_settings, get_token_stats_model_names
 from .core.digest import GROUP_NOTES_REFRESH_MIN_NEW, count_new_group_fragments
@@ -28,6 +30,7 @@ from .core.llm import chat_client, feedback_client
 from .core.logic import message2BotMessage
 from .core.memory_query import acquire_query_slot, impression_text, query_memory_profile
 from .core.metrics import metrics
+from .core.prompts import PRESETS
 from .core.state_manager import (
     ensure_group_state,
     is_shutting_down,
@@ -46,7 +49,7 @@ from .storage.db import disable_group, enable_group, get_token_stats
 from .storage.models import PersonaHistoryModel, SessionModel
 
 # persona 命令列出的最近改动条数（人生线和本群合计）
-PERSONA_HISTORY_LIMIT = 6
+PERSONA_HISTORY_LIMIT = 4
 
 
 @dataclass(frozen=True)
@@ -304,19 +307,38 @@ async def _do_persona(matcher: type[Matcher], group_id: int, _args: str):
     if not name:
         await matcher.finish("本群还没设人设（或预设文件不在），先 set_preset")
 
-    history = await PersonaHistoryModel.filter(
-        Q(scope="life", key=preset) | Q(scope="group", key=f"{group_id}:{preset}")
-    ).order_by("-date", "-id").limit(PERSONA_HISTORY_LIMIT)
-    changes = "\n".join(
-        f"- {row.date:%m-%d} {'人生线' if row.scope == 'life' else '本群'}：{row.changes}"
-        for row in history
-    )
-    await matcher.finish(
-        f"人设：{preset}（{name}）\n\n"
-        f"[人生线]\n{self_life or '还没整理过（每天 03:30 整理）'}\n\n"
-        f"[本群的她]\n{self_in_group or '还没整理过'}\n\n"
-        f"[最近的改动]\n{changes or '无'}"
-    )
+    # 「无」是整理过但没改，不算改动，不上尺子也不进流水
+    history = [
+        PersonaChange(row.date, row.scope, row.changes)
+        for row in await PersonaHistoryModel.filter(
+            Q(scope="life", key=preset) | Q(scope="group", key=f"{group_id}:{preset}")
+        ).order_by("-date", "-id")
+        if row.changes and row.changes != "无"
+    ]
+    recent = history[:PERSONA_HISTORY_LIMIT]
+    try:
+        image = await render_persona_card(
+            name=name,
+            as_of=PRESETS[preset].as_of,
+            life=self_life,
+            group_text=self_in_group,
+            group_name=await _group_name(group_id),
+            changes=recent,
+            marks=history,
+        )
+    except Exception as e:
+        logger.error(f"渲染人设卡片失败: {e}")
+        changes = "\n".join(
+            f"- {change.day:%m-%d} {'人生线' if change.scope == 'life' else '本群'}：{change.text}"
+            for change in recent
+        )
+        await matcher.finish(
+            f"人设：{preset}（{name}）\n\n"
+            f"[人生线]\n{self_life}\n\n"
+            f"[在这个群]\n{self_in_group or '还没整理过（每天 03:30 整理）'}\n\n"
+            f"[最近的改动]\n{changes or '无'}"
+        )
+    await matcher.finish(MessageSegment.image(image))
 
 
 async def _do_calm_down(matcher: type[Matcher], group_id: int, _args: str):
@@ -348,6 +370,14 @@ async def _do_reset(matcher: type[Matcher], group_id: int, args: str):
     await matcher.finish("已重置会话")
 
 
+async def _group_name(group_id: int) -> str:
+    try:
+        group_info = await get_bot().get_group_info(group_id=group_id)
+        return group_info.get("group_name") or f"群 {group_id}"
+    except Exception:
+        return f"群 {group_id}"
+
+
 async def _do_group_notes(matcher: type[Matcher], group_id: int, _args: str):
     await _group_state_or_finish(matcher, group_id)
     pending = await count_new_group_fragments(str(group_id))
@@ -363,14 +393,9 @@ async def _do_group_notes(matcher: type[Matcher], group_id: int, _args: str):
     if session_db is None or not session_db.group_notes:
         await matcher.finish("本群还没有群志（每天 03:30 整理）")
     try:
-        group_info = await get_bot().get_group_info(group_id=group_id)
-        group_name = group_info.get("group_name") or f"群 {group_id}"
-    except Exception:
-        group_name = f"群 {group_id}"
-    try:
         image = await render_group_notes_card(
             notes=session_db.group_notes,
-            group_name=group_name,
+            group_name=await _group_name(group_id),
             updated_at=session_db.notes_summarized_until,
         )
     except Exception as e:
