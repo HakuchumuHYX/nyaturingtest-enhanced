@@ -3,7 +3,8 @@
 两层决策：
 1. 规则层（本模块）决定这批消息「值不值得调用 Feedback 考虑说话」：被点名、聊天对象在接话、
    或意愿值够高且自己最近没说太多。
-2. Feedback 的 willing 决定「说不说」，门槛按场景区分（被点名必回、聊天对象接话或被戳 0.45、主动插嘴 0.6）。
+2. Feedback 的 willing 决定「说不说」，门槛按场景区分（被点名 0.3、聊天对象接话或被戳 0.45、主动插嘴 0.6）。
+   被点名也不强制回：两个 Bot 互相回复时，只有 Feedback 看着发言量压低 willing 才停得下来。
 """
 
 from dataclasses import dataclass
@@ -25,7 +26,8 @@ INTEREST_MAX_FACTOR = 1.8
 ENGAGE_THRESHOLD = 0.45
 # 最近 SHORT_CONTEXT_LIMIT 条消息里自己的发言占比达到该值，就不再主动插嘴（被点名/聊天对象接话不受限）
 SELF_SHARE_LIMIT = 0.2
-# Feedback willing 的接话门槛：聊天对象在接话 / 主动插嘴；被点名时必回
+# Feedback willing 的接话门槛：被点名 / 聊天对象在接话 / 主动插嘴
+SPEAK_THRESHOLD_ADDRESSED = 0.3
 SPEAK_THRESHOLD_CONVERSATION = 0.45
 SPEAK_THRESHOLD_PASSIVE = 0.6
 # 被点名（名字/别名、@、回复 Bot）时的意愿下限
@@ -75,7 +77,7 @@ class EngagementDecision:
     @property
     def speak_threshold(self) -> float:
         if self.relevant:
-            return 0.0
+            return SPEAK_THRESHOLD_ADDRESSED
         if self.in_conversation or self.poked:
             return SPEAK_THRESHOLD_CONVERSATION
         return SPEAK_THRESHOLD_PASSIVE

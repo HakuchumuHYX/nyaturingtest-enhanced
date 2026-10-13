@@ -2,13 +2,13 @@ import math
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from nonebot import logger
 
 from ..storage.db import get_history_before, message_final_id
 from .domain import EmotionState, PersonProfile
-from ..memory.short_term import Message
+from ..memory.short_term import SHORT_TERM_BUFFER_SIZE, Message
 from ..memory.validation import validate_memory_candidate
 from ..memory.vector import (
     RAG_FINAL_K,
@@ -45,7 +45,7 @@ CONSOLIDATION_INTERVAL_SECONDS = 180.0
 CONSOLIDATION_MAX_MESSAGES = 60
 HISTORY_RECALL_LIMIT = 20
 MY_RECENT_REPLIES_LIMIT = 6
-GROUP_HEAT_SECONDS = 600
+GROUP_HEAT_SECONDS = 900
 
 
 def _user_key(message: Message) -> str:
@@ -59,16 +59,44 @@ def _format_history(messages: list[Message]) -> list[dict]:
     ]
 
 
-def _group_heat(messages: list[Message], bot_name: str, now: datetime) -> str:
-    """近 10 分钟群友的消息数和发言人数，给 Feedback 判断群里聊得热不热。"""
+def _group_heat(messages: list[Message], bot_name: str) -> str:
+    """群友的消息数、发言人数，加上角色自己的发言量，给 Feedback 判断群热度和自己是不是说多了。
 
-    recent = [
-        m
-        for m in messages
-        if m.user_name != bot_name and (now - m.time).total_seconds() <= GROUP_HEAT_SECONDS
-    ]
-    speakers = {_user_key(m) for m in recent}
-    return f"近10分钟 {len(recent)} 条、{len(speakers)} 人在说话"
+    messages 是窗口内的全部消息。角色连续发的几条算一次开口，接的是开口前最后一个群友。
+    """
+
+    others = [m for m in messages if m.user_name != bot_name]
+    speakers = {_user_key(m) for m in others}
+    heat = f"近15分钟群友 {len(others)} 条、{len(speakers)} 人在说话"
+
+    own_count = 0
+    turns = 0
+    partner_turns: dict[str, int] = {}
+    partner_names: dict[str, str] = {}
+    last_other: Message | None = None
+    previous_is_own = False
+    for m in messages:
+        if m.user_name != bot_name:
+            last_other = m
+            previous_is_own = False
+            continue
+        own_count += 1
+        if not previous_is_own:
+            turns += 1
+            if last_other is not None:
+                key = _user_key(last_other)
+                partner_turns[key] = partner_turns.get(key, 0) + 1
+                partner_names[key] = last_other.user_name
+        previous_is_own = True
+
+    if not own_count:
+        return f"{heat}；你一句没说"
+    heat += f"；你开口 {turns} 次、共 {own_count} 条"
+    if partner_turns:
+        top_key = max(partner_turns, key=partner_turns.get)
+        if partner_turns[top_key] >= 2:
+            heat += f"，其中 {partner_turns[top_key]} 次是在接 {partner_names[top_key]} 的话"
+    return heat
 
 
 def _history_without_current_chunk(
@@ -423,11 +451,11 @@ class ConversationOrchestrator:
             if decision is not None:
                 self._advance_consolidation_watermark(messages_chunk)
 
-            # Feedback 失败时只有被点名才回
-            speak = is_relevant or (
-                decision is not None
-                and decision.llm_willing >= engagement.speak_threshold
-            )
+            # 被点名也交给 willing 判断；Feedback 失败时只有被点名才回
+            if decision is None:
+                speak = is_relevant
+            else:
+                speak = decision.llm_willing >= engagement.speak_threshold
             log_event(
                 "speak_decision",
                 session_id=session.id,
@@ -603,7 +631,11 @@ class ConversationOrchestrator:
                 for index, msg in enumerate(messages_chunk)
             ],
             group_heat=_group_heat(
-                self.session.runtime.short_term_memory.access(), state.name, now
+                self.session.runtime.short_term_memory.messages_after(
+                    now - timedelta(seconds=GROUP_HEAT_SECONDS),
+                    limit=SHORT_TERM_BUFFER_SIZE,
+                ),
+                state.name,
             ),
         )
 
