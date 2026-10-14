@@ -10,7 +10,7 @@ class SessionModel(Model):
     # 预设文件名，空串是没设人设（不说话）；名字、别名等运行时从预设读，不存快照，免得改了 json 不同步
     preset = fields.CharField(max_length=255, default="")
 
-    # 角色在群里的心情；读取前按 emotion_updated_at 结算回落，见 core/domain.py
+    # 角色在群里的心情；读取前按 emotion_updated_at 结算回落，见 chat/domain.py
     valence = fields.FloatField(default=0.0)
     arousal = fields.FloatField(default=0.3)
     dominance = fields.FloatField(default=0.0)
@@ -23,7 +23,7 @@ class SessionModel(Model):
     # 群志只由每日整理任务写入；水位是已整理到的最新碎片 created_at
     group_notes = fields.TextField(default="")
     notes_summarized_until = fields.DatetimeField(null=True)
-    # 分段整理已读到的最后一条消息时间，只由 core/episodes.py 写入
+    # 分段整理已读到的最后一条消息时间，只由 memory/episodes.py 写入
     episodes_until = fields.DatetimeField(null=True)
 
     class Meta:
@@ -112,7 +112,7 @@ class MemoryModel(Model):
 
 
 class PersonaLifeModel(Model):
-    """人生线：每个预设一份，各群共享，只由每日整理写入（core/persona.py）。"""
+    """人生线：每个预设一份，各群共享，只由每日整理写入（memory/persona.py）。"""
 
     preset = fields.CharField(pk=True, max_length=255)
     text = fields.TextField(default="")

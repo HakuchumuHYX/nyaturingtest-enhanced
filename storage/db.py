@@ -6,7 +6,7 @@ from nonebot import logger
 from tortoise import Tortoise
 from tortoise.transactions import in_transaction
 
-from ..memory.short_term import SHORT_TERM_BUFFER_SIZE, Message
+from ..messages.message import SHORT_TERM_BUFFER_SIZE, Message
 from .models import (
     DailyTokenUsageModel,
     EnabledGroupModel,

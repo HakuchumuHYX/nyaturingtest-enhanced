@@ -18,6 +18,15 @@ from datetime import date, datetime, timedelta
 
 from nonebot import logger
 
+from ..llm import extract_and_parse_json, feedback_client
+from ..prompts import (
+    JOURNAL_DAYS,
+    MAX_LIFE_FACTS,
+    PRESETS,
+    RolePreset,
+    get_persona_group_prompt,
+    get_persona_life_prompt,
+)
 from ..storage.models import (
     GlobalMessageModel,
     PersonaGroupModel,
@@ -25,15 +34,6 @@ from ..storage.models import (
     PersonaLifeModel,
     SessionModel,
     UserProfileModel,
-)
-from .llm import extract_and_parse_json, feedback_client
-from .prompts import (
-    JOURNAL_DAYS,
-    MAX_LIFE_FACTS,
-    PRESETS,
-    RolePreset,
-    get_persona_group_prompt,
-    get_persona_life_prompt,
 )
 
 GROUP_MATERIAL_CHARS = 12000

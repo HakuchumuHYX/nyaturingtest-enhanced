@@ -11,7 +11,7 @@ import httpx
 from nonebot import logger
 from openai import APIConnectionError, APITimeoutError, AsyncOpenAI
 
-from ..config import EndpointSettings, get_app_settings
+from .config import EndpointSettings, get_app_settings
 from .metrics import log_event, metrics, record_token_usage
 from .prompts import CHAT_SYSTEM_PROMPT, FEEDBACK_SYSTEM_PROMPT, JSON_SYSTEM_PROMPT
 

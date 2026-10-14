@@ -4,15 +4,15 @@ from datetime import datetime
 
 from nonebot import logger
 
+from ..chat.groups import GroupState
+from ..llm import chat_client, extract_and_parse_json
+from ..prompts import describe_relation, get_impression_prompt
 from ..storage.db import get_recent_messages_by_user
-from ..memory.vector import (
+from .vector import (
     RAG_ITEM_CHARS,
     RAG_MEMORY_CHAR_BUDGET,
     RAG_MERGED_CANDIDATE_CAP,
 )
-from .llm import chat_client, extract_and_parse_json
-from .prompts import describe_relation, get_impression_prompt
-from .state_manager import GroupState
 
 MEMORY_QUERY_USER_COOLDOWN_SECONDS = 30.0
 MEMORY_QUERY_GROUP_COOLDOWN_SECONDS = 3.0

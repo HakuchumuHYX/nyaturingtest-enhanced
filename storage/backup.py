@@ -1,4 +1,4 @@
-# 数据备份、保留期清理与定时任务
+# 数据备份、保留期清理
 
 import asyncio
 import os
@@ -15,7 +15,6 @@ require("nonebot_plugin_apscheduler")
 from nonebot_plugin_apscheduler import scheduler  # noqa: E402  必须在 require 之后导入
 
 from ..config import BACKUP_DIR, get_data_dir
-from ..core.state_manager import maintain_long_term_memory
 from .models import GlobalMessageModel, TokenUsageModel
 
 # 原始明细保留天数
@@ -163,7 +162,7 @@ async def backup_task() -> bool:
 
 
 def setup_backup_job():
-    """注册定时备份与长期记忆维护任务"""
+    """注册定时备份（顺带清理保留期外的原始明细）"""
 
     scheduler.add_job(
         backup_task,
@@ -172,15 +171,6 @@ def setup_backup_job():
         minute=0,
         id="nyaturingtest_daily_backup",
         misfire_grace_time=3600,  # 允许误差一小时（比如刚好四点时机器人没开机）
-        replace_existing=True,
-    )
-    scheduler.add_job(
-        maintain_long_term_memory,
-        "cron",
-        hour=3,
-        minute=30,
-        id="nyaturingtest_vector_maintenance",
-        misfire_grace_time=3600,
         replace_existing=True,
     )
     logger.info("已注册自动备份定时任务: 每天凌晨 04:00")

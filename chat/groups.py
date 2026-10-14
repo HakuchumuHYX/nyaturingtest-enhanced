@@ -3,18 +3,21 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from nonebot import logger
+from nonebot import logger, require
 from nonebot.adapters.onebot.v11 import Bot, Event
 from tortoise import Tortoise
 
-from ..storage.db import load_enabled_group_ids
-from ..memory.short_term import Message as MMessage
-from ..memory.vector import close_clients, maintain_memories
-from .digest import digest_group_notes, digest_user_profiles
-from .llm import close_http_client
-from .metrics import drain_usage_tasks
-from .persona import maintain_personas
-from .session import Session
+require("nonebot_plugin_apscheduler")
+from nonebot_plugin_apscheduler import scheduler  # noqa: E402  必须在 require 之后导入
+
+from ..llm import close_http_client  # noqa: E402
+from ..memory.digest import digest_group_notes, digest_user_profiles  # noqa: E402
+from ..memory.persona import maintain_personas  # noqa: E402
+from ..memory.vector import close_clients, maintain_memories  # noqa: E402
+from ..messages.message import Message as MMessage  # noqa: E402
+from ..metrics import drain_usage_tasks  # noqa: E402
+from ..storage.db import load_enabled_group_ids  # noqa: E402
+from .session import Session  # noqa: E402
 
 QUEUE_MAX_SIZE = 200
 
@@ -78,8 +81,8 @@ def ensure_group_state(group_id: int):
     task = _group_tasks.get(group_id)
     if task is None or task.done():
         _group_tasks.pop(group_id, None)
-        # 局部导入：logic 反向依赖本模块的 GroupState
-        from .logic import spawn_state
+        # 局部导入：worker 反向依赖本模块的 GroupState
+        from .worker import spawn_state
 
         logger.info(f"启动群 {group_id} 的 spawn_state 后台任务...")
         _group_tasks[group_id] = asyncio.create_task(
@@ -184,6 +187,18 @@ async def _maintain_personas() -> None:
             state.self_life = lives[state.preset]
         if str(group_id) in groups:
             state.self_in_group = groups[str(group_id)]
+
+
+def setup_maintenance_job():
+    scheduler.add_job(
+        maintain_long_term_memory,
+        "cron",
+        hour=3,
+        minute=30,
+        id="nyaturingtest_vector_maintenance",
+        misfire_grace_time=3600,
+        replace_existing=True,
+    )
 
 
 async def cleanup_global_resources():

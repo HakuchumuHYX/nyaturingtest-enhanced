@@ -7,8 +7,8 @@ from pathlib import Path
 
 from nonebot import logger
 
-from ..core.llm import get_http_client
-from ..core.memory_query import Impression
+from ..llm import get_http_client
+from ..memory.query import Impression
 from .browser import screenshot
 
 _TEMPLATE = Path(__file__).with_name("impression.html")

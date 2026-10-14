@@ -24,29 +24,29 @@ from .cards.notes import render_group_notes_card
 from .cards.persona import Change as PersonaChange
 from .cards.persona import render_persona_card
 from .cards.token_stats import render_token_stats_card
-from .config import get_app_settings, get_token_stats_model_names
-from .core.digest import GROUP_NOTES_REFRESH_MIN_NEW, count_new_group_fragments
-from .core.faces import ensure_faces, face_name
-from .core.forward import digest_forward
-from .core.llm import chat_client, feedback_client
-from .core.logic import fill_caption, message2BotMessage
-from .core.memory_query import acquire_query_slot, impression_text, query_memory_profile
-from .core.metrics import log_event
-from .core.metrics import metrics
-from .core.prompts import PRESETS
-from .core.state_manager import (
+from .chat.groups import (
     ensure_group_state,
     is_shutting_down,
     refresh_group_notes,
     remove_group_state,
     runtime_enabled_groups,
 )
-from .memory.short_term import Message as MMessage
+from .config import get_app_settings, get_token_stats_model_names
+from .llm import chat_client, feedback_client
+from .memory.digest import GROUP_NOTES_REFRESH_MIN_NEW, count_new_group_fragments
+from .memory.query import acquire_query_slot, impression_text, query_memory_profile
 from .memory.vector import (
     RAG_FINAL_K,
     RAG_MERGED_CANDIDATE_CAP,
     RAG_PER_QUERY_RECALL_K,
 )
+from .messages.convert import fill_caption, message2BotMessage
+from .messages.faces import ensure_faces, face_name
+from .messages.forward import digest_forward
+from .messages.message import Message as MMessage
+from .metrics import log_event
+from .metrics import metrics
+from .prompts import PRESETS
 from .storage.backup import backup_task
 from .storage.db import disable_group, enable_group, get_token_stats, recall_message
 from .storage.models import PersonaHistoryModel, SessionModel

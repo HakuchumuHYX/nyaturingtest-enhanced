@@ -11,19 +11,19 @@ from nonebot import logger, require
 require("nonebot_plugin_apscheduler")
 from nonebot_plugin_apscheduler import scheduler  # noqa: E402  必须在 require 之后导入
 
-from ..storage.db import get_latest_user_names, message_final_id  # noqa: E402
-from ..memory.short_term import Message  # noqa: E402
-from ..storage.models import GlobalMessageModel, MemoryModel, SessionModel  # noqa: E402
-from .llm import extract_and_parse_json, feedback_client  # noqa: E402
-from .metrics import log_event  # noqa: E402
-from .orchestrator import save_memory_candidates  # noqa: E402
-from .prompts import get_episode_prompt, truncate_text  # noqa: E402
-from .state_manager import (  # noqa: E402
+from ..chat.groups import (  # noqa: E402
     GroupState,
     group_states,
     is_shutting_down,
     runtime_enabled_groups,
 )
+from ..llm import extract_and_parse_json, feedback_client  # noqa: E402
+from ..messages.message import Message  # noqa: E402
+from ..metrics import log_event  # noqa: E402
+from ..prompts import get_episode_prompt, truncate_text  # noqa: E402
+from ..storage.db import get_latest_user_names, message_final_id  # noqa: E402
+from ..storage.models import GlobalMessageModel, MemoryModel, SessionModel  # noqa: E402
+from .candidates import save_memory_candidates  # noqa: E402
 
 SCAN_INTERVAL_MINUTES = 5
 # 最后一条消息距今这么久，算一段聊完了

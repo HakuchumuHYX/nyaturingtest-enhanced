@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 
-from ..memory.short_term import Message
+from ..messages.message import Message
 
 # 两次发送之间的最小间隔（在发送前等待，不再跳过整轮）
 SPEAK_COOLDOWN_SECONDS = 16.0

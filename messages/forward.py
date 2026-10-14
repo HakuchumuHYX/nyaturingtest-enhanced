@@ -14,13 +14,13 @@ from nonebot.adapters.onebot.v11 import Bot, Event
 from nonebot.adapters.onebot.v11.exception import ActionFailed
 from nonebot.exception import NetworkError
 
-from ..memory.image import fetch_image_input
-from ..memory.short_term import Message
-from .llm import VisionInput, extract_and_parse_json, feedback_client
-from .logic import FORWARD_PLACEHOLDER, segment_text
-from .metrics import log_event
-from .prompts import get_forward_prompt
-from .state_manager import GroupState
+from ..chat.groups import GroupState
+from ..llm import VisionInput, extract_and_parse_json, feedback_client
+from ..metrics import log_event
+from ..prompts import get_forward_prompt
+from .convert import FORWARD_PLACEHOLDER, segment_text
+from .image import fetch_image_input
+from .message import Message
 
 # 上限只为控制单次请求的大小；超出的在提示词里注明，不悄悄丢
 FORWARD_MAX_CHARS = 8000

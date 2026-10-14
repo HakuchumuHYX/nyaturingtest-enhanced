@@ -24,7 +24,7 @@ class Message:
     poke: bool = field(default=False, repr=False, compare=False)
     # 合并转发：读完后内容是别人的聊天记录，里面出现 bot 的名字不算点名。不落库
     forward: bool = field(default=False, repr=False, compare=False)
-    # 后台看图的任务（logic.fill_caption）；处理这批消息前先等它们。不落库
+    # 后台看图的任务（convert.fill_caption）；处理这批消息前先等它们。不落库
     caption_tasks: list[Any] = field(default_factory=list, repr=False, compare=False)
     revision: int = field(default=0, repr=False, compare=False)
     _persistence_id: str = field(default="", repr=False, compare=False)

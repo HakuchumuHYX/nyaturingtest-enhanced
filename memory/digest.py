@@ -18,15 +18,15 @@ from functools import partial
 
 from nonebot import logger
 
-from ..storage.db import get_latest_user_names
-from ..storage.models import MemoryModel, SessionModel, UserProfileModel
-from .llm import extract_and_parse_json, feedback_client
-from .prompts import (
+from ..llm import extract_and_parse_json, feedback_client
+from ..prompts import (
     get_group_notes_prompt,
     get_group_points_prompt,
     get_profile_points_prompt,
     get_profile_prompt,
 )
+from ..storage.db import get_latest_user_names
+from ..storage.models import MemoryModel, SessionModel, UserProfileModel
 
 PROFILE_MIN_NEW_MEMORIES = 10
 # 手动查看群志时新碎片攒到这么多才重新整理：群志只在旧稿上小改，几条新碎片通常改不动什么

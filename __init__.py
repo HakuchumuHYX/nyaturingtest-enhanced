@@ -4,11 +4,16 @@ from nonebot import get_driver, logger
 from tortoise import Tortoise
 
 from . import handlers  # 导入即注册所有 matcher
-from .storage.backup import setup_backup_job
+from .chat.groups import (
+    cleanup_global_resources,
+    init_enabled_groups,
+    setup_maintenance_job,
+)
+from .chat.initiative import setup_initiative_job
 from .config import get_data_dir
-from .core.episodes import setup_episode_job
-from .core.initiative import setup_initiative_job
-from .core.state_manager import cleanup_global_resources, init_enabled_groups
+from .memory.episodes import setup_episode_job
+from .messages.image import setup_image_cache_job
+from .storage.backup import setup_backup_job
 
 driver = get_driver()
 
@@ -31,14 +36,16 @@ async def init_db():
     # 初始化群组列表
     await init_enabled_groups()
 
-    # 注册定时备份、主动发起话题检查与分段整理
-    setup_backup_job()
-    setup_initiative_job()
+    # 注册定时任务：分段整理、主动话题、图片缓存清理、长期记忆维护、备份
     setup_episode_job()
+    setup_initiative_job()
+    setup_image_cache_job()
+    setup_maintenance_job()
+    setup_backup_job()
 
 
 @driver.on_shutdown
 async def cleanup_tasks():
     """生命周期钩子：关机清理"""
-    # 委托给 state_manager 处理，确保顺序正确
+    # 委托给 chat/groups 处理，确保顺序正确
     await cleanup_global_resources()

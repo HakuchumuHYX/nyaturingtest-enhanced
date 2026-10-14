@@ -11,24 +11,24 @@ from nonebot import logger, require
 require("nonebot_plugin_apscheduler")
 from nonebot_plugin_apscheduler import scheduler  # noqa: E402  必须在 require 之后导入
 
-from .domain import PersonProfile  # noqa: E402
-from .llm import build_turn_calls, extract_and_parse_json  # noqa: E402
-from .logic import dispatch_replies  # noqa: E402
-from .metrics import log_event  # noqa: E402
-from .orchestrator import MY_RECENT_REPLIES_LIMIT, _format_history  # noqa: E402
-from .prompts import (  # noqa: E402
+from ..llm import build_turn_calls, extract_and_parse_json  # noqa: E402
+from ..metrics import log_event  # noqa: E402
+from ..prompts import (  # noqa: E402
     describe_mood,
     describe_relation,
     get_initiative_prompt,
     get_time_description,
     is_rest_day,
 )
-from .state_manager import (  # noqa: E402
+from .domain import PersonProfile  # noqa: E402
+from .groups import (  # noqa: E402
     GroupState,
     group_states,
     is_shutting_down,
     runtime_enabled_groups,
 )
+from .orchestrator import MY_RECENT_REPLIES_LIMIT, format_history  # noqa: E402
+from .send import dispatch_replies  # noqa: E402
 
 SCAN_INTERVAL_MINUTES = 10
 # 群里最后一条消息距今至少这么久才算冷场
@@ -144,7 +144,7 @@ async def _initiate(state: GroupState, silence: int) -> None:
         presets=session_state.preset_lines,
         group_notes=session_state.group_notes,
         summary=session_state.chat_summary,
-        recent_msgs=_format_history(messages),
+        recent_msgs=format_history(messages),
         my_recent_replies=my_recent_replies,
         member_profiles=member_profiles,
         recent_memories=recent_memories,

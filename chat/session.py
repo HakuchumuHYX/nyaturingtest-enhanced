@@ -4,6 +4,10 @@ from datetime import datetime
 
 from nonebot import logger
 
+from ..memory.vector import VectorMemory
+from ..messages.message import Memory, Message
+from ..metrics import log_event
+from ..prompts import PRESETS, reload_presets
 from ..storage.db import (
     delete_session_data,
     load_full_session_data,
@@ -14,11 +18,7 @@ from ..storage.db import (
     update_user_profiles,
 )
 from .domain import EmotionState, PersonProfile
-from ..memory.short_term import Memory, Message
-from ..memory.vector import VectorMemory
 from .engagement import WILLINGNESS_LOAD_VALUE, chatting_state
-from .metrics import log_event
-from .prompts import PRESETS, reload_presets
 
 # 后台任务排空超时、保存去抖
 MEMORY_DRAIN_TIMEOUT_SECONDS = 10.0

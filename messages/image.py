@@ -14,14 +14,14 @@ from nonebot.utils import run_sync
 from PIL import Image
 
 from ..config import IMAGE_CACHE_DIR
-from ..core.llm import (
+from ..llm import (
     VisionInput,
     extract_and_parse_json,
     feedback_client,
     get_http_client,
 )
-from ..core.metrics import log_event
-from ..core.prompts import get_image_caption_prompt
+from ..metrics import log_event
+from ..prompts import get_image_caption_prompt
 
 require("nonebot_plugin_apscheduler")
 from nonebot_plugin_apscheduler import scheduler  # noqa: E402  必须在 require 之后导入
@@ -286,11 +286,12 @@ async def cleanup_image_cache_task():
     await _clean_old_image_caches_sync()
 
 
-scheduler.add_job(
-    cleanup_image_cache_task,
-    "cron",
-    hour=3,
-    minute=0,
-    id="nyabot_image_cache_cleanup",
-    replace_existing=True,
-)
+def setup_image_cache_job():
+    scheduler.add_job(
+        cleanup_image_cache_task,
+        "cron",
+        hour=3,
+        minute=0,
+        id="nyabot_image_cache_cleanup",
+        replace_existing=True,
+    )
