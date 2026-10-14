@@ -181,8 +181,9 @@ import sys
 
 from nonebot.log import default_format, logger, logger_id
 
-# NoneBot 内核、适配器和 uvicorn 只留 WARNING 起，其余来源（包括所有插件）跟随 LOG_LEVEL
-NOISY_SOURCES = {"nonebot", "uvicorn"}
+# NoneBot 内核、适配器、uvicorn 和 websockets 只留 WARNING 起，其余来源（包括所有插件）跟随 LOG_LEVEL；
+# 连上时插件自己会记一行「Bot N 已连接」
+NOISY_SOURCES = {"nonebot", "uvicorn", "websockets"}
 
 
 def _log_filter(record) -> bool:
