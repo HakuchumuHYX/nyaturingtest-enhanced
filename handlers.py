@@ -7,6 +7,7 @@ from nonebot.adapters.onebot.v11 import (
     Bot,
     Event,
     GroupMessageEvent,
+    GroupRecallNoticeEvent,
     Message,
     MessageSegment,
     NoticeEvent,
@@ -26,9 +27,11 @@ from .cards.token_stats import render_token_stats_card
 from .config import get_app_settings, get_token_stats_model_names
 from .core.digest import GROUP_NOTES_REFRESH_MIN_NEW, count_new_group_fragments
 from .core.faces import ensure_faces, face_name
+from .core.forward import digest_forward
 from .core.llm import chat_client, feedback_client
-from .core.logic import message2BotMessage
+from .core.logic import fill_caption, message2BotMessage
 from .core.memory_query import acquire_query_slot, impression_text, query_memory_profile
+from .core.metrics import log_event
 from .core.metrics import metrics
 from .core.prompts import PRESETS
 from .core.state_manager import (
@@ -45,7 +48,7 @@ from .memory.vector import (
     RAG_PER_QUERY_RECALL_K,
 )
 from .storage.backup import backup_task
-from .storage.db import disable_group, enable_group, get_token_stats
+from .storage.db import disable_group, enable_group, get_token_stats, recall_message
 from .storage.models import PersonaHistoryModel, SessionModel
 
 # persona 命令列出的最近改动条数（人生线和本群合计）
@@ -236,6 +239,13 @@ async def is_group_poke(event: Event) -> bool:
 
 
 group_poke = on_notice(rule=is_group_poke, priority=99, block=False)
+
+
+async def is_group_recall(event: Event) -> bool:
+    return isinstance(event, GroupRecallNoticeEvent)
+
+
+group_recall = on_notice(rule=is_group_recall, priority=99, block=False)
 
 
 def _dual_command(cmd: str, aliases: set[str], handler):
@@ -460,17 +470,19 @@ async def handle_auto_chat(bot: Bot, event: GroupMessageEvent):
     async with state.session_lock:
         await state.session.load_session()
         bot_name = state.session.state.name
+        generation = state.session.state.generation
 
     # Shutdown 检查：避免在关机时进入耗时的消息处理
     if is_shutting_down():
         return
 
-    message_content, image_inputs, mentions = await message2BotMessage(
+    message_content, image_inputs, mentions, caption_jobs = await message2BotMessage(
         bot_name=bot_name,
         group_id=group_id,
         message=event.original_message,
         bot=bot,
         message_scope=str(event.message_id),
+        caption=bool(bot_name),
     )
     if not message_content:
         return
@@ -485,21 +497,40 @@ async def handle_auto_chat(bot: Bot, event: GroupMessageEvent):
             or user_id
         )
 
+    message = MMessage(
+        time=datetime.now(),
+        user_name=nickname,
+        content=message_content,
+        id=str(event.message_id),
+        user_id=user_id,
+        image_inputs=image_inputs,
+        mentions=mentions,
+        to_me=user_id != str(bot.self_id) and _addresses_bot(bot, event),
+    )
+    message.caption_tasks = [
+        state.session.spawn(fill_caption(state.session, message, job, generation))
+        for job in caption_jobs
+    ]
+    # 合并转发总是单独一条：先以占位进队列，后台读完改写成摘要再放回来（没设人设的群不读）
+    forward_id = next(
+        (
+            str(seg.data.get("id") or "")
+            for seg in event.original_message
+            if seg.type == "forward"
+        ),
+        "",
+    )
+    if forward_id:
+        message.forward = True
+        if bot_name:
+            state.session.spawn(
+                digest_forward(state, bot, event, message, forward_id, generation)
+            )
+
     async with state.data_lock:
         state.event = event
         state.bot = bot
-        state.messages_chunk.append(
-            MMessage(
-                time=datetime.now(),
-                user_name=nickname,
-                content=message_content,
-                id=str(event.message_id),
-                user_id=user_id,
-                image_inputs=image_inputs,
-                mentions=mentions,
-                to_me=user_id != str(bot.self_id) and _addresses_bot(bot, event),
-            )
-        )
+        state.messages_chunk.append(message)
         state.new_message_signal.set()
 
 
@@ -601,6 +632,40 @@ async def handle_group_poke(bot: Bot, event: PokeNotifyEvent):
             )
         )
         state.new_message_signal.set()
+
+
+@group_recall.handle()
+async def handle_group_recall(event: GroupRecallNoticeEvent):
+    """撤回：原消息内容原地改成撤回标记，不删，bot 之前对它的回复在上下文里才接得上；不触发新一轮。
+
+    队列、短期缓冲、消息库三处都改，哪处没有就是不在那里。已经整理进记忆碎片、档案、群志的不追删。
+    """
+
+    if is_shutting_down():
+        return
+    state = ensure_group_state(event.group_id)
+    if not state:
+        return
+    async with state.session_lock:
+        await state.session.load_session()
+
+    msg_id = str(event.message_id)
+    by_author = event.operator_id == event.user_id
+    content = "[撤回了一条消息]" if by_author else "[一条消息被管理员撤回了]"
+    async with state.data_lock:
+        queued = [m for m in state.messages_chunk if m.id == msg_id]
+        for message in queued:
+            message.content = content
+            message.image_inputs = []
+    in_buffer = state.session.recall_message(msg_id, content)
+    await recall_message(state.session.id, msg_id, content)
+    log_event(
+        "recall",
+        session_id=state.session.id,
+        by_author=by_author,
+        queued=bool(queued),
+        in_buffer=in_buffer,
+    )
 
 
 @manage_cmd.handle()

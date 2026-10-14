@@ -224,6 +224,14 @@ async def sync_messages(session_id: str, recent_msgs: list[Message]):
         logger.debug(f"[Repo] 更新了 {len(updates)} 条已丰富消息")
 
 
+async def recall_message(session_id: str, msg_id: str, content: str) -> int:
+    """消息库里那条改成撤回标记；还没落库时改不到，由缓冲里改写过的那条落库时带上。"""
+
+    return await GlobalMessageModel.filter(session_id=session_id, msg_id=msg_id).update(
+        content=content
+    )
+
+
 async def get_history_before(
     session_id: str, time_point: datetime, limit: int = 20
 ) -> list[Message]:

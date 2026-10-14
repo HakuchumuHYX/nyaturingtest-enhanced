@@ -20,18 +20,19 @@ from .prompts import CHAT_SYSTEM_PROMPT, FEEDBACK_SYSTEM_PROMPT, JSON_SYSTEM_PRO
 class VisionInput:
     """Ephemeral image input for an OpenAI-compatible multimodal request."""
 
+    # 附图标签，写明是哪条消息的哪张图（如「消息 527151 引用的第 1 张图」），模型靠它和消息 id 对上号
     ref_id: str
     data_url: str = field(repr=False)
     is_sticker: bool = False
-    source: str = "primary"
     detail: str = "auto"
+    # 原始字节的 SHA-1，描述缓存的 key：同一张图换人发、换 fileid 也一样
+    digest: str = ""
 
     def to_openai_content(self) -> list[dict]:
-        source_label = "引用消息图片" if self.source == "referenced" else "当前消息图片"
         return [
             {
                 "type": "text",
-                "text": f"[{source_label} image_ref={self.ref_id}]",
+                "text": f"[{self.ref_id}]",
             },
             {
                 "type": "image_url",
@@ -261,7 +262,10 @@ feedback_client = LLMClient(get_app_settings().feedback)
 def build_turn_calls(
     session_id: str, images: list[VisionInput]
 ) -> tuple[Callable[[str], Awaitable[str]], Callable[[str], Awaitable[str]]]:
-    """构造本轮对话的 chat / feedback 两个调用闭包（带上本轮图片）。"""
+    """构造本轮对话的 chat / feedback 两个调用闭包。
+
+    只有 Chat 带本轮原图：Feedback 判断心情和要不要说话，看消息里的图片描述就够了。
+    """
 
     async def chat_call(prompt: str) -> str:
         return await chat_client.generate(
@@ -279,7 +283,6 @@ def build_turn_calls(
             session_id=session_id,
             temperature=0.1,
             system_prompt=FEEDBACK_SYSTEM_PROMPT,
-            images=images,
         )
 
     return chat_call, feedback_call

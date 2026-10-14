@@ -22,6 +22,10 @@ class Message:
     to_me: bool = field(default=False, repr=False, compare=False)
     # 戳一戳通知转成的记录；被戳不算点名，只让 bot 看一眼、自己决定理不理。不落库
     poke: bool = field(default=False, repr=False, compare=False)
+    # 合并转发：读完后内容是别人的聊天记录，里面出现 bot 的名字不算点名。不落库
+    forward: bool = field(default=False, repr=False, compare=False)
+    # 后台看图的任务（logic.fill_caption）；处理这批消息前先等它们。不落库
+    caption_tasks: list[Any] = field(default_factory=list, repr=False, compare=False)
     revision: int = field(default=0, repr=False, compare=False)
     _persistence_id: str = field(default="", repr=False, compare=False)
 
@@ -54,6 +58,20 @@ class Memory:
     def mark_dirty(self, message: Message) -> None:
         message.revision += 1
         self.__dirty_messages[id(message)] = message
+
+    def rewrite(self, msg_id: str, content: str) -> bool:
+        """按 msg_id 改写缓冲里的一条消息（撤回时用）；不在缓冲里返回 False。
+
+        图片一并清掉，免得进行中这一轮的图片观察再把内容写回去。
+        """
+
+        for message in self.__messages:
+            if message.id == msg_id:
+                message.content = content
+                message.image_inputs = []
+                self.mark_dirty(message)
+                return True
+        return False
 
     def messages_after(self, watermark: datetime | None, limit: int) -> list[Message]:
         """固化水位之后的缓冲消息，最多 limit 条。"""

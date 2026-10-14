@@ -371,6 +371,14 @@ class Session:
         memory.update([msg])
         self.schedule_save()
 
+    def recall_message(self, msg_id: str, content: str) -> bool:
+        """群友撤回消息：缓冲里那条原地改成撤回标记，随下次保存写回消息库。"""
+
+        if not self.runtime.short_term_memory.rewrite(msg_id, content):
+            return False
+        self.schedule_save()
+        return True
+
     def record_incoming(self, messages_chunk: list[Message]) -> None:
         """写入短时记忆并累计固化窗口。"""
 

@@ -673,43 +673,6 @@ class ConversationOrchestrator:
 
         return response
 
-    def _apply_image_observations(
-        self,
-        response: dict,
-        messages_chunk: list[Message],
-    ) -> None:
-        """把 Feedback 对图片的一句话观察写回消息文本，作为历史里的图片痕迹。"""
-
-        raw_observations = response.get("image_observations", [])
-        if not isinstance(raw_observations, list):
-            return
-        observations_by_ref = {
-            str(item.get("image_ref") or ""): item
-            for item in raw_observations
-            if isinstance(item, dict) and str(item.get("image_ref") or "")
-        }
-        if not observations_by_ref:
-            return
-
-        for msg in messages_chunk:
-            labels = []
-            for image_input in msg.image_inputs:
-                observation = observations_by_ref.get(image_input.ref_id)
-                if not observation:
-                    continue
-                summary = str(
-                    observation.get("summary") or observation.get("description") or ""
-                ).strip()
-                if not summary:
-                    continue
-                label = "表情包" if image_input.is_sticker else "图片"
-                labels.append(f"[{label}: {summary[:80]}]")
-            if not labels:
-                continue
-            content = msg.content.replace("[表情包]", "").replace("[图片]", "").strip()
-            msg.content = f"{content}{''.join(labels)}".strip()
-            self.session.runtime.short_term_memory.mark_dirty(msg)
-
     def _apply_sediment(
         self,
         response: dict,
@@ -823,7 +786,6 @@ class ConversationOrchestrator:
         )
         if response is None or self.session.stale(generation, "feedback_sediment"):
             return None
-        self._apply_image_observations(response, messages_chunk)
         self._apply_sediment(response, messages_chunk, generation, search_result.refs)
         decision = await self._apply_decision(
             response, messages_chunk, is_relevant, generation
@@ -856,7 +818,6 @@ class ConversationOrchestrator:
             return
         if self.session.stale(generation, "consolidation_sediment"):
             return
-        self._apply_image_observations(response, messages_chunk)
         self._apply_sediment(response, messages_chunk, generation, search_result.refs)
         self._advance_consolidation_watermark(messages_chunk)
 

@@ -7,6 +7,7 @@
    被点名也不强制回：两个 Bot 互相回复时，只有 Feedback 看着发言量压低 willing 才停得下来。
 """
 
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
@@ -30,6 +31,8 @@ SELF_SHARE_LIMIT = 0.2
 SPEAK_THRESHOLD_ADDRESSED = 0.3
 SPEAK_THRESHOLD_CONVERSATION = 0.45
 SPEAK_THRESHOLD_PASSIVE = 0.6
+# 图片、表情包（带描述或还没看清）、语音、视频的标记；去掉后什么都不剩就是纯媒体
+_MEDIA_TAG_RE = re.compile(r"\[(?:图片|表情包)(?:[:#][^\]]*)?\]|\[语音\]|\[视频\]")
 # 被点名（名字/别名、@、回复 Bot）时的意愿下限
 RELEVANCE_WILLINGNESS_FLOOR = 0.85
 # Bot 说话后的对话窗口：窗口内只有上次接话的那批人（聊天对象）再说话才算对话在继续
@@ -109,7 +112,7 @@ def evaluate_engagement(
     if relevant:
         state.willingness = max(state.willingness, RELEVANCE_WILLINGNESS_FLOOR)
     elif state.willingness < PASSIVE_GROWTH_CAP:
-        interest = score_message_interest([message.content for message in messages])
+        interest = score_message_interest(messages)
         growth = PASSIVE_GROWTH_PER_MESSAGE * interest * len(messages)
         state.willingness = min(PASSIVE_GROWTH_CAP, state.willingness + growth)
 
@@ -133,9 +136,12 @@ def check_relevance(
     """@Bot、回复 Bot 的消息，或提到名字/别名（至少 2 个字）。
 
     戳一戳记录不算：被戳了回不回话交给 Feedback，不必回。
+    合并转发也不算：读完后是别人的聊天记录，里面出现名字不是在叫 bot。
     """
 
-    messages = [message for message in messages if not message.poke]
+    messages = [
+        message for message in messages if not message.poke and not message.forward
+    ]
     if any(message.to_me for message in messages):
         return True
     triggers = [
@@ -150,19 +156,41 @@ def check_relevance(
     )
 
 
-def score_message_interest(contents: list[str]) -> float:
-    """这批消息有多值得插嘴：提问、有实质内容加分，纯复读/纯表情减分。"""
+def _directed_at_others(message: Message) -> bool:
+    """@ 或回复了别的群友，是在点名对别人说。
 
+    回复自己接着说不算；@ bot 不进 mentions，回复 bot 时 to_me 为真，都不会算进来。
+    """
+
+    return (
+        not message.poke
+        and not message.to_me
+        and any(user_id != message.user_id for user_id in message.mentions)
+    )
+
+
+def score_message_interest(messages: list[Message]) -> float:
+    """这批消息有多值得插嘴：提问、有实质内容加分，纯复读/纯媒体、点名对别人说减分。"""
+
+    contents = [message.content for message in messages]
     text = " ".join(contents).strip()
     if not text:
         return INTEREST_MIN_FACTOR
+    directed = [_directed_at_others(message) for message in messages]
     score = 1.0
-    if "?" in text or "？" in text:
+    # 问别人的问题不是在给 bot 递话头
+    if any(
+        "?" in content or "？" in content
+        for content, is_directed in zip(contents, directed)
+        if not is_directed
+    ):
         score += 0.6
     if any(len(content.strip()) >= 15 for content in contents):
         score += 0.2
     if len(set(text)) <= 2 and len(text) >= 3:
         score -= 0.6
-    if all(content.strip() in {"[图片]", "[表情包]"} for content in contents):
+    if all(not _MEDIA_TAG_RE.sub("", content).strip() for content in contents):
         score -= 0.5
+    if any(directed):
+        score -= 0.6
     return max(INTEREST_MIN_FACTOR, min(INTEREST_MAX_FACTOR, score))

@@ -2,7 +2,9 @@
 
 import asyncio
 import base64
+import hashlib
 import io
+import os
 import re
 import time
 
@@ -12,7 +14,14 @@ from nonebot.utils import run_sync
 from PIL import Image
 
 from ..config import IMAGE_CACHE_DIR
-from ..core.llm import VisionInput, get_http_client
+from ..core.llm import (
+    VisionInput,
+    extract_and_parse_json,
+    feedback_client,
+    get_http_client,
+)
+from ..core.metrics import log_event
+from ..core.prompts import get_image_caption_prompt
 
 require("nonebot_plugin_apscheduler")
 from nonebot_plugin_apscheduler import scheduler  # noqa: E402  必须在 require 之后导入
@@ -25,6 +34,13 @@ SAFE_IMAGE_CONTENT_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"
 _CACHE_KEY_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 _IMG_SEMAPHORE = asyncio.Semaphore(3)
+
+# 原图缓存从写入起留 48 小时；描述缓存命中续租，30 天没被命中才删
+RAW_RETENTION_SECONDS = 48 * 3600
+CAPTION_RETENTION_SECONDS = 30 * 24 * 3600
+CAPTION_TEMPERATURE = 0.1
+CAPTION_CHARS = 120
+_CAPTION_SEMAPHORE = asyncio.Semaphore(4)
 
 
 def _sanitize_cache_key(key: str) -> str:
@@ -71,13 +87,12 @@ async def fetch_image_input(
     *,
     is_sticker: bool,
     ref_id: str,
-    source: str,
 ) -> tuple[str, VisionInput | None]:
-    """下载图片并准备原生多模态输入。返回 (消息文本占位符, 图片输入)。"""
+    """下载图片并准备原生多模态输入。返回 (消息文本占位符, 图片输入)；拿不到图时占位写明原因。"""
 
-    placeholder = "\n[表情包]\n" if is_sticker else "\n[图片]\n"
+    placeholder = "[表情包]" if is_sticker else "[图片]"
     if not url:
-        return ("\n[无效图片]\n", None)
+        return ("[无效图片]", None)
 
     async with _IMG_SEMAPHORE:
         try:
@@ -101,10 +116,10 @@ async def fetch_image_input(
                             and content_type not in SAFE_IMAGE_CONTENT_TYPES
                         ):
                             logger.warning(f"拒绝非图片响应: {content_type}")
-                            return ("\n[图片类型不支持]\n", None)
+                            return ("[图片类型不支持]", None)
                         if len(resp.content) > MAX_IMAGE_BYTES:
                             logger.warning(f"拒绝过大图片: {len(resp.content)} bytes")
-                            return ("\n[图片过大]\n", None)
+                            return ("[图片过大]", None)
                         image_bytes = resp.content
                         break
                     except Exception:
@@ -113,7 +128,7 @@ async def fetch_image_input(
                     await _write_cached(key, image_bytes)
 
             if not image_bytes:
-                return ("\n[图片下载失败]\n", None)
+                return ("[图片下载失败]", None)
 
             payload = await _prepare_native_image_payload(
                 image_bytes, max_side=MAX_IMAGE_SIDE
@@ -128,12 +143,68 @@ async def fetch_image_input(
                     ref_id=ref_id,
                     data_url=f"data:image/{image_format};base64,{encoded}",
                     is_sticker=is_sticker,
-                    source=source,
+                    digest=hashlib.sha1(image_bytes).hexdigest(),
                 ),
             )
         except Exception as e:
             logger.error(f"Image fetch error: {e}")
-            return ("\n[图片处理出错]\n", None)
+            return ("[图片处理出错]", None)
+
+
+def _caption_path(digest: str):
+    return IMAGE_CACHE_DIR.joinpath("caption", f"{digest}.txt")
+
+
+async def cached_caption(digest: str) -> str | None:
+    """查描述缓存；命中就刷新文件时间续租。"""
+
+    path = _caption_path(digest)
+    if not digest or not path.exists():
+        return None
+    try:
+        async with await anyio.open_file(path, encoding="utf-8") as f:
+            caption = await f.read()
+        os.utime(path)
+    except Exception as e:
+        logger.warning(f"读取图片描述缓存失败: {e}")
+        return None
+    return caption or None
+
+
+async def caption_image(vision_input: VisionInput, session_id: str) -> str:
+    """单独看一张图写描述并缓存；失败返回空串。
+
+    描述只写图本身、和发图的人与上下文无关，所以能按内容跨消息、跨群复用。
+    """
+
+    started_at = time.perf_counter()
+    async with _CAPTION_SEMAPHORE:
+        parsed = extract_and_parse_json(
+            await feedback_client.generate(
+                get_image_caption_prompt(is_sticker=vision_input.is_sticker),
+                session_id=session_id,
+                temperature=CAPTION_TEMPERATURE,
+                images=[vision_input],
+            )
+        )
+    raw = str(parsed.get("caption") or "") if isinstance(parsed, dict) else ""
+    # 方括号会和消息里的标记混在一起
+    caption = " ".join(raw.replace("[", "【").replace("]", "】").split())[:CAPTION_CHARS]
+    if caption and vision_input.digest:
+        path = _caption_path(vision_input.digest)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            async with await anyio.open_file(path, "w", encoding="utf-8") as f:
+                await f.write(caption)
+        except Exception as e:
+            logger.warning(f"写入图片描述缓存失败: {e}")
+    log_event(
+        "image_caption",
+        session_id=session_id,
+        outcome="ok" if caption else "failed",
+        latency_ms=int((time.perf_counter() - started_at) * 1000),
+    )
+    return caption
 
 
 @run_sync
@@ -183,28 +254,29 @@ def _prepare_native_image_payload(
 
 @run_sync
 def _clean_old_image_caches_sync():
-    """清理超过 48 小时的图片缓存文件。"""
+    """清理过期的原图缓存（写入起 48 小时）和描述缓存（30 天没被命中）。"""
 
     try:
         now = time.time()
-        retention_seconds = 48 * 3600
-        count = 0
-
-        if IMAGE_CACHE_DIR.exists():
-            raw_dir = IMAGE_CACHE_DIR.joinpath("raw")
-            if raw_dir.exists():
-                for file_path in raw_dir.iterdir():
-                    if file_path.is_file() and (
-                        now - file_path.stat().st_mtime > retention_seconds
-                    ):
-                        try:
-                            file_path.unlink()
-                            count += 1
-                        except Exception as e:
-                            logger.warning(f"删除过期原图缓存失败 {file_path}: {e}")
-
-        if count > 0:
-            logger.info(f"成功清理 {count} 个超过 48 小时的旧图片缓存文件。")
+        for name, retention_seconds in (
+            ("raw", RAW_RETENTION_SECONDS),
+            ("caption", CAPTION_RETENTION_SECONDS),
+        ):
+            cache_dir = IMAGE_CACHE_DIR.joinpath(name)
+            if not cache_dir.exists():
+                continue
+            count = 0
+            for file_path in cache_dir.iterdir():
+                if file_path.is_file() and (
+                    now - file_path.stat().st_mtime > retention_seconds
+                ):
+                    try:
+                        file_path.unlink()
+                        count += 1
+                    except Exception as e:
+                        logger.warning(f"删除过期图片缓存失败 {file_path}: {e}")
+            if count > 0:
+                logger.info(f"清理了 {count} 个过期的图片缓存文件（{name}）")
     except Exception as e:
         logger.error(f"清理图片缓存任务执行异常: {e}")
 
