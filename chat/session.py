@@ -210,7 +210,6 @@ class Session:
                 )
                 self.runtime.short_term_memory.mark_persisted(pending_messages)
 
-            logger.debug(f"[Session {self.id}] 数据库保存成功")
             return True
         except Exception as e:
             logger.warning(f"[Session {self.id}] 数据库保存警告: {e}")
@@ -347,9 +346,6 @@ class Session:
         """
         主动记录 Bot 自己的发言 (防止等待回显导致记忆延迟)
         """
-        logger.debug(
-            f"[Session {self.id}] 主动写入自身记忆: {content[:20]}... (ID: {msg_id})"
-        )
         msg = Message(
             time=datetime.now(),
             user_name=self.state.name,

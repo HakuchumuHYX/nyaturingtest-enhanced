@@ -1,7 +1,6 @@
 """每群的后台 worker：防抖取一批消息、等图片描述、跑一轮对话、把结果发出去。"""
 
 import asyncio
-import traceback
 from dataclasses import dataclass
 
 from nonebot import logger
@@ -9,6 +8,7 @@ from nonebot.adapters.onebot.v11 import Bot, Event
 
 from ..llm import build_turn_calls
 from ..messages.message import Message as MMessage
+from ..metrics import log_event
 from .groups import SELF_SENT_MSG_IDS, GroupState, is_shutting_down
 from .orchestrator import ConversationOrchestrator
 from .send import dispatch_replies, send_poke, send_reaction
@@ -78,9 +78,17 @@ async def _process_inbox_batch(state: GroupState, batch: InboxBatch) -> None:
     if pending:
         _, not_done = await asyncio.wait(pending, timeout=CAPTION_WAIT_SECONDS)
         if not_done:
-            logger.info(
+            logger.warning(
                 f"{len(not_done)} 张图 {CAPTION_WAIT_SECONDS:.0f}s 内没看完，先带着占位处理"
             )
+    for message in current_chunk:
+        log_event(
+            "message",
+            "DEBUG",
+            session_id=state.session.id,
+            user=message.user_name,
+            content=message.content,
+        )
     if is_shutting_down():
         return
 
@@ -117,7 +125,6 @@ async def _process_inbox_batch(state: GroupState, batch: InboxBatch) -> None:
 async def spawn_state(state: GroupState):
     """Small worker boundary: debounce, invoke one turn, contain failures."""
 
-    logger.info(f"GroupState 后台任务启动: {id(state)}")
     while True:
         try:
             batch = await next_inbox_batch(state)
@@ -128,6 +135,5 @@ async def spawn_state(state: GroupState):
             logger.info(f"后台任务被取消: {id(state)}")
             break
         except Exception as e:
-            logger.error(f"Spawn loop error: {e}")
-            traceback.print_exc()
+            logger.exception(f"Spawn loop error: {e}")
             await asyncio.sleep(5.0)

@@ -143,7 +143,9 @@ async def message2BotMessage(
         kind = _image_kind(vision_input)
         cached = await cached_caption(vision_input.digest)
         if cached:
-            log_event("image_caption", session_id=str(group_id), outcome="cache_hit")
+            log_event(
+                "image_caption", "DEBUG", session_id=str(group_id), outcome="cache_hit"
+            )
             return (f"[{kind}: {cached}]", [vision_input])
         token = f"[{kind}#{secrets.token_hex(2)}]"
         caption_jobs.append(CaptionJob(token, vision_input))

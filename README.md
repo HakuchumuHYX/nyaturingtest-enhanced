@@ -166,6 +166,40 @@
 
 备份里有聊天内容、QQ 号和对群友的记忆，属于敏感数据，请妥善保存。
 
+## 日志
+
+插件的日志级别跟随 `.env` 的 `LOG_LEVEL`：
+
+- `INFO`：每轮说不说（`speak_decision`）、发出的话（`reply`）、贴表情、记忆写入、定时整理结果。
+- `DEBUG`：再加上收到的消息（`message`）、检索统计、每次模型调用、看图，顺着 `message` → `speak_decision` → `reply` 能读出一轮是怎么走的。
+
+NoneBot 自己在 INFO/DEBUG 会给每条消息打十几行匹配器调度日志，开 `DEBUG` 时很吵。想只压掉它们，可以在 `bot.py` 里
+`nonebot.init()` 之前换掉默认的日志输出，其他插件不受影响：
+
+```python
+import sys
+
+from nonebot.log import default_format, logger, logger_id
+
+# NoneBot 内核、适配器和 uvicorn 只留 WARNING 起，其余来源（包括所有插件）跟随 LOG_LEVEL
+NOISY_SOURCES = {"nonebot", "uvicorn"}
+
+
+def _log_filter(record) -> bool:
+    level = (
+        "WARNING"
+        if record["name"] in NOISY_SOURCES
+        else record["extra"].get("nonebot_log_level", "INFO")
+    )
+    return record["level"].no >= logger.level(level).no
+
+
+logger.remove(logger_id)
+logger.add(sys.stdout, level=0, diagnose=False, filter=_log_filter, format=default_format)
+```
+
+压掉之后，收到消息的原文（NoneBot 的 SUCCESS 行）也不再输出，插件的 `message` 记的是转换后的文字（图片已换成描述）。
+
 ## 致谢与许可
 
 感谢原项目作者 [shadow3aaa](https://github.com/shadow3aaa/)。

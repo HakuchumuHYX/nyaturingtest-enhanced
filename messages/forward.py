@@ -163,6 +163,7 @@ async def digest_forward(
         outcome = "failed"
     log_event(
         "forward_digest",
+        "DEBUG",
         session_id=session.id,
         nodes=node_count,
         images=len(out.images),

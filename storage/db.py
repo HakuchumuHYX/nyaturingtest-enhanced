@@ -214,14 +214,11 @@ async def sync_messages(session_id: str, recent_msgs: list[Message]):
 
     if bulk_msgs:
         await GlobalMessageModel.bulk_create(bulk_msgs)
-        logger.debug(f"[Repo] 同步了 {len(bulk_msgs)} 条新消息")
     for final_msg_id, values in updates:
         await GlobalMessageModel.filter(
             session=session_db,
             msg_id=final_msg_id,
         ).update(**values)
-    if updates:
-        logger.debug(f"[Repo] 更新了 {len(updates)} 条已丰富消息")
 
 
 async def recall_message(session_id: str, msg_id: str, content: str) -> int:

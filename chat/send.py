@@ -82,6 +82,7 @@ async def send_one(
         if isinstance(result, dict) and "message_id" in result:
             message_id = str(result["message_id"])
             SELF_SENT_MSG_IDS.append(message_id)
+        log_event("reply", session_id=state.session.id, content=memory_text)
 
         # 同步写入短时记忆，中间没有 await，不需要再拿 session_lock
         if not state.session.stale(generation, "append_self_message"):

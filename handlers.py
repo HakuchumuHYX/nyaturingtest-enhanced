@@ -661,6 +661,7 @@ async def handle_group_recall(event: GroupRecallNoticeEvent):
     await recall_message(state.session.id, msg_id, content)
     log_event(
         "recall",
+        "DEBUG",
         session_id=state.session.id,
         by_author=by_author,
         queued=bool(queued),

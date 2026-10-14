@@ -407,9 +407,6 @@ class VectorMemory:
                 if len(final_results) >= k:
                     break
 
-            logger.debug(
-                f"Rerank完成: 初筛{len(candidates)} -> 终选{len(final_results)} (阈值{threshold})"
-            )
             if not final_results:
                 return RetrievalResult(
                     [], _retrieval_stats(candidates, [], "rerank_all_filtered")

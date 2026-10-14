@@ -7,14 +7,28 @@ from nonebot import logger
 from .storage.db import log_token_usage
 
 
-def log_event(event: str, **fields):
-    """输出一行结构化 JSON 事件日志。"""
+def log_event(event: str, level: str = "INFO", **fields):
+    """输出一行结构化事件日志：event k=v k=v，字段按调用顺序。"""
 
-    payload = {"event": event}
-    payload.update({key: value for key, value in fields.items() if value is not None})
-    logger.info(
-        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    parts = [event]
+    parts.extend(
+        f"{key}={_format_value(value)}"
+        for key, value in fields.items()
+        if value is not None
     )
+    logger.log(level, " ".join(parts))
+
+
+def _format_value(value) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (list, dict)):
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    text = str(value)
+    # 含空白、等号、引号或为空时加引号；换行顺带转义，保证一事件一行
+    if not text or any(ch.isspace() or ch in '="' for ch in text):
+        return json.dumps(text, ensure_ascii=False)
+    return text
 
 
 @dataclass
@@ -30,14 +44,7 @@ USAGE_DRAIN_TIMEOUT_SECONDS = 10.0
 
 
 def record_token_usage(session_id: str, model_name: str, usage: dict) -> None:
-    log_event(
-        "token_usage",
-        session_id=session_id,
-        model=model_name,
-        tokens=usage.get("total_tokens", 0),
-        decision=usage.get("finish_reason", ""),
-    )
-    task = asyncio.create_task(log_token_usage(session_id, model_name, usage))
+    task =asyncio.create_task(log_token_usage(session_id, model_name, usage))
     _PENDING_USAGE_TASKS.add(task)
     task.add_done_callback(_log_usage_task_error)
 

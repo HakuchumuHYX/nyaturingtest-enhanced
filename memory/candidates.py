@@ -161,12 +161,13 @@ async def save_memory_candidates(
             skipped_quality += 1
             log_event(
                 "memory_candidate_rejected",
+                "DEBUG",
                 session_id=session.id,
                 action=candidate["action"],
                 category=candidate["category"],
                 reason=reason,
+                content=candidate["content"][:30],
             )
-            logger.debug(f"[Memory] 跳过不可靠记忆({reason}): {candidate['content'][:30]}...")
             continue
 
         pending_memories.append(

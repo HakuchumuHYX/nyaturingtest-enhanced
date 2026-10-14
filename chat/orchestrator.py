@@ -242,8 +242,6 @@ class ConversationOrchestrator:
                 now=datetime.now(),
             )
             is_relevant = engagement.relevant
-            if is_relevant:
-                logger.info("检测到强关联，意愿值提升")
 
             if not engagement.engaged:
                 if self._consolidation_due():
@@ -254,8 +252,14 @@ class ConversationOrchestrator:
                     await self.consolidate_stage(
                         pending_messages, feedback_call, generation
                     )
-                logger.debug(
-                    f"未进入参与态 (意愿 {state.willingness:.2f}, 自己发言占比 {self_share:.0%})，跳过响应"
+                log_event(
+                    "speak_decision",
+                    "DEBUG",
+                    session_id=session.id,
+                    engaged=False,
+                    relevant=is_relevant,
+                    willingness=round(state.willingness, 2),
+                    self_share=round(self_share, 2),
                 )
                 return None
 
@@ -264,7 +268,6 @@ class ConversationOrchestrator:
             if session.stale(generation, "rag_search"):
                 return None
 
-            logger.debug("启用拟人化串行模式: Feedback -> Check -> Chat")
             try:
                 decision = await self.feedback_stage(
                     messages_chunk,
@@ -289,6 +292,7 @@ class ConversationOrchestrator:
             log_event(
                 "speak_decision",
                 session_id=session.id,
+                engaged=True,
                 relevant=is_relevant,
                 in_conversation=engagement.in_conversation,
                 llm_willing=decision.llm_willing if decision else None,
@@ -348,7 +352,6 @@ class ConversationOrchestrator:
         elif not user_ids:
             rag_stats["skip_reason"] = "no_users"
         else:
-            logger.debug(f"触发长期记忆检索: {queries[:5]}...")
             retrieval = await vector_memory.retrieve_with_decay(
                 queries,
                 k=RAG_FINAL_K,
@@ -365,7 +368,7 @@ class ConversationOrchestrator:
         rag_stats["injected_count"] = len(preset_lines) + len(memory_lines)
         rag_stats["injected_chars"] = sum(len(line) for line in preset_lines + memory_lines)
         rag_stats["elapsed_ms"] = int((time.perf_counter() - started_at) * 1000)
-        log_event("rag_search", **rag_stats)
+        log_event("rag_search", "DEBUG", **rag_stats)
         return RetrievalResult(
             records=records,
             stats=rag_stats,
@@ -476,6 +479,7 @@ class ConversationOrchestrator:
         if response is None:
             log_event(
                 "feedback_rejected",
+                "WARNING",
                 session_id=self.session.id,
                 failure_reason=failure_reason,
             )
@@ -493,6 +497,7 @@ class ConversationOrchestrator:
         if missing_fields:
             log_event(
                 "feedback_fields_missing",
+                "WARNING",
                 session_id=self.session.id,
                 missing_feedback_fields=missing_fields,
                 response_keys=sorted(str(key) for key in response),
@@ -559,7 +564,6 @@ class ConversationOrchestrator:
 
         # 主动历史溯源 (Historical Recall)
         if response.get("need_history", False):
-            logger.info(f"[Session {self.session.id}] 观察者请求翻阅历史记录...")
             current_msgs = self.session.runtime.short_term_memory.access()
             if current_msgs:
                 recalled_msgs = await get_history_before(
@@ -570,10 +574,9 @@ class ConversationOrchestrator:
                 recalled_history = [
                     f"[{m.time:%H:%M}] {m.user_name}: {m.content}" for m in recalled_msgs
                 ]
-                if recalled_history:
-                    logger.info(
-                        f"[Session {self.session.id}] 成功回溯了 {len(recalled_history)} 条历史消息"
-                    )
+                logger.debug(
+                    f"[Session {self.session.id}] 回溯了 {len(recalled_history)} 条历史消息"
+                )
 
         if self.session.stale(generation, "feedback_decision"):
             return None
@@ -607,7 +610,6 @@ class ConversationOrchestrator:
         """反馈阶段：分析情绪、记忆更正、更新摘要、给出接话意愿。
         Feedback 失败或会话已作废时返回 None。"""
 
-        logger.debug(">> 反馈阶段 (Feedback) 开始")
         response = await self._run_feedback_llm(
             messages_chunk, llm_call, is_relevant, search_result
         )
@@ -617,7 +619,6 @@ class ConversationOrchestrator:
         decision = await self._apply_decision(
             response, messages_chunk, is_relevant, generation
         )
-        logger.debug(f"<< 反馈结束: 意愿 {self.session.state.willingness:.2f}")
         return decision
 
     async def consolidate_stage(
@@ -657,7 +658,6 @@ class ConversationOrchestrator:
         search_result: RetrievalResult,
         generation: int,
     ) -> list:
-        logger.debug(">> 对话阶段 (Chat) 开始")
         state = self.session.state
         new_msgs = [
             {"id": msg.id, "name": msg.user_name, "content": msg.content}
@@ -694,6 +694,7 @@ class ConversationOrchestrator:
         )
         log_event(
             "rag_prompt_budget",
+            "DEBUG",
             session_id=self.session.id,
             chat_prompt_total_chars=len(prompt),
             rag_injected_count=len(search_result.memory_lines),

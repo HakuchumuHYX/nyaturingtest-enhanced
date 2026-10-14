@@ -165,6 +165,7 @@ class LLMClient:
             metrics.llm_failure += 1
         log_event(
             "llm_success" if content else "llm_failure",
+            "DEBUG" if content else "WARNING",
             model=self.settings.model,
             latency_ms=int((time.perf_counter() - started_at) * 1000),
             decision="content" if content else self.provider_status.last_error_type,

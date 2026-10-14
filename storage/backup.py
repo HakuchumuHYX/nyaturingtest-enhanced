@@ -99,7 +99,6 @@ def _backup_data_sync() -> bool:
 
     backup_dir.mkdir(parents=True, exist_ok=True)
     backup_filepath = backup_dir / f"nyabot_backup_{datetime.now():%Y%m%d_%H%M%S}.zip"
-    logger.info(f"开始备份 NyaTuringTest 数据到: {backup_filepath}")
 
     try:
         with TemporaryDirectory(prefix="nyaturingtest_backup_") as tmp:
@@ -148,7 +147,6 @@ def _clean_old_backups_sync():
 async def backup_task() -> bool:
     """执行一次数据备份；仅备份文件创建成功时返回 ``True``。"""
 
-    logger.info("触发自动备份任务...")
     if not await asyncio.to_thread(_backup_data_sync):
         return False
 

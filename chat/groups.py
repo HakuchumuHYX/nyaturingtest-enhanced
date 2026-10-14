@@ -72,7 +72,6 @@ def ensure_group_state(group_id: int):
         return None
 
     if group_id not in group_states:
-        logger.info(f"初始化群 {group_id} 的 GroupState...")
         group_states[group_id] = GroupState(
             session=Session(id=f"{group_id}")
         )
@@ -84,7 +83,7 @@ def ensure_group_state(group_id: int):
         # 局部导入：worker 反向依赖本模块的 GroupState
         from .worker import spawn_state
 
-        logger.info(f"启动群 {group_id} 的 spawn_state 后台任务...")
+        logger.info(f"启动群 {group_id} 的后台任务")
         _group_tasks[group_id] = asyncio.create_task(
             spawn_state(state=group_states[group_id])
         )

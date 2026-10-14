@@ -1,6 +1,7 @@
 # __init__.py
 
 from nonebot import get_driver, logger
+from nonebot.adapters import Bot
 from tortoise import Tortoise
 
 from . import handlers  # 导入即注册所有 matcher
@@ -42,6 +43,16 @@ async def init_db():
     setup_image_cache_job()
     setup_maintenance_job()
     setup_backup_job()
+
+
+@driver.on_bot_connect
+async def log_bot_connect(bot: Bot):
+    logger.info(f"Bot {bot.self_id} 已连接")
+
+
+@driver.on_bot_disconnect
+async def log_bot_disconnect(bot: Bot):
+    logger.warning(f"Bot {bot.self_id} 断开连接")
 
 
 @driver.on_shutdown

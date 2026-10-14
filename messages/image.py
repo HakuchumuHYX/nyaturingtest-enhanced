@@ -200,6 +200,7 @@ async def caption_image(vision_input: VisionInput, session_id: str) -> str:
             logger.warning(f"写入图片描述缓存失败: {e}")
     log_event(
         "image_caption",
+        "DEBUG",
         session_id=session_id,
         outcome="ok" if caption else "failed",
         latency_ms=int((time.perf_counter() - started_at) * 1000),
@@ -282,7 +283,6 @@ def _clean_old_image_caches_sync():
 
 
 async def cleanup_image_cache_task():
-    logger.info("触发图片缓存自动清理任务...")
     await _clean_old_image_caches_sync()
 
 
