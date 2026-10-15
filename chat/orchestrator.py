@@ -335,7 +335,7 @@ class ConversationOrchestrator:
         rag_stats = {
             "session_id": self.session.id,
             "query_count": len(queries),
-            "queries_preview": [q[:40] for q in queries[:3]],
+            "queries": queries,
             "use_rerank": use_rerank,
             "skip_reason": "none",
         }
