@@ -66,7 +66,7 @@ async def _image_text(data: dict, out: _Expansion) -> str:
         out.skipped_images += 1
         return "[图片]"
     ref_id = f"图{len(out.images) + 1}"
-    text, vision_input = await fetch_image_input(
+    text, vision_input, _ = await fetch_image_input(
         data.get("url", ""),
         data.get("file_unique", ""),
         is_sticker=str(data.get("sub_type", "")) == "1",

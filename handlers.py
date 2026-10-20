@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -43,7 +44,9 @@ from .memory.vector import (
 from .messages.convert import fill_caption, message2BotMessage
 from .messages.faces import ensure_faces, face_name
 from .messages.forward import digest_forward
+from .messages.image import fetch_image_input
 from .messages.message import Message as MMessage
+from .messages.stickers import block as block_sticker
 from .metrics import log_event
 from .metrics import metrics
 from .prompts import PRESETS
@@ -76,6 +79,7 @@ COMMANDS: tuple[CommandMeta, ...] = (
     CommandMeta("reset_emotion", "仅重置心情（不动好感度）", "reset_emotion <群号>"),
     CommandMeta("reset confirm", "先备份再完全重置本群", "reset <群号> confirm"),
     CommandMeta("token统计", "查看当前 chat / feedback 模型的 Token 用量"),
+    CommandMeta("stickerdel", "回复一张图：从表情包库删掉并拉黑，以后只描述不收"),
     CommandMeta("backup_data", "手动触发数据备份", "backup_data"),
     CommandMeta("help", "显示帮助", "help"),
 )
@@ -216,6 +220,13 @@ token_stats = on_command(
     permission=SUPERUSER,
     cmd="token统计",
     aliases={"autochat token统计"},
+    priority=1,
+    block=True,
+)
+sticker_del = on_command(
+    rule=is_group_message,
+    permission=SUPERUSER,
+    cmd="stickerdel",
     priority=1,
     block=True,
 )
@@ -705,6 +716,41 @@ async def handle_manage_autochat(
         await manage_cmd.finish(
             "指令格式错误。请使用: autochat enable 或 autochat disable"
         )
+
+
+@sticker_del.handle()
+async def handle_sticker_del(event: GroupMessageEvent):
+    """回复的消息里每张图都按内容哈希删掉、拉黑；库里没有的也先拉黑，以后见到只描述不收。"""
+
+    images = []
+    if event.reply:
+        images = [seg for seg in event.reply.message if seg.type == "image"]
+    if not images:
+        await sticker_del.finish("用法：回复一条带图的消息，发 stickerdel")
+    removed = blocked = failed = 0
+    for seg in images:
+        _, _, image_bytes = await fetch_image_input(
+            seg.data.get("url", ""),
+            seg.data.get("file_unique", ""),
+            is_sticker=True,
+            ref_id="stickerdel",
+        )
+        if image_bytes is None:
+            failed += 1
+        elif await block_sticker(hashlib.sha1(image_bytes).hexdigest()):
+            removed += 1
+        else:
+            blocked += 1
+    parts = [
+        f"{label} {count} 张"
+        for label, count in (
+            ("已从库里删掉并拉黑", removed),
+            ("库里没有、已拉黑", blocked),
+            ("下载失败", failed),
+        )
+        if count
+    ]
+    await sticker_del.finish("，".join(parts))
 
 
 @token_stats.handle()

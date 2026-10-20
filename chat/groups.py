@@ -39,9 +39,10 @@ class GroupState:
     data_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     session_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     new_message_signal: asyncio.Event = field(default_factory=asyncio.Event)
-    # 贴表情、戳一戳的冷却只存内存，重启后重新计时
+    # 贴表情、戳一戳、表情包的冷却只存内存，重启后重新计时
     last_react_time: datetime = datetime.min
     last_poke_time: datetime = datetime.min
+    last_sticker_time: datetime = datetime.min
 
 
 # 全局状态字典

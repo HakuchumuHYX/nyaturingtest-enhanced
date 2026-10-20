@@ -1,7 +1,7 @@
 """QQ 系统表情目录。
 
-发表情、贴表情和收到的表情转文字都按 SnowLuma 的 fetch_sys_faces 来：
-SnowLuma 发 face 段时查的是同一份目录，目录里没有的编号会直接发送失败，所以不另写白名单。
+贴表情和收到的表情转文字都按 SnowLuma 的 fetch_sys_faces 来，不另写白名单。
+Chat 不再发 QQ 表情，改发表情包（messages/stickers.py）。
 """
 
 from dataclasses import dataclass
@@ -110,12 +110,6 @@ def face_name(face_id: str) -> str:
     if _catalog is None:
         return ""
     return _catalog.names.get(face_id, "")
-
-
-def sendable_face(name: str) -> Face | None:
-    if _catalog is None:
-        return None
-    return _catalog.sendable.get(_clean(name))
 
 
 def reaction_emoji(name: str) -> tuple[str, str] | None:

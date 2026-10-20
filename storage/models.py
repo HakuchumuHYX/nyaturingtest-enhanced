@@ -156,6 +156,31 @@ class PersonaHistoryModel(Model):
         indexes = (Index(fields=("scope", "key", "date"), name="idx_persona_history_key"),)
 
 
+class StickerModel(Model):
+    """表情包库，兼做黑名单；文件在 data 目录的 stickers/<digest>.<ext>，所有群共用。"""
+
+    # 原始字节 SHA-1，和图片描述缓存同一个 key
+    digest = fields.CharField(pk=True, max_length=40)
+    ext = fields.CharField(max_length=8, default="")
+    # 表情、动作、语气、配字；挑图的向量只按这段算
+    reaction = fields.TextField(default="")
+    # 外观，不含角色名
+    subject = fields.TextField(default="")
+    tags = fields.JSONField(default=list)
+    # library:<素材库文件夹> / group:<群号>
+    source = fields.CharField(max_length=255, default="")
+    # 归一化后的 float32 字节；NULL 表示 embedding 调用失败，启动时补算
+    embedding = fields.BinaryField(null=True)
+    embedding_model = fields.CharField(max_length=255, default="")
+    # 被 stickerdel 删过：文件、描述、向量都已清掉，再见到只描述不收
+    blocked = fields.BooleanField(default=False)
+    created_at = fields.DatetimeField(auto_now_add=True)
+    last_sent_at = fields.DatetimeField(null=True)
+
+    class Meta:
+        table = "nyabot_stickers"
+
+
 class EnabledGroupModel(Model):
     """存储启用的群组ID"""
 

@@ -1,16 +1,19 @@
-"""回复切分与发送、贴表情、戳一戳，以及各自的冷却。"""
+"""回复切分与发送、表情包、贴表情、戳一戳，以及各自的冷却。"""
 
 import asyncio
 import random
 import re
+from dataclasses import dataclass
 from datetime import datetime
 
 from nonebot import logger
 from nonebot.adapters.onebot.v11 import Bot, Event, Message, MessageSegment
 from nonebot.adapters.onebot.v11.exception import ActionFailed
 
-from ..messages.faces import Reaction, sendable_face
+from ..messages.faces import Reaction
+from ..messages.stickers import Sticker, mark_sent, pick
 from ..metrics import log_event
+from ..prompts import STICKER_TAGS
 from .engagement import SPEAK_COOLDOWN_SECONDS
 from .groups import SELF_SENT_MSG_IDS, GroupState
 from .orchestrator import Poke
@@ -19,6 +22,7 @@ MAX_REPLY_MESSAGES = 2
 REACT_COOLDOWN_SECONDS = 60
 # 戳一戳会给对方弹提醒，比贴表情打扰人，间隔放长些
 POKE_COOLDOWN_SECONDS = 120
+STICKER_COOLDOWN_SECONDS = 120
 
 _SPLIT_PATTERN = re.compile(
     r"(?<=[。！？!?~\n])\s*|(?<!\.)\.(?!\.)(?=\s|$|[\u4e00-\u9fff])\s*"
@@ -51,16 +55,26 @@ def build_send_parts(text: str, max_messages: int = MAX_REPLY_MESSAGES) -> list[
     return parts
 
 
-def _response_content(response) -> tuple[str, object | None, str]:
+def _response_content(response) -> tuple[str, object | None, tuple[str, str] | None]:
+    """(文字, 引用的消息 id, 表情包请求 (tag, want))；词表外的标签当没带。"""
+
     if isinstance(response, str):
-        return response, None, ""
-    if isinstance(response, dict):
-        return (
-            str(response.get("content") or ""),
-            response.get("target_id") or response.get("reply_to"),
-            str(response.get("face") or ""),
-        )
-    return "", None, ""
+        return response, None, None
+    if not isinstance(response, dict):
+        return "", None, None
+    sticker = response.get("sticker")
+    request = None
+    if isinstance(sticker, dict):
+        tag = str(sticker.get("tag") or "").strip()
+        if tag in STICKER_TAGS:
+            request = (tag, str(sticker.get("want") or "").strip())
+        else:
+            logger.debug(f"表情包标签不在词表里，丢弃: {tag}")
+    return (
+        str(response.get("content") or ""),
+        response.get("target_id") or response.get("reply_to"),
+        request,
+    )
 
 
 def _delay_seconds(part: str) -> float:
@@ -103,6 +117,45 @@ async def send_one(
     return False
 
 
+@dataclass(frozen=True)
+class _PickedSticker:
+    sticker: Sticker
+    tag: str
+    want: str
+    score: float | None
+
+
+async def _pick_sticker(
+    state: GroupState, tag: str, want: str
+) -> tuple[Message, str, _PickedSticker] | None:
+    """挑一张要发的表情包：(消息, 写进短期记忆的文本, 发送后记日志用的信息)。
+
+    冷却中或标签下没图返回 None。
+    """
+
+    since_last = (datetime.now() - state.last_sticker_time).total_seconds()
+    if since_last < STICKER_COOLDOWN_SECONDS:
+        outcome = "cooldown"
+    else:
+        picked = await pick(tag, want)
+        if picked is not None:
+            sticker, score = picked
+            # sub_type=1 让 QQ 按表情包显示；SnowLuma 容器挂载了同一路径，直接给本地文件
+            segment = MessageSegment(
+                "image", {"file": sticker.path.as_uri(), "sub_type": 1}
+            )
+            return (
+                Message(segment),
+                f"[表情包: {sticker.caption}]",
+                _PickedSticker(sticker, tag, want, score),
+            )
+        outcome = "empty"
+    log_event(
+        "sticker", session_id=state.session.id, tag=tag, want=want, outcome=outcome
+    )
+    return None
+
+
 async def dispatch_replies(
     *,
     state: GroupState,
@@ -122,31 +175,25 @@ async def dispatch_replies(
 
     total = len(responses)
     sent_count = 0
+    text_count = 0
+    # 一轮最多一张表情包，不占文字的 MAX_REPLY_MESSAGES 名额
+    sticker_requested = False
     for response_index, response in enumerate(responses):
-        if sent_count >= MAX_REPLY_MESSAGES:
-            break
-        raw_content, reply_id, face_text = _response_content(response)
-        face = sendable_face(face_text) if face_text else None
-        if face_text and face is None:
-            logger.debug(f"表情不在目录里，丢弃: {face_text}")
-        # (消息, 写进短期记忆的文本, 这条带的表情)；模型写的文字一律按纯文本发，不解析 CQ 码
-        outgoing = [
-            (Message(MessageSegment.text(part)), part, None)
-            for part in build_send_parts(raw_content, MAX_REPLY_MESSAGES - sent_count)
-        ]
-        if face is not None:
-            face_seg = MessageSegment.face(int(face.id))
-            face_mark = f"[表情:{face.name}]"
-            # 大动画表情和文字混发的显示效果没验证过，单独发一条
-            if outgoing and not face.big:
-                message, text, _ = outgoing[-1]
-                outgoing[-1] = (message + face_seg, text + face_mark, face)
-            else:
-                outgoing.append((Message(face_seg), face_mark, face))
+        raw_content, reply_id, sticker_request = _response_content(response)
+        # (消息, 写进短期记忆的文本, 这条是不是表情包)；模型写的文字一律按纯文本发，不解析 CQ 码
+        outgoing: list[tuple[Message, str, _PickedSticker | None]] = []
+        if text_count < MAX_REPLY_MESSAGES:
+            parts = build_send_parts(raw_content, MAX_REPLY_MESSAGES - text_count)
+            outgoing = [
+                (Message(MessageSegment.text(part)), part, None) for part in parts
+            ]
+        if sticker_request is not None and not sticker_requested:
+            sticker_requested = True
+            picked = await _pick_sticker(state, *sticker_request)
+            if picked is not None:
+                outgoing.append(picked)
 
-        for part_index, (message, memory_text, sent_face) in enumerate(outgoing):
-            if sent_count >= MAX_REPLY_MESSAGES:
-                break
+        for part_index, (message, memory_text, picked_sticker) in enumerate(outgoing):
             if state.session.stale(generation, "send_loop"):
                 break
             if reply_id and response_index == 0 and part_index == 0:
@@ -165,13 +212,22 @@ async def dispatch_replies(
             )
             if sent:
                 sent_count += 1
-                if sent_face is not None:
-                    log_event(
-                        "face_sent",
-                        session_id=state.session.id,
-                        name=sent_face.name,
-                        big=sent_face.big,
-                    )
+                if picked_sticker is None:
+                    text_count += 1
+                else:
+                    state.last_sticker_time = datetime.now()
+                    await mark_sent(picked_sticker.sticker)
+            if picked_sticker is not None:
+                score = picked_sticker.score
+                log_event(
+                    "sticker",
+                    session_id=state.session.id,
+                    tag=picked_sticker.tag,
+                    want=picked_sticker.want,
+                    digest=picked_sticker.sticker.digest[:8],
+                    score=None if score is None else round(score, 3),
+                    outcome="ok" if sent else "failed",
+                )
 
             has_more = part_index < len(outgoing) - 1 or response_index < total - 1
             if has_more:

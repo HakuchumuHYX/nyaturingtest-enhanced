@@ -14,6 +14,7 @@ from .models import (
     PersonaGroupModel,
     PersonaLifeModel,
     SessionModel,
+    StickerModel,
     TokenUsageModel,
     UserProfileModel,
 )
@@ -339,6 +340,70 @@ TOKEN_FIELDS = (
     "prompt_cache_miss_tokens",
     "reasoning_tokens",
 )
+
+
+async def load_stickers() -> list[StickerModel]:
+    """没拉黑的表情包，启动时整表载入内存。"""
+
+    return await StickerModel.filter(blocked=False)
+
+
+async def sticker_known(digest: str) -> bool:
+    """库里有这张，或者它被拉黑过。"""
+
+    return await StickerModel.exists(digest=digest)
+
+
+async def add_sticker(
+    *,
+    digest: str,
+    ext: str,
+    reaction: str,
+    subject: str,
+    tags: list[str],
+    source: str,
+    embedding: bytes | None,
+    embedding_model: str,
+) -> StickerModel:
+    return await StickerModel.create(
+        digest=digest,
+        ext=ext,
+        reaction=reaction,
+        subject=subject,
+        tags=tags,
+        source=source,
+        embedding=embedding,
+        embedding_model=embedding_model,
+    )
+
+
+async def save_sticker_embedding(
+    digest: str, embedding: bytes, embedding_model: str
+) -> None:
+    await StickerModel.filter(digest=digest).update(
+        embedding=embedding, embedding_model=embedding_model
+    )
+
+
+async def mark_sticker_sent(digest: str, sent_at: datetime) -> None:
+    await StickerModel.filter(digest=digest).update(last_sent_at=sent_at)
+
+
+async def block_sticker(digest: str) -> None:
+    """拉黑：库里有就清掉描述和向量，没有就插一条空行占住这个 digest。"""
+
+    await StickerModel.update_or_create(
+        digest=digest,
+        defaults={
+            "blocked": True,
+            "ext": "",
+            "reaction": "",
+            "subject": "",
+            "tags": [],
+            "embedding": None,
+            "embedding_model": "",
+        },
+    )
 
 
 def _model_key(name: str) -> str:

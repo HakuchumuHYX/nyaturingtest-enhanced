@@ -161,8 +161,11 @@ _embedding_client: AsyncOpenAI | None = None
 _rerank_client: httpx.AsyncClient | None = None
 
 
-async def embed_texts(texts: list[str], *, query: bool = False) -> np.ndarray:
-    """返回逐行 L2 归一化的 float32 矩阵，余弦相似度直接用点积。"""
+async def embed_texts(texts: list[str], *, instruction: str = "") -> np.ndarray:
+    """返回逐行 L2 归一化的 float32 矩阵，余弦相似度直接用点积。
+
+    instruction 只给查询加（各检索场景自己写一句），被检索的正文不加。
+    """
 
     global _embedding_client
     settings = get_app_settings()
@@ -175,9 +178,7 @@ async def embed_texts(texts: list[str], *, query: bool = False) -> np.ndarray:
         )
     response = await _embedding_client.embeddings.create(
         model=settings.memory.model,
-        input=[
-            (QUERY_INSTRUCTION if query else "") + text.replace("\n", " ") for text in texts
-        ],
+        input=[instruction + text.replace("\n", " ") for text in texts],
         encoding_format="float",
     )
     vectors = np.asarray([item.embedding for item in response.data], dtype=np.float32)
@@ -324,7 +325,10 @@ class VectorMemory:
             if not self._ids:
                 return RetrievalResult([], _retrieval_stats([], []))
 
-            scores = await embed_texts(unique_queries, query=True) @ self._matrix.T
+            scores = (
+                await embed_texts(unique_queries, instruction=QUERY_INSTRUCTION)
+                @ self._matrix.T
+            )
             if user_ids is not None:
                 wanted = frozenset(user_ids)
                 mask = np.fromiter(

@@ -14,6 +14,7 @@ from .chat.initiative import setup_initiative_job
 from .config import get_data_dir
 from .memory.episodes import setup_episode_job
 from .messages.image import setup_image_cache_job
+from .messages.stickers import load_stickers
 from .storage.backup import setup_backup_job
 
 driver = get_driver()
@@ -36,6 +37,7 @@ async def init_db():
 
     # 初始化群组列表
     await init_enabled_groups()
+    await load_stickers()
 
     # 注册定时任务：分段整理、主动话题、图片缓存清理、长期记忆维护、备份
     setup_episode_job()

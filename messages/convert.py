@@ -13,8 +13,9 @@ from ..llm import VisionInput
 from ..metrics import log_event
 from ..prompts import truncate_text
 from .faces import ensure_faces, face_name
-from .image import cached_caption, caption_image, fetch_image_input
+from .image import cached_caption, caption_image, caption_sticker, fetch_image_input
 from .message import Message as MMessage
+from .stickers import collect
 
 CARD_CHARS = 120
 FORWARD_PLACEHOLDER = "[合并转发]"
@@ -87,6 +88,8 @@ class CaptionJob:
 
     token: str
     vision_input: VisionInput
+    # 只有表情包带：看图要拼九宫格，收进库也要原始字节
+    image_bytes: bytes | None
 
 
 def _image_kind(vision_input: VisionInput) -> str:
@@ -96,12 +99,21 @@ def _image_kind(vision_input: VisionInput) -> str:
 async def fill_caption(
     session: Session, message: MMessage, job: CaptionJob, generation: int
 ) -> None:
-    """后台看完一张图，把消息里的占位换成描述。
+    """后台看完一张图，把消息里的占位换成描述；表情包顺带判断收不收。
 
     会话作废、或占位已经不在（被撤回）就只留缓存；没看成就换回 [图片] / [表情包]。
+    收图另起任务：worker 处理这批消息前会等这个任务，入库不该拖住它。
     """
 
-    caption = await caption_image(job.vision_input, session.id)
+    if job.image_bytes is None:
+        caption = await caption_image(job.vision_input, session.id)
+    else:
+        result = await caption_sticker(
+            job.image_bytes, job.vision_input.ref_id, session.id
+        )
+        caption = result.caption if result else ""
+        if result is not None and result.keep:
+            session.spawn(collect(job.image_bytes, result, f"group:{session.id}"))
     if session.stale(generation, "image_caption") or job.token not in message.content:
         return
     kind = _image_kind(job.vision_input)
@@ -132,7 +144,7 @@ async def message2BotMessage(
     await ensure_faces(bot)
 
     async def image_part(data: dict, label: str) -> tuple[str, list[VisionInput]]:
-        text, vision_input = await fetch_image_input(
+        text, vision_input, image_bytes = await fetch_image_input(
             data.get("url", ""),
             data.get("file_unique", ""),
             is_sticker=_is_sticker_segment_data(data),
@@ -148,7 +160,8 @@ async def message2BotMessage(
             )
             return (f"[{kind}: {cached}]", [vision_input])
         token = f"[{kind}#{secrets.token_hex(2)}]"
-        caption_jobs.append(CaptionJob(token, vision_input))
+        sticker_bytes = image_bytes if vision_input.is_sticker else None
+        caption_jobs.append(CaptionJob(token, vision_input, sticker_bytes))
         return (token, [vision_input])
 
     # 附图标签按消息 id 和第几张写，模型靠它把原图和消息对上号
