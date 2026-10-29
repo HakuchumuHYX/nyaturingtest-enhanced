@@ -5,7 +5,7 @@ from datetime import datetime
 from nonebot import logger
 
 from ..chat.groups import GroupState
-from ..llm import chat_client, extract_and_parse_json
+from ..llm import chat_client
 from ..prompts import describe_relation, get_impression_prompt
 from ..storage.db import get_recent_messages_by_user
 from .vector import (
@@ -81,16 +81,14 @@ def impression_text(page: Impression) -> str:
 async def query_memory_profile(
     state: GroupState, *, target_id: str, target_name: str, sender_id: str
 ) -> Impression | str:
-    """生成 Bot 对目标用户的印象；没有印象或生成失败时返回要直接回复的文字。"""
+    """生成 Bot 对目标用户的印象（state 由调用方加载好）；没有印象或生成失败时返回要直接回复的文字。"""
 
-    async with state.session_lock:
-        session = state.session
-        await session.load_session()
-        profile = session.state.profiles.get(target_id)
-        summary = session.state.user_summaries.get(target_id, "")
-        bot_name = session.state.name
-        self_life = session.state.self_life
-        affinity = profile.level() if profile else 0
+    session = state.session
+    profile = session.state.profiles.get(target_id)
+    summary = session.state.user_summaries.get(target_id, "")
+    bot_name = session.state.name
+    self_life = session.state.self_life
+    affinity = profile.level() if profile else 0
 
     if not bot_name:
         return "本群还没设人设，先 set_preset 吧。"
@@ -100,7 +98,7 @@ async def query_memory_profile(
     first_interaction_at = profile.first_interaction_at if profile else None
 
     target_records, unscoped_records = await _retrieve(
-        session.runtime.vector_memory,
+        session.vector_memory,
         target_id=target_id,
         target_name=target_name,
         interactions=interactions,
@@ -129,10 +127,10 @@ async def query_memory_profile(
         unscoped_text=unscoped_text,
         recent=recent,
     )
-    result = extract_and_parse_json(
-        await chat_client.generate(prompt, session_id=session.id, temperature=0.8)
+    result = await chat_client.generate_json(
+        prompt, session_id=session.id, temperature=0.8
     )
-    if not isinstance(result, dict) or not result.get("headline") or not result.get("impression"):
+    if not result or not result.get("headline") or not result.get("impression"):
         logger.warning("印象生成 JSON 解析失败")
         return "大脑处理过载，记忆读取失败，请稍后再试。"
     memories = [str(item).strip() for item in result.get("memories") or []]

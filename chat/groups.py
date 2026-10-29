@@ -1,5 +1,6 @@
 import asyncio
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -43,6 +44,26 @@ class GroupState:
     last_react_time: datetime = datetime.min
     last_poke_time: datetime = datetime.min
     last_sticker_time: datetime = datetime.min
+
+    async def load(self) -> None:
+        """懒加载会话。session_lock 只让加载和管理命令互斥，一轮对话不持锁，靠 generation 判断过期。"""
+
+        async with self.session_lock:
+            await self.session.load_session()
+
+    async def enqueue(self, message: MMessage, bot: Bot, event: Event) -> None:
+        """放进待处理队列并唤醒 worker。
+
+        同一条已在队列里就什么都不做：转发读得比防抖还快时占位还在队列里，改写过的内容会随那一轮一起处理。
+        """
+
+        async with self.data_lock:
+            if any(m is message for m in self.messages_chunk):
+                return
+            self.event = event
+            self.bot = bot
+            self.messages_chunk.append(message)
+            self.new_message_signal.set()
 
 
 # 全局状态字典
@@ -92,6 +113,15 @@ def ensure_group_state(group_id: int):
     return group_states[group_id]
 
 
+async def loaded_group_state(group_id: int) -> GroupState | None:
+    """启用的群返回已加载会话的 GroupState，未启用返回 None。"""
+
+    state = ensure_group_state(group_id)
+    if state is not None:
+        await state.load()
+    return state
+
+
 async def remove_group_state(group_id: int):
     """安全移除群组状态并取消后台任务"""
     task = _group_tasks.pop(group_id, None)
@@ -118,14 +148,17 @@ def _generation(group_id: int) -> int:
     return group_state.session.state.generation if group_state else 0
 
 
+def _generation_guard(group_id: int) -> Callable[[], bool]:
+    """记下此刻的 generation，返回「会话还没被 reset/load_preset 作废」的检查。"""
+
+    generation = _generation(group_id)
+    return lambda: _generation(group_id) == generation
+
+
 async def refresh_group_notes(group_id: int, *, min_new: int = 1) -> str | None:
     """把新碎片整理进群志；群志不随 save_session 回写，已加载的群同步内存副本。"""
 
-    generation = _generation(group_id)
-
-    def still_current() -> bool:
-        return _generation(group_id) == generation
-
+    still_current = _generation_guard(group_id)
     notes = await digest_group_notes(str(group_id), still_current, min_new=min_new)
     group_state = group_states.get(group_id)
     if notes is not None and group_state is not None and still_current():
@@ -139,11 +172,7 @@ async def maintain_long_term_memory() -> None:
 
     for group_id in list(runtime_enabled_groups):
         session_id = str(group_id)
-        generation = _generation(group_id)
-
-        def still_current(group_id: int = group_id, generation: int = generation) -> bool:
-            return _generation(group_id) == generation
-
+        still_current = _generation_guard(group_id)
         try:
             summaries = await digest_user_profiles(session_id, still_current)
             await refresh_group_notes(group_id)
@@ -162,25 +191,21 @@ async def maintain_long_term_memory() -> None:
     except Exception as e:
         logger.warning(f"长期记忆定时维护失败: {e}")
     for state in group_states.values():
-        state.session.runtime.vector_memory.drop_cache()
+        state.session.vector_memory.drop_cache()
 
 
 async def _maintain_personas() -> None:
     group_ids = list(runtime_enabled_groups)
-    generations = {str(group_id): _generation(group_id) for group_id in group_ids}
-
-    def still_current(session_id: str) -> bool:
-        return _generation(int(session_id)) == generations[session_id]
-
+    guards = {str(group_id): _generation_guard(group_id) for group_id in group_ids}
     try:
-        lives, groups = await maintain_personas(group_ids, still_current)
+        lives, groups = await maintain_personas(group_ids, guards)
     except Exception as e:
         logger.warning(f"人设成长整理失败: {e}")
         return
     # 人生线和群层不随 save_session 回写，已加载的群要同步内存副本
     for group_id in group_ids:
         group_state = group_states.get(group_id)
-        if group_state is None or not still_current(str(group_id)):
+        if group_state is None or not guards[str(group_id)]():
             continue
         state = group_state.session.state
         if state.preset in lives:

@@ -17,13 +17,18 @@ from ..chat.groups import (  # noqa: E402
     is_shutting_down,
     runtime_enabled_groups,
 )
-from ..llm import extract_and_parse_json, feedback_client  # noqa: E402
+from ..llm import feedback_client  # noqa: E402
 from ..messages.message import Message  # noqa: E402
 from ..metrics import log_event  # noqa: E402
 from ..prompts import get_episode_prompt, truncate_text  # noqa: E402
-from ..storage.db import get_latest_user_names, message_final_id  # noqa: E402
+from ..storage.db import get_latest_user_names  # noqa: E402
 from ..storage.models import GlobalMessageModel, MemoryModel, SessionModel  # noqa: E402
-from .candidates import save_memory_candidates  # noqa: E402
+from .candidates import (  # noqa: E402
+    clamp01,
+    memory_metadata,
+    save_memory_candidates,
+    source_messages,
+)
 
 SCAN_INTERVAL_MINUTES = 5
 # 最后一条消息距今这么久，算一段聊完了
@@ -66,40 +71,20 @@ def _episode_memories(
         if not isinstance(item, dict):
             continue
         content = str(item.get("content") or "").strip()
-        source = item.get("source")
-        sources = [
-            messages[index]
-            for index in (source if isinstance(source, list) else [])
-            if isinstance(index, int) and 0 <= index < len(messages)
-        ]
+        sources = source_messages(item, messages)
         if len(content) < EPISODE_MIN_CHARS or not sources:
             continue
-        try:
-            importance = max(0.0, min(1.0, float(item.get("importance", 0.2))))
-        except (TypeError, ValueError):
-            importance = 0.2
-        participants = (m.user_id for m in sources if m.user_id and m.user_name != bot_name)
-        memories.append(
-            (
-                content,
-                {
-                    "category": "episode",
-                    "date": date,
-                    "subject_user_id": "",
-                    "subject_user_name": "",
-                    "speaker_user_id": "",
-                    "speaker_user_name": "",
-                    "confidence": EPISODE_CONFIDENCE,
-                    "importance": importance,
-                    "source_msg_ids": " ".join(
-                        dict.fromkeys(message_final_id(m) for m in sources)
-                    ),
-                    "participant_ids": " ".join(dict.fromkeys(participants)),
-                    "is_correction": False,
-                    "replaces": "",
-                },
-            )
+        metadata = memory_metadata(
+            category="episode",
+            date=date,
+            confidence=EPISODE_CONFIDENCE,
+            importance=clamp01(item.get("importance"), 0.2),
+            sources=sources,
+            participant_ids=(
+                m.user_id for m in sources if m.user_id and m.user_name != bot_name
+            ),
         )
+        memories.append((content, metadata))
     return memories
 
 
@@ -160,12 +145,10 @@ async def _digest_batch(
                 for index, m in enumerate(messages)
             ],
         )
-        parsed = extract_and_parse_json(
-            await feedback_client.generate(
-                prompt, session_id=session.id, temperature=EPISODE_TEMPERATURE
-            )
+        parsed = await feedback_client.generate_json(
+            prompt, session_id=session.id, temperature=EPISODE_TEMPERATURE
         )
-        if not isinstance(parsed, dict):
+        if parsed is None:
             logger.warning(f"[Episode] 群 {session.id} 整理输出无效，下轮重试")
             return False
 
@@ -184,7 +167,7 @@ async def _digest_batch(
         date = int(rows[-1].time.strftime("%Y%m%d"))
         episodes = _episode_memories(parsed.get("episodes"), messages, bot_name, date)
         if episodes:
-            stored = await session.runtime.vector_memory.add_memories(
+            stored = await session.vector_memory.add_memories(
                 episodes,
                 still_current=lambda: session_state.generation == generation,
             )

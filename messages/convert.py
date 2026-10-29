@@ -3,10 +3,12 @@
 import asyncio
 import json
 import secrets
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from nonebot import logger
 from nonebot.adapters.onebot.v11 import Bot, Message, MessageSegment
+from nonebot.adapters.onebot.v11.exception import ActionFailed
+from nonebot.exception import NetworkError
 
 from ..chat.session import Session
 from ..llm import VisionInput
@@ -21,8 +23,19 @@ CARD_CHARS = 120
 FORWARD_PLACEHOLDER = "[合并转发]"
 
 
-def _is_sticker_segment_data(data: dict) -> bool:
+def is_sticker_segment(data: dict) -> bool:
     return str(data.get("sub_type", "")) == "1"
+
+
+async def member_name(bot: Bot, group_id: int, user_id: str) -> str | None:
+    """群名片，没有就用 QQ 昵称；查不到（退群、接口失败、@全体成员的 all）返回 None。"""
+
+    try:
+        info = await bot.get_group_member_info(group_id=group_id, user_id=int(user_id))
+    except (ActionFailed, NetworkError, ValueError) as e:
+        logger.debug(f"查群 {group_id} 成员 {user_id} 的名片失败: {e}")
+        return None
+    return info.get("card") or info.get("nickname") or user_id
 
 
 def _card_text(raw) -> str:
@@ -120,8 +133,124 @@ async def fill_caption(
     message.content = message.content.replace(
         job.token, f"[{kind}: {caption}]" if caption else f"[{kind}]"
     )
-    session.runtime.short_term_memory.mark_dirty(message)
+    session.short_term_memory.mark_dirty(message)
     session.schedule_save()
+
+
+@dataclass
+class _Part:
+    """一个消息段读出来的东西：文字、原图、被 @/被回复的人、待看的图。"""
+
+    text: str
+    images: list[VisionInput] = field(default_factory=list)
+    mentions: dict[str, str] = field(default_factory=dict)
+    jobs: list[CaptionJob] = field(default_factory=list)
+
+
+async def _image_part(data: dict, label: str, group_id: int, caption: bool) -> _Part:
+    text, vision_input, image_bytes = await fetch_image_input(
+        data.get("url", ""),
+        data.get("file_unique", ""),
+        is_sticker=is_sticker_segment(data),
+        ref_id=label,
+    )
+    if vision_input is None:
+        return _Part(text)
+    if not caption:
+        return _Part(text, [vision_input])
+    kind = _image_kind(vision_input)
+    cached = await cached_caption(vision_input.digest)
+    if cached:
+        log_event("image_caption", "DEBUG", session_id=str(group_id), outcome="cache_hit")
+        return _Part(f"[{kind}: {cached}]", [vision_input])
+    token = f"[{kind}#{secrets.token_hex(2)}]"
+    sticker_bytes = image_bytes if vision_input.is_sticker else None
+    return _Part(token, [vision_input], jobs=[CaptionJob(token, vision_input, sticker_bytes)])
+
+
+async def _at_part(bot: Bot, data: dict, group_id: int, bot_name: str) -> _Part:
+    target = data.get("qq")
+    if not target:
+        return _Part("")
+    if target == str(bot.self_id):
+        return _Part(f" @{bot_name} ")
+    name = await member_name(bot, group_id, str(target))
+    if name is None:
+        return _Part(f" @{target} ")
+    return _Part(f" @{name} ", mentions={str(target): name})
+
+
+async def _reply_part(
+    bot: Bot, data: dict, message_scope: str, group_id: int, caption: bool
+) -> _Part:
+    """被回复的原文，引用的图和正文的图一样放进附图。"""
+
+    reply_id = data.get("id")
+    if not reply_id:
+        return _Part("")
+    try:
+        source_msg = await bot.get_msg(message_id=int(reply_id))
+        # 优先群名片，与 @ 和发言人名字保持同一套称呼，否则模型会把昵称当成另一个人
+        sender_info = source_msg.get("sender", {})
+        sender = sender_info.get("card") or sender_info.get("nickname", "未知")
+        part = _Part("")
+        if sender_info.get("user_id"):
+            part.mentions[str(sender_info["user_id"])] = sender
+        content_data = source_msg.get("message", [])
+        source_text = ""
+
+        if isinstance(content_data, str):
+            source_text = content_data
+        elif isinstance(content_data, list):
+            for segment in content_data:
+                msg_type = segment.get("type")
+                seg_data = segment.get("data", {})
+                text = segment_text(msg_type, seg_data)
+                if text is not None:
+                    source_text += text
+                elif msg_type == "image":
+                    # 引用的图和原消息是同一份字节，原消息看过就命中描述缓存
+                    image = await _image_part(
+                        seg_data,
+                        f"消息 {message_scope} 引用的第 {len(part.images) + 1} 张图",
+                        group_id,
+                        caption,
+                    )
+                    source_text += image.text
+                    part.images.extend(image.images)
+                    part.jobs.extend(image.jobs)
+
+        if len(source_text) > 800:
+            source_text = source_text[:800] + "..."
+        part.text = f' [回复 {sender}: "{source_text}"] '
+        return part
+    except Exception as e:
+        logger.warning(f"获取回复内容失败: {e}")
+        return _Part(" [回复] ")
+
+
+async def _segment_part(
+    seg: MessageSegment,
+    image_number: int,
+    *,
+    bot: Bot,
+    group_id: int,
+    bot_name: str,
+    message_scope: str,
+    caption: bool,
+) -> _Part:
+    text = segment_text(seg.type, seg.data)
+    if text is not None:
+        return _Part(text)
+    if seg.type == "image":
+        label = f"消息 {message_scope} 的第 {image_number} 张图"
+        return await _image_part(seg.data, label, group_id, caption)
+    if seg.type == "at":
+        return await _at_part(bot, seg.data, group_id, bot_name)
+    if seg.type == "reply":
+        return await _reply_part(bot, seg.data, message_scope, group_id, caption)
+    logger.debug(f"未处理的消息段: {seg.type}")
+    return _Part("")
 
 
 async def message2BotMessage(
@@ -139,117 +268,29 @@ async def message2BotMessage(
     caption 为假（没设人设的群）时不看图，只写 [图片]。
     """
 
-    mentions: dict[str, str] = {}
-    caption_jobs: list[CaptionJob] = []
     await ensure_faces(bot)
-
-    async def image_part(data: dict, label: str) -> tuple[str, list[VisionInput]]:
-        text, vision_input, image_bytes = await fetch_image_input(
-            data.get("url", ""),
-            data.get("file_unique", ""),
-            is_sticker=_is_sticker_segment_data(data),
-            ref_id=label,
-        )
-        if vision_input is None or not caption:
-            return (text, [vision_input] if vision_input else [])
-        kind = _image_kind(vision_input)
-        cached = await cached_caption(vision_input.digest)
-        if cached:
-            log_event(
-                "image_caption", "DEBUG", session_id=str(group_id), outcome="cache_hit"
-            )
-            return (f"[{kind}: {cached}]", [vision_input])
-        token = f"[{kind}#{secrets.token_hex(2)}]"
-        sticker_bytes = image_bytes if vision_input.is_sticker else None
-        caption_jobs.append(CaptionJob(token, vision_input, sticker_bytes))
-        return (token, [vision_input])
-
     # 附图标签按消息 id 和第几张写，模型靠它把原图和消息对上号
     image_numbers: dict[int, int] = {}
     for index, seg in enumerate(message):
         if seg.type == "image" and segment_text(seg.type, seg.data) is None:
             image_numbers[index] = len(image_numbers) + 1
 
-    async def process_segment(
-        seg: MessageSegment,
-        segment_index: int,
-    ) -> tuple[str, list[VisionInput]]:
-        text = segment_text(seg.type, seg.data)
-        if text is not None:
-            return (text, [])
-
-        if seg.type == "image":
-            return await image_part(
-                seg.data,
-                f"消息 {message_scope} 的第 {image_numbers[segment_index]} 张图",
+    parts = await asyncio.gather(
+        *(
+            _segment_part(
+                seg,
+                image_numbers.get(index, 0),
+                bot=bot,
+                group_id=group_id,
+                bot_name=bot_name,
+                message_scope=message_scope,
+                caption=caption,
             )
-
-        if seg.type == "at":
-            target = seg.data.get("qq")
-            if not target:
-                return ("", [])
-            if target == str(bot.self_id):
-                return (f" @{bot_name} ", [])
-            try:
-                user_info = await bot.get_group_member_info(
-                    group_id=group_id, user_id=int(target)
-                )
-                nickname = (
-                    user_info.get("card") or user_info.get("nickname") or str(target)
-                )
-                mentions[str(target)] = nickname
-                return (f" @{nickname} ", [])
-            except Exception:
-                return (f" @{target} ", [])
-
-        if seg.type == "reply":
-            reply_id = seg.data.get("id")
-            if not reply_id:
-                return ("", [])
-            try:
-                source_msg = await bot.get_msg(message_id=int(reply_id))
-                # 优先群名片，与 @ 和发言人名字保持同一套称呼，否则模型会把昵称当成另一个人
-                sender_info = source_msg.get("sender", {})
-                sender = sender_info.get("card") or sender_info.get("nickname", "未知")
-                if sender_info.get("user_id"):
-                    mentions[str(sender_info["user_id"])] = sender
-                content_data = source_msg.get("message", [])
-                source_text = ""
-                image_inputs: list[VisionInput] = []
-
-                if isinstance(content_data, str):
-                    source_text = content_data
-                elif isinstance(content_data, list):
-                    for segment in content_data:
-                        msg_type = segment.get("type")
-                        data = segment.get("data", {})
-                        text = segment_text(msg_type, data)
-                        if text is not None:
-                            source_text += text
-                        elif msg_type == "image":
-                            # 引用的图和原消息是同一份字节，原消息看过就命中描述缓存
-                            img_text, img_inputs = await image_part(
-                                data,
-                                f"消息 {message_scope} 引用的第 {len(image_inputs) + 1} 张图",
-                            )
-                            source_text += img_text
-                            image_inputs.extend(img_inputs)
-
-                if len(source_text) > 800:
-                    source_text = source_text[:800] + "..."
-                return (f' [回复 {sender}: "{source_text}"] ', image_inputs)
-            except Exception as e:
-                logger.warning(f"获取回复内容失败: {e}")
-                return (" [回复] ", [])
-
-        logger.debug(f"未处理的消息段: {seg.type}")
-        return ("", [])
-
-    tasks = [process_segment(seg, index) for index, seg in enumerate(message)]
-    results = await asyncio.gather(*tasks)
-
-    content = "".join(result[0] for result in results).strip()
-    image_inputs = [item for result in results for item in result[1]]
-    return (content, image_inputs, mentions, caption_jobs)
-
-
+            for index, seg in enumerate(message)
+        )
+    )
+    content = "".join(part.text for part in parts).strip()
+    images = [image for part in parts for image in part.images]
+    mentions = {uid: name for part in parts for uid, name in part.mentions.items()}
+    jobs = [job for part in parts for job in part.jobs]
+    return content, images, mentions, jobs

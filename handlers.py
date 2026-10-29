@@ -1,4 +1,3 @@
-import asyncio
 import hashlib
 from dataclasses import dataclass
 from datetime import datetime
@@ -15,6 +14,8 @@ from nonebot.adapters.onebot.v11 import (
     PokeNotifyEvent,
     PrivateMessageEvent,
 )
+from nonebot.adapters.onebot.v11.exception import ActionFailed
+from nonebot.exception import NetworkError
 from nonebot.matcher import Matcher
 from nonebot.params import CommandArg
 from nonebot.permission import SUPERUSER
@@ -28,6 +29,7 @@ from .cards.token_stats import render_token_stats_card
 from .chat.groups import (
     ensure_group_state,
     is_shutting_down,
+    loaded_group_state,
     refresh_group_notes,
     remove_group_state,
     runtime_enabled_groups,
@@ -41,7 +43,7 @@ from .memory.vector import (
     RAG_MERGED_CANDIDATE_CAP,
     RAG_PER_QUERY_RECALL_K,
 )
-from .messages.convert import fill_caption, message2BotMessage
+from .messages.convert import fill_caption, member_name, message2BotMessage
 from .messages.faces import ensure_faces, face_name
 from .messages.forward import digest_forward
 from .messages.image import fetch_image_input
@@ -102,7 +104,7 @@ def render_private_help() -> str:
     return "\n".join(lines)
 
 
-# ==================== 辅助规则 ====================
+# ==================== 规则与公共函数 ====================
 
 
 async def is_group_message(event: Event) -> bool:
@@ -111,6 +113,10 @@ async def is_group_message(event: Event) -> bool:
 
 async def is_private_message(event: Event) -> bool:
     return isinstance(event, PrivateMessageEvent)
+
+
+def _is_group_or_private(event: Event) -> bool:
+    return isinstance(event, (GroupMessageEvent, PrivateMessageEvent))
 
 
 def _addresses_bot(bot: Bot, event: GroupMessageEvent) -> bool:
@@ -128,135 +134,20 @@ def _addresses_bot(bot: Bot, event: GroupMessageEvent) -> bool:
     )
 
 
-async def _parse_group_id_or_finish(matcher: type[Matcher], raw: str) -> int:
-    raw_group_id = raw.strip()
+async def _group_name(group_id: int) -> str:
     try:
-        return int(raw_group_id)
-    except ValueError:
-        await matcher.finish("群号必须是数字")
-        raise
+        group_info = await get_bot().get_group_info(group_id=group_id)
+    except (ActionFailed, NetworkError, ValueError) as e:
+        logger.debug(f"查群 {group_id} 的群名失败: {e}")
+        return f"群 {group_id}"
+    return group_info.get("group_name") or f"群 {group_id}"
 
 
-async def reset_session_with_backup(state, backup) -> bool:
-    """作废进行中的 turn，备份运行数据，然后重置该群会话。
-
-    备份刻意放在 session_lock 之外：它可能长时间打包整个数据目录。
-    """
-
-    async with state.session_lock:
-        await state.session.load_session()
-        state.session.bump_generation("reset_requested")
-
-    if not await backup():
-        return False
-
-    async with state.session_lock:
-        await state.session.reset()
-    return True
-
-
-async def describe_status(state) -> str:
-    """拼装会话与运行时诊断视图。"""
-
-    async with state.session_lock:
-        await state.session.load_session()
-        status = state.session.status()
-    settings = get_app_settings()
-    lines = [
-        "",
-        "Provider:",
-        f"- Chat reasoning_effort: {settings.chat.reasoning_effort or '未指定（由上游决定）'}",
-        f"- Feedback reasoning_effort: {settings.feedback.reasoning_effort or '未指定（由上游决定）'}",
-        f"- Queue length: {len(state.messages_chunk)}",
-        f"- Metrics: llm={metrics.llm_success}/{metrics.llm_failure}",
-    ]
-    for name, client in (("Chat", chat_client), ("Feedback", feedback_client)):
-        provider_status = client.provider_status
-        if provider_status.last_error_type:
-            lines.append(
-                f"- {name} last_error={provider_status.last_error_type} "
-                "circuit_remaining="
-                f"{provider_status.circuit_remaining_seconds}s"
-            )
-    return status + "\n".join(lines)
-
-
-# ==================== 命令注册 ====================
-
-
-def _is_group_or_private(event: Event) -> bool:
-    return isinstance(event, (GroupMessageEvent, PrivateMessageEvent))
-
-
-help_cmd = on_command(
-    rule=_is_group_or_private,
-    permission=SUPERUSER,
-    cmd="help",
-    aliases={"帮助"},
-    priority=0,
-    block=True,
-)
-list_groups_pm = on_command(
-    rule=is_private_message,
-    permission=SUPERUSER,
-    cmd="list_groups",
-    aliases={"群组列表"},
-    priority=0,
-    block=True,
-)
-manual_backup_cmd = on_command(
-    rule=_is_group_or_private,
-    permission=SUPERUSER,
-    cmd="backup_data",
-    aliases={"备份数据"},
-    priority=0,
-    block=True,
-)
-manage_cmd = on_command(
-    rule=is_group_message, permission=SUPERUSER, cmd="autochat", priority=1, block=True
-)
-token_stats = on_command(
-    rule=is_group_message,
-    permission=SUPERUSER,
-    cmd="token统计",
-    aliases={"autochat token统计"},
-    priority=1,
-    block=True,
-)
-sticker_del = on_command(
-    rule=is_group_message,
-    permission=SUPERUSER,
-    cmd="stickerdel",
-    priority=1,
-    block=True,
-)
-auto_chat = on_message(rule=is_group_message, priority=99, block=False)
-
-
-async def is_emoji_like_added(event: Event) -> bool:
-    # OneBot 适配器没有这个 notice 的模型，落到通用 NoticeEvent，额外字段在 model_dump 里
-    return (
-        isinstance(event, NoticeEvent)
-        and event.notice_type == "group_msg_emoji_like"
-        and event.model_dump().get("sub_type") == "add"
-    )
-
-
-emoji_like = on_notice(rule=is_emoji_like_added, priority=99, block=False)
-
-
-async def is_group_poke(event: Event) -> bool:
-    return isinstance(event, PokeNotifyEvent) and event.group_id is not None
-
-
-group_poke = on_notice(rule=is_group_poke, priority=99, block=False)
-
-
-async def is_group_recall(event: Event) -> bool:
-    return isinstance(event, GroupRecallNoticeEvent)
-
-
-group_recall = on_notice(rule=is_group_recall, priority=99, block=False)
+async def _group_state_or_finish(matcher: type[Matcher], group_id: int):
+    state = await loaded_group_state(group_id)
+    if not state:
+        await matcher.finish("本群 Autochat 未启用，请先使用 autochat enable")
+    return state
 
 
 def _dual_command(cmd: str, aliases: set[str], handler):
@@ -283,205 +174,29 @@ def _dual_command(cmd: str, aliases: set[str], handler):
         parts = args.extract_plain_text().strip().split(" ", 1)
         if not parts[0]:
             await matcher.finish("请提供<群号>")
-        group_id = await _parse_group_id_or_finish(matcher, parts[0])
+        try:
+            group_id = int(parts[0])
+        except ValueError:
+            await matcher.finish("群号必须是数字")
         await handler(matcher, group_id, parts[1].strip() if len(parts) > 1 else "")
 
     return matcher
 
 
-async def _group_state_or_finish(matcher: type[Matcher], group_id: int):
-    state = ensure_group_state(group_id)
-    if not state:
-        await matcher.finish("本群 Autochat 未启用，请先使用 autochat enable")
-    return state
+# ==================== 事件入口 ====================
 
 
-# ==================== 处理逻辑 ====================
-
-
-async def _do_get_presets(matcher: type[Matcher], group_id: int, _args: str):
-    state = await _group_state_or_finish(matcher, group_id)
-    async with state.session_lock:
-        await state.session.load_session()
-        presets = state.session.presets()
-    msg = "可选的预设:\n" + "".join(f"- {preset}\n" for preset in presets)
-    await matcher.finish(msg + "使用方法: set_presets <预设名称>\n")
-
-
-async def _do_set_presets(matcher: type[Matcher], group_id: int, args: str):
-    if not args:
-        await matcher.finish("请提供<预设文件名>")
-    state = await _group_state_or_finish(matcher, group_id)
-    async with state.session_lock:
-        await state.session.load_session()
-        loaded = await state.session.load_preset(filename=args)
-    await matcher.finish(f"预设已加载: {args}" if loaded else f"不存在的预设: {args}")
-
-
-async def _do_persona(matcher: type[Matcher], group_id: int, _args: str):
-    state = await _group_state_or_finish(matcher, group_id)
-    async with state.session_lock:
-        await state.session.load_session()
-        session_state = state.session.state
-        preset, name = session_state.preset, session_state.name
-        self_life, self_in_group = session_state.self_life, session_state.self_in_group
-    if not name:
-        await matcher.finish("本群还没设人设（或预设文件不在），先 set_preset")
-
-    # 「无」是整理过但没改，不算改动，不上尺子也不进流水
-    history = [
-        PersonaChange(row.date, row.scope, row.changes)
-        for row in await PersonaHistoryModel.filter(
-            Q(scope="life", key=preset) | Q(scope="group", key=f"{group_id}:{preset}")
-        ).order_by("-date", "-id")
-        if row.changes and row.changes != "无"
-    ]
-    recent = history[:PERSONA_HISTORY_LIMIT]
-    try:
-        image = await render_persona_card(
-            name=name,
-            as_of=PRESETS[preset].as_of,
-            life=self_life,
-            group_text=self_in_group,
-            group_name=await _group_name(group_id),
-            changes=recent,
-            marks=history,
-        )
-    except Exception as e:
-        logger.error(f"渲染人设卡片失败: {e}")
-        changes = "\n".join(
-            f"- {change.day:%m-%d} {'人生线' if change.scope == 'life' else '本群'}：{change.text}"
-            for change in recent
-        )
-        await matcher.finish(
-            f"人设：{preset}（{name}）\n\n"
-            f"[人生线]\n{self_life}\n\n"
-            f"[在这个群]\n{self_in_group or '还没整理过（每天 03:30 整理）'}\n\n"
-            f"[最近的改动]\n{changes or '无'}"
-        )
-    await matcher.finish(MessageSegment.image(image))
-
-
-async def _do_calm_down(matcher: type[Matcher], group_id: int, _args: str):
-    state = await _group_state_or_finish(matcher, group_id)
-    async with state.session_lock:
-        await state.session.load_session()
-        await state.session.calm_down()
-    await matcher.finish("已老实")
-
-
-async def _do_reset_emotion(matcher: type[Matcher], group_id: int, _args: str):
-    state = await _group_state_or_finish(matcher, group_id)
-    async with state.session_lock:
-        await state.session.load_session()
-        await state.session.reset_emotion()
-    await matcher.finish("心情已重置")
-
-
-async def _do_reset(matcher: type[Matcher], group_id: int, args: str):
-    if args.lower() != "confirm":
-        await matcher.finish(
-            "危险操作：将清空本群会话、记忆和画像。确认执行请发送：reset confirm"
-        )
-    state = await _group_state_or_finish(matcher, group_id)
-    await matcher.send("即将重置，会先执行一次数据备份...")
-    if not await reset_session_with_backup(state, backup_task):
-        await matcher.finish("备份失败，已中止重置；会话、记忆和画像均未清除。")
-        return
-    await matcher.finish("已重置会话")
-
-
-async def _group_name(group_id: int) -> str:
-    try:
-        group_info = await get_bot().get_group_info(group_id=group_id)
-        return group_info.get("group_name") or f"群 {group_id}"
-    except Exception:
-        return f"群 {group_id}"
-
-
-async def _do_group_notes(matcher: type[Matcher], group_id: int, _args: str):
-    await _group_state_or_finish(matcher, group_id)
-    pending = await count_new_group_fragments(str(group_id))
-    if pending >= GROUP_NOTES_REFRESH_MIN_NEW:
-        await matcher.send(f"有 {pending} 条新记忆还没整理进群志，正在整理，稍等一下")
-        try:
-            await refresh_group_notes(group_id, min_new=GROUP_NOTES_REFRESH_MIN_NEW)
-        except Exception as e:
-            # 整理失败照常发旧群志，水位没动，下次查看或夜里再整理
-            logger.warning(f"群 {group_id} 手动整理群志失败: {e}")
-    # 读库而不是内存副本：要带上整理水位做日期
-    session_db = await SessionModel.get_or_none(id=str(group_id))
-    if session_db is None or not session_db.group_notes:
-        await matcher.finish("本群还没有群志（每天 03:30 整理）")
-    try:
-        image = await render_group_notes_card(
-            notes=session_db.group_notes,
-            group_name=await _group_name(group_id),
-            updated_at=session_db.notes_summarized_until,
-        )
-    except Exception as e:
-        logger.error(f"渲染群志卡片失败: {e}")
-        await matcher.finish(f"群志：\n{session_db.group_notes}")
-    await matcher.finish(MessageSegment.image(image))
-
-
-async def _do_status(matcher: type[Matcher], group_id: int, _args: str):
-    state = await _group_state_or_finish(matcher, group_id)
-    await matcher.finish(await describe_status(state))
-
-
-get_presets = _dual_command("presets", {"preset"}, _do_get_presets)
-set_presets = _dual_command("set_preset", {"set_presets"}, _do_set_presets)
-get_persona = _dual_command("persona", {"人设"}, _do_persona)
-calm_down = _dual_command("calm", {"冷静"}, _do_calm_down)
-reset_emotion = _dual_command("reset_emotion", {"重置情绪"}, _do_reset_emotion)
-reset = _dual_command("reset", {"重置"}, _do_reset)
-get_status = _dual_command("status", {"状态"}, _do_status)
-get_group_notes = _dual_command("group_notes", {"群志", "查看群志"}, _do_group_notes)
-
-
-@help_cmd.handle()
-async def handle_help(event: Event):
-    await help_cmd.finish(
-        render_group_help()
-        if isinstance(event, GroupMessageEvent)
-        else render_private_help()
-    )
-
-
-async def _do_manual_backup(matcher: type[Matcher]):
-    await matcher.send("开始手动备份 NyaTuringTest 数据，请稍候...")
-    if await backup_task():
-        await matcher.finish("备份完成！")
-    await matcher.finish("备份失败，请检查日志和数据目录。")
-
-
-@manual_backup_cmd.handle()
-async def handle_manual_backup():
-    await _do_manual_backup(manual_backup_cmd)
-
-
-@list_groups_pm.handle()
-async def handle_list_groups_pm():
-    if not runtime_enabled_groups:
-        await list_groups_pm.finish("没有启用的群组")
-    msg = "启用的群组:\n" + "".join(
-        f"- {group_id}\n" for group_id in runtime_enabled_groups
-    )
-    await list_groups_pm.finish(msg)
+auto_chat = on_message(rule=is_group_message, priority=99, block=False)
 
 
 @auto_chat.handle()
 async def handle_auto_chat(bot: Bot, event: GroupMessageEvent):
     group_id = event.group_id
-    state = ensure_group_state(group_id)
+    state = await loaded_group_state(group_id)
     if not state:
         return
-
-    async with state.session_lock:
-        await state.session.load_session()
-        bot_name = state.session.state.name
-        generation = state.session.state.generation
+    bot_name = state.session.state.name
+    generation = state.session.state.generation
 
     # Shutdown 检查：避免在关机时进入耗时的消息处理
     if is_shutting_down():
@@ -538,33 +253,40 @@ async def handle_auto_chat(bot: Bot, event: GroupMessageEvent):
                 digest_forward(state, bot, event, message, forward_id, generation)
             )
 
-    async with state.data_lock:
-        state.event = event
-        state.bot = bot
-        state.messages_chunk.append(message)
-        state.new_message_signal.set()
+    await state.enqueue(message, bot, event)
+
+
+async def is_emoji_like_added(event: Event) -> bool:
+    # OneBot 适配器没有这个 notice 的模型，落到通用 NoticeEvent，额外字段在 model_dump 里
+    return (
+        isinstance(event, NoticeEvent)
+        and event.notice_type == "group_msg_emoji_like"
+        and event.model_dump().get("sub_type") == "add"
+    )
+
+
+emoji_like = on_notice(rule=is_emoji_like_added, priority=99, block=False)
 
 
 @emoji_like.handle()
 async def handle_emoji_like(bot: Bot, event: NoticeEvent):
     data = event.model_dump()
     user_id = str(data["user_id"])
+    group_id = int(data["group_id"])
     # 自己贴的表情也会上报
     if user_id == str(bot.self_id) or is_shutting_down():
         return
-    state = ensure_group_state(int(data["group_id"]))
+    state = await loaded_group_state(group_id)
     if not state:
         return
 
-    async with state.session_lock:
-        await state.session.load_session()
     session = state.session
     message_id = str(data["message_id"])
     # 只关心 bot 自己的消息；群友互相贴的、太旧不在短期记忆里的都不管
     target = next(
         (
             m
-            for m in session.runtime.short_term_memory.access()
+            for m in session.short_term_memory.access()
             if m.id == message_id and m.user_name == session.state.name
         ),
         None,
@@ -574,21 +296,21 @@ async def handle_emoji_like(bot: Bot, event: NoticeEvent):
 
     await ensure_faces(bot)
     emoji = face_name(str(data["likes"][0]["emoji_id"]))
-    try:
-        info = await bot.get_group_member_info(
-            group_id=int(data["group_id"]), user_id=int(user_id)
-        )
-        nickname = info.get("card") or info.get("nickname") or user_id
-    except Exception:
-        nickname = user_id
     session.record_reaction(
         MMessage(
             time=datetime.now(),
-            user_name=nickname,
+            user_name=await member_name(bot, group_id, user_id) or user_id,
             content=f"[给你的消息「{target.content[:20]}」贴了表情:{emoji or '未知'}]",
             user_id=user_id,
         )
     )
+
+
+async def is_group_poke(event: Event) -> bool:
+    return isinstance(event, PokeNotifyEvent) and event.group_id is not None
+
+
+group_poke = on_notice(rule=is_group_poke, priority=99, block=False)
 
 
 @group_poke.handle()
@@ -597,28 +319,23 @@ async def handle_group_poke(bot: Bot, event: PokeNotifyEvent):
 
     if is_shutting_down():
         return
-    state = ensure_group_state(event.group_id)
+    state = await loaded_group_state(event.group_id)
     if not state:
         return
-    async with state.session_lock:
-        await state.session.load_session()
-        bot_name = state.session.state.name
+    bot_name = state.session.state.name
 
     self_id = str(bot.self_id)
     poker_id, target_id = str(event.user_id), str(event.target_id)
-
-    async def display_name(user_id: str) -> str:
-        if user_id == self_id:
-            return bot_name
-        try:
-            info = await bot.get_group_member_info(
-                group_id=event.group_id, user_id=int(user_id)
-            )
-            return info.get("card") or info.get("nickname") or user_id
-        except Exception:
-            return user_id
-
-    poker, target = await asyncio.gather(display_name(poker_id), display_name(target_id))
+    poker = (
+        bot_name
+        if poker_id == self_id
+        else await member_name(bot, event.group_id, poker_id) or poker_id
+    )
+    target = (
+        bot_name
+        if target_id == self_id
+        else await member_name(bot, event.group_id, target_id) or target_id
+    )
     # 动作文字各人自定义（戳了戳、拍了拍、捏了捏…），照通知里的 action / suffix 原样拼
     data = event.model_dump()
     content = f"[戳一戳: {data.get('action') or '戳了戳'} {target}{data.get('suffix') or ''}]"
@@ -627,22 +344,24 @@ async def handle_group_poke(bot: Bot, event: PokeNotifyEvent):
         state.session.append_self_message(content, "", self_id)
         return
 
-    async with state.data_lock:
-        state.event = event
-        state.bot = bot
-        state.messages_chunk.append(
-            MMessage(
-                time=datetime.now(),
-                user_name=poker,
-                content=content,
-                user_id=poker_id,
-                # 被戳的人记进 mentions，Feedback 才能跟着戳他
-                mentions={} if target_id == self_id else {target_id: target},
-                to_me=target_id == self_id,
-                poke=True,
-            )
-        )
-        state.new_message_signal.set()
+    message = MMessage(
+        time=datetime.now(),
+        user_name=poker,
+        content=content,
+        user_id=poker_id,
+        # 被戳的人记进 mentions，Feedback 才能跟着戳他
+        mentions={} if target_id == self_id else {target_id: target},
+        to_me=target_id == self_id,
+        poke=True,
+    )
+    await state.enqueue(message, bot, event)
+
+
+async def is_group_recall(event: Event) -> bool:
+    return isinstance(event, GroupRecallNoticeEvent)
+
+
+group_recall = on_notice(rule=is_group_recall, priority=99, block=False)
 
 
 @group_recall.handle()
@@ -654,11 +373,9 @@ async def handle_group_recall(event: GroupRecallNoticeEvent):
 
     if is_shutting_down():
         return
-    state = ensure_group_state(event.group_id)
+    state = await loaded_group_state(event.group_id)
     if not state:
         return
-    async with state.session_lock:
-        await state.session.load_session()
 
     msg_id = str(event.message_id)
     by_author = event.operator_id == event.user_id
@@ -678,6 +395,71 @@ async def handle_group_recall(event: GroupRecallNoticeEvent):
         queued=bool(queued),
         in_buffer=in_buffer,
     )
+
+
+# ==================== 管理命令 ====================
+
+
+help_cmd = on_command(
+    rule=_is_group_or_private,
+    permission=SUPERUSER,
+    cmd="help",
+    aliases={"帮助"},
+    priority=0,
+    block=True,
+)
+
+
+@help_cmd.handle()
+async def handle_help(event: Event):
+    await help_cmd.finish(
+        render_group_help()
+        if isinstance(event, GroupMessageEvent)
+        else render_private_help()
+    )
+
+
+list_groups_pm = on_command(
+    rule=is_private_message,
+    permission=SUPERUSER,
+    cmd="list_groups",
+    aliases={"群组列表"},
+    priority=0,
+    block=True,
+)
+
+
+@list_groups_pm.handle()
+async def handle_list_groups_pm():
+    if not runtime_enabled_groups:
+        await list_groups_pm.finish("没有启用的群组")
+    msg = "启用的群组:\n" + "".join(
+        f"- {group_id}\n" for group_id in runtime_enabled_groups
+    )
+    await list_groups_pm.finish(msg)
+
+
+manual_backup_cmd = on_command(
+    rule=_is_group_or_private,
+    permission=SUPERUSER,
+    cmd="backup_data",
+    aliases={"备份数据"},
+    priority=0,
+    block=True,
+)
+
+
+@manual_backup_cmd.handle()
+async def handle_manual_backup():
+    await manual_backup_cmd.send("开始手动备份 NyaTuringTest 数据，请稍候...")
+    if await backup_task():
+        await manual_backup_cmd.finish("备份完成！")
+    await manual_backup_cmd.finish("备份失败，请检查日志和数据目录。")
+
+
+manage_cmd = on_command(
+    rule=is_group_message, permission=SUPERUSER, cmd="autochat", priority=1, block=True
+)
 
 
 @manage_cmd.handle()
@@ -718,6 +500,202 @@ async def handle_manage_autochat(
         )
 
 
+async def _do_status(matcher: type[Matcher], group_id: int, _args: str):
+    state = await _group_state_or_finish(matcher, group_id)
+    settings = get_app_settings()
+    lines = [
+        "",
+        "Provider:",
+        f"- Chat reasoning_effort: {settings.chat.reasoning_effort or '未指定（由上游决定）'}",
+        f"- Feedback reasoning_effort: {settings.feedback.reasoning_effort or '未指定（由上游决定）'}",
+        f"- Queue length: {len(state.messages_chunk)}",
+        f"- Metrics: llm={metrics.llm_success}/{metrics.llm_failure}",
+    ]
+    for name, client in (("Chat", chat_client), ("Feedback", feedback_client)):
+        provider_status = client.provider_status
+        if provider_status.last_error_type:
+            lines.append(
+                f"- {name} last_error={provider_status.last_error_type} "
+                "circuit_remaining="
+                f"{provider_status.circuit_remaining_seconds}s"
+            )
+    await matcher.finish(state.session.status() + "\n".join(lines))
+
+
+get_status = _dual_command("status", {"状态"}, _do_status)
+
+
+async def _do_get_presets(matcher: type[Matcher], group_id: int, _args: str):
+    state = await _group_state_or_finish(matcher, group_id)
+    presets = state.session.presets()
+    msg = "可选的预设:\n" + "".join(f"- {preset}\n" for preset in presets)
+    await matcher.finish(msg + "使用方法: set_presets <预设名称>\n")
+
+
+get_presets = _dual_command("presets", {"preset"}, _do_get_presets)
+
+
+async def _do_set_presets(matcher: type[Matcher], group_id: int, args: str):
+    if not args:
+        await matcher.finish("请提供<预设文件名>")
+    state = await _group_state_or_finish(matcher, group_id)
+    async with state.session_lock:
+        loaded = await state.session.load_preset(filename=args)
+    await matcher.finish(f"预设已加载: {args}" if loaded else f"不存在的预设: {args}")
+
+
+set_presets = _dual_command("set_preset", {"set_presets"}, _do_set_presets)
+
+
+async def _do_persona(matcher: type[Matcher], group_id: int, _args: str):
+    state = await _group_state_or_finish(matcher, group_id)
+    session_state = state.session.state
+    preset, name = session_state.preset, session_state.name
+    self_life, self_in_group = session_state.self_life, session_state.self_in_group
+    if not name:
+        await matcher.finish("本群还没设人设（或预设文件不在），先 set_preset")
+
+    # 「无」是整理过但没改，不算改动，不上尺子也不进流水
+    history = [
+        PersonaChange(row.date, row.scope, row.changes)
+        for row in await PersonaHistoryModel.filter(
+            Q(scope="life", key=preset) | Q(scope="group", key=f"{group_id}:{preset}")
+        ).order_by("-date", "-id")
+        if row.changes and row.changes != "无"
+    ]
+    recent = history[:PERSONA_HISTORY_LIMIT]
+    try:
+        image = await render_persona_card(
+            name=name,
+            as_of=PRESETS[preset].as_of,
+            life=self_life,
+            group_text=self_in_group,
+            group_name=await _group_name(group_id),
+            changes=recent,
+            marks=history,
+        )
+    except Exception as e:
+        logger.error(f"渲染人设卡片失败: {e}")
+        changes = "\n".join(
+            f"- {change.day:%m-%d} {'人生线' if change.scope == 'life' else '本群'}：{change.text}"
+            for change in recent
+        )
+        await matcher.finish(
+            f"人设：{preset}（{name}）\n\n"
+            f"[人生线]\n{self_life}\n\n"
+            f"[在这个群]\n{self_in_group or '还没整理过（每天 03:30 整理）'}\n\n"
+            f"[最近的改动]\n{changes or '无'}"
+        )
+    await matcher.finish(MessageSegment.image(image))
+
+
+get_persona = _dual_command("persona", {"人设"}, _do_persona)
+
+
+async def _do_group_notes(matcher: type[Matcher], group_id: int, _args: str):
+    await _group_state_or_finish(matcher, group_id)
+    pending = await count_new_group_fragments(str(group_id))
+    if pending >= GROUP_NOTES_REFRESH_MIN_NEW:
+        await matcher.send(f"有 {pending} 条新记忆还没整理进群志，正在整理，稍等一下")
+        try:
+            await refresh_group_notes(group_id, min_new=GROUP_NOTES_REFRESH_MIN_NEW)
+        except Exception as e:
+            # 整理失败照常发旧群志，水位没动，下次查看或夜里再整理
+            logger.warning(f"群 {group_id} 手动整理群志失败: {e}")
+    # 读库而不是内存副本：要带上整理水位做日期
+    session_db = await SessionModel.get_or_none(id=str(group_id))
+    if session_db is None or not session_db.group_notes:
+        await matcher.finish("本群还没有群志（每天 03:30 整理）")
+    try:
+        image = await render_group_notes_card(
+            notes=session_db.group_notes,
+            group_name=await _group_name(group_id),
+            updated_at=session_db.notes_summarized_until,
+        )
+    except Exception as e:
+        logger.error(f"渲染群志卡片失败: {e}")
+        await matcher.finish(f"群志：\n{session_db.group_notes}")
+    await matcher.finish(MessageSegment.image(image))
+
+
+get_group_notes = _dual_command("group_notes", {"群志", "查看群志"}, _do_group_notes)
+
+
+async def _do_calm_down(matcher: type[Matcher], group_id: int, _args: str):
+    state = await _group_state_or_finish(matcher, group_id)
+    async with state.session_lock:
+        await state.session.calm_down()
+    await matcher.finish("已老实")
+
+
+calm_down = _dual_command("calm", {"冷静"}, _do_calm_down)
+
+
+async def _do_reset_emotion(matcher: type[Matcher], group_id: int, _args: str):
+    state = await _group_state_or_finish(matcher, group_id)
+    async with state.session_lock:
+        await state.session.reset_emotion()
+    await matcher.finish("心情已重置")
+
+
+reset_emotion = _dual_command("reset_emotion", {"重置情绪"}, _do_reset_emotion)
+
+
+async def _do_reset(matcher: type[Matcher], group_id: int, args: str):
+    if args.lower() != "confirm":
+        await matcher.finish(
+            "危险操作：将清空本群会话、记忆和画像。确认执行请发送：reset confirm"
+        )
+    state = await _group_state_or_finish(matcher, group_id)
+    await matcher.send("即将重置，会先执行一次数据备份...")
+    # 先作废进行中的 turn 再备份；备份刻意放在 session_lock 之外：它可能长时间打包整个数据目录
+    async with state.session_lock:
+        state.session.bump_generation("reset_requested")
+    if not await backup_task():
+        await matcher.finish("备份失败，已中止重置；会话、记忆和画像均未清除。")
+    async with state.session_lock:
+        await state.session.reset()
+    await matcher.finish("已重置会话")
+
+
+reset = _dual_command("reset", {"重置"}, _do_reset)
+
+
+token_stats = on_command(
+    rule=is_group_message,
+    permission=SUPERUSER,
+    cmd="token统计",
+    aliases={"autochat token统计"},
+    priority=1,
+    block=True,
+)
+
+
+@token_stats.handle()
+async def handle_token_stats(event: GroupMessageEvent):
+    stats = await get_token_stats(event.group_id, get_token_stats_model_names())
+    try:
+        image = await render_token_stats_card(stats)
+    except Exception as e:
+        logger.error(f"渲染 Token 统计卡片失败: {e}")
+        lines = [
+            f"{label} {item['model']}: {item['total']:,}"
+            for label, view in (("今日本群", "1d_local"), ("今日全部", "1d_global"))
+            for item in stats[view]
+        ]
+        await token_stats.finish("Token 统计\n" + ("\n".join(lines) or "今日暂无"))
+    await token_stats.finish(MessageSegment.image(image))
+
+
+sticker_del = on_command(
+    rule=is_group_message,
+    permission=SUPERUSER,
+    cmd="stickerdel",
+    priority=1,
+    block=True,
+)
+
+
 @sticker_del.handle()
 async def handle_sticker_del(event: GroupMessageEvent):
     """回复的消息里每张图都按内容哈希删掉、拉黑；库里没有的也先拉黑，以后见到只描述不收。"""
@@ -753,29 +731,6 @@ async def handle_sticker_del(event: GroupMessageEvent):
     await sticker_del.finish("，".join(parts))
 
 
-@token_stats.handle()
-async def handle_token_stats(event: GroupMessageEvent):
-    stats = await get_token_stats(event.group_id, get_token_stats_model_names())
-    try:
-        image = await render_token_stats_card(stats)
-    except Exception as e:
-        logger.error(f"渲染 Token 统计卡片失败: {e}")
-        lines = [
-            f"{label} {item['model']}: {item['total']:,}"
-            for label, view in (("今日本群", "1d_local"), ("今日全部", "1d_global"))
-            for item in stats[view]
-        ]
-        await token_stats.finish("Token 统计\n" + ("\n".join(lines) or "今日暂无"))
-    await token_stats.finish(MessageSegment.image(image))
-
-
-query_memory = on_command(
-    "查询记忆",
-    aliases={"memory"},
-    rule=is_group_message,
-    priority=5,
-    block=True,
-)
 rag_debug = on_command(
     "rag_debug",
     aliases={"记忆诊断"},
@@ -785,18 +740,14 @@ rag_debug = on_command(
     block=True,
 )
 
-def _format_rag_debug_score(value) -> str:
-    if value is None:
-        return "-"
-    try:
-        return f"{float(value):.4f}"
-    except (TypeError, ValueError):
-        return str(value)
+
+def _format_rag_debug_score(value: float | None) -> str:
+    return "-" if value is None else f"{value:.4f}"
 
 
 def _format_rag_debug_record(index: int, record: dict) -> str:
-    metadata = dict(record.get("metadata") or {})
-    content = str(record.get("content") or "").replace("\n", " ")
+    metadata = record["metadata"]
+    content = record["content"].replace("\n", " ")
     return (
         f"{index}. ref={metadata.get('memory_ref') or '-'} "
         f"category={metadata.get('category') or '-'} "
@@ -818,15 +769,11 @@ async def handle_rag_debug(
     query = args.extract_plain_text().strip()
     if not query:
         await rag_debug.finish("用法: rag_debug <query>")
-        return
-    state = ensure_group_state(event.group_id)
+    state = await loaded_group_state(event.group_id)
     if not state:
         await rag_debug.finish("本群尚未启用 AI 功能。")
-        return
 
-    async with state.session_lock:
-        await state.session.load_session()
-    result = await state.session.runtime.vector_memory.retrieve_with_decay(
+    result = await state.session.vector_memory.retrieve_with_decay(
         [query],
         k=RAG_FINAL_K,
         use_rerank=True,
@@ -853,22 +800,16 @@ async def handle_rag_debug(
     await rag_debug.finish("\n".join(lines))
 
 
-async def _target_display_name(
-    bot: Bot,
-    event: GroupMessageEvent,
-    target_id: str,
-) -> str:
-    sender_id = str(event.user_id)
-    if target_id == sender_id:
-        return event.sender.card or event.sender.nickname or sender_id
-    try:
-        info = await bot.get_group_member_info(
-            group_id=event.group_id,
-            user_id=int(target_id),
-        )
-        return info.get("card") or info.get("nickname") or target_id
-    except Exception:
-        return target_id
+# ==================== 群友命令 ====================
+
+
+query_memory = on_command(
+    "查询记忆",
+    aliases={"memory"},
+    rule=is_group_message,
+    priority=5,
+    block=True,
+)
 
 
 @query_memory.handle()
@@ -882,11 +823,10 @@ async def handle_query_memory(
         if segment.type == "at" and str(segment.data.get("qq", "")):
             target_id = str(segment.data["qq"])
             break
-    target_name = await _target_display_name(bot, event, target_id)
-    state = ensure_group_state(event.group_id)
+    state = await loaded_group_state(event.group_id)
     if not state:
         await query_memory.finish("本群尚未启用 AI 功能。")
-        return
+    target_name = await member_name(bot, event.group_id, target_id) or target_id
 
     retry_after = acquire_query_slot(str(event.group_id), str(event.user_id))
     if retry_after > 0:

@@ -57,28 +57,16 @@ class SessionState:
     generation: int = 0
 
 
-@dataclass
-class SessionRuntime:
-    """一个 Session 持有的 I/O 资源与后台任务。"""
-
-    short_term_memory: Memory
-    vector_memory: VectorMemory
-    background_tasks: set[asyncio.Task] = field(default_factory=set)
-    save_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-
-
 class Session:
-    """
-    群聊会话
-    """
+    """群聊会话：领域状态 state，加上它持有的 I/O 资源与后台任务。"""
 
     def __init__(self, id: str):
         self.id = id
         self.state = SessionState()
-        self.runtime = SessionRuntime(
-            short_term_memory=Memory(),
-            vector_memory=VectorMemory(id),
-        )
+        self.short_term_memory = Memory()
+        self.vector_memory = VectorMemory(id)
+        self.background_tasks: set[asyncio.Task] = set()
+        self.save_lock = asyncio.Lock()
         # 保存请求去抖 + 单飞：频繁的 schedule_save 合并成一次后台写库
         self._save_pending = False
         self._save_task: asyncio.Task | None = None
@@ -111,11 +99,11 @@ class Session:
         generation = self.bump_generation("reset")
         # 重置的是本群的数据，不是换人：人设留着，群层随 delete_session_data 清掉
         self.state = SessionState(loaded=True, generation=generation, preset=self.state.preset)
-        self.runtime.short_term_memory.clear()
-        await self.runtime.vector_memory.clear()
+        self.short_term_memory.clear()
+        await self.vector_memory.clear()
         # 清理数据库中的所有关联数据，并与后台持久化共用同一把锁：
         # 旧 generation 的后台写入要么已在删除前完成，要么拿锁后被跳过。
-        async with self.runtime.save_lock:
+        async with self.save_lock:
             await delete_session_data(self.id)
             await self._save_session_locked()
         await self._apply_preset()
@@ -139,12 +127,12 @@ class Session:
     def spawn(self, coro) -> asyncio.Task:
         """创建受 drain_background_tasks 管理、异常会记日志的后台任务"""
         task = asyncio.create_task(coro)
-        self.runtime.background_tasks.add(task)
+        self.background_tasks.add(task)
         task.add_done_callback(self._on_task_done)
         return task
 
     def _on_task_done(self, task: asyncio.Task):
-        self.runtime.background_tasks.discard(task)
+        self.background_tasks.discard(task)
         if task.cancelled():
             return
         exc = task.exception()
@@ -168,7 +156,7 @@ class Session:
             await asyncio.shield(task)
 
     async def save_session(self) -> bool:
-        async with self.runtime.save_lock:
+        async with self.save_lock:
             return await self._save_session_locked()
 
     async def _save_session_locked(self) -> bool:
@@ -202,13 +190,13 @@ class Session:
                     profile.dirty = False
 
             # 3. 只同步新增或内容被图片观察丰富过的消息。
-            pending_messages = self.runtime.short_term_memory.pending_messages()
+            pending_messages = self.short_term_memory.pending_messages()
             if pending_messages:
                 await sync_messages(
                     self.id,
                     [message for message, _ in pending_messages],
                 )
-                self.runtime.short_term_memory.mark_persisted(pending_messages)
+                self.short_term_memory.mark_persisted(pending_messages)
 
             return True
         except Exception as e:
@@ -266,7 +254,7 @@ class Session:
                 dirty=False,
             )
 
-        self.runtime.short_term_memory = Memory(messages=data["messages"])
+        self.short_term_memory = Memory(messages=data["messages"])
 
         self.state.loaded = True
         logger.info(f"[Session {self.id}] 加载完成")
@@ -325,7 +313,7 @@ class Session:
 
     def status(self) -> str:
         self.state.global_emotion.settle()
-        recent_messages = self.runtime.short_term_memory.access()
+        recent_messages = self.short_term_memory.access()
         recent_str = (
             "\n".join([f"{m.user_name}: {m.content}" for m in recent_messages])
             if recent_messages
@@ -336,7 +324,7 @@ class Session:
 意愿值：{self.state.willingness:.2f}
 状态: {chatting_state(self.state, datetime.now())}
 心情：V{self.state.global_emotion.valence:.2f} A{self.state.global_emotion.arousal:.2f} D{self.state.global_emotion.dominance:.2f}
-后台任务数: {len(self.runtime.background_tasks)}
+后台任务数: {len(self.background_tasks)}
 摘要：{self.state.chat_summary}
 最近消息：
 {recent_str}
@@ -353,7 +341,7 @@ class Session:
             id=msg_id,
             user_id=bot_user_id,
         )
-        self.runtime.short_term_memory.update([msg])
+        self.short_term_memory.update([msg])
 
     def record_reaction(self, msg: Message) -> None:
         """群友给 bot 的消息贴了表情：只进短期记忆，不进固化计数，也不触发新一轮对话。
@@ -361,7 +349,7 @@ class Session:
         一条消息常被好几个人贴同一个表情，已有相同记录就跳过，免得挤满上下文窗口。
         """
 
-        memory = self.runtime.short_term_memory
+        memory = self.short_term_memory
         if any(m.content == msg.content for m in memory.access()):
             return
         memory.update([msg])
@@ -370,7 +358,7 @@ class Session:
     def recall_message(self, msg_id: str, content: str) -> bool:
         """群友撤回消息：缓冲里那条原地改成撤回标记，随下次保存写回消息库。"""
 
-        if not self.runtime.short_term_memory.rewrite(msg_id, content):
+        if not self.short_term_memory.rewrite(msg_id, content):
             return False
         self.schedule_save()
         return True
@@ -378,12 +366,12 @@ class Session:
     def record_incoming(self, messages_chunk: list[Message]) -> None:
         """写入短时记忆并累计固化窗口。"""
 
-        self.runtime.short_term_memory.update(messages_chunk)
+        self.short_term_memory.update(messages_chunk)
         self.state.messages_since_consolidation += len(messages_chunk)
         self.schedule_save()
 
     async def drain_background_tasks(self):
-        pending = [task for task in self.runtime.background_tasks if not task.done()]
+        pending = [task for task in self.background_tasks if not task.done()]
         if not pending:
             return
         try:

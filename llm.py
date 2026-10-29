@@ -3,7 +3,6 @@ import json
 import re
 import ssl
 import time
-from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -13,7 +12,7 @@ from openai import APIConnectionError, APITimeoutError, AsyncOpenAI
 
 from .config import EndpointSettings, get_app_settings
 from .metrics import log_event, metrics, record_token_usage
-from .prompts import CHAT_SYSTEM_PROMPT, FEEDBACK_SYSTEM_PROMPT, JSON_SYSTEM_PROMPT
+from .prompts import JSON_SYSTEM_PROMPT
 
 
 @dataclass(frozen=True)
@@ -172,6 +171,26 @@ class LLMClient:
         )
         return content
 
+    async def generate_json(
+        self,
+        prompt: str,
+        *,
+        session_id: str,
+        temperature: float,
+        system_prompt: str = JSON_SYSTEM_PROMPT,
+        images: list[VisionInput] | None = None,
+    ) -> dict | None:
+        """返回模型输出的 JSON 对象；调用失败或输出不是对象返回 None。"""
+
+        content = await self.generate(
+            prompt,
+            session_id=session_id,
+            temperature=temperature,
+            system_prompt=system_prompt,
+            images=images,
+        )
+        return _parse_json_object(content) if content else None
+
     async def _request(
         self,
         prompt: str,
@@ -260,67 +279,25 @@ chat_client = LLMClient(get_app_settings().chat)
 feedback_client = LLMClient(get_app_settings().feedback)
 
 
-def build_turn_calls(
-    session_id: str, images: list[VisionInput]
-) -> tuple[Callable[[str], Awaitable[str]], Callable[[str], Awaitable[str]]]:
-    """构造本轮对话的 chat / feedback 两个调用闭包。
+def _parse_json_object(text: str) -> dict | None:
+    """从模型输出里取出 JSON 对象：去掉 <think> 和代码块标记，解析失败再用 json_repair 修一次。"""
 
-    只有 Chat 带本轮原图：Feedback 判断心情和要不要说话，看消息里的图片描述就够了。
-    """
-
-    async def chat_call(prompt: str) -> str:
-        return await chat_client.generate(
-            prompt,
-            session_id=session_id,
-            # 略高的温度换取用词和句式的变化；0.9 时会开始编造群友说过的话
-            temperature=0.8,
-            system_prompt=CHAT_SYSTEM_PROMPT,
-            images=images,
-        )
-
-    async def feedback_call(prompt: str) -> str:
-        return await feedback_client.generate(
-            prompt,
-            session_id=session_id,
-            temperature=0.1,
-            system_prompt=FEEDBACK_SYSTEM_PROMPT,
-        )
-
-    return chat_call, feedback_call
-
-
-def extract_and_parse_json(text: str) -> dict | list | None:
-    """Extract a JSON object/array from a bounded LLM response."""
-
-    if not text:
-        return None
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
     match = re.search(r"```(?:json)?\s*(.*?)\s*```", text, flags=re.DOTALL)
     if match:
         text = match.group(1)
-    else:
-        text = re.sub(r"```json\s*|```\s*", "", text)
-    object_start = text.find("{")
-    array_start = text.find("[")
-    if object_start != -1 and (array_start == -1 or object_start < array_start):
-        end = text.rfind("}")
-        payload = text[object_start : end + 1] if end != -1 else ""
-    elif array_start != -1:
-        end = text.rfind("]")
-        payload = text[array_start : end + 1] if end != -1 else ""
-    else:
-        payload = ""
-    if not payload:
+    start, end = text.find("{"), text.rfind("}")
+    if start == -1 or end < start:
         return None
+    payload = text[start : end + 1]
     try:
-        return json.loads(payload)
+        parsed = json.loads(payload)
     except json.JSONDecodeError:
-        pass
-    try:
-        from json_repair import repair_json
+        try:
+            from json_repair import repair_json
 
-        repaired = repair_json(payload, return_objects=True)
-        return repaired if isinstance(repaired, (dict, list)) else None
-    except Exception as e:
-        logger.warning(f"json_repair 失败: {e}")
-        return None
+            parsed = repair_json(payload, return_objects=True)
+        except Exception as e:
+            logger.warning(f"json_repair 失败: {e}")
+            return None
+    return parsed if isinstance(parsed, dict) else None

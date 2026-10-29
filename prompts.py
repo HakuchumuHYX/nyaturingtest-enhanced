@@ -732,6 +732,22 @@ _CORRECTION_POINTS_RULE = "标有「更正」的碎片单独写成一条「更�
 _STYLE_RULE = "用连贯的短句，不用斜杠或顿号串起一长串名词。只依据资料，不推测、不评价。"
 
 
+def fragments_material(lines: str) -> str:
+    """新碎片只有一块时，直接拿碎片重写档案或群志。"""
+
+    return f"[新的记忆碎片]（按时间先后，格式 [日期|类别] 内容）\n{lines}"
+
+
+def points_material(segments: list[tuple[str, str]]) -> str:
+    """新碎片分了多块时，拿各段要点重写；segments 是 (时间跨度, 要点)。"""
+
+    body = "\n\n".join(
+        f"[第 {index} 段 {span}]\n{points}"
+        for index, (span, points) in enumerate(segments, 1)
+    )
+    return f"[新增要点]（新碎片较多，已按时间分段提炼，越靠后越新）\n{body}"
+
+
 def get_profile_prompt(name: str, user_id: str, summary: str, material: str) -> str:
     return f"""
 你在为群聊角色整理对群友「{name}」（ID {user_id}）的长期档案：一段让角色快速想起「这是个什么样的人」的简介。

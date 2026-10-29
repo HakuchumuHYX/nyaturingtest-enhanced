@@ -11,9 +11,10 @@ from nonebot import logger, require
 require("nonebot_plugin_apscheduler")
 from nonebot_plugin_apscheduler import scheduler  # noqa: E402  必须在 require 之后导入
 
-from ..llm import build_turn_calls, extract_and_parse_json  # noqa: E402
+from ..llm import chat_client  # noqa: E402
 from ..metrics import log_event  # noqa: E402
 from ..prompts import (  # noqa: E402
+    CHAT_SYSTEM_PROMPT,
     describe_mood,
     describe_relation,
     get_initiative_prompt,
@@ -27,7 +28,12 @@ from .groups import (  # noqa: E402
     is_shutting_down,
     runtime_enabled_groups,
 )
-from .orchestrator import MY_RECENT_REPLIES_LIMIT, format_history  # noqa: E402
+from .orchestrator import (  # noqa: E402
+    CHAT_TEMPERATURE,
+    MY_RECENT_REPLIES_LIMIT,
+    Reply,
+    format_history,
+)
 from .send import dispatch_replies  # noqa: E402
 
 SCAN_INTERVAL_MINUTES = 10
@@ -58,7 +64,7 @@ def _silence_minutes(state: GroupState, now: datetime) -> int | None:
     """最后一条是群友的消息时返回安静了多少分钟；没有消息或最后一条是自己说的返回 None，
     这样发起后没人理就一直等到有人说话，不会对着空气连说两次。"""
 
-    messages = state.session.runtime.short_term_memory.access()
+    messages = state.session.short_term_memory.access()
     if not messages or messages[-1].user_name == state.session.state.name:
         return None
     return int((now - messages[-1].time).total_seconds() // 60)
@@ -99,12 +105,11 @@ async def scan_groups() -> None:
 
 async def _initiate(state: GroupState, silence: int) -> None:
     session = state.session
-    async with state.session_lock:
-        await session.load_session()
-        generation = session.state.generation
+    await state.load()
+    generation = session.state.generation
     session_state = session.state
 
-    messages = session.runtime.short_term_memory.access()
+    messages = session.short_term_memory.access()
     names = {m.user_id: m.user_name for m in messages if m.user_id}
     # 最近说过话的群友，越近越靠前
     members = list(
@@ -125,7 +130,7 @@ async def _initiate(state: GroupState, silence: int) -> None:
         for uid in members
         if session_state.user_summaries.get(uid)
     ][:MEMBER_PROFILE_LIMIT]
-    rows = await session.runtime.vector_memory.recent(RECENT_MEMORY_LIMIT)
+    rows = await session.vector_memory.recent(RECENT_MEMORY_LIMIT)
     recent_memories = [
         f"【主体:{row.subject_user_name or '无'}|d:{row.date}】{row.content}"
         for row in reversed(rows)
@@ -152,9 +157,13 @@ async def _initiate(state: GroupState, silence: int) -> None:
         silence_minutes=silence,
         time_info=get_time_description(datetime.now()),
     )
-    chat_call, _ = build_turn_calls(str(session.id), [])
-    parsed = extract_and_parse_json(await chat_call(prompt))
-    content = str(parsed.get("content") or "").strip() if isinstance(parsed, dict) else ""
+    parsed = await chat_client.generate_json(
+        prompt,
+        session_id=session.id,
+        temperature=CHAT_TEMPERATURE,
+        system_prompt=CHAT_SYSTEM_PROMPT,
+    )
+    content = str(parsed.get("content") or "").strip() if parsed else ""
 
     if session.stale(generation, "initiative"):
         outcome = "stale"
@@ -165,7 +174,7 @@ async def _initiate(state: GroupState, silence: int) -> None:
     else:
         sent = await dispatch_replies(
             state=state,
-            responses=[{"content": content}],
+            replies=[Reply(text=content)],
             bot=state.bot,
             event=state.event,
             generation=generation,

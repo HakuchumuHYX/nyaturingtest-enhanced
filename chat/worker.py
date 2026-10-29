@@ -6,11 +6,10 @@ from dataclasses import dataclass
 from nonebot import logger
 from nonebot.adapters.onebot.v11 import Bot, Event
 
-from ..llm import build_turn_calls
 from ..messages.message import Message as MMessage
 from ..metrics import log_event
 from .groups import SELF_SENT_MSG_IDS, GroupState, is_shutting_down
-from .orchestrator import ConversationOrchestrator
+from .orchestrator import process_chunk
 from .send import dispatch_replies, send_poke, send_reaction
 
 DEBOUNCE_SECONDS = 2.0
@@ -92,17 +91,12 @@ async def _process_inbox_batch(state: GroupState, batch: InboxBatch) -> None:
     if is_shutting_down():
         return
 
-    async with state.session_lock:
-        await state.session.load_session()
-        generation = state.session.state.generation
-        session_id = str(state.session.id)
+    await state.load()
+    generation = state.session.state.generation
 
     images = [item for message in current_chunk for item in message.image_inputs]
-    chat_call, feedback_call = build_turn_calls(session_id, images)
     try:
-        turn = await ConversationOrchestrator(state.session).process_chunk(
-            current_chunk, chat_call, feedback_call, generation
-        )
+        turn = await process_chunk(state.session, current_chunk, images, generation)
     finally:
         for message in current_chunk:
             message.image_inputs.clear()
@@ -115,7 +109,7 @@ async def _process_inbox_batch(state: GroupState, batch: InboxBatch) -> None:
         await send_poke(state, batch.bot, batch.event, turn.poke, generation)
     await dispatch_replies(
         state=state,
-        responses=turn.replies,
+        replies=turn.replies,
         bot=batch.bot,
         event=batch.event,
         generation=generation,

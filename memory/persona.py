@@ -18,7 +18,7 @@ from datetime import date, datetime, timedelta
 
 from nonebot import logger
 
-from ..llm import extract_and_parse_json, feedback_client
+from ..llm import feedback_client
 from ..prompts import (
     JOURNAL_DAYS,
     MAX_LIFE_FACTS,
@@ -134,15 +134,6 @@ def life_due(last_digest: date | None, day: date, has_facts: bool) -> bool:
     return last_digest is None or has_facts or day - last_digest >= LIFE_INTERVAL
 
 
-async def _generate(prompt: str, session_id: str) -> dict | None:
-    data = extract_and_parse_json(
-        await feedback_client.generate(
-            prompt, session_id=session_id, temperature=PERSONA_TEMPERATURE
-        )
-    )
-    return data if isinstance(data, dict) else None
-
-
 async def digest_group(
     persona: RolePreset,
     *,
@@ -160,7 +151,7 @@ async def digest_group(
     days_in_group 从本群群友档案里最早的 first_interaction_at 算起（和查询记忆的认识天数同一口径）。
     """
 
-    data = await _generate(
+    data = await feedback_client.generate_json(
         get_persona_group_prompt(
             persona,
             life,
@@ -170,7 +161,8 @@ async def digest_group(
             group_material(rows, persona.name),
             day,
         ),
-        session_id,
+        session_id=session_id,
+        temperature=PERSONA_TEMPERATURE,
     )
     if (
         data is None
@@ -201,8 +193,10 @@ async def digest_life(
 ) -> LifeDigest | None:
     """整理人生线，失败返回 None。"""
 
-    data = await _generate(
-        get_persona_life_prompt(persona, life, life_facts, group_styles, day), session_id
+    data = await feedback_client.generate_json(
+        get_persona_life_prompt(persona, life, life_facts, group_styles, day),
+        session_id=session_id,
+        temperature=PERSONA_TEMPERATURE,
     )
     if data is None or not isinstance(data.get("life"), str):
         logger.warning(f"[Persona] {persona.name} {day} 人生线整理输出无效")
@@ -265,7 +259,7 @@ async def _maintain_preset(
     filename: str,
     session_ids: list[str],
     yesterday: date,
-    still_current: Callable[[str], bool],
+    guards: dict[str, Callable[[], bool]],
 ) -> tuple[PersonaLifeModel, dict[str, PersonaGroupModel]]:
     persona = PRESETS[filename]
     life_session = f"persona:{filename}"
@@ -315,7 +309,7 @@ async def _maintain_preset(
                     )
                 )
                 # 整理途中群被 reset 或换了预设，结果作废
-                if result is None or not still_current(session_id):
+                if result is None or not guards[session_id]():
                     blocked.add(session_id)
                     continue
                 layer.text = result.text
@@ -354,11 +348,12 @@ async def _maintain_preset(
 
 
 async def maintain_personas(
-    group_ids: list[int], still_current: Callable[[str], bool]
+    group_ids: list[int], guards: dict[str, Callable[[], bool]]
 ) -> tuple[dict[str, str], dict[str, str]]:
     """每日整理：设了人设的启用群把群层推到昨天，再整理对应预设的人生线。
 
     返回（{预设文件名: 人生线}, {群号: 群层}），外层用来同步已加载 session 的只读副本。
+    guards 是 {群号: 会话还没被作废的检查}，整理途中作废的群结果丢弃。
     """
 
     by_preset: dict[str, list[str]] = defaultdict(list)
@@ -372,7 +367,7 @@ async def maintain_personas(
     lives: dict[str, str] = {}
     groups: dict[str, str] = {}
     for filename, session_ids in by_preset.items():
-        life, updated = await _maintain_preset(filename, session_ids, yesterday, still_current)
+        life, updated = await _maintain_preset(filename, session_ids, yesterday, guards)
         lives[filename] = life.text
         groups.update({session_id: layer.text for session_id, layer in updated.items()})
     return lives, groups

@@ -15,10 +15,10 @@ from nonebot.adapters.onebot.v11.exception import ActionFailed
 from nonebot.exception import NetworkError
 
 from ..chat.groups import GroupState
-from ..llm import VisionInput, extract_and_parse_json, feedback_client
+from ..llm import VisionInput, feedback_client
 from ..metrics import log_event
 from ..prompts import get_forward_prompt
-from .convert import FORWARD_PLACEHOLDER, segment_text
+from .convert import FORWARD_PLACEHOLDER, is_sticker_segment, segment_text
 from .image import fetch_image_input
 from .message import Message
 
@@ -69,7 +69,7 @@ async def _image_text(data: dict, out: _Expansion) -> str:
     text, vision_input, _ = await fetch_image_input(
         data.get("url", ""),
         data.get("file_unique", ""),
-        is_sticker=str(data.get("sub_type", "")) == "1",
+        is_sticker=is_sticker_segment(data),
         ref_id=ref_id,
     )
     if vision_input is None:
@@ -120,24 +120,20 @@ async def digest_forward(
     node_count = 0
     try:
         node_count = await _expand(bot, forward_id, 1, out)
-        parsed = extract_and_parse_json(
-            await feedback_client.generate(
-                get_forward_prompt(
-                    bot_name=session.state.name,
-                    sender_name=message.user_name,
-                    node_count=node_count,
-                    lines=out.lines,
-                    skipped_nodes=out.skipped_nodes,
-                    skipped_images=out.skipped_images,
-                ),
-                session_id=session.id,
-                temperature=FORWARD_TEMPERATURE,
-                images=out.images,
-            )
+        parsed = await feedback_client.generate_json(
+            get_forward_prompt(
+                bot_name=session.state.name,
+                sender_name=message.user_name,
+                node_count=node_count,
+                lines=out.lines,
+                skipped_nodes=out.skipped_nodes,
+                skipped_images=out.skipped_images,
+            ),
+            session_id=session.id,
+            temperature=FORWARD_TEMPERATURE,
+            images=out.images,
         )
-        summary = (
-            str(parsed.get("summary") or "").strip() if isinstance(parsed, dict) else ""
-        )
+        summary = str(parsed.get("summary") or "").strip() if parsed else ""
         if not summary:
             logger.warning(f"[Forward] 群 {session.id} 转发摘要输出无效，留着占位")
             outcome = "failed"
@@ -148,15 +144,9 @@ async def digest_forward(
             outcome = "recalled"
         else:
             message.content = f"[合并转发 {node_count}条（{FORWARD_NOTE}）: {summary}]"
-            session.runtime.short_term_memory.mark_dirty(message)
+            session.short_term_memory.mark_dirty(message)
             session.schedule_save()
-            async with state.data_lock:
-                # 读得比防抖还快时占位还在队列里，改写过的内容会随那一轮一起处理
-                if not any(m is message for m in state.messages_chunk):
-                    state.event = event
-                    state.bot = bot
-                    state.messages_chunk.append(message)
-                    state.new_message_signal.set()
+            await state.enqueue(message, bot, event)
             outcome = "ok"
     except (ActionFailed, NetworkError) as e:
         logger.warning(f"[Forward] 群 {session.id} 拉取转发内容失败，留着占位: {e}")

@@ -14,16 +14,17 @@ import asyncio
 from collections import defaultdict
 from collections.abc import Callable
 from datetime import datetime, timedelta
-from functools import partial
 
 from nonebot import logger
 
-from ..llm import extract_and_parse_json, feedback_client
+from ..llm import feedback_client
 from ..prompts import (
+    fragments_material,
     get_group_notes_prompt,
     get_group_points_prompt,
     get_profile_points_prompt,
     get_profile_prompt,
+    points_material,
 )
 from ..storage.db import get_latest_user_names
 from ..storage.models import MemoryModel, SessionModel, UserProfileModel
@@ -91,18 +92,6 @@ def _chunk_lines(chunk: list[dict]) -> str:
     return "\n".join(_memory_line(row) for row in chunk)
 
 
-def _fragments_material(chunk: list[dict]) -> str:
-    return f"[新的记忆碎片]（按时间先后，格式 [日期|类别] 内容）\n{_chunk_lines(chunk)}"
-
-
-def _points_material(segments: list[tuple[str, str]]) -> str:
-    body = "\n\n".join(
-        f"[第 {index} 段 {span}]\n{points}"
-        for index, (span, points) in enumerate(segments, 1)
-    )
-    return f"[新增要点]（新碎片较多，已按时间分段提炼，越靠后越新）\n{body}"
-
-
 def _due(
     new_count: int,
     until: datetime | None,
@@ -120,12 +109,10 @@ def _due(
 
 
 async def _generate(session_id: str, prompt: str, key: str) -> str | None:
-    data = extract_and_parse_json(
-        await feedback_client.generate(
-            prompt, session_id=session_id, temperature=DIGEST_TEMPERATURE
-        )
+    data = await feedback_client.generate_json(
+        prompt, session_id=session_id, temperature=DIGEST_TEMPERATURE
     )
-    if not isinstance(data, dict) or not isinstance(data.get(key), str):
+    if data is None or not isinstance(data.get(key), str):
         logger.warning(f"[Digest] 群 {session_id} 整理输出无效，跳过，下次再试")
         return None
     return data[key].strip()
@@ -136,49 +123,31 @@ async def _condense(
     chunks: list[list[dict]],
     *,
     rewrite_prompt: Callable[[str], str],
-    points_prompt: Callable[[list[dict]], str],
+    points_prompt: Callable[[str, str], str],
     key: str,
 ) -> str | None:
-    """一块直接重写；多块先并行提炼各段要点再合并。任一步失败返回 None，水位不动。"""
+    """一块直接重写；多块先并行提炼各段要点再合并。任一步失败返回 None，水位不动。
+
+    rewrite_prompt(材料)、points_prompt(时间跨度, 碎片行) 由档案和群志各自给出模板。
+    """
 
     if len(chunks) == 1:
         return await _generate(
-            session_id, rewrite_prompt(_fragments_material(chunks[0])), key
+            session_id, rewrite_prompt(fragments_material(_chunk_lines(chunks[0]))), key
         )
 
     limit = asyncio.Semaphore(POINTS_CONCURRENCY)
 
     async def points_of(chunk: list[dict]) -> str | None:
         async with limit:
-            return await _generate(session_id, points_prompt(chunk), "points")
+            prompt = points_prompt(_span(chunk), _chunk_lines(chunk))
+            return await _generate(session_id, prompt, "points")
 
     points = await asyncio.gather(*(points_of(chunk) for chunk in chunks))
     if any(item is None for item in points):
         return None
     segments = [(_span(chunk), item) for chunk, item in zip(chunks, points)]
-    return await _generate(session_id, rewrite_prompt(_points_material(segments)), key)
-
-
-def _calls(chunks: list[list[dict]]) -> int:
-    return 1 if len(chunks) == 1 else len(chunks) + 1
-
-
-def _profile_points_prompt(name: str, user_id: str, chunk: list[dict]) -> str:
-    return get_profile_points_prompt(name, user_id, _span(chunk), _chunk_lines(chunk))
-
-
-def _group_points_prompt(chunk: list[dict]) -> str:
-    return get_group_points_prompt(_span(chunk), _chunk_lines(chunk))
-
-
-async def _save_profile(
-    session_id: str, user_id: str, summary: str, until: datetime
-) -> None:
-    await UserProfileModel.update_or_create(
-        session_id=session_id,
-        user_id=user_id,
-        defaults={"summary": summary, "summarized_until": until},
-    )
+    return await _generate(session_id, rewrite_prompt(points_material(segments)), key)
 
 
 async def profile_rows_by_user(session_id: str) -> dict[str, list[dict]]:
@@ -243,19 +212,27 @@ async def digest_user_profiles(
         name = profile_name(user_id, rows, latest_names)
         old_summary = profile.summary if profile else ""
         chunks = _chunks(new_rows, PROFILE_CHUNK_CHARS)
-        calls += _calls(chunks)
+        calls += 1 if len(chunks) == 1 else len(chunks) + 1
         summary = await _condense(
             session_id,
             chunks,
-            rewrite_prompt=partial(get_profile_prompt, name, user_id, old_summary),
-            points_prompt=partial(_profile_points_prompt, name, user_id),
+            rewrite_prompt=lambda material: get_profile_prompt(
+                name, user_id, old_summary, material
+            ),
+            points_prompt=lambda span, lines: get_profile_points_prompt(
+                name, user_id, span, lines
+            ),
             key="summary",
         )
         if summary is None:
             continue
         if not still_current():
             return {}
-        await _save_profile(session_id, user_id, summary, new_rows[-1]["created_at"])
+        await UserProfileModel.update_or_create(
+            session_id=session_id,
+            user_id=user_id,
+            defaults={"summary": summary, "summarized_until": new_rows[-1]["created_at"]},
+        )
         updated[user_id] = summary
 
     logger.info(
@@ -283,39 +260,36 @@ async def digest_group_notes(
     """新碎片不少于 min_new 条就合进群志，返回新群志；不到期或失败返回 None。"""
 
     async with _group_notes_locks[session_id]:
-        return await _digest_group_notes(session_id, still_current, min_new)
+        session_db = await SessionModel.get_or_none(id=session_id)
+        if session_db is None:
+            return None
+        until = session_db.notes_summarized_until
+        rows = (
+            await _new_group_fragments(session_id, until)
+            .order_by("created_at")
+            .values(*_MEMORY_FIELDS)
+        )
+        if not _due(len(rows), until, min_new=min_new):
+            return None
 
-
-async def _digest_group_notes(
-    session_id: str, still_current: Callable[[], bool], min_new: int
-) -> str | None:
-    session_db = await SessionModel.get_or_none(id=session_id)
-    if session_db is None:
-        return None
-    until = session_db.notes_summarized_until
-    rows = (
-        await _new_group_fragments(session_id, until)
-        .order_by("created_at")
-        .values(*_MEMORY_FIELDS)
-    )
-    if not _due(len(rows), until, min_new=min_new):
-        return None
-
-    chunks = _chunks(rows, GROUP_NOTES_CHUNK_CHARS)
-    notes = await _condense(
-        session_id,
-        chunks,
-        rewrite_prompt=partial(get_group_notes_prompt, session_db.group_notes),
-        points_prompt=_group_points_prompt,
-        key="group_notes",
-    )
-    logger.info(
-        f"[Digest] 群 {session_id} 群志：调用 {_calls(chunks)} 次，"
-        f"{'失败，下次再试' if notes is None else f'{len(notes)} 字'}"
-    )
-    if notes is None or not still_current():
-        return None
-    await SessionModel.filter(id=session_id).update(
-        group_notes=notes, notes_summarized_until=rows[-1]["created_at"]
-    )
-    return notes
+        chunks = _chunks(rows, GROUP_NOTES_CHUNK_CHARS)
+        notes = await _condense(
+            session_id,
+            chunks,
+            rewrite_prompt=lambda material: get_group_notes_prompt(
+                session_db.group_notes, material
+            ),
+            points_prompt=get_group_points_prompt,
+            key="group_notes",
+        )
+        calls = 1 if len(chunks) == 1 else len(chunks) + 1
+        logger.info(
+            f"[Digest] 群 {session_id} 群志：调用 {calls} 次，"
+            f"{'失败，下次再试' if notes is None else f'{len(notes)} 字'}"
+        )
+        if notes is None or not still_current():
+            return None
+        await SessionModel.filter(id=session_id).update(
+            group_notes=notes, notes_summarized_until=rows[-1]["created_at"]
+        )
+        return notes

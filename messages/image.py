@@ -16,12 +16,7 @@ from nonebot.utils import run_sync
 from PIL import Image
 
 from ..config import IMAGE_CACHE_DIR
-from ..llm import (
-    VisionInput,
-    extract_and_parse_json,
-    feedback_client,
-    get_http_client,
-)
+from ..llm import VisionInput, feedback_client, get_http_client
 from ..metrics import log_event
 from ..prompts import (
     STICKER_TAGS,
@@ -250,15 +245,13 @@ async def caption_image(vision_input: VisionInput, session_id: str) -> str:
 
     started_at = time.perf_counter()
     async with _CAPTION_SEMAPHORE:
-        parsed = extract_and_parse_json(
-            await feedback_client.generate(
-                get_image_caption_prompt(),
-                session_id=session_id,
-                temperature=CAPTION_TEMPERATURE,
-                images=[vision_input],
-            )
+        parsed = await feedback_client.generate_json(
+            get_image_caption_prompt(),
+            session_id=session_id,
+            temperature=CAPTION_TEMPERATURE,
+            images=[vision_input],
         )
-    caption = _clean_caption(parsed.get("caption") if isinstance(parsed, dict) else "")
+    caption = _clean_caption(parsed.get("caption") if parsed else "")
     if caption and vision_input.digest:
         await _write_caption(vision_input.digest, caption)
     _log_caption(session_id, bool(caption), started_at)
@@ -285,15 +278,13 @@ async def describe_sticker(
     """看一张表情包；模型没给出可用结果时返回 None。"""
 
     async with _CAPTION_SEMAPHORE:
-        parsed = extract_and_parse_json(
-            await feedback_client.generate(
-                get_sticker_caption_prompt(),
-                session_id=session_id,
-                temperature=CAPTION_TEMPERATURE,
-                images=[vision_input],
-            )
+        parsed = await feedback_client.generate_json(
+            get_sticker_caption_prompt(),
+            session_id=session_id,
+            temperature=CAPTION_TEMPERATURE,
+            images=[vision_input],
         )
-    if not isinstance(parsed, dict):
+    if parsed is None:
         return None
     reaction = _clean_caption(parsed.get("reaction"))
     if not reaction:
