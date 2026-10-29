@@ -6,7 +6,7 @@ from nonebot import logger
 from tortoise import Tortoise
 from tortoise.transactions import in_transaction
 
-from ..messages.message import SHORT_TERM_BUFFER_SIZE, Message
+from ..messages.message import SHORT_TERM_BUFFER_SIZE, ChatMessage
 from .models import (
     DailyTokenUsageModel,
     EnabledGroupModel,
@@ -126,7 +126,7 @@ async def load_full_session_data(session_id: str):
         .limit(SHORT_TERM_BUFFER_SIZE)
     )
     history_msgs = [
-        Message(
+        ChatMessage(
             time=msg_db.time,
             user_name=msg_db.user_name,
             content=msg_db.content,
@@ -153,7 +153,7 @@ def _field_changed(field: str, existing, value) -> bool:
     return existing != value
 
 
-def message_final_id(msg: Message) -> str:
+def message_final_id(msg: ChatMessage) -> str:
     if msg._persistence_id:
         return msg._persistence_id
     final_msg_id = str(msg.id or "")
@@ -171,7 +171,7 @@ def message_final_id(msg: Message) -> str:
     return final_msg_id
 
 
-async def sync_messages(session_id: str, recent_msgs: list[Message]):
+async def sync_messages(session_id: str, recent_msgs: list[ChatMessage]):
     """增量同步消息到数据库"""
 
     session_db = await SessionModel.get_or_none(id=session_id)
@@ -232,7 +232,7 @@ async def recall_message(session_id: str, msg_id: str, content: str) -> int:
 
 async def get_history_before(
     session_id: str, time_point: datetime, limit: int = 20
-) -> list[Message]:
+) -> list[ChatMessage]:
     """获取指定时间之前的历史消息"""
 
     session_db = await SessionModel.get_or_none(id=session_id)
@@ -249,7 +249,7 @@ async def get_history_before(
     )
 
     return [
-        Message(
+        ChatMessage(
             time=m.time,
             user_name=m.user_name,
             content=m.content,

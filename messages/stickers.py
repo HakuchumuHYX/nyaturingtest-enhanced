@@ -1,7 +1,6 @@
 """表情包库：内存索引、收图、挑图、拉黑。设计见 docs/nyaturingtest-sticker-2026-10-20.md。
 
-所有群共用一个库。启动时整表载入内存，之后收图、发送、拉黑同时改内存和库；
-导入脚本直接写库，要重启 bot 才进内存。
+所有群共用一个库。启动时整表载入内存，之后收图、发送、拉黑同时改内存和库。
 """
 
 import hashlib
@@ -187,7 +186,7 @@ async def block(digest: str) -> bool:
     """删掉文件和描述并拉黑，以后再见到只描述不收；返回库里原来有没有这张。"""
 
     _stickers.pop(digest, None)
-    # 按 digest 找文件而不是查内存：导入脚本刚写进库、还没重启载入的也要删到
+    # 按 digest 找文件而不是查内存：collect 先写文件再入库，入库失败时文件留下了、内存里却没有
     files = list(STICKER_DIR.glob(f"{digest}.*"))
     for path in files:
         try:

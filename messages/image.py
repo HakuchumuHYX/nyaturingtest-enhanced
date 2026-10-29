@@ -111,7 +111,7 @@ async def fetch_image_input(
 
             if not image_bytes:
                 client = get_http_client()
-                for _ in range(2):
+                for attempt in range(2):
                     try:
                         resp = await client.get(url, timeout=10.0)
                         resp.raise_for_status()
@@ -132,7 +132,8 @@ async def fetch_image_input(
                             return ("[图片过大]", None, None)
                         image_bytes = resp.content
                         break
-                    except Exception:
+                    except Exception as e:
+                        logger.warning(f"下载图片失败（第 {attempt + 1} 次）: {e}")
                         await asyncio.sleep(0.5)
                 if image_bytes and key:
                     await _write_cached(key, image_bytes)

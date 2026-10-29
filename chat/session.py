@@ -5,7 +5,7 @@ from datetime import datetime
 from nonebot import logger
 
 from ..memory.vector import VectorMemory
-from ..messages.message import Memory, Message
+from ..messages.message import ChatMessage, Memory
 from ..metrics import log_event
 from ..prompts import PRESETS, reload_presets
 from ..storage.db import (
@@ -334,7 +334,7 @@ class Session:
         """
         主动记录 Bot 自己的发言 (防止等待回显导致记忆延迟)
         """
-        msg = Message(
+        msg = ChatMessage(
             time=datetime.now(),
             user_name=self.state.name,
             content=content,
@@ -343,7 +343,7 @@ class Session:
         )
         self.short_term_memory.update([msg])
 
-    def record_reaction(self, msg: Message) -> None:
+    def record_reaction(self, msg: ChatMessage) -> None:
         """群友给 bot 的消息贴了表情：只进短期记忆，不进固化计数，也不触发新一轮对话。
 
         一条消息常被好几个人贴同一个表情，已有相同记录就跳过，免得挤满上下文窗口。
@@ -363,7 +363,7 @@ class Session:
         self.schedule_save()
         return True
 
-    def record_incoming(self, messages_chunk: list[Message]) -> None:
+    def record_incoming(self, messages_chunk: list[ChatMessage]) -> None:
         """写入短时记忆并累计固化窗口。"""
 
         self.short_term_memory.update(messages_chunk)

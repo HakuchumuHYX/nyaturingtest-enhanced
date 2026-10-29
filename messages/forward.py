@@ -20,7 +20,7 @@ from ..metrics import log_event
 from ..prompts import get_forward_prompt
 from .convert import FORWARD_PLACEHOLDER, is_sticker_segment, segment_text
 from .image import fetch_image_input
-from .message import Message
+from .message import ChatMessage
 
 # 上限只为控制单次请求的大小；超出的在提示词里注明，不悄悄丢
 FORWARD_MAX_CHARS = 8000
@@ -105,16 +105,16 @@ async def _expand(bot: Bot, forward_id: str, depth: int, out: _Expansion) -> int
 
 
 async def digest_forward(
-    state: GroupState,
+    group: GroupState,
     bot: Bot,
     event: Event,
-    message: Message,
+    message: ChatMessage,
     forward_id: str,
     generation: int,
 ) -> None:
     """读完一份转发，把占位改写成摘要，再放回队列触发一轮。"""
 
-    session = state.session
+    session = group.session
     started_at = time.perf_counter()
     out = _Expansion()
     node_count = 0
@@ -146,7 +146,7 @@ async def digest_forward(
             message.content = f"[合并转发 {node_count}条（{FORWARD_NOTE}）: {summary}]"
             session.short_term_memory.mark_dirty(message)
             session.schedule_save()
-            await state.enqueue(message, bot, event)
+            await group.enqueue(message, bot, event)
             outcome = "ok"
     except (ActionFailed, NetworkError) as e:
         logger.warning(f"[Forward] 群 {session.id} 拉取转发内容失败，留着占位: {e}")

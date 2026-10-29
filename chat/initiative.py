@@ -47,7 +47,7 @@ TRIGGER_PROBABILITY = 0.3
 # 允许发起的时段：工作日只在午休和下班后，休息日白天到晚上；凌晨一律不发
 WORKDAY_WINDOWS = ((time(12, 0), time(13, 30)), (time(18, 30), time(23, 0)))
 RESTDAY_WINDOWS = ((time(10, 0), time(23, 0)),)
-# 写话题的素材：最近活跃群友的档案、最近写入的记忆碎片（群志每周才整理，这一两天的事只在碎片里）
+# 写话题的素材：最近活跃群友的档案、最近写入的记忆碎片（群志每晚才整理，这一两天的事只在碎片里）
 MEMBER_PROFILE_LIMIT = 8
 RECENT_MEMORY_LIMIT = 40
 
@@ -60,12 +60,12 @@ def _in_window(now: datetime) -> bool:
     return any(start <= now.time() < end for start, end in windows)
 
 
-def _silence_minutes(state: GroupState, now: datetime) -> int | None:
+def _silence_minutes(group: GroupState, now: datetime) -> int | None:
     """最后一条是群友的消息时返回安静了多少分钟；没有消息或最后一条是自己说的返回 None，
     这样发起后没人理就一直等到有人说话，不会对着空气连说两次。"""
 
-    messages = state.session.short_term_memory.access()
-    if not messages or messages[-1].user_name == state.session.state.name:
+    messages = group.session.short_term_memory.access()
+    if not messages or messages[-1].user_name == group.session.state.name:
         return None
     return int((now - messages[-1].time).total_seconds() // 60)
 
@@ -81,33 +81,33 @@ async def scan_groups() -> None:
     if is_shutting_down() or not _in_window(now):
         return
     for group_id in list(runtime_enabled_groups):
-        state = group_states.get(group_id)
+        group = group_states.get(group_id)
         # 本次启动后群里说过话才有 bot/event 可用来发送
         if (
-            state is None
-            or state.bot is None
-            or state.event is None
-            or not state.session.state.loaded
-            or not state.session.state.name  # 没设人设不说话
+            group is None
+            or group.bot is None
+            or group.event is None
+            or not group.session.state.loaded
+            or not group.session.state.name  # 没设人设不说话
         ):
             continue
-        silence = _silence_minutes(state, now)
+        silence = _silence_minutes(group, now)
         if silence is None or silence < SILENCE_MINUTES or not _quota_left(group_id, now):
             continue
         if random.random() >= TRIGGER_PROBABILITY:
             continue
         _attempts[group_id].append(now)
         try:
-            await _initiate(state, silence)
+            await _initiate(group, silence)
         except Exception as e:
             logger.warning(f"群 {group_id} 主动发起话题失败: {e}")
 
 
-async def _initiate(state: GroupState, silence: int) -> None:
-    session = state.session
-    await state.load()
-    generation = session.state.generation
-    session_state = session.state
+async def _initiate(group: GroupState, silence: int) -> None:
+    session = group.session
+    await group.load()
+    state = session.state
+    generation = state.generation
 
     messages = session.short_term_memory.access()
     names = {m.user_id: m.user_name for m in messages if m.user_id}
@@ -116,19 +116,19 @@ async def _initiate(state: GroupState, silence: int) -> None:
         dict.fromkeys(
             m.user_id
             for m in reversed(messages)
-            if m.user_id and m.user_name != session_state.name
+            if m.user_id and m.user_name != state.name
         )
     )
     member_profiles = [
         {
             "name": names[uid],
             "relation": describe_relation(
-                session_state.profiles.get(uid, PersonProfile(user_id=uid)).level()
+                state.profiles.get(uid, PersonProfile(user_id=uid)).level()
             ),
-            "summary": session_state.user_summaries[uid],
+            "summary": state.user_summaries[uid],
         }
         for uid in members
-        if session_state.user_summaries.get(uid)
+        if state.user_summaries.get(uid)
     ][:MEMBER_PROFILE_LIMIT]
     rows = await session.vector_memory.recent(RECENT_MEMORY_LIMIT)
     recent_memories = [
@@ -136,24 +136,24 @@ async def _initiate(state: GroupState, silence: int) -> None:
         for row in reversed(rows)
     ]
     my_recent_replies = [
-        m.content for m in messages if m.user_name == session_state.name
+        m.content for m in messages if m.user_name == state.name
     ][-MY_RECENT_REPLIES_LIMIT:]
 
-    session_state.global_emotion.settle()
+    state.global_emotion.settle()
     prompt = get_initiative_prompt(
-        bot_name=session_state.name,
-        profile=session_state.profile,
-        bottom_lines=session_state.bottom_lines,
-        self_life=session_state.self_life,
-        self_in_group=session_state.self_in_group,
-        presets=session_state.preset_lines,
-        group_notes=session_state.group_notes,
-        summary=session_state.chat_summary,
+        bot_name=state.name,
+        profile=state.profile,
+        bottom_lines=state.bottom_lines,
+        self_life=state.self_life,
+        self_in_group=state.self_in_group,
+        presets=state.preset_lines,
+        group_notes=state.group_notes,
+        summary=state.chat_summary,
         recent_msgs=format_history(messages),
         my_recent_replies=my_recent_replies,
         member_profiles=member_profiles,
         recent_memories=recent_memories,
-        mood=describe_mood(session_state.global_emotion),
+        mood=describe_mood(state.global_emotion),
         silence_minutes=silence,
         time_info=get_time_description(datetime.now()),
     )
@@ -169,20 +169,20 @@ async def _initiate(state: GroupState, silence: int) -> None:
         outcome = "stale"
     elif not content:
         outcome = "skipped_by_llm"
-    elif (_silence_minutes(state, datetime.now()) or 0) < SILENCE_MINUTES:
+    elif (_silence_minutes(group, datetime.now()) or 0) < SILENCE_MINUTES:
         outcome = "spoken_meanwhile"
     else:
         sent = await dispatch_replies(
-            state=state,
+            group=group,
             replies=[Reply(text=content)],
-            bot=state.bot,
-            event=state.event,
+            bot=group.bot,
+            event=group.event,
             generation=generation,
         )
         outcome = "sent" if sent else "send_failed"
         if sent:
             # 最近活跃的人接话时按「聊天对象在接话」处理，不 @ 也接得上
-            session_state.conversation_partners = set(members)
+            state.conversation_partners = set(members)
 
     log_event(
         "initiative",

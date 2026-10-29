@@ -3,7 +3,7 @@ import math
 import re
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -57,15 +57,41 @@ SCOPE_WEIGHT = {
 }
 
 
+@dataclass
+class RetrievedMemory:
+    """检索到的一条碎片和它的分数。"""
+
+    row: MemoryModel
+    retrieval_score: float
+    rerank_score: float | None = None
+    # 以下由 retrieve_with_decay 加权排序时填
+    adjusted_score: float = 0.0
+    scope: str = ""
+
+
 @dataclass(frozen=True)
 class RetrievalResult:
-    records: list[dict[str, Any]]
+    records: list[RetrievedMemory]
     stats: dict[str, Any]
-    # 预设条目每轮都一样，与每轮变化的记忆分开送进 Prompt，便于前缀缓存命中
-    preset_lines: list[str] = field(default_factory=list)
-    memory_lines: list[str] = field(default_factory=list)
-    # 行里的编号 m1、m2… → 记忆 id，Feedback 用 correct 动作指认要替换的那条
-    refs: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class NewMemory:
+    """待写入的一条碎片；由 candidates.build_memory 构造，source_msg_ids / participant_ids 已去重拼好。"""
+
+    content: str
+    category: str
+    date: int
+    confidence: float
+    importance: float
+    source_msg_ids: str
+    participant_ids: str
+    subject_user_id: str = ""
+    subject_user_name: str = ""
+    speaker_user_id: str = ""
+    speaker_user_name: str = ""
+    is_correction: bool = False
+    replaces: str = ""
 
 
 def _retrieval_stats(
@@ -113,14 +139,14 @@ def _query_mentions_name(queries: list[str], name: str) -> bool:
 
 
 def _memory_scope(
-    meta: dict, active_scope_ids: set[str], queries: list[str]
+    row: MemoryModel, active_scope_ids: set[str], queries: list[str]
 ) -> tuple[str, float]:
-    subject_user_id = meta["subject_user_id"]
+    subject_user_id = row.subject_user_id
     if active_scope_ids and subject_user_id and subject_user_id in active_scope_ids:
         return "active_subject", SCOPE_WEIGHT["active_subject"]
-    if _query_mentions_name(queries, meta["subject_user_name"]):
+    if _query_mentions_name(queries, row.subject_user_name):
         return "mentioned_subject", SCOPE_WEIGHT["mentioned_subject"]
-    speaker_user_id = meta["speaker_user_id"]
+    speaker_user_id = row.speaker_user_id
     if active_scope_ids and speaker_user_id and speaker_user_id in active_scope_ids:
         return "active_speaker", SCOPE_WEIGHT["active_speaker"]
     if subject_user_id:
@@ -138,22 +164,6 @@ def memory_expires_at(category: str, date: int, importance: float) -> datetime:
     base_days = EVENT_TTL_DAYS if category in ("event", "episode") else FACT_TTL_DAYS
     ttl_days = int(base_days * (1.0 + importance))
     return _parse_date(date) + timedelta(days=ttl_days + 1)
-
-
-def _row_metadata(row: MemoryModel) -> dict[str, Any]:
-    return {
-        "memory_ref": row.id,
-        "category": row.category,
-        "subject_user_id": row.subject_user_id,
-        "subject_user_name": row.subject_user_name,
-        "speaker_user_id": row.speaker_user_id,
-        "speaker_user_name": row.speaker_user_name,
-        "participant_ids": row.participant_ids,
-        "confidence": row.confidence,
-        "importance": row.importance,
-        "date": row.date,
-        "is_correction": row.is_correction,
-    }
 
 
 # Embedding / Rerank 客户端全进程共享，首次使用时按配置创建
@@ -358,23 +368,15 @@ class VectorMemory:
             rows = await MemoryModel.filter(id__in=list(ref_scores))
 
             # 同一正文只留最高分（不同主体可能被抽取出完全相同的句子）
-            candidate_by_content: dict[str, dict[str, Any]] = {}
+            candidate_by_content: dict[str, RetrievedMemory] = {}
             for row in rows:
-                metadata = _row_metadata(row)
-                metadata["retrieval_score"] = max(0.0, min(1.0, ref_scores[row.id]))
+                score = max(0.0, min(1.0, ref_scores[row.id]))
                 existing = candidate_by_content.get(row.content)
-                if (
-                    existing is None
-                    or metadata["retrieval_score"]
-                    > existing["metadata"]["retrieval_score"]
-                ):
-                    candidate_by_content[row.content] = {
-                        "content": row.content,
-                        "metadata": metadata,
-                    }
+                if existing is None or score > existing.retrieval_score:
+                    candidate_by_content[row.content] = RetrievedMemory(row, score)
             candidates = sorted(
                 candidate_by_content.values(),
-                key=lambda item: item["metadata"]["retrieval_score"],
+                key=lambda item: item.retrieval_score,
                 reverse=True,
             )
             if merged_candidate_cap is not None:
@@ -391,7 +393,7 @@ class VectorMemory:
 
             # 第二步：Rerank。search_stage 已把最新有效消息排在第一位；summary query 只做补充召回。
             rerank_results = await _rerank(
-                unique_queries[0], [item["content"] for item in candidates]
+                unique_queries[0], [item.row.content for item in candidates]
             )
             if not rerank_results:
                 fallback = candidates[:k]
@@ -406,7 +408,7 @@ class VectorMemory:
                 if score < threshold:
                     continue
                 item = candidates[res["index"]]
-                item["metadata"]["rerank_score"] = score
+                item.rerank_score = score
                 final_results.append(item)
                 if len(final_results) >= k:
                     break
@@ -455,49 +457,32 @@ class VectorMemory:
         scope_counts: dict[str, int] = {}
 
         for item in raw_results:
-            meta = item["metadata"]
-            scope, scope_weight = _memory_scope(meta, active_scope_ids, queries)
+            row = item.row
+            scope, scope_weight = _memory_scope(row, active_scope_ids, queries)
             scope_counts[scope] = scope_counts.get(scope, 0) + 1
             if scope == "other_subject":
                 other_subject_downweighted_count += 1
 
-            days_ago = max(0, (today_dt - _parse_date(meta["date"])).days)
+            days_ago = max(0, (today_dt - _parse_date(row.date)).days)
             decay_rate = MEMORY_TYPE_DECAY_RATE.get(
-                meta["category"], MEMORY_TYPE_DECAY_RATE["event"]
+                row.category, MEMORY_TYPE_DECAY_RATE["event"]
             )
-            decay_factor = math.exp(-decay_rate * days_ago)
-
-            original_score = meta.get("rerank_score")
-            if original_score is None:
-                original_score = meta["retrieval_score"]
-
-            type_weight = MEMORY_TYPE_WEIGHT.get(meta["category"], 1.0)
-            confidence_weight = 0.7 + meta["confidence"] * 0.3
-            importance_weight = 1.0 + meta["importance"] * 0.15
-            meta["adjusted_score"] = (
+            original_score = (
+                item.retrieval_score if item.rerank_score is None else item.rerank_score
+            )
+            item.adjusted_score = (
                 original_score
-                * decay_factor
-                * type_weight
-                * confidence_weight
-                * importance_weight
+                * math.exp(-decay_rate * days_ago)
+                * MEMORY_TYPE_WEIGHT.get(row.category, 1.0)
+                * (0.7 + row.confidence * 0.3)
+                * (1.0 + row.importance * 0.15)
                 * scope_weight
             )
-            meta["days_ago"] = days_ago
-            meta["decay_rate"] = decay_rate
-            meta["decay_factor"] = decay_factor
-            meta["source_type_weight"] = type_weight
-            meta["confidence_weight"] = confidence_weight
-            meta["importance_weight"] = importance_weight
-            meta["scope"] = scope
-            meta["scope_weight"] = scope_weight
+            item.scope = scope
 
-        sorted_results = sorted(
-            raw_results, key=lambda x: x["metadata"]["adjusted_score"], reverse=True
-        )
+        sorted_results = sorted(raw_results, key=lambda x: x.adjusted_score, reverse=True)
         final_results = sorted_results[:k]
-        stats.update(
-            _score_distribution([item["metadata"]["adjusted_score"] for item in raw_results])
-        )
+        stats.update(_score_distribution([item.adjusted_score for item in raw_results]))
         stats["returned_count"] = len(final_results)
         stats["other_subject_downweighted_count"] = other_subject_downweighted_count
         stats["scope_counts"] = scope_counts
@@ -505,7 +490,7 @@ class VectorMemory:
 
     async def add_memories(
         self,
-        memories: list[tuple[str, dict]],
+        memories: list[NewMemory],
         *,
         still_current: Callable[[], bool],
     ) -> dict[str, int] | None:
@@ -518,21 +503,20 @@ class VectorMemory:
         """
 
         result = {"added": 0, "skipped_dedup": 0, "corrected": 0}
-        valid: list[tuple[str, dict]] = []
+        valid: list[NewMemory] = []
         seen_batch = set()
-        for content, metadata in memories:
-            content = content.strip()
-            batch_key = (content, metadata["subject_user_id"], metadata["category"])
-            if not content or batch_key in seen_batch:
-                result["skipped_dedup"] += bool(content)
+        for memory in memories:
+            batch_key = (memory.content, memory.subject_user_id, memory.category)
+            if not memory.content or batch_key in seen_batch:
+                result["skipped_dedup"] += bool(memory.content)
                 continue
             seen_batch.add(batch_key)
-            valid.append((content, metadata))
+            valid.append(memory)
         if not valid:
             return result
 
         try:
-            vectors = await embed_texts([content for content, _ in valid])
+            vectors = await embed_texts([memory.content for memory in valid])
         except Exception as e:
             logger.error(f"[Memory] Embedding 失败，记忆先不带向量落库: {e}")
             vectors = None
@@ -540,36 +524,32 @@ class VectorMemory:
         embedding_model = get_app_settings().memory.model
         async with self._lock:
             new_rows: list[MemoryModel] = []
-            for index, (content, metadata) in enumerate(valid):
+            for index, memory in enumerate(valid):
                 vector = None if vectors is None else vectors[index]
                 new_rows.append(
                     MemoryModel(
                         id=str(uuid.uuid4()),
                         session_id=self.session_id,
-                        content=content,
+                        content=memory.content,
                         embedding=None if vector is None else vector.tobytes(),
                         embedding_model="" if vector is None else embedding_model,
-                        category=metadata["category"],
-                        subject_user_id=metadata["subject_user_id"],
-                        subject_user_name=metadata["subject_user_name"],
-                        speaker_user_id=metadata["speaker_user_id"],
-                        speaker_user_name=metadata["speaker_user_name"],
-                        confidence=metadata["confidence"],
-                        importance=metadata["importance"],
-                        date=metadata["date"],
+                        category=memory.category,
+                        subject_user_id=memory.subject_user_id,
+                        subject_user_name=memory.subject_user_name,
+                        speaker_user_id=memory.speaker_user_id,
+                        speaker_user_name=memory.speaker_user_name,
+                        confidence=memory.confidence,
+                        importance=memory.importance,
+                        date=memory.date,
                         expires_at=memory_expires_at(
-                            metadata["category"], metadata["date"], metadata["importance"]
+                            memory.category, memory.date, memory.importance
                         ),
-                        source_msg_ids=metadata["source_msg_ids"],
-                        participant_ids=metadata["participant_ids"],
-                        is_correction=metadata["is_correction"],
+                        source_msg_ids=memory.source_msg_ids,
+                        participant_ids=memory.participant_ids,
+                        is_correction=memory.is_correction,
                     )
                 )
-            replaces = {
-                metadata["replaces"]: content
-                for content, metadata in valid
-                if metadata["replaces"]
-            }
+            replaces = {memory.replaces: memory.content for memory in valid if memory.replaces}
 
             async with in_transaction():
                 # 在事务内确认代际：reset 先递增 generation 再删库，所以这里放行的写入一定早于删除
@@ -620,15 +600,14 @@ async def maintain_memories() -> None:
 
 # 纯表情/标点（「？？？」「哈哈哈」「233」这类都短于 4 字，长度过滤已覆盖）
 _EMOJI_ONLY_RE = re.compile(r"^[\W_]+$", re.UNICODE)
+# 回复引用和表情的写法见 messages/convert.py；判断时只看群友自己写的话
+_REPLY_PREFIX_RE = re.compile(r'^\[回复 .+?: ".*?"\]', re.S)
+_STICKER_RE = re.compile(r"\[表情[^\]]*\]")  # [表情包: …]、[表情包#xxxx]、[表情:狗头]
 
 
 def is_low_value_rag_query(text: str) -> bool:
-    query = text.strip()
-    return (
-        len(query) < 4
-        or query.startswith("[表情包]")
-        or bool(_EMOJI_ONLY_RE.fullmatch(query))
-    )
+    own = _STICKER_RE.sub("", _REPLY_PREFIX_RE.sub("", text.strip())).strip()
+    return len(own) < 4 or bool(_EMOJI_ONLY_RE.fullmatch(own))
 
 
 def build_chat_rag_queries(

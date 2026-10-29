@@ -15,7 +15,7 @@ from ..llm import close_http_client  # noqa: E402
 from ..memory.digest import digest_group_notes, digest_user_profiles  # noqa: E402
 from ..memory.persona import maintain_personas  # noqa: E402
 from ..memory.vector import close_clients, maintain_memories  # noqa: E402
-from ..messages.message import Message as MMessage  # noqa: E402
+from ..messages.message import ChatMessage  # noqa: E402
 from ..metrics import drain_usage_tasks  # noqa: E402
 from ..storage.db import load_enabled_group_ids  # noqa: E402
 from .session import Session  # noqa: E402
@@ -33,7 +33,7 @@ class GroupState:
     bot: Bot | None = None
 
     # 满了丢最旧的：2s 防抖下几乎不可能积压到上限
-    messages_chunk: deque[MMessage] = field(
+    messages_chunk: deque[ChatMessage] = field(
         default_factory=lambda: deque(maxlen=QUEUE_MAX_SIZE)
     )
 
@@ -51,7 +51,7 @@ class GroupState:
         async with self.session_lock:
             await self.session.load_session()
 
-    async def enqueue(self, message: MMessage, bot: Bot, event: Event) -> None:
+    async def enqueue(self, message: ChatMessage, bot: Bot, event: Event) -> None:
         """放进待处理队列并唤醒 worker。
 
         同一条已在队列里就什么都不做：转发读得比防抖还快时占位还在队列里，改写过的内容会随那一轮一起处理。
@@ -98,16 +98,16 @@ def ensure_group_state(group_id: int):
             session=Session(id=f"{group_id}")
         )
 
-    # 任务守护：任务挂了或没启动就重启（spawn_state 自己吞异常，done 即退出）
+    # 任务守护：任务挂了或没启动就重启（run_worker 自己吞异常，done 即退出）
     task = _group_tasks.get(group_id)
     if task is None or task.done():
         _group_tasks.pop(group_id, None)
         # 局部导入：worker 反向依赖本模块的 GroupState
-        from .worker import spawn_state
+        from .worker import run_worker
 
         logger.info(f"启动群 {group_id} 的后台任务")
         _group_tasks[group_id] = asyncio.create_task(
-            spawn_state(state=group_states[group_id])
+            run_worker(group_states[group_id])
         )
 
     return group_states[group_id]
@@ -116,10 +116,10 @@ def ensure_group_state(group_id: int):
 async def loaded_group_state(group_id: int) -> GroupState | None:
     """启用的群返回已加载会话的 GroupState，未启用返回 None。"""
 
-    state = ensure_group_state(group_id)
-    if state is not None:
-        await state.load()
-    return state
+    group = ensure_group_state(group_id)
+    if group is not None:
+        await group.load()
+    return group
 
 
 async def remove_group_state(group_id: int):
@@ -137,15 +137,15 @@ async def remove_group_state(group_id: int):
 
     if group_id in group_states:
         logger.info(f"移除群 {group_id} 的 GroupState...")
-        state = group_states.pop(group_id)
-        await state.session.drain_background_tasks()
+        group = group_states.pop(group_id)
+        await group.session.drain_background_tasks()
 
 
 def _generation(group_id: int) -> int:
     """未加载的群按 0 算：加载不改 generation，只有 reset/load_preset 等会递增。"""
 
-    group_state = group_states.get(group_id)
-    return group_state.session.state.generation if group_state else 0
+    group = group_states.get(group_id)
+    return group.session.state.generation if group else 0
 
 
 def _generation_guard(group_id: int) -> Callable[[], bool]:
@@ -160,9 +160,9 @@ async def refresh_group_notes(group_id: int, *, min_new: int = 1) -> str | None:
 
     still_current = _generation_guard(group_id)
     notes = await digest_group_notes(str(group_id), still_current, min_new=min_new)
-    group_state = group_states.get(group_id)
-    if notes is not None and group_state is not None and still_current():
-        group_state.session.state.group_notes = notes
+    group = group_states.get(group_id)
+    if notes is not None and group is not None and still_current():
+        group.session.state.group_notes = notes
     return notes
 
 
@@ -180,9 +180,9 @@ async def maintain_long_term_memory() -> None:
             logger.warning(f"群 {group_id} 档案/群志整理失败: {e}")
             continue
         # 档案不随 save_session 回写，已加载的群要同步内存副本
-        group_state = group_states.get(group_id)
-        if group_state is not None and still_current():
-            group_state.session.state.user_summaries.update(summaries)
+        group = group_states.get(group_id)
+        if group is not None and still_current():
+            group.session.state.user_summaries.update(summaries)
 
     await _maintain_personas()
 
@@ -190,28 +190,28 @@ async def maintain_long_term_memory() -> None:
         await maintain_memories()
     except Exception as e:
         logger.warning(f"长期记忆定时维护失败: {e}")
-    for state in group_states.values():
-        state.session.vector_memory.drop_cache()
+    for group in group_states.values():
+        group.session.vector_memory.drop_cache()
 
 
 async def _maintain_personas() -> None:
     group_ids = list(runtime_enabled_groups)
     guards = {str(group_id): _generation_guard(group_id) for group_id in group_ids}
     try:
-        lives, groups = await maintain_personas(group_ids, guards)
+        lives, group_texts = await maintain_personas(group_ids, guards)
     except Exception as e:
         logger.warning(f"人设成长整理失败: {e}")
         return
     # 人生线和群层不随 save_session 回写，已加载的群要同步内存副本
     for group_id in group_ids:
-        group_state = group_states.get(group_id)
-        if group_state is None or not guards[str(group_id)]():
+        group = group_states.get(group_id)
+        if group is None or not guards[str(group_id)]():
             continue
-        state = group_state.session.state
+        state = group.session.state
         if state.preset in lives:
             state.self_life = lives[state.preset]
-        if str(group_id) in groups:
-            state.self_in_group = groups[str(group_id)]
+        if str(group_id) in group_texts:
+            state.self_in_group = group_texts[str(group_id)]
 
 
 def setup_maintenance_job():
@@ -245,17 +245,17 @@ async def cleanup_global_resources():
                 logger.error(f"清理任务 {gid} 异常: {e}")
 
     # 2. worker 停止后再排空后台写入，并在数据库仍可用时做最终保存。
-    for state in group_states.values():
+    for group in group_states.values():
         try:
-            await state.session.drain_background_tasks()
+            await group.session.drain_background_tasks()
         except Exception as e:
             logger.warning(f"排空群会话后台任务失败: {e}")
 
     save_tasks = []
-    for group_id, state in group_states.items():
-        if state.session.state.loaded:
+    for group_id, group in group_states.items():
+        if group.session.state.loaded:
             logger.info(f"正在保存群 {group_id} 的会话状态...")
-            save_tasks.append(state.session.save_session())
+            save_tasks.append(group.session.save_session())
 
     if save_tasks:
         try:

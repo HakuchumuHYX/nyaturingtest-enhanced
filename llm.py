@@ -17,7 +17,7 @@ from .prompts import JSON_SYSTEM_PROMPT
 
 @dataclass(frozen=True)
 class VisionInput:
-    """Ephemeral image input for an OpenAI-compatible multimodal request."""
+    """发给 OpenAI 兼容多模态接口的一张图；只在本进程短暂持有，不落库。"""
 
     # 附图标签，写明是哪条消息的哪张图（如「消息 527151 引用的第 1 张图」），模型靠它和消息 id 对上号
     ref_id: str

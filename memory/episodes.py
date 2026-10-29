@@ -18,17 +18,18 @@ from ..chat.groups import (  # noqa: E402
     runtime_enabled_groups,
 )
 from ..llm import feedback_client  # noqa: E402
-from ..messages.message import Message  # noqa: E402
+from ..messages.message import ChatMessage  # noqa: E402
 from ..metrics import log_event  # noqa: E402
 from ..prompts import get_episode_prompt, truncate_text  # noqa: E402
 from ..storage.db import get_latest_user_names  # noqa: E402
 from ..storage.models import GlobalMessageModel, MemoryModel, SessionModel  # noqa: E402
 from .candidates import (  # noqa: E402
+    build_memory,
     clamp01,
-    memory_metadata,
     save_memory_candidates,
     source_messages,
 )
+from .vector import NewMemory  # noqa: E402
 
 SCAN_INTERVAL_MINUTES = 5
 # 最后一条消息距今这么久，算一段聊完了
@@ -62,9 +63,9 @@ def _trigger(rows: list[GlobalMessageModel], bot_name: str, now: datetime) -> st
 
 
 def _episode_memories(
-    items, messages: list[Message], bot_name: str, date: int
-) -> list[tuple[str, dict]]:
-    """把模型给出的小结整理成写库元数据；参与者和来源都按 source 指向的消息由代码算。"""
+    items, messages: list[ChatMessage], bot_name: str, date: int
+) -> list[NewMemory]:
+    """把模型给出的小结整理成待写入的记忆；参与者和来源都按 source 指向的消息由代码算。"""
 
     memories = []
     for item in items if isinstance(items, list) else []:
@@ -74,31 +75,33 @@ def _episode_memories(
         sources = source_messages(item, messages)
         if len(content) < EPISODE_MIN_CHARS or not sources:
             continue
-        metadata = memory_metadata(
-            category="episode",
-            date=date,
-            confidence=EPISODE_CONFIDENCE,
-            importance=clamp01(item.get("importance"), 0.2),
-            sources=sources,
-            participant_ids=(
-                m.user_id for m in sources if m.user_id and m.user_name != bot_name
-            ),
+        memories.append(
+            build_memory(
+                content,
+                category="episode",
+                date=date,
+                confidence=EPISODE_CONFIDENCE,
+                importance=clamp01(item.get("importance"), 0.2),
+                sources=sources,
+                participant_ids=(
+                    m.user_id for m in sources if m.user_id and m.user_name != bot_name
+                ),
+            )
         )
-        memories.append((content, metadata))
     return memories
 
 
 async def _digest_batch(
-    state: GroupState, rows: list[GlobalMessageModel], trigger: str
+    group: GroupState, rows: list[GlobalMessageModel], trigger: str
 ) -> bool:
     """整理一批并推进水位；模型输出无效或会话已作废返回 False，水位不动，下轮重试。"""
 
-    session = state.session
-    session_state = session.state
-    generation = session_state.generation
-    bot_name = session_state.name
+    session = group.session
+    state = session.state
+    generation = state.generation
+    bot_name = state.name
     messages = [
-        Message(
+        ChatMessage(
             time=row.time,
             user_name=row.user_name,
             content=row.content,
@@ -109,7 +112,7 @@ async def _digest_batch(
     ]
     members = [m for m in messages if m.user_name != bot_name]
 
-    episodes: list[tuple[str, dict]] = []
+    episodes: list[NewMemory] = []
     facts_result = {"added": 0, "rejected": 0}
     # 只有角色自己说话的一批没什么可记，直接推进水位
     if members:
@@ -119,10 +122,10 @@ async def _digest_batch(
             {
                 "user_id": uid,
                 "name": latest_names.get(uid, ""),
-                "summary": session_state.user_summaries[uid],
+                "summary": state.user_summaries[uid],
             }
             for uid in speakers
-            if session_state.user_summaries.get(uid)
+            if state.user_summaries.get(uid)
         ][:MEMBER_PROFILE_LIMIT]
         previous = (
             await MemoryModel.filter(session_id=session.id, category="episode")
@@ -131,7 +134,7 @@ async def _digest_batch(
         )
         prompt = get_episode_prompt(
             bot_name=bot_name,
-            group_notes=session_state.group_notes,
+            group_notes=state.group_notes,
             member_profiles=member_profiles,
             previous_episode=previous.content if previous else "",
             messages=[
@@ -169,7 +172,7 @@ async def _digest_batch(
         if episodes:
             stored = await session.vector_memory.add_memories(
                 episodes,
-                still_current=lambda: session_state.generation == generation,
+                still_current=lambda: state.generation == generation,
             )
             if stored is None:
                 return False
@@ -189,29 +192,29 @@ async def _digest_batch(
     return True
 
 
-async def _digest_pending(state: GroupState) -> None:
+async def _digest_pending(group: GroupState) -> None:
     """水位之后的消息按批整理，直到剩下的还不够一段。"""
 
-    session_id = state.session.id
+    session_id = group.session.id
     while not is_shutting_down():
         until = (await SessionModel.get(id=session_id)).episodes_until
         query = GlobalMessageModel.filter(session_id=session_id)
         if until is not None:
             query = query.filter(time__gt=until)
         rows = await query.order_by("time").limit(SEGMENT_MAX_MESSAGES)
-        trigger = _trigger(rows, state.session.state.name, datetime.now())
-        if trigger is None or not await _digest_batch(state, rows, trigger):
+        trigger = _trigger(rows, group.session.state.name, datetime.now())
+        if trigger is None or not await _digest_batch(group, rows, trigger):
             return
 
 
 async def scan_groups() -> None:
     for group_id in list(runtime_enabled_groups):
-        state = group_states.get(group_id)
+        group = group_states.get(group_id)
         # 用已加载的 vector_memory 写入，矩阵缓存才一致；没加载说明重启后还没人说话，也就没有新消息
-        if is_shutting_down() or state is None or not state.session.state.loaded:
+        if is_shutting_down() or group is None or not group.session.state.loaded:
             continue
         try:
-            await _digest_pending(state)
+            await _digest_pending(group)
         except Exception as e:
             logger.warning(f"群 {group_id} 分段整理失败: {e}")
 

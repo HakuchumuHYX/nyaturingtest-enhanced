@@ -8,7 +8,7 @@ SHORT_TERM_BUFFER_SIZE = 200
 
 
 @dataclass
-class Message:
+class ChatMessage:
     time: datetime
     user_name: str
     content: str
@@ -33,29 +33,29 @@ class Message:
 class Memory:
     """短时消息窗口；话题摘要只存在 SessionState.chat_summary，这里不再保留副本。"""
 
-    def __init__(self, messages: list[Message] | None = None):
+    def __init__(self, messages: list[ChatMessage] | None = None):
         # 保留缓冲区，access 只返回最近 SHORT_CONTEXT_LIMIT 条
         self.__messages = deque(messages or [], maxlen=SHORT_TERM_BUFFER_SIZE)
-        self.__dirty_messages: dict[int, Message] = {}
+        self.__dirty_messages: dict[int, ChatMessage] = {}
 
     def clear(self) -> None:
         self.__messages.clear()
         self.__dirty_messages.clear()
 
-    def access(self) -> list[Message]:
+    def access(self) -> list[ChatMessage]:
         return list(self.__messages)[-SHORT_CONTEXT_LIMIT:]
 
-    def pending_messages(self) -> list[tuple[Message, int]]:
+    def pending_messages(self) -> list[tuple[ChatMessage, int]]:
         return [
             (message, message.revision) for message in self.__dirty_messages.values()
         ]
 
-    def mark_persisted(self, persisted: list[tuple[Message, int]]) -> None:
+    def mark_persisted(self, persisted: list[tuple[ChatMessage, int]]) -> None:
         for message, revision in persisted:
             if message.revision == revision:
                 self.__dirty_messages.pop(id(message), None)
 
-    def mark_dirty(self, message: Message) -> None:
+    def mark_dirty(self, message: ChatMessage) -> None:
         message.revision += 1
         self.__dirty_messages[id(message)] = message
 
@@ -73,7 +73,7 @@ class Memory:
                 return True
         return False
 
-    def messages_after(self, watermark: datetime | None, limit: int) -> list[Message]:
+    def messages_after(self, watermark: datetime | None, limit: int) -> list[ChatMessage]:
         """固化水位之后的缓冲消息，最多 limit 条。"""
 
         messages = list(self.__messages)
@@ -82,7 +82,7 @@ class Memory:
             messages = [m for m in messages if m.time.timestamp() > watermark_ts]
         return messages[-limit:]
 
-    def update(self, message_chunk: list[Message]) -> None:
+    def update(self, message_chunk: list[ChatMessage]) -> None:
         """追加到滚动窗口，按消息 ID 去重。"""
 
         existing_ids = {msg.id for msg in self.__messages if msg.id}

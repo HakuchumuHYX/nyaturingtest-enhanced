@@ -16,7 +16,7 @@ from ..metrics import log_event
 from ..prompts import truncate_text
 from .faces import ensure_faces, face_name
 from .image import cached_caption, caption_image, caption_sticker, fetch_image_input
-from .message import Message as MMessage
+from .message import ChatMessage
 from .stickers import collect
 
 CARD_CHARS = 120
@@ -110,7 +110,7 @@ def _image_kind(vision_input: VisionInput) -> str:
 
 
 async def fill_caption(
-    session: Session, message: MMessage, job: CaptionJob, generation: int
+    session: Session, message: ChatMessage, job: CaptionJob, generation: int
 ) -> None:
     """后台看完一张图，把消息里的占位换成描述；表情包顺带判断收不收。
 
@@ -190,43 +190,44 @@ async def _reply_part(
         return _Part("")
     try:
         source_msg = await bot.get_msg(message_id=int(reply_id))
-        # 优先群名片，与 @ 和发言人名字保持同一套称呼，否则模型会把昵称当成另一个人
-        sender_info = source_msg.get("sender", {})
-        sender = sender_info.get("card") or sender_info.get("nickname", "未知")
-        part = _Part("")
-        if sender_info.get("user_id"):
-            part.mentions[str(sender_info["user_id"])] = sender
-        content_data = source_msg.get("message", [])
-        source_text = ""
-
-        if isinstance(content_data, str):
-            source_text = content_data
-        elif isinstance(content_data, list):
-            for segment in content_data:
-                msg_type = segment.get("type")
-                seg_data = segment.get("data", {})
-                text = segment_text(msg_type, seg_data)
-                if text is not None:
-                    source_text += text
-                elif msg_type == "image":
-                    # 引用的图和原消息是同一份字节，原消息看过就命中描述缓存
-                    image = await _image_part(
-                        seg_data,
-                        f"消息 {message_scope} 引用的第 {len(part.images) + 1} 张图",
-                        group_id,
-                        caption,
-                    )
-                    source_text += image.text
-                    part.images.extend(image.images)
-                    part.jobs.extend(image.jobs)
-
-        if len(source_text) > 800:
-            source_text = source_text[:800] + "..."
-        part.text = f' [回复 {sender}: "{source_text}"] '
-        return part
-    except Exception as e:
+    except (ActionFailed, NetworkError, ValueError) as e:
         logger.warning(f"获取回复内容失败: {e}")
         return _Part(" [回复] ")
+
+    # 优先群名片，与 @ 和发言人名字保持同一套称呼，否则模型会把昵称当成另一个人
+    sender_info = source_msg.get("sender", {})
+    sender = sender_info.get("card") or sender_info.get("nickname", "未知")
+    part = _Part("")
+    if sender_info.get("user_id"):
+        part.mentions[str(sender_info["user_id"])] = sender
+    content_data = source_msg.get("message", [])
+    source_text = ""
+
+    if isinstance(content_data, str):
+        source_text = content_data
+    elif isinstance(content_data, list):
+        for segment in content_data:
+            msg_type = segment.get("type")
+            seg_data = segment.get("data", {})
+            text = segment_text(msg_type, seg_data)
+            if text is not None:
+                source_text += text
+            elif msg_type == "image":
+                # 引用的图和原消息是同一份字节，原消息看过就命中描述缓存
+                image = await _image_part(
+                    seg_data,
+                    f"消息 {message_scope} 引用的第 {len(part.images) + 1} 张图",
+                    group_id,
+                    caption,
+                )
+                source_text += image.text
+                part.images.extend(image.images)
+                part.jobs.extend(image.jobs)
+
+    if len(source_text) > 800:
+        source_text = source_text[:800] + "..."
+    part.text = f' [回复 {sender}: "{source_text}"] '
+    return part
 
 
 async def _segment_part(
@@ -253,7 +254,7 @@ async def _segment_part(
     return _Part("")
 
 
-async def message2BotMessage(
+async def read_message(
     bot_name: str,
     group_id: int,
     message: Message,

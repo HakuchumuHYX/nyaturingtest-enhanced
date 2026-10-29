@@ -15,11 +15,11 @@ from ..memory.vector import (
     RAG_MEMORY_CHAR_BUDGET,
     RAG_MERGED_CANDIDATE_CAP,
     RAG_PER_QUERY_RECALL_K,
-    RetrievalResult,
+    RetrievedMemory,
     build_chat_rag_queries,
 )
 from ..messages.faces import Reaction, reaction_emoji
-from ..messages.message import SHORT_TERM_BUFFER_SIZE, Message
+from ..messages.message import SHORT_TERM_BUFFER_SIZE, ChatMessage
 from ..metrics import log_event
 from ..prompts import (
     CHAT_SYSTEM_PROMPT,
@@ -93,24 +93,32 @@ class FeedbackOutput:
 
 
 @dataclass(frozen=True)
+class MemoryContext:
+    """注入 prompt 的记忆行，和行号 → 记忆 id（Feedback 用 correct 指认要替换的那条）。"""
+
+    lines: list[str]
+    refs: dict[str, str]
+
+
+@dataclass(frozen=True)
 class TurnResult:
     replies: list[Reply]
     react: Reaction | None
     poke: Poke | None
 
 
-def _user_key(message: Message) -> str:
+def _user_key(message: ChatMessage) -> str:
     return message.user_id or message.user_name
 
 
-def format_history(messages: list[Message]) -> list[dict]:
+def format_history(messages: list[ChatMessage]) -> list[dict]:
     return [
         {"time": m.time.strftime("%H:%M"), "name": m.user_name, "content": m.content}
         for m in messages
     ]
 
 
-def _group_heat(messages: list[Message], bot_name: str) -> str:
+def _group_heat(messages: list[ChatMessage], bot_name: str) -> str:
     """群友的消息数、发言人数，加上角色自己的发言量，给 Feedback 判断群热度和自己是不是说多了。
 
     messages 是窗口内的全部消息。角色连续发的几条算一次开口，接的是开口前最后一个群友。
@@ -124,7 +132,7 @@ def _group_heat(messages: list[Message], bot_name: str) -> str:
     turns = 0
     partner_turns: dict[str, int] = {}
     partner_names: dict[str, str] = {}
-    last_other: Message | None = None
+    last_other: ChatMessage | None = None
     previous_is_own = False
     for m in messages:
         if m.user_name != bot_name:
@@ -150,7 +158,7 @@ def _group_heat(messages: list[Message], bot_name: str) -> str:
     return heat
 
 
-def _history_context(session: Session, messages_chunk: list[Message]) -> list[dict]:
+def _history_context(session: Session, messages_chunk: list[ChatMessage]) -> list[dict]:
     """短时窗口里除本轮新消息以外的历史，避免 Prompt 上下文重复。"""
 
     chunk_ids = {msg.id for msg in messages_chunk if msg.id}
@@ -162,8 +170,8 @@ def _history_context(session: Session, messages_chunk: list[Message]) -> list[di
     return format_history(history)
 
 
-def _memory_lines(records: list[dict]) -> tuple[list[str], dict[str, str]]:
-    """按总字符预算与单条上限把检索结果整理成 prompt 行，返回行与「编号 → 记忆 id」。
+def _memory_lines(records: list[RetrievedMemory]) -> MemoryContext:
+    """按总字符预算与单条上限把检索结果整理成 prompt 行。
 
     行里带编号和主体：模型能看出一条记忆挂在谁身上，也能用编号指认要更正的那条。
     """
@@ -174,21 +182,18 @@ def _memory_lines(records: list[dict]) -> tuple[list[str], dict[str, str]]:
     for item in records:
         if remaining <= 0:
             break
-        meta = item["metadata"]
+        row = item.row
         ref = f"m{len(lines) + 1}"
-        tag = "更正|" if meta["is_correction"] else ""
-        line = (
-            f"【{tag}{ref}|主体:{meta['subject_user_name'] or '无'}|d:{meta['date']}】"
-            f"{item['content']}"
-        )
+        tag = "更正|" if row.is_correction else ""
+        line = f"【{tag}{ref}|主体:{row.subject_user_name or '无'}|d:{row.date}】{row.content}"
         line = line[: min(remaining, RAG_ITEM_CHARS)].rstrip()
         lines.append(line)
-        refs[ref] = meta["memory_ref"]
+        refs[ref] = row.id
         remaining -= len(line)
-    return lines, refs
+    return MemoryContext(lines, refs)
 
 
-def _speaker_ids(messages_chunk: list[Message], bot_name: str) -> list[str]:
+def _speaker_ids(messages_chunk: list[ChatMessage], bot_name: str) -> list[str]:
     """本轮发言的群友，不含角色自己。"""
 
     return list(
@@ -197,7 +202,7 @@ def _speaker_ids(messages_chunk: list[Message], bot_name: str) -> list[str]:
 
 
 def _related_profiles(
-    session: Session, messages_chunk: list[Message], *, for_chat: bool
+    session: Session, messages_chunk: list[ChatMessage], *, for_chat: bool
 ) -> list[dict]:
     """Feedback 要在当前好感度上打分，给数值；Chat 只需要知道关系，给文字。"""
 
@@ -267,7 +272,7 @@ def _parse_affinity_changes(raw, speaker_ids: set[str]) -> dict[str, int]:
     return changes
 
 
-def _parse_reaction(raw, messages_chunk: list[Message], bot_name: str) -> Reaction | None:
+def _parse_reaction(raw, messages_chunk: list[ChatMessage], bot_name: str) -> Reaction | None:
     """react：只能贴这批新消息里群友的消息，表情要在目录里。"""
 
     if not isinstance(raw, dict):
@@ -285,7 +290,7 @@ def _parse_reaction(raw, messages_chunk: list[Message], bot_name: str) -> Reacti
     return Reaction(target_id=target.id, emoji_id=emoji[0], name=emoji[1])
 
 
-def _parse_poke(raw, messages_chunk: list[Message], bot_name: str) -> Poke | None:
+def _parse_poke(raw, messages_chunk: list[ChatMessage], bot_name: str) -> Poke | None:
     """poke 是 QQ 号：只能戳这批里说话的人，或被 @、被回复、被戳的人。"""
 
     user_id = str(raw or "").strip()
@@ -299,7 +304,7 @@ def _parse_poke(raw, messages_chunk: list[Message], bot_name: str) -> Poke | Non
 
 
 def parse_feedback(
-    data: dict | None, messages_chunk: list[Message], session: Session
+    data: dict | None, messages_chunk: list[ChatMessage], session: Session
 ) -> FeedbackOutput | None:
     """Feedback 输出的唯一校验入口；心情无效就整份丢弃，其余字段缺了或不对按没给处理。"""
 
@@ -377,7 +382,7 @@ def parse_reply(data: dict | None) -> list[Reply]:
 
 async def process_chunk(
     session: Session,
-    messages_chunk: list[Message],
+    messages_chunk: list[ChatMessage],
     images: list[VisionInput],
     generation: int,
 ) -> TurnResult | None:
@@ -421,25 +426,19 @@ async def process_chunk(
             return None
 
         # 要说话的轮次都重排：不重排时只能按向量分取前 k，闲聊上它分不出相关和无关
-        search_result = await search_stage(session, messages_chunk, use_rerank=True)
+        memories = await search_stage(session, messages_chunk, use_rerank=True)
         if session.stale(generation, "rag_search"):
             return None
 
-        try:
-            feedback = await feedback_stage(
-                session,
-                messages_chunk,
-                is_relevant=is_relevant,
-                search_result=search_result,
-                generation=generation,
-            )
-        finally:
-            session.schedule_save()
-
+        feedback = await feedback_stage(
+            session,
+            messages_chunk,
+            is_relevant=is_relevant,
+            memories=memories,
+            generation=generation,
+        )
         if session.stale(generation, "feedback"):
             return None
-        if feedback is not None:
-            _advance_consolidation_watermark(session, messages_chunk)
 
         # 被点名也交给 willing 判断；Feedback 失败时只有被点名才回
         if feedback is None:
@@ -467,7 +466,7 @@ async def process_chunk(
             messages_chunk,
             images,
             need_history=feedback is not None and feedback.need_history,
-            search_result=search_result,
+            memories=memories,
             generation=generation,
         )
         if session.stale(generation, "chat"):
@@ -480,10 +479,10 @@ async def process_chunk(
 
 async def search_stage(
     session: Session,
-    messages_chunk: list[Message],
+    messages_chunk: list[ChatMessage],
     *,
     use_rerank: bool,
-) -> RetrievalResult:
+) -> MemoryContext:
     started_at = time.perf_counter()
     state = session.state
 
@@ -498,7 +497,6 @@ async def search_stage(
         "skip_reason": "none",
     }
 
-    preset_lines = state.preset_lines
     # 只翻这批发言人和被 @、被回复的人的记忆：拿闲聊原话在全群里撞，翻出来的多是字面巧合
     speaker_ids = {msg.user_id for msg in messages_chunk if msg.user_id}
     user_ids = speaker_ids.union(*(msg.mentions for msg in messages_chunk))
@@ -522,32 +520,24 @@ async def search_stage(
         records = retrieval.records
         rag_stats.update(retrieval.stats)
 
-    memory_lines, refs = _memory_lines(records)
-    rag_stats["injected_count"] = len(preset_lines) + len(memory_lines)
-    rag_stats["injected_chars"] = sum(len(line) for line in preset_lines + memory_lines)
+    memories = _memory_lines(records)
+    injected = state.preset_lines + memories.lines
+    rag_stats["injected_count"] = len(injected)
+    rag_stats["injected_chars"] = sum(len(line) for line in injected)
     rag_stats["elapsed_ms"] = int((time.perf_counter() - started_at) * 1000)
     log_event("rag_search", "DEBUG", **rag_stats)
-    return RetrievalResult(
-        records=records,
-        stats=rag_stats,
-        preset_lines=preset_lines,
-        memory_lines=memory_lines,
-        refs=refs,
-    )
+    return memories
 
 
 async def _ask_feedback(
     session: Session,
-    messages_chunk: list[Message],
+    messages_chunk: list[ChatMessage],
     is_relevant: bool,
-    search_result: RetrievalResult,
+    memories: MemoryContext,
 ) -> FeedbackOutput | None:
     """调一次 Feedback 并校验输出；失败返回 None。Feedback 不带图，看消息里的图片描述就够了。"""
 
     state = session.state
-    for uid in _speaker_ids(messages_chunk, state.name):
-        state.profiles.setdefault(uid, PersonProfile(user_id=uid))
-
     now = datetime.now()
     state.global_emotion.settle(now)
     prompt = get_feedback_prompt(
@@ -563,10 +553,10 @@ async def _ask_feedback(
         ],
         emotion=state.global_emotion.vad(),
         related_profiles=_related_profiles(session, messages_chunk, for_chat=False),
-        search_result=search_result.memory_lines,
+        search_result=memories.lines,
         is_relevant=is_relevant,
         time_info=get_time_description(now),
-        presets=search_result.preset_lines,
+        presets=state.preset_lines,
         group_notes=state.group_notes,
         new_msg_speakers=[
             {
@@ -597,22 +587,26 @@ async def _ask_feedback(
 def _apply_sediment(
     session: Session,
     feedback: FeedbackOutput,
-    messages_chunk: list[Message],
+    messages_chunk: list[ChatMessage],
     generation: int,
     refs: dict[str, str],
 ) -> None:
-    """应用 Feedback 的沉淀结果：情绪、画像、摘要、记忆更正。refs 是本轮检索行编号 → 记忆 id。"""
+    """应用 Feedback 的沉淀结果：情绪、画像、摘要、记忆更正，最后推进固化水位。
+
+    refs 是本轮检索行编号 → 记忆 id。
+    """
 
     state = session.state
 
     # 1. 心情：parse_feedback 已校验范围，apply 再限制每轮步长
     state.global_emotion.apply(feedback.emotion)
 
-    # 2. 互动计数按消息记；好感度只改 Feedback 点名的人。画像已在 _ask_feedback 里建好
+    # 2. 互动计数按消息记；好感度只改 Feedback 点名的人（parse_feedback 只收本轮发言人）
     now = datetime.now()
     for msg in messages_chunk:
         if msg.user_name != state.name:
-            state.profiles[_user_key(msg)].record_interaction(now)
+            uid = _user_key(msg)
+            state.profiles.setdefault(uid, PersonProfile(user_id=uid)).record_interaction(now)
     for uid, delta in feedback.affinity_changes.items():
         state.profiles[uid].add_affinity(delta)
 
@@ -637,22 +631,25 @@ def _apply_sediment(
             )
         )
 
+    # 5. 这批已经沉淀过，下次静默固化从这之后开始
+    _advance_consolidation_watermark(session, messages_chunk)
+
 
 async def feedback_stage(
     session: Session,
-    messages_chunk: list[Message],
+    messages_chunk: list[ChatMessage],
     *,
     is_relevant: bool,
-    search_result: RetrievalResult,
+    memories: MemoryContext,
     generation: int,
 ) -> FeedbackOutput | None:
     """反馈阶段：分析情绪、记忆更正、更新摘要、给出接话意愿。
     Feedback 失败或会话已作废时返回 None。"""
 
-    feedback = await _ask_feedback(session, messages_chunk, is_relevant, search_result)
+    feedback = await _ask_feedback(session, messages_chunk, is_relevant, memories)
     if feedback is None or session.stale(generation, "feedback_sediment"):
         return None
-    _apply_sediment(session, feedback, messages_chunk, generation, search_result.refs)
+    _apply_sediment(session, feedback, messages_chunk, generation, memories.refs)
 
     # 说不说由 willing 按场景门槛决定（见 process_chunk）；规则意愿只向它靠拢一半，
     # 让模型觉得不想说时下一批不必再急着调用 Feedback
@@ -665,7 +662,7 @@ async def feedback_stage(
 
 async def consolidate_stage(
     session: Session,
-    messages_chunk: list[Message],
+    messages_chunk: list[ChatMessage],
     generation: int,
 ) -> None:
     """常驻记忆固化：分析+沉淀，但不改回复意愿、不做发言决策。"""
@@ -674,26 +671,22 @@ async def consolidate_stage(
         return
     session.state.last_consolidation_attempt = datetime.now()
     logger.debug(f"[Session {session.id}] >> 记忆固化 (Consolidate) {len(messages_chunk)} 条")
-    search_result = await search_stage(session, messages_chunk, use_rerank=False)
+    memories = await search_stage(session, messages_chunk, use_rerank=False)
     if session.stale(generation, "consolidation_search"):
         return
-    feedback = await _ask_feedback(session, messages_chunk, False, search_result)
-    if feedback is None:
-        session.schedule_save()
+    feedback = await _ask_feedback(session, messages_chunk, False, memories)
+    if feedback is None or session.stale(generation, "consolidation_sediment"):
         return
-    if session.stale(generation, "consolidation_sediment"):
-        return
-    _apply_sediment(session, feedback, messages_chunk, generation, search_result.refs)
-    _advance_consolidation_watermark(session, messages_chunk)
+    _apply_sediment(session, feedback, messages_chunk, generation, memories.refs)
 
 
 async def chat_stage(
     session: Session,
-    messages_chunk: list[Message],
+    messages_chunk: list[ChatMessage],
     images: list[VisionInput],
     *,
     need_history: bool,
-    search_result: RetrievalResult,
+    memories: MemoryContext,
     generation: int,
 ) -> list[Reply]:
     state = session.state
@@ -734,8 +727,8 @@ async def chat_stage(
         new_msgs=new_msgs,
         mood=describe_mood(state.global_emotion),
         related_profiles=related_profiles,
-        search_result=search_result.memory_lines,
-        presets=search_result.preset_lines,
+        search_result=memories.lines,
+        presets=state.preset_lines,
         group_notes=state.group_notes,
         recalled_history=recalled_str,
         my_recent_replies=my_recent_replies,
@@ -746,10 +739,10 @@ async def chat_stage(
         "DEBUG",
         session_id=session.id,
         chat_prompt_total_chars=len(prompt),
-        rag_injected_count=len(search_result.memory_lines),
-        rag_injected_chars=sum(len(item) for item in search_result.memory_lines),
-        preset_injected_count=len(search_result.preset_lines),
-        preset_injected_chars=sum(len(item) for item in search_result.preset_lines),
+        rag_injected_count=len(memories.lines),
+        rag_injected_chars=sum(len(item) for item in memories.lines),
+        preset_injected_count=len(state.preset_lines),
+        preset_injected_chars=sum(len(item) for item in state.preset_lines),
         group_notes_chars=len(state.group_notes),
         profile_summary_chars=sum(len(item["summary"]) for item in related_profiles),
         history_chars=len(state.chat_summary)
@@ -782,7 +775,7 @@ async def chat_stage(
     return replies
 
 
-def _advance_consolidation_watermark(session: Session, messages_chunk: list[Message]) -> None:
+def _advance_consolidation_watermark(session: Session, messages_chunk: list[ChatMessage]) -> None:
     state = session.state
     latest = max(msg.time for msg in messages_chunk)
     if state.last_consolidated_time is None or latest > state.last_consolidated_time:

@@ -16,6 +16,7 @@ from .vector import (
 
 MEMORY_QUERY_USER_COOLDOWN_SECONDS = 30.0
 MEMORY_QUERY_GROUP_COOLDOWN_SECONDS = 3.0
+IMPRESSION_TEMPERATURE = 0.8
 
 _last_user_query: dict[tuple[str, str], float] = {}
 _last_group_query: dict[str, float] = {}
@@ -79,11 +80,11 @@ def impression_text(page: Impression) -> str:
 
 
 async def query_memory_profile(
-    state: GroupState, *, target_id: str, target_name: str, sender_id: str
+    group: GroupState, *, target_id: str, target_name: str, sender_id: str
 ) -> Impression | str:
-    """生成 Bot 对目标用户的印象（state 由调用方加载好）；没有印象或生成失败时返回要直接回复的文字。"""
+    """生成 Bot 对目标用户的印象（group 由调用方加载好）；没有印象或生成失败时返回要直接回复的文字。"""
 
-    session = state.session
+    session = group.session
     profile = session.state.profiles.get(target_id)
     summary = session.state.user_summaries.get(target_id, "")
     bot_name = session.state.name
@@ -128,7 +129,7 @@ async def query_memory_profile(
         recent=recent,
     )
     result = await chat_client.generate_json(
-        prompt, session_id=session.id, temperature=0.8
+        prompt, session_id=session.id, temperature=IMPRESSION_TEMPERATURE
     )
     if not result or not result.get("headline") or not result.get("impression"):
         logger.warning("印象生成 JSON 解析失败")
@@ -185,13 +186,13 @@ async def _retrieve(
     seen = set()
     remaining = RAG_MEMORY_CHAR_BUDGET
     for record in result.records:
-        content = record["content"]
+        content = record.row.content
         if content in seen:
             continue
         seen.add(content)
         content = content[: min(RAG_ITEM_CHARS, remaining)]
         remaining -= len(content)
-        if target_id in record["metadata"]["participant_ids"].split():
+        if target_id in record.row.participant_ids.split():
             target_records.append(content)
         else:
             unscoped_records.append(content)

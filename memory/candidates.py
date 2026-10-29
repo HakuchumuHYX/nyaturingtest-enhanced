@@ -11,9 +11,10 @@ from datetime import datetime
 from nonebot import logger
 
 from ..chat.session import Session
-from ..messages.message import Message
+from ..messages.message import ChatMessage
 from ..metrics import log_event
 from ..storage.db import message_final_id
+from .vector import NewMemory
 
 ALLOWED_MEMORY_CATEGORIES = {"event", "preference", "profile", "relationship"}
 MIN_MEMORY_CONFIDENCE = 0.6
@@ -29,7 +30,7 @@ def clamp01(value, default: float) -> float:
         return default
 
 
-def source_messages(item: dict, messages: list[Message]) -> list[Message]:
+def source_messages(item: dict, messages: list[ChatMessage]) -> list[ChatMessage]:
     """模型给的 source 下标指向的消息；越界和非整数的下标丢掉。"""
 
     source = item.get("source")
@@ -40,49 +41,51 @@ def source_messages(item: dict, messages: list[Message]) -> list[Message]:
     ]
 
 
-def memory_metadata(
+def build_memory(
+    content: str,
     *,
     category: str,
     date: int,
     confidence: float,
     importance: float,
-    sources: list[Message],
+    sources: list[ChatMessage],
     participant_ids: Iterable[str],
     subject: tuple[str, str] = ("", ""),
     speaker: tuple[str, str] = ("", ""),
     is_correction: bool = False,
     replaces: str = "",
-) -> dict:
-    """add_memories 要的元数据；subject / speaker 是 (QQ 号, 名字)，来源 msg_id 由 sources 算出。"""
+) -> NewMemory:
+    """subject / speaker 是 (QQ 号, 名字)，来源 msg_id 由 sources 算出。"""
 
-    return {
-        "category": category,
-        "date": date,
-        "subject_user_id": subject[0],
-        "subject_user_name": subject[1],
-        "speaker_user_id": speaker[0],
-        "speaker_user_name": speaker[1],
-        "confidence": confidence,
-        "importance": importance,
-        "source_msg_ids": " ".join(dict.fromkeys(message_final_id(m) for m in sources)),
-        "participant_ids": " ".join(dict.fromkeys(participant_ids)),
-        "is_correction": is_correction,
-        "replaces": replaces,
-    }
+    return NewMemory(
+        content=content,
+        category=category,
+        date=date,
+        confidence=confidence,
+        importance=importance,
+        source_msg_ids=" ".join(dict.fromkeys(message_final_id(m) for m in sources)),
+        participant_ids=" ".join(dict.fromkeys(participant_ids)),
+        subject_user_id=subject[0],
+        subject_user_name=subject[1],
+        speaker_user_id=speaker[0],
+        speaker_user_name=speaker[1],
+        is_correction=is_correction,
+        replaces=replaces,
+    )
 
 
-def validate_memory_candidate(content: str, metadata: dict) -> str:
+def validate_memory_candidate(memory: NewMemory) -> str:
     """返回拒绝原因；空串表示可存。"""
 
-    if not metadata["source_msg_ids"]:
+    if not memory.source_msg_ids:
         return "missing_source"
-    if len(content) < MIN_CONTENT_CHARS:
+    if len(memory.content) < MIN_CONTENT_CHARS:
         return "too_short"
-    if metadata["category"] not in ALLOWED_MEMORY_CATEGORIES:
+    if memory.category not in ALLOWED_MEMORY_CATEGORIES:
         return "unsupported_category"
-    if metadata["confidence"] < MIN_MEMORY_CONFIDENCE:
+    if memory.confidence < MIN_MEMORY_CONFIDENCE:
         return "low_confidence"
-    if not metadata["subject_user_id"] and not metadata["subject_user_name"]:
+    if not memory.subject_user_id and not memory.subject_user_name:
         return "missing_subject"
     return ""
 
@@ -117,12 +120,12 @@ def _resolve_user(
 
 def _parse_memory_candidate(
     item,
-    messages: list[Message],
+    messages: list[ChatMessage],
     known_users: dict[str, str],
     refs: dict[str, str],
     date: int,
-) -> tuple[str, str, dict] | None:
-    """把 LLM 返回的一条 add/correct 候选规范化成 (action, 正文, 元数据)；ignore、未知 action、非对象返回 None。
+) -> tuple[str, NewMemory] | None:
+    """把 LLM 返回的一条 add/correct 候选规范化成 (action, 记忆)；ignore、未知 action、非对象返回 None。
 
     说话人由代码按 source 指向的第一条消息定，不信模型自报；source 缺失时来源为空，由校验拒绝。
     主体没填名字时才默认记到说话人头上；填了别人的名字就不能这样兜底。
@@ -148,7 +151,8 @@ def _parse_memory_candidate(
     )
     # 编号只在本轮有效；查不到就当没指认，只写一条更正
     replaces = refs.get(str(item.get("target") or "").strip(), "") if action == "correct" else ""
-    metadata = memory_metadata(
+    memory = build_memory(
+        str(item.get("content") or "").strip(),
         category=str(item.get("category") or "event").strip().lower() or "event",
         date=date,
         confidence=clamp01(item.get("confidence"), 0.7),
@@ -160,14 +164,14 @@ def _parse_memory_candidate(
         is_correction=action == "correct",
         replaces=replaces,
     )
-    return action, str(item.get("content") or "").strip(), metadata
+    return action, memory
 
 
 async def save_memory_candidates(
     session: Session,
     items: list,
     *,
-    messages: list[Message],
+    messages: list[ChatMessage],
     known_users: dict[str, str],
     refs: dict[str, str],
     generation: int,
@@ -182,17 +186,17 @@ async def save_memory_candidates(
 
     today = int(datetime.now().strftime("%Y%m%d"))
     skipped_quality = 0
-    pending_memories: list[tuple[str, dict]] = []
+    pending_memories: list[NewMemory] = []
 
     for raw_item in items:
         parsed = _parse_memory_candidate(raw_item, messages, known_users, refs, today)
         if parsed is None:
             continue
-        action, content, metadata = parsed
+        action, memory = parsed
 
         # 质量过滤：长度 + 类别/置信度/主体边界（先过滤，避免为废候选调 embedding）
-        reason = validate_memory_candidate(content, metadata)
-        if not reason and metadata["speaker_user_name"] == session.state.name:
+        reason = validate_memory_candidate(memory)
+        if not reason and memory.speaker_user_name == session.state.name:
             # 角色自己说的话只是上下文，不当事实来源
             reason = "bot_source"
         if reason:
@@ -202,12 +206,12 @@ async def save_memory_candidates(
                 "DEBUG",
                 session_id=session.id,
                 action=action,
-                category=metadata["category"],
+                category=memory.category,
                 reason=reason,
-                content=content[:30],
+                content=memory.content[:30],
             )
             continue
-        pending_memories.append((content, metadata))
+        pending_memories.append(memory)
 
     store_result = {"added": 0, "skipped_dedup": 0, "corrected": 0}
     if pending_memories:

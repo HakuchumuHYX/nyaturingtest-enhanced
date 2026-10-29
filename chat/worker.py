@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from nonebot import logger
 from nonebot.adapters.onebot.v11 import Bot, Event
 
-from ..messages.message import Message as MMessage
+from ..messages.message import ChatMessage
 from ..metrics import log_event
 from .groups import SELF_SENT_MSG_IDS, GroupState, is_shutting_down
 from .orchestrator import process_chunk
@@ -19,32 +19,32 @@ CAPTION_WAIT_SECONDS = 15.0
 
 @dataclass(frozen=True)
 class InboxBatch:
-    messages: list[MMessage]
+    messages: list[ChatMessage]
     bot: Bot
     event: Event
 
 
-async def next_inbox_batch(state: GroupState) -> InboxBatch | None:
+async def next_inbox_batch(group: GroupState) -> InboxBatch | None:
     """等到静默窗口结束，再一次性取走积压的消息。"""
 
-    await state.new_message_signal.wait()
+    await group.new_message_signal.wait()
     await asyncio.sleep(DEBOUNCE_SECONDS)
-    state.new_message_signal.clear()
-    async with state.data_lock:
-        if state.bot is None or state.event is None or not state.messages_chunk:
+    group.new_message_signal.clear()
+    async with group.data_lock:
+        if group.bot is None or group.event is None or not group.messages_chunk:
             return None
         batch = InboxBatch(
-            messages=list(state.messages_chunk),
-            bot=state.bot,
-            event=state.event,
+            messages=list(group.messages_chunk),
+            bot=group.bot,
+            event=group.event,
         )
-        state.messages_chunk.clear()
+        group.messages_chunk.clear()
         return batch
 
 
 def _filter_local_self_echoes(
-    messages: list[MMessage], bot_self_id: str
-) -> tuple[list[MMessage], list[MMessage]]:
+    messages: list[ChatMessage], bot_self_id: str
+) -> tuple[list[ChatMessage], list[ChatMessage]]:
     """按本地已发送消息 ID 分离自身回显。"""
 
     filtered, local_echoes = [], []
@@ -56,7 +56,7 @@ def _filter_local_self_echoes(
     return filtered, local_echoes
 
 
-async def _process_inbox_batch(state: GroupState, batch: InboxBatch) -> None:
+async def _process_inbox_batch(group: GroupState, batch: InboxBatch) -> None:
     bot_self_id = str(batch.bot.self_id)
     current_chunk, local_echoes = _filter_local_self_echoes(batch.messages, bot_self_id)
     if local_echoes:
@@ -84,19 +84,19 @@ async def _process_inbox_batch(state: GroupState, batch: InboxBatch) -> None:
         log_event(
             "message",
             "DEBUG",
-            session_id=state.session.id,
+            session_id=group.session.id,
             user=message.user_name,
             content=message.content,
         )
     if is_shutting_down():
         return
 
-    await state.load()
-    generation = state.session.state.generation
+    await group.load()
+    generation = group.session.state.generation
 
     images = [item for message in current_chunk for item in message.image_inputs]
     try:
-        turn = await process_chunk(state.session, current_chunk, images, generation)
+        turn = await process_chunk(group.session, current_chunk, images, generation)
     finally:
         for message in current_chunk:
             message.image_inputs.clear()
@@ -104,11 +104,11 @@ async def _process_inbox_batch(state: GroupState, batch: InboxBatch) -> None:
         return
 
     if turn.react is not None:
-        await send_reaction(state, batch.bot, turn.react, generation)
+        await send_reaction(group, batch.bot, turn.react, generation)
     if turn.poke is not None:
-        await send_poke(state, batch.bot, batch.event, turn.poke, generation)
+        await send_poke(group, batch.bot, batch.event, turn.poke, generation)
     await dispatch_replies(
-        state=state,
+        group=group,
         replies=turn.replies,
         bot=batch.bot,
         event=batch.event,
@@ -116,18 +116,18 @@ async def _process_inbox_batch(state: GroupState, batch: InboxBatch) -> None:
     )
 
 
-async def spawn_state(state: GroupState):
-    """Small worker boundary: debounce, invoke one turn, contain failures."""
+async def run_worker(group: GroupState):
+    """群 worker 的主循环：防抖取一批、跑一轮；单轮异常记日志后继续，不让任务退出。"""
 
     while True:
         try:
-            batch = await next_inbox_batch(state)
+            batch = await next_inbox_batch(group)
             if batch is None:
                 continue
-            await _process_inbox_batch(state, batch)
+            await _process_inbox_batch(group, batch)
         except asyncio.CancelledError:
-            logger.info(f"后台任务被取消: {id(state)}")
+            logger.info(f"后台任务被取消: {id(group)}")
             break
         except Exception as e:
-            logger.exception(f"Spawn loop error: {e}")
+            logger.exception(f"群 worker 异常: {e}")
             await asyncio.sleep(5.0)

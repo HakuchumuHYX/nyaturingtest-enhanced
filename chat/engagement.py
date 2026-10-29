@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 
-from ..messages.message import Message
+from ..messages.message import ChatMessage
 
 # 两次发送之间的最小间隔（在发送前等待，不再跳过整轮）
 SPEAK_COOLDOWN_SECONDS = 16.0
@@ -89,7 +89,7 @@ class EngagementDecision:
 def evaluate_engagement(
     *,
     state,
-    messages: list[Message],
+    messages: list[ChatMessage],
     self_share: float,
     now: datetime,
 ) -> EngagementDecision:
@@ -131,7 +131,7 @@ def evaluate_engagement(
 def check_relevance(
     bot_name: str,
     aliases: list[str],
-    messages: list[Message],
+    messages: list[ChatMessage],
 ) -> bool:
     """@Bot、回复 Bot 的消息，或提到名字/别名（至少 2 个字）。
 
@@ -156,7 +156,7 @@ def check_relevance(
     )
 
 
-def _directed_at_others(message: Message) -> bool:
+def _directed_at_others(message: ChatMessage) -> bool:
     """@ 或回复了别的群友，是在点名对别人说。
 
     回复自己接着说不算；@ bot 不进 mentions，回复 bot 时 to_me 为真，都不会算进来。
@@ -169,7 +169,7 @@ def _directed_at_others(message: Message) -> bool:
     )
 
 
-def score_message_interest(messages: list[Message]) -> float:
+def score_message_interest(messages: list[ChatMessage]) -> float:
     """这批消息有多值得插嘴：提问、有实质内容加分，纯复读/纯媒体、点名对别人说减分。"""
 
     contents = [message.content for message in messages]
