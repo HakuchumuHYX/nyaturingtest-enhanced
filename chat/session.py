@@ -259,14 +259,6 @@ class Session:
         self.state.loaded = True
         logger.info(f"[Session {self.id}] 加载完成")
 
-    def presets(self) -> list[str]:
-        reload_presets()
-        return [
-            f"{filename}: {preset.name} {preset.seed.split('。')[0]}"
-            for filename, preset in PRESETS.items()
-            if not preset.hidden
-        ]
-
     async def load_preset(self, filename: str) -> bool:
         reload_presets()
         if not filename.endswith(".json") and f"{filename}.json" in PRESETS.keys():
@@ -311,25 +303,6 @@ class Session:
         # 新人设第一次整理要等到当晚，这之前拿出发点顶上，不然这一天没有性格
         self.state.self_life = life or preset.seed
 
-    def status(self) -> str:
-        self.state.global_emotion.settle()
-        recent_messages = self.short_term_memory.access()
-        recent_str = (
-            "\n".join([f"{m.user_name}: {m.content}" for m in recent_messages])
-            if recent_messages
-            else "无"
-        )
-        return f"""
-人设：{self.state.preset or "未设（不说话）"}
-意愿值：{self.state.willingness:.2f}
-状态: {chatting_state(self.state, datetime.now())}
-心情：V{self.state.global_emotion.valence:.2f} A{self.state.global_emotion.arousal:.2f} D{self.state.global_emotion.dominance:.2f}
-后台任务数: {len(self.background_tasks)}
-摘要：{self.state.chat_summary}
-最近消息：
-{recent_str}
-"""
-
     def append_self_message(self, content: str, msg_id: str, bot_user_id: str):
         """
         主动记录 Bot 自己的发言 (防止等待回显导致记忆延迟)
@@ -358,7 +331,7 @@ class Session:
     def recall_message(self, msg_id: str, content: str) -> bool:
         """群友撤回消息：缓冲里那条原地改成撤回标记，随下次保存写回消息库。"""
 
-        if not self.short_term_memory.rewrite(msg_id, content):
+        if not self.short_term_memory.recall(msg_id, content):
             return False
         self.schedule_save()
         return True

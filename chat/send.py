@@ -3,6 +3,7 @@
 import asyncio
 import random
 import re
+from collections import deque
 from datetime import datetime
 
 from nonebot import logger
@@ -13,7 +14,7 @@ from ..messages.faces import Reaction
 from ..messages.stickers import Sticker, mark_sent, pick
 from ..metrics import log_event
 from .engagement import SPEAK_COOLDOWN_SECONDS
-from .groups import SELF_SENT_MSG_IDS, GroupState
+from .groups import GroupState
 from .orchestrator import Poke, Reply
 
 MAX_REPLY_MESSAGES = 2
@@ -21,6 +22,9 @@ REACT_COOLDOWN_SECONDS = 60
 # 戳一戳会给对方弹提醒，比贴表情打扰人，间隔放长些
 POKE_COOLDOWN_SECONDS = 120
 STICKER_COOLDOWN_SECONDS = 120
+
+# 本机发出的消息 id，worker 据此过滤平台推回来的自身回显
+SELF_SENT_MSG_IDS = deque(maxlen=50)
 
 _SPLIT_PATTERN = re.compile(
     r"(?<=[。！？!?~\n])\s*|(?<!\.)\.(?!\.)(?=\s|$|[\u4e00-\u9fff])\s*"

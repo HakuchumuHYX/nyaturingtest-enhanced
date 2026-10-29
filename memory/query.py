@@ -4,7 +4,7 @@ from datetime import datetime
 
 from nonebot import logger
 
-from ..chat.groups import GroupState
+from ..chat.session import Session
 from ..llm import chat_client
 from ..prompts import describe_relation, get_impression_prompt
 from ..storage.db import get_recent_messages_by_user
@@ -80,11 +80,10 @@ def impression_text(page: Impression) -> str:
 
 
 async def query_memory_profile(
-    group: GroupState, *, target_id: str, target_name: str, sender_id: str
+    session: Session, *, target_id: str, target_name: str, sender_id: str
 ) -> Impression | str:
-    """生成 Bot 对目标用户的印象（group 由调用方加载好）；没有印象或生成失败时返回要直接回复的文字。"""
+    """生成 Bot 对目标用户的印象（session 由调用方加载好）；没有印象或生成失败时返回要直接回复的文字。"""
 
-    session = group.session
     profile = session.state.profiles.get(target_id)
     summary = session.state.user_summaries.get(target_id, "")
     bot_name = session.state.name

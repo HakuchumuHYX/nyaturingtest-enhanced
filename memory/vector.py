@@ -1,6 +1,5 @@
 import asyncio
 import math
-import re
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -597,25 +596,3 @@ async def maintain_memories() -> None:
         filled += len(batch)
     logger.info(f"[Memory] 维护完成：删除过期 {deleted} 条，补算向量 {filled}/{len(pending)} 条")
 
-
-# 纯表情/标点（「？？？」「哈哈哈」「233」这类都短于 4 字，长度过滤已覆盖）
-_EMOJI_ONLY_RE = re.compile(r"^[\W_]+$", re.UNICODE)
-# 回复引用和表情的写法见 messages/convert.py；判断时只看群友自己写的话
-_REPLY_PREFIX_RE = re.compile(r'^\[回复 .+?: ".*?"\]', re.S)
-_STICKER_RE = re.compile(r"\[表情[^\]]*\]")  # [表情包: …]、[表情包#xxxx]、[表情:狗头]
-
-
-def is_low_value_rag_query(text: str) -> bool:
-    own = _STICKER_RE.sub("", _REPLY_PREFIX_RE.sub("", text.strip())).strip()
-    return len(own) < 4 or bool(_EMOJI_ONLY_RE.fullmatch(own))
-
-
-def build_chat_rag_queries(
-    raw_queries: list[str],
-    *,
-    chat_summary: str,
-) -> list[str]:
-    queries = [query.strip() for query in raw_queries if not is_low_value_rag_query(query)]
-    if chat_summary.strip():
-        queries.append(chat_summary.strip())
-    return _dedupe_preserve_order(queries)

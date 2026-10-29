@@ -1,28 +1,20 @@
 import asyncio
 from collections import deque
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from nonebot import logger, require
+from nonebot import logger
 from nonebot.adapters.onebot.v11 import Bot, Event
 from tortoise import Tortoise
 
-require("nonebot_plugin_apscheduler")
-from nonebot_plugin_apscheduler import scheduler  # noqa: E402  必须在 require 之后导入
-
-from ..llm import close_http_client  # noqa: E402
-from ..memory.digest import digest_group_notes, digest_user_profiles  # noqa: E402
-from ..memory.persona import maintain_personas  # noqa: E402
-from ..memory.vector import close_clients, maintain_memories  # noqa: E402
-from ..messages.message import ChatMessage  # noqa: E402
-from ..metrics import drain_usage_tasks  # noqa: E402
-from ..storage.db import load_enabled_group_ids  # noqa: E402
-from .session import Session  # noqa: E402
+from ..llm import close_http_client
+from ..memory.vector import close_clients
+from ..messages.message import ChatMessage
+from ..metrics import drain_usage_tasks
+from ..storage.db import disable_group, enable_group, load_enabled_group_ids
+from .session import Session
 
 QUEUE_MAX_SIZE = 200
-
-SELF_SENT_MSG_IDS = deque(maxlen=50)
 
 
 @dataclass
@@ -141,89 +133,20 @@ async def remove_group_state(group_id: int):
         await group.session.drain_background_tasks()
 
 
-def _generation(group_id: int) -> int:
-    """未加载的群按 0 算：加载不改 generation，只有 reset/load_preset 等会递增。"""
+async def enable_autochat(group_id: int) -> None:
+    """写库、加进注册表，并立即建好群状态和 worker。"""
 
-    group = group_states.get(group_id)
-    return group.session.state.generation if group else 0
-
-
-def _generation_guard(group_id: int) -> Callable[[], bool]:
-    """记下此刻的 generation，返回「会话还没被 reset/load_preset 作废」的检查。"""
-
-    generation = _generation(group_id)
-    return lambda: _generation(group_id) == generation
+    await enable_group(group_id)
+    runtime_enabled_groups.add(group_id)
+    ensure_group_state(group_id)
 
 
-async def refresh_group_notes(group_id: int, *, min_new: int = 1) -> str | None:
-    """把新碎片整理进群志；群志不随 save_session 回写，已加载的群同步内存副本。"""
+async def disable_autochat(group_id: int) -> None:
+    """写库、移出注册表，再取消 worker、排空后台写入。"""
 
-    still_current = _generation_guard(group_id)
-    notes = await digest_group_notes(str(group_id), still_current, min_new=min_new)
-    group = group_states.get(group_id)
-    if notes is not None and group is not None and still_current():
-        group.session.state.group_notes = notes
-    return notes
-
-
-async def maintain_long_term_memory() -> None:
-    """长期记忆每日维护：先把新碎片整理进档案与群志，再整理人设成长，最后删过期碎片，
-    这样即将过期的碎片一定先被归纳过；最后让已加载的群下次重新读矩阵。"""
-
-    for group_id in list(runtime_enabled_groups):
-        session_id = str(group_id)
-        still_current = _generation_guard(group_id)
-        try:
-            summaries = await digest_user_profiles(session_id, still_current)
-            await refresh_group_notes(group_id)
-        except Exception as e:
-            logger.warning(f"群 {group_id} 档案/群志整理失败: {e}")
-            continue
-        # 档案不随 save_session 回写，已加载的群要同步内存副本
-        group = group_states.get(group_id)
-        if group is not None and still_current():
-            group.session.state.user_summaries.update(summaries)
-
-    await _maintain_personas()
-
-    try:
-        await maintain_memories()
-    except Exception as e:
-        logger.warning(f"长期记忆定时维护失败: {e}")
-    for group in group_states.values():
-        group.session.vector_memory.drop_cache()
-
-
-async def _maintain_personas() -> None:
-    group_ids = list(runtime_enabled_groups)
-    guards = {str(group_id): _generation_guard(group_id) for group_id in group_ids}
-    try:
-        lives, group_texts = await maintain_personas(group_ids, guards)
-    except Exception as e:
-        logger.warning(f"人设成长整理失败: {e}")
-        return
-    # 人生线和群层不随 save_session 回写，已加载的群要同步内存副本
-    for group_id in group_ids:
-        group = group_states.get(group_id)
-        if group is None or not guards[str(group_id)]():
-            continue
-        state = group.session.state
-        if state.preset in lives:
-            state.self_life = lives[state.preset]
-        if str(group_id) in group_texts:
-            state.self_in_group = group_texts[str(group_id)]
-
-
-def setup_maintenance_job():
-    scheduler.add_job(
-        maintain_long_term_memory,
-        "cron",
-        hour=3,
-        minute=30,
-        id="nyaturingtest_vector_maintenance",
-        misfire_grace_time=3600,
-        replace_existing=True,
-    )
+    await disable_group(group_id)
+    runtime_enabled_groups.discard(group_id)
+    await remove_group_state(group_id)
 
 
 async def cleanup_global_resources():

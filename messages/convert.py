@@ -1,12 +1,21 @@
-"""把 OneBot 消息读成文字：各类消息段的文字标记、被回复的原文、图片占位与后台描述。"""
+"""把 OneBot 事件读成 ChatMessage：各类消息段的文字标记、被回复的原文、图片占位与后台描述，
+以及戳一戳、贴表情、撤回标记的写法。"""
 
 import asyncio
 import json
+import re
 import secrets
 from dataclasses import dataclass, field
+from datetime import datetime
 
 from nonebot import logger
-from nonebot.adapters.onebot.v11 import Bot, Message, MessageSegment
+from nonebot.adapters.onebot.v11 import (
+    Bot,
+    GroupMessageEvent,
+    Message,
+    MessageSegment,
+    PokeNotifyEvent,
+)
 from nonebot.adapters.onebot.v11.exception import ActionFailed
 from nonebot.exception import NetworkError
 
@@ -21,6 +30,11 @@ from .stickers import collect
 
 CARD_CHARS = 120
 FORWARD_PLACEHOLDER = "[合并转发]"
+# 群友自己说的话至少这么多字才算说了东西：「？？？」「哈哈哈」「233」这类都短于 4 字
+SUBSTANTIVE_MIN_CHARS = 4
+_PUNCTUATION_ONLY_RE = re.compile(r"^[\W_]+$", re.UNICODE)
+# 这几类消息段的文字算群友自己说的话；图片另算（不含表情包）
+_OWN_WORD_SEGMENTS = {"text", "json", "file", "forward"}
 
 
 def is_sticker_segment(data: dict) -> bool:
@@ -139,12 +153,17 @@ async def fill_caption(
 
 @dataclass
 class _Part:
-    """一个消息段读出来的东西：文字、原图、被 @/被回复的人、待看的图。"""
+    """一个消息段读出来的东西：文字、原图、被 @/被回复的人、待看的图。
+
+    own 是这段里算作群友自己说的话：只有文字、卡片、文件、转发和图片（不含表情包）算；
+    回复引用、表情、@、语音、视频不算。
+    """
 
     text: str
     images: list[VisionInput] = field(default_factory=list)
     mentions: dict[str, str] = field(default_factory=dict)
     jobs: list[CaptionJob] = field(default_factory=list)
+    own: str = ""
 
 
 async def _image_part(data: dict, label: str, group_id: int, caption: bool) -> _Part:
@@ -242,10 +261,13 @@ async def _segment_part(
 ) -> _Part:
     text = segment_text(seg.type, seg.data)
     if text is not None:
-        return _Part(text)
+        return _Part(text, own=text if seg.type in _OWN_WORD_SEGMENTS else "")
     if seg.type == "image":
         label = f"消息 {message_scope} 的第 {image_number} 张图"
-        return await _image_part(seg.data, label, group_id, caption)
+        part = await _image_part(seg.data, label, group_id, caption)
+        if not is_sticker_segment(seg.data):
+            part.own = part.text
+        return part
     if seg.type == "at":
         return await _at_part(bot, seg.data, group_id, bot_name)
     if seg.type == "reply":
@@ -254,21 +276,45 @@ async def _segment_part(
     return _Part("")
 
 
-async def read_message(
-    bot_name: str,
-    group_id: int,
-    message: Message,
-    bot: Bot,
-    *,
-    message_scope: str,
-    caption: bool,
-) -> tuple[str, list[VisionInput], dict[str, str], list[CaptionJob]]:
-    """把 OneBot 消息转成可读文本，并收集原生图片输入、被 @/被回复的人（QQ 号 -> 群名片）和待看的图。
+def forward_id(message: Message) -> str:
+    """合并转发总是单独一条消息；返回转发的 id，不是转发返回空串。"""
 
-    图片写在它原本的位置：描述缓存命中就是 [图片: 描述]，没命中先写占位、由 fill_caption 后台补上。
-    caption 为假（没设人设的群）时不看图，只写 [图片]。
+    return next(
+        (str(seg.data.get("id") or "") for seg in message if seg.type == "forward"),
+        "",
+    )
+
+
+def _addresses_bot(bot: Bot, event: GroupMessageEvent) -> bool:
+    """@Bot 或回复 Bot 的消息。
+
+    不用 event.to_me：.env 里 NICKNAME=[""] 会让适配器把所有文本开头的消息都判成 to_me。
     """
 
+    self_id = str(bot.self_id)
+    if event.reply and str(event.reply.sender.user_id) == self_id:
+        return True
+    return any(
+        seg.type == "at" and str(seg.data.get("qq", "")) == self_id
+        for seg in event.original_message
+    )
+
+
+def _is_substantive(parts: list[_Part]) -> bool:
+    own = "".join(part.own for part in parts).strip()
+    return len(own) >= SUBSTANTIVE_MIN_CHARS and not _PUNCTUATION_ONLY_RE.fullmatch(own)
+
+
+async def read_message(bot: Bot, event: GroupMessageEvent, session: Session) -> ChatMessage:
+    """把一条群消息读成 ChatMessage：可读文本、原图、被 @/被回复的人（QQ 号 -> 群名片），并起后台看图任务。
+
+    图片写在它原本的位置：描述缓存命中就是 [图片: 描述]，没命中先写占位、由 fill_caption 后台补上。
+    没设人设的群不看图，只写 [图片]。
+    """
+
+    bot_name = session.state.name
+    generation = session.state.generation
+    message = event.original_message
     await ensure_faces(bot)
     # 附图标签按消息 id 和第几张写，模型靠它把原图和消息对上号
     image_numbers: dict[int, int] = {}
@@ -282,16 +328,86 @@ async def read_message(
                 seg,
                 image_numbers.get(index, 0),
                 bot=bot,
-                group_id=group_id,
+                group_id=event.group_id,
                 bot_name=bot_name,
-                message_scope=message_scope,
-                caption=caption,
+                message_scope=str(event.message_id),
+                caption=bool(bot_name),
             )
             for index, seg in enumerate(message)
         )
     )
-    content = "".join(part.text for part in parts).strip()
-    images = [image for part in parts for image in part.images]
-    mentions = {uid: name for part in parts for uid, name in part.mentions.items()}
-    jobs = [job for part in parts for job in part.jobs]
-    return content, images, mentions, jobs
+
+    user_id, self_id = str(event.user_id), str(bot.self_id)
+    if user_id == self_id:
+        user_name = bot_name
+    else:
+        user_name = (
+            str(event.sender.card or "").strip()
+            or str(event.sender.nickname or "").strip()
+            or user_id
+        )
+    chat_message = ChatMessage(
+        time=datetime.now(),
+        user_name=user_name,
+        content="".join(part.text for part in parts).strip(),
+        id=str(event.message_id),
+        user_id=user_id,
+        image_inputs=[image for part in parts for image in part.images],
+        mentions={uid: name for part in parts for uid, name in part.mentions.items()},
+        to_me=user_id != self_id and _addresses_bot(bot, event),
+        forward=bool(forward_id(message)),
+        substantive=_is_substantive(parts),
+    )
+    chat_message.caption_tasks = [
+        session.spawn(fill_caption(session, chat_message, job, generation))
+        for part in parts
+        for job in part.jobs
+    ]
+    return chat_message
+
+
+async def read_poke(bot: Bot, event: PokeNotifyEvent, bot_name: str) -> ChatMessage:
+    """戳一戳通知读成一条消息；被戳的群友记进 mentions，Feedback 才能跟着戳他。"""
+
+    self_id = str(bot.self_id)
+    poker_id, target_id = str(event.user_id), str(event.target_id)
+    poker = (
+        bot_name
+        if poker_id == self_id
+        else await member_name(bot, event.group_id, poker_id) or poker_id
+    )
+    target = (
+        bot_name
+        if target_id == self_id
+        else await member_name(bot, event.group_id, target_id) or target_id
+    )
+    # 动作文字各人自定义（戳了戳、拍了拍、捏了捏…），照通知里的 action / suffix 原样拼
+    data = event.model_dump()
+    return ChatMessage(
+        time=datetime.now(),
+        user_name=poker,
+        content=f"[戳一戳: {data.get('action') or '戳了戳'} {target}{data.get('suffix') or ''}]",
+        user_id=poker_id,
+        mentions={} if target_id == self_id else {target_id: target},
+        to_me=target_id == self_id,
+        poke=True,
+    )
+
+
+async def read_reaction(
+    bot: Bot, group_id: int, user_id: str, target: ChatMessage, emoji_id: str
+) -> ChatMessage:
+    """群友给 bot 的消息贴了表情，读成一条消息。"""
+
+    await ensure_faces(bot)
+    emoji = face_name(emoji_id)
+    return ChatMessage(
+        time=datetime.now(),
+        user_name=await member_name(bot, group_id, user_id) or user_id,
+        content=f"[给你的消息「{target.content[:20]}」贴了表情:{emoji or '未知'}]",
+        user_id=user_id,
+    )
+
+
+def recall_text(by_author: bool) -> str:
+    return "[撤回了一条消息]" if by_author else "[一条消息被管理员撤回了]"

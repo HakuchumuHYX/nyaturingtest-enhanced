@@ -8,9 +8,9 @@ from nonebot.adapters.onebot.v11 import Bot, Event
 
 from ..messages.message import ChatMessage
 from ..metrics import log_event
-from .groups import SELF_SENT_MSG_IDS, GroupState, is_shutting_down
+from .groups import GroupState, is_shutting_down
 from .orchestrator import process_chunk
-from .send import dispatch_replies, send_poke, send_reaction
+from .send import SELF_SENT_MSG_IDS, dispatch_replies, send_poke, send_reaction
 
 DEBOUNCE_SECONDS = 2.0
 # 一批消息处理前最多等多久图片描述；超时带着占位继续，描述出来后照样补上

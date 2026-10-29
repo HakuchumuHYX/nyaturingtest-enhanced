@@ -5,14 +5,11 @@ from nonebot.adapters import Bot
 from tortoise import Tortoise
 
 from . import handlers  # 导入即注册所有 matcher
-from .chat.groups import (
-    cleanup_global_resources,
-    init_enabled_groups,
-    setup_maintenance_job,
-)
+from .chat.groups import cleanup_global_resources, init_enabled_groups
 from .chat.initiative import setup_initiative_job
 from .config import get_data_dir
 from .memory.episodes import setup_episode_job
+from .memory.maintenance import setup_maintenance_job
 from .messages.image import setup_image_cache_job
 from .messages.stickers import load_stickers
 from .storage.backup import setup_backup_job

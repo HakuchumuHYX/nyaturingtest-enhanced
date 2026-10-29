@@ -26,8 +26,17 @@ class ChatMessage:
     forward: bool = field(default=False, repr=False, compare=False)
     # 后台看图的任务（convert.fill_caption）；处理这批消息前先等它们。不落库
     caption_tasks: list[Any] = field(default_factory=list, repr=False, compare=False)
+    # 群友自己说了东西（convert.read_message 按消息段算），只有这种才拿去检索记忆。不落库
+    substantive: bool = field(default=False, repr=False, compare=False)
     revision: int = field(default=0, repr=False, compare=False)
     _persistence_id: str = field(default="", repr=False, compare=False)
+
+    def recall(self, content: str) -> None:
+        """撤回：内容原地改成撤回标记。图片一并清掉，免得进行中这一轮的图片观察再把内容写回去。"""
+
+        self.content = content
+        self.image_inputs = []
+        self.substantive = False
 
 
 class Memory:
@@ -59,16 +68,12 @@ class Memory:
         message.revision += 1
         self.__dirty_messages[id(message)] = message
 
-    def rewrite(self, msg_id: str, content: str) -> bool:
-        """按 msg_id 改写缓冲里的一条消息（撤回时用）；不在缓冲里返回 False。
-
-        图片一并清掉，免得进行中这一轮的图片观察再把内容写回去。
-        """
+    def recall(self, msg_id: str, content: str) -> bool:
+        """按 msg_id 把缓冲里的一条消息改成撤回标记；不在缓冲里返回 False。"""
 
         for message in self.__messages:
             if message.id == msg_id:
-                message.content = content
-                message.image_inputs = []
+                message.recall(content)
                 self.mark_dirty(message)
                 return True
         return False

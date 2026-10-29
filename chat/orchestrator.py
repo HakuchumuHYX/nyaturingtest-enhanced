@@ -16,7 +16,6 @@ from ..memory.vector import (
     RAG_MERGED_CANDIDATE_CAP,
     RAG_PER_QUERY_RECALL_K,
     RetrievedMemory,
-    build_chat_rag_queries,
 )
 from ..messages.faces import Reaction, reaction_emoji
 from ..messages.message import SHORT_TERM_BUFFER_SIZE, ChatMessage
@@ -486,9 +485,14 @@ async def search_stage(
     started_at = time.perf_counter()
     state = session.state
 
-    # Reranker 使用第一条 query 作为主 query，因此必须最新消息优先。
-    raw_queries = [msg.content for msg in reversed(messages_chunk[-3:])]
-    queries = build_chat_rag_queries(raw_queries, chat_summary=state.chat_summary)
+    # Reranker 使用第一条 query 作为主 query，因此必须最新消息优先；
+    # 回复引用、表情、戳一戳这类群友没说什么的不拿去检索（见 ChatMessage.substantive）
+    queries = [
+        msg.content.strip() for msg in reversed(messages_chunk[-3:]) if msg.substantive
+    ]
+    if state.chat_summary.strip():
+        queries.append(state.chat_summary.strip())
+    queries = list(dict.fromkeys(queries))
     rag_stats = {
         "session_id": session.id,
         "query_count": len(queries),

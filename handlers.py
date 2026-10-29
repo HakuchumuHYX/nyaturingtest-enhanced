@@ -26,17 +26,18 @@ from .cards.notes import render_group_notes_card
 from .cards.persona import Change as PersonaChange
 from .cards.persona import render_persona_card
 from .cards.token_stats import render_token_stats_card
+from .chat.engagement import chatting_state
 from .chat.groups import (
-    ensure_group_state,
+    disable_autochat,
+    enable_autochat,
     is_shutting_down,
     loaded_group_state,
-    refresh_group_notes,
-    remove_group_state,
     runtime_enabled_groups,
 )
 from .config import get_app_settings, get_token_stats_model_names
 from .llm import chat_client, feedback_client
 from .memory.digest import GROUP_NOTES_REFRESH_MIN_NEW, count_new_group_fragments
+from .memory.maintenance import refresh_group_notes
 from .memory.query import acquire_query_slot, impression_text, query_memory_profile
 from .memory.vector import (
     RAG_FINAL_K,
@@ -44,17 +45,22 @@ from .memory.vector import (
     RAG_PER_QUERY_RECALL_K,
     RetrievedMemory,
 )
-from .messages.convert import fill_caption, member_name, read_message
-from .messages.faces import ensure_faces, face_name
+from .messages.convert import (
+    forward_id,
+    member_name,
+    read_message,
+    read_poke,
+    read_reaction,
+    recall_text,
+)
 from .messages.forward import digest_forward
 from .messages.image import fetch_image_input
-from .messages.message import ChatMessage
 from .messages.stickers import block as block_sticker
 from .metrics import log_event
 from .metrics import metrics
-from .prompts import PRESETS
+from .prompts import PRESETS, reload_presets
 from .storage.backup import backup_task
-from .storage.db import disable_group, enable_group, get_token_stats, recall_message
+from .storage.db import get_token_stats, recall_message
 from .storage.models import PersonaHistoryModel, SessionModel
 
 # persona 命令列出的最近改动条数（人生线和本群合计）
@@ -120,21 +126,6 @@ def _is_group_or_private(event: Event) -> bool:
     return isinstance(event, (GroupMessageEvent, PrivateMessageEvent))
 
 
-def _addresses_bot(bot: Bot, event: GroupMessageEvent) -> bool:
-    """@Bot 或回复 Bot 的消息。
-
-    不用 event.to_me：.env 里 NICKNAME=[""] 会让适配器把所有文本开头的消息都判成 to_me。
-    """
-
-    self_id = str(bot.self_id)
-    if event.reply and str(event.reply.sender.user_id) == self_id:
-        return True
-    return any(
-        seg.type == "at" and str(seg.data.get("qq", "")) == self_id
-        for seg in event.original_message
-    )
-
-
 async def _group_name(group_id: int) -> str:
     try:
         group_info = await get_bot().get_group_info(group_id=group_id)
@@ -196,63 +187,23 @@ async def handle_auto_chat(bot: Bot, event: GroupMessageEvent):
     group = await loaded_group_state(group_id)
     if not group:
         return
-    bot_name = group.session.state.name
-    generation = group.session.state.generation
+    session = group.session
+    generation = session.state.generation
 
     # Shutdown 检查：避免在关机时进入耗时的消息处理
     if is_shutting_down():
         return
 
-    message_content, image_inputs, mentions, caption_jobs = await read_message(
-        bot_name=bot_name,
-        group_id=group_id,
-        message=event.original_message,
-        bot=bot,
-        message_scope=str(event.message_id),
-        caption=bool(bot_name),
-    )
-    if not message_content:
+    message = await read_message(bot, event, session)
+    if not message.content:
         return
-
-    user_id = str(event.user_id)
-    if user_id == str(bot.self_id):
-        nickname = bot_name
-    else:
-        nickname = (
-            str(event.sender.card or "").strip()
-            or str(event.sender.nickname or "").strip()
-            or user_id
-        )
-
-    message = ChatMessage(
-        time=datetime.now(),
-        user_name=nickname,
-        content=message_content,
-        id=str(event.message_id),
-        user_id=user_id,
-        image_inputs=image_inputs,
-        mentions=mentions,
-        to_me=user_id != str(bot.self_id) and _addresses_bot(bot, event),
-    )
-    message.caption_tasks = [
-        group.session.spawn(fill_caption(group.session, message, job, generation))
-        for job in caption_jobs
-    ]
-    # 合并转发总是单独一条：先以占位进队列，后台读完改写成摘要再放回来（没设人设的群不读）
-    forward_id = next(
-        (
-            str(seg.data.get("id") or "")
-            for seg in event.original_message
-            if seg.type == "forward"
-        ),
-        "",
-    )
-    if forward_id:
-        message.forward = True
-        if bot_name:
-            group.session.spawn(
-                digest_forward(group, bot, event, message, forward_id, generation)
+    # 合并转发：先以占位进队列，后台读完改写成摘要再放回来（没设人设的群不读）
+    if message.forward and session.state.name:
+        session.spawn(
+            digest_forward(
+                group, bot, event, message, forward_id(event.original_message), generation
             )
+        )
 
     await group.enqueue(message, bot, event)
 
@@ -295,14 +246,9 @@ async def handle_emoji_like(bot: Bot, event: NoticeEvent):
     if target is None or not data.get("likes"):
         return
 
-    await ensure_faces(bot)
-    emoji = face_name(str(data["likes"][0]["emoji_id"]))
     session.record_reaction(
-        ChatMessage(
-            time=datetime.now(),
-            user_name=await member_name(bot, group_id, user_id) or user_id,
-            content=f"[给你的消息「{target.content[:20]}」贴了表情:{emoji or '未知'}]",
-            user_id=user_id,
+        await read_reaction(
+            bot, group_id, user_id, target, str(data["likes"][0]["emoji_id"])
         )
     )
 
@@ -323,38 +269,12 @@ async def handle_group_poke(bot: Bot, event: PokeNotifyEvent):
     group = await loaded_group_state(event.group_id)
     if not group:
         return
-    bot_name = group.session.state.name
 
-    self_id = str(bot.self_id)
-    poker_id, target_id = str(event.user_id), str(event.target_id)
-    poker = (
-        bot_name
-        if poker_id == self_id
-        else await member_name(bot, event.group_id, poker_id) or poker_id
-    )
-    target = (
-        bot_name
-        if target_id == self_id
-        else await member_name(bot, event.group_id, target_id) or target_id
-    )
-    # 动作文字各人自定义（戳了戳、拍了拍、捏了捏…），照通知里的 action / suffix 原样拼
-    data = event.model_dump()
-    content = f"[戳一戳: {data.get('action') or '戳了戳'} {target}{data.get('suffix') or ''}]"
-    if poker_id == self_id:
+    message = await read_poke(bot, event, group.session.state.name)
+    if message.user_id == str(bot.self_id):
         # bot 自己戳的：和自己发的消息一样直接进短期记忆，不触发新一轮
-        group.session.append_self_message(content, "", self_id)
+        group.session.append_self_message(message.content, "", message.user_id)
         return
-
-    message = ChatMessage(
-        time=datetime.now(),
-        user_name=poker,
-        content=content,
-        user_id=poker_id,
-        # 被戳的人记进 mentions，Feedback 才能跟着戳他
-        mentions={} if target_id == self_id else {target_id: target},
-        to_me=target_id == self_id,
-        poke=True,
-    )
     await group.enqueue(message, bot, event)
 
 
@@ -380,12 +300,11 @@ async def handle_group_recall(event: GroupRecallNoticeEvent):
 
     msg_id = str(event.message_id)
     by_author = event.operator_id == event.user_id
-    content = "[撤回了一条消息]" if by_author else "[一条消息被管理员撤回了]"
+    content = recall_text(by_author)
     async with group.data_lock:
         queued = [m for m in group.messages_chunk if m.id == msg_id]
         for message in queued:
-            message.content = content
-            message.image_inputs = []
+            message.recall(content)
     in_buffer = group.session.recall_message(msg_id, content)
     await recall_message(group.session.id, msg_id, content)
     log_event(
@@ -473,26 +392,13 @@ async def handle_manage_autochat(
     if arg == "enable":
         if group_id in runtime_enabled_groups:
             await manage_cmd.finish("本群 Autochat 已处于启用状态")
-
-        await enable_group(group_id)
-        # 更新内存
-        runtime_enabled_groups.add(group_id)
-        # 立即初始化状态
-        ensure_group_state(group_id)
-
+        await enable_autochat(group_id)
         await manage_cmd.finish("Autochat 已在本群启用 (已保存至数据库)")
 
     elif arg == "disable":
         if group_id not in runtime_enabled_groups:
             await manage_cmd.finish("本群 Autochat 未启用")
-
-        await disable_group(group_id)
-        # 更新内存
-        runtime_enabled_groups.discard(group_id)
-
-        # 安全清理运行时状态和后台任务
-        await remove_group_state(group_id)
-
+        await disable_autochat(group_id)
         await manage_cmd.finish("Autochat 已在本群禁用")
 
     else:
@@ -503,8 +409,23 @@ async def handle_manage_autochat(
 
 async def _do_status(matcher: type[Matcher], group_id: int, _args: str):
     group = await _group_state_or_finish(matcher, group_id)
+    state = group.session.state
+    state.global_emotion.settle()
+    emotion = state.global_emotion
+    recent = "\n".join(
+        f"{m.user_name}: {m.content}" for m in group.session.short_term_memory.access()
+    )
     settings = get_app_settings()
     lines = [
+        "",
+        f"人设：{state.preset or '未设（不说话）'}",
+        f"意愿值：{state.willingness:.2f}",
+        f"状态: {chatting_state(state, datetime.now())}",
+        f"心情：V{emotion.valence:.2f} A{emotion.arousal:.2f} D{emotion.dominance:.2f}",
+        f"后台任务数: {len(group.session.background_tasks)}",
+        f"摘要：{state.chat_summary}",
+        "最近消息：",
+        recent or "无",
         "",
         "Provider:",
         f"- Chat reasoning_effort: {settings.chat.reasoning_effort or '未指定（由上游决定）'}",
@@ -520,16 +441,20 @@ async def _do_status(matcher: type[Matcher], group_id: int, _args: str):
                 "circuit_remaining="
                 f"{provider_status.circuit_remaining_seconds}s"
             )
-    await matcher.finish(group.session.status() + "\n".join(lines))
+    await matcher.finish("\n".join(lines))
 
 
 get_status = _dual_command("status", {"状态"}, _do_status)
 
 
 async def _do_get_presets(matcher: type[Matcher], group_id: int, _args: str):
-    group = await _group_state_or_finish(matcher, group_id)
-    presets = group.session.presets()
-    msg = "可选的预设:\n" + "".join(f"- {preset}\n" for preset in presets)
+    await _group_state_or_finish(matcher, group_id)
+    reload_presets()
+    msg = "可选的预设:\n" + "".join(
+        f"- {filename}: {preset.name} {preset.seed.split('。')[0]}\n"
+        for filename, preset in PRESETS.items()
+        if not preset.hidden
+    )
     await matcher.finish(msg + "使用方法: set_presets <预设名称>\n")
 
 
@@ -836,7 +761,7 @@ async def handle_query_memory(
 
     try:
         page = await query_memory_profile(
-            group,
+            group.session,
             target_id=target_id,
             target_name=target_name,
             sender_id=str(event.user_id),
