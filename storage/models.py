@@ -18,8 +18,8 @@ class SessionModel(Model):
 
     chat_summary = fields.TextField(default="")
     last_speak_time = fields.DatetimeField(null=True)
-    last_consolidated_time = fields.DatetimeField(null=True)
-    chatting_state = fields.IntField(default=0)
+    # 已读水位：Feedback 读到的最后一条消息时间
+    last_read_time = fields.DatetimeField(null=True)
     # 群志只由每日整理任务写入；水位是已整理到的最新碎片 created_at
     group_notes = fields.TextField(default="")
     notes_summarized_until = fields.DatetimeField(null=True)

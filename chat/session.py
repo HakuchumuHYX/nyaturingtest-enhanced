@@ -18,7 +18,7 @@ from ..storage.db import (
     update_user_profiles,
 )
 from .domain import EmotionState, PersonProfile
-from .engagement import WILLINGNESS_LOAD_VALUE, chatting_state
+from .engagement import LOOK_MAX_MESSAGES
 
 # 后台任务排空超时、保存去抖
 MEMORY_DRAIN_TIMEOUT_SECONDS = 10.0
@@ -45,14 +45,12 @@ class SessionState:
     group_notes: str = ""
     global_emotion: EmotionState = field(default_factory=EmotionState)
     chat_summary: str = ""
-    willingness: float = 0.0
-    last_decay_time: datetime = field(default_factory=datetime.now)
     last_speak_time: datetime = datetime.min
     # 上次接话时那批消息的发言人；只在进程内保持，重启后对话窗口自然失效
     conversation_partners: set[str] = field(default_factory=set)
-    last_consolidated_time: datetime | None = None
-    messages_since_consolidation: int = 0
-    last_consolidation_attempt: datetime = datetime.min
+    # 已读水位：Feedback 读到的最后一条消息时间，之后的都是未读；见 chat/engagement.py
+    last_read_time: datetime | None = None
+    last_look_time: datetime = datetime.min
     loaded: bool = False
     generation: int = 0
 
@@ -112,7 +110,6 @@ class Session:
     async def calm_down(self):
         self.bump_generation("calm_down")
         self.state.global_emotion = EmotionState()
-        self.state.willingness = 0.0
         # 退出对话窗口
         self.state.last_speak_time = datetime.min
         await self.save_session()
@@ -172,9 +169,7 @@ class Session:
                     "emotion_updated_at": self.state.global_emotion.updated_at,
                     "chat_summary": self.state.chat_summary,
                     "last_speak_time": self.state.last_speak_time,
-                    "last_consolidated_time": self.state.last_consolidated_time,
-                    # 派生值，只为在库里能看到当时的状态；加载时不读
-                    "chatting_state": chatting_state(self.state, datetime.now()).value,
+                    "last_read_time": self.state.last_read_time,
                 },
             )
 
@@ -232,9 +227,8 @@ class Session:
             if t.tzinfo is not None:
                 t = t.astimezone(None).replace(tzinfo=None)
             self.state.last_speak_time = t
-        self.state.last_consolidated_time = session_db.last_consolidated_time
+        self.state.last_read_time = session_db.last_read_time
 
-        self.state.willingness = WILLINGNESS_LOAD_VALUE
         self.state.profiles = {}
         self.state.user_summaries = {
             user_data["user_id"]: user_data["summary"]
@@ -317,7 +311,7 @@ class Session:
         self.short_term_memory.update([msg])
 
     def record_reaction(self, msg: ChatMessage) -> None:
-        """群友给 bot 的消息贴了表情：只进短期记忆，不进固化计数，也不触发新一轮对话。
+        """群友给 bot 的消息贴了表情：只进短期记忆，不触发新一轮对话；算一条未读，等下次看群一起读。
 
         一条消息常被好几个人贴同一个表情，已有相同记录就跳过，免得挤满上下文窗口。
         """
@@ -337,11 +331,15 @@ class Session:
         return True
 
     def record_incoming(self, messages_chunk: list[ChatMessage]) -> None:
-        """写入短时记忆并累计固化窗口。"""
+        """写入短时记忆；水位之后的就是未读。"""
 
         self.short_term_memory.update(messages_chunk)
-        self.state.messages_since_consolidation += len(messages_chunk)
         self.schedule_save()
+
+    def unread(self) -> list[ChatMessage]:
+        """已读水位之后的消息，最多 LOOK_MAX_MESSAGES 条（取最新的）。"""
+
+        return self.short_term_memory.messages_after(self.state.last_read_time, LOOK_MAX_MESSAGES)
 
     async def drain_background_tasks(self):
         pending = [task for task in self.background_tasks if not task.done()]

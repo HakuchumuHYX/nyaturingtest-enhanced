@@ -26,7 +26,7 @@ from .cards.notes import render_group_notes_card
 from .cards.persona import Change as PersonaChange
 from .cards.persona import render_persona_card
 from .cards.token_stats import render_token_stats_card
-from .chat.engagement import chatting_state
+from .chat.engagement import unread_count
 from .chat.groups import (
     disable_autochat,
     enable_autochat,
@@ -415,12 +415,14 @@ async def _do_status(matcher: type[Matcher], group_id: int, _args: str):
     recent = "\n".join(
         f"{m.user_name}: {m.content}" for m in group.session.short_term_memory.access()
     )
+    last_look = "（本次启动还没看过）"
+    if state.last_look_time != datetime.min:
+        last_look = f"{state.last_look_time:%H:%M:%S}"
     settings = get_app_settings()
     lines = [
         "",
         f"人设：{state.preset or '未设（不说话）'}",
-        f"意愿值：{state.willingness:.2f}",
-        f"状态: {chatting_state(state, datetime.now())}",
+        f"未读：{unread_count(state, group.session.unread())} 条，上次看群 {last_look}",
         f"心情：V{emotion.valence:.2f} A{emotion.arousal:.2f} D{emotion.dominance:.2f}",
         f"后台任务数: {len(group.session.background_tasks)}",
         f"摘要：{state.chat_summary}",

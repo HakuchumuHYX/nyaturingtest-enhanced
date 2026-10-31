@@ -1,4 +1,4 @@
-"""一轮对话的编排：短时记忆 → 意愿/相关性 → RAG → Feedback → Chat。"""
+"""一轮对话的编排：短时记忆 → 看不看群 → RAG → Feedback（沉淀 + 说不说）→ Chat。"""
 
 import math
 import time
@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 
 from nonebot import logger
 
-from ..llm import VisionInput, chat_client, feedback_client
+from ..llm import chat_client, feedback_client
 from ..memory.candidates import clamp01, save_memory_candidates
 from ..memory.vector import (
     RAG_FINAL_K,
@@ -18,7 +18,7 @@ from ..memory.vector import (
     RetrievedMemory,
 )
 from ..messages.faces import Reaction, reaction_emoji
-from ..messages.message import SHORT_TERM_BUFFER_SIZE, ChatMessage
+from ..messages.message import SHORT_CONTEXT_LIMIT, SHORT_TERM_BUFFER_SIZE, ChatMessage
 from ..metrics import log_event
 from ..prompts import (
     CHAT_SYSTEM_PROMPT,
@@ -33,17 +33,9 @@ from ..prompts import (
 )
 from ..storage.db import get_history_before
 from .domain import EmotionState, PersonProfile
-from .engagement import (
-    RELEVANCE_WILLINGNESS_FLOOR,
-    SPEAK_WILLINGNESS_RETAIN_FACTOR,
-    chatting_state,
-    evaluate_engagement,
-)
+from .engagement import SELF_SHARE_LIMIT, LookTrigger, decide_look, unread_count
 from .session import Session
 
-CONSOLIDATION_MESSAGE_THRESHOLD = 8
-CONSOLIDATION_INTERVAL_SECONDS = 180.0
-CONSOLIDATION_MAX_MESSAGES = 60
 HISTORY_RECALL_LIMIT = 20
 MY_RECENT_REPLIES_LIMIT = 6
 GROUP_HEAT_SECONDS = 900
@@ -57,6 +49,7 @@ FEEDBACK_FIELDS = (
     "affinity_changes",
     "summary",
     "need_history",
+    "focus",
 )
 
 
@@ -82,13 +75,15 @@ class FeedbackOutput:
 
     emotion: dict[str, float]
     willing: float
-    # 只含本轮发言的群友
+    # 只含这段未读里发言的群友
     affinity_changes: dict[str, int]
     summary: str | None
     corrections: list
     need_history: bool
     react: Reaction | None
     poke: Poke | None
+    # 角色想接的那条（不会是她自己的）；Chat 回应它、附它的图，聊天对象也按它定
+    focus: ChatMessage | None
 
 
 @dataclass(frozen=True)
@@ -157,16 +152,13 @@ def _group_heat(messages: list[ChatMessage], bot_name: str) -> str:
     return heat
 
 
-def _history_context(session: Session, messages_chunk: list[ChatMessage]) -> list[dict]:
-    """短时窗口里除本轮新消息以外的历史，避免 Prompt 上下文重复。"""
+def _read_context(session: Session, unread: list[ChatMessage]) -> list[ChatMessage]:
+    """未读之前的 SHORT_CONTEXT_LIMIT 条，作为 recent_msgs。
 
-    chunk_ids = {msg.id for msg in messages_chunk if msg.id}
-    history = [
-        m
-        for m in session.short_term_memory.access()
-        if m.id not in chunk_ids and not any(m is chunk_msg for chunk_msg in messages_chunk)
-    ]
-    return format_history(history)
+    不能用「窗口减掉未读」：未读一多，上下文就被挤没了。
+    """
+
+    return session.short_term_memory.messages_before(unread[0].time, SHORT_CONTEXT_LIMIT)
 
 
 def _memory_lines(records: list[RetrievedMemory]) -> MemoryContext:
@@ -192,22 +184,22 @@ def _memory_lines(records: list[RetrievedMemory]) -> MemoryContext:
     return MemoryContext(lines, refs)
 
 
-def _speaker_ids(messages_chunk: list[ChatMessage], bot_name: str) -> list[str]:
-    """本轮发言的群友，不含角色自己。"""
+def _speaker_ids(unread: list[ChatMessage], bot_name: str) -> list[str]:
+    """这段未读里发言的群友，不含角色自己。"""
 
     return list(
-        dict.fromkeys(_user_key(msg) for msg in messages_chunk if msg.user_name != bot_name)
+        dict.fromkeys(_user_key(msg) for msg in unread if msg.user_name != bot_name)
     )
 
 
 def _related_profiles(
-    session: Session, messages_chunk: list[ChatMessage], *, for_chat: bool
+    session: Session, unread: list[ChatMessage], *, for_chat: bool
 ) -> list[dict]:
     """Feedback 要在当前好感度上打分，给数值；Chat 只需要知道关系，给文字。"""
 
     state = session.state
     profiles = []
-    for uid in _speaker_ids(messages_chunk, state.name):
+    for uid in _speaker_ids(unread, state.name):
         affinity = state.profiles.get(uid, PersonProfile(user_id=uid)).level()
         profiles.append(
             {
@@ -256,7 +248,7 @@ def _parse_emotion(raw, current: EmotionState) -> tuple[dict[str, float] | None,
 
 
 def _parse_affinity_changes(raw, speaker_ids: set[str]) -> dict[str, int]:
-    """affinity_changes：只收本轮发言群友（不含角色自己）的整数变化量。"""
+    """affinity_changes：只收这段未读里发言的群友（不含角色自己）的整数变化量。"""
 
     if not isinstance(raw, dict):
         return {}
@@ -271,15 +263,15 @@ def _parse_affinity_changes(raw, speaker_ids: set[str]) -> dict[str, int]:
     return changes
 
 
-def _parse_reaction(raw, messages_chunk: list[ChatMessage], bot_name: str) -> Reaction | None:
-    """react：只能贴这批新消息里群友的消息，表情要在目录里。"""
+def _parse_reaction(raw, unread: list[ChatMessage], bot_name: str) -> Reaction | None:
+    """react：只能贴这段未读里群友的消息，表情要在目录里。"""
 
     if not isinstance(raw, dict):
         return None
     index = raw.get("index")
-    if not isinstance(index, int) or not 0 <= index < len(messages_chunk):
+    if not isinstance(index, int) or not 0 <= index < len(unread):
         return None
-    target = messages_chunk[index]
+    target = unread[index]
     if not target.id or target.user_name == bot_name:
         return None
     emoji = reaction_emoji(str(raw.get("emoji") or ""))
@@ -289,12 +281,12 @@ def _parse_reaction(raw, messages_chunk: list[ChatMessage], bot_name: str) -> Re
     return Reaction(target_id=target.id, emoji_id=emoji[0], name=emoji[1])
 
 
-def _parse_poke(raw, messages_chunk: list[ChatMessage], bot_name: str) -> Poke | None:
-    """poke 是 QQ 号：只能戳这批里说话的人，或被 @、被回复、被戳的人。"""
+def _parse_poke(raw, unread: list[ChatMessage], bot_name: str) -> Poke | None:
+    """poke 是 QQ 号：只能戳这段未读里说话的人，或被 @、被回复、被戳的人。"""
 
     user_id = str(raw or "").strip()
-    candidates = {msg.user_id: msg.user_name for msg in messages_chunk if msg.user_id}
-    for msg in messages_chunk:
+    candidates = {msg.user_id: msg.user_name for msg in unread if msg.user_id}
+    for msg in unread:
         candidates.update(msg.mentions)
     name = candidates.get(user_id)
     if not user_id or name is None or name == bot_name:
@@ -302,8 +294,17 @@ def _parse_poke(raw, messages_chunk: list[ChatMessage], bot_name: str) -> Poke |
     return Poke(user_id=user_id, user_name=name)
 
 
+def _parse_focus(raw, unread: list[ChatMessage], bot_name: str) -> ChatMessage | None:
+    """focus：角色想接的那条在 new_msgs 里的 index，不能是她自己的话。"""
+
+    if not isinstance(raw, int) or not 0 <= raw < len(unread):
+        return None
+    target = unread[raw]
+    return None if target.user_name == bot_name else target
+
+
 def parse_feedback(
-    data: dict | None, messages_chunk: list[ChatMessage], session: Session
+    data: dict | None, unread: list[ChatMessage], session: Session
 ) -> FeedbackOutput | None:
     """Feedback 输出的唯一校验入口；心情无效就整份丢弃，其余字段缺了或不对按没给处理。"""
 
@@ -337,13 +338,14 @@ def parse_feedback(
         emotion=emotion,
         willing=clamp01(data.get("willing"), 0.0),
         affinity_changes=_parse_affinity_changes(
-            data.get("affinity_changes"), set(_speaker_ids(messages_chunk, state.name))
+            data.get("affinity_changes"), set(_speaker_ids(unread, state.name))
         ),
         summary=None if summary is None else str(summary)[:SUMMARY_CHARS],
         corrections=corrections if isinstance(corrections, list) else [],
         need_history=bool(data.get("need_history")),
-        react=_parse_reaction(data.get("react"), messages_chunk, state.name),
-        poke=_parse_poke(data.get("poke"), messages_chunk, state.name),
+        react=_parse_reaction(data.get("react"), unread, state.name),
+        poke=_parse_poke(data.get("poke"), unread, state.name),
+        focus=_parse_focus(data.get("focus"), unread, state.name),
     )
 
 
@@ -382,114 +384,127 @@ def parse_reply(data: dict | None) -> list[Reply]:
 async def process_chunk(
     session: Session,
     messages_chunk: list[ChatMessage],
-    images: list[VisionInput],
     generation: int,
 ) -> TurnResult | None:
-    """images 是这批的原图（新发的和被回复的），只给 Chat 看。"""
+    """messages_chunk 是这次新进来的一批，到点补看时为空；看不看群按全部未读判断。"""
 
     try:
         if session.stale(generation, "process_start"):
             return None
-        session.record_incoming(messages_chunk)
+        if messages_chunk:
+            session.record_incoming(messages_chunk)
 
         state = session.state
-        # 没设人设（或预设文件不在）：消息照常记，不判断、不说话
+        # 没设人设（或预设文件不在）：消息照常记，不判断、不说话，原图也用不上
         if not state.name:
+            for message in messages_chunk:
+                message.image_inputs.clear()
             return None
-        recent = session.short_term_memory.access()
-        self_share = sum(m.user_name == state.name for m in recent) / len(recent)
-        engagement = evaluate_engagement(
-            state=state,
-            messages=messages_chunk,
-            self_share=self_share,
-            now=datetime.now(),
-        )
-        is_relevant = engagement.relevant
-
-        if not engagement.engaged:
-            if _consolidation_due(session):
-                pending_messages = session.short_term_memory.messages_after(
-                    state.last_consolidated_time,
-                    limit=CONSOLIDATION_MAX_MESSAGES,
-                )
-                await consolidate_stage(session, pending_messages, generation)
+        unread = session.unread()
+        trigger = decide_look(state, unread, datetime.now())
+        if trigger is None:
             log_event(
                 "speak_decision",
                 "DEBUG",
                 session_id=session.id,
-                engaged=False,
-                relevant=is_relevant,
-                willingness=round(state.willingness, 2),
-                self_share=round(self_share, 2),
+                looked=False,
+                unread=unread_count(state, unread),
             )
             return None
-
-        # 要说话的轮次都重排：不重排时只能按向量分取前 k，闲聊上它分不出相关和无关
-        memories = await search_stage(session, messages_chunk, use_rerank=True)
-        if session.stale(generation, "rag_search"):
-            return None
-
-        feedback = await feedback_stage(
-            session,
-            messages_chunk,
-            is_relevant=is_relevant,
-            memories=memories,
-            generation=generation,
-        )
-        if session.stale(generation, "feedback"):
-            return None
-
-        # 被点名也交给 willing 判断；Feedback 失败时只有被点名才回
-        if feedback is None:
-            speak = is_relevant
-        else:
-            speak = feedback.willing >= engagement.speak_threshold
-        log_event(
-            "speak_decision",
-            session_id=session.id,
-            engaged=True,
-            relevant=is_relevant,
-            in_conversation=engagement.in_conversation,
-            llm_willing=feedback.willing if feedback else None,
-            threshold=engagement.speak_threshold,
-            self_share=round(self_share, 2),
-            speak=speak,
-        )
-        react = feedback.react if feedback else None
-        poke = feedback.poke if feedback else None
-        if not speak:
-            return TurnResult(replies=[], react=react, poke=poke)
-
-        replies = await chat_stage(
-            session,
-            messages_chunk,
-            images,
-            need_history=feedback is not None and feedback.need_history,
-            memories=memories,
-            generation=generation,
-        )
-        if session.stale(generation, "chat"):
-            return None
-        # last_speak_time 在真正发出去之后由 dispatch_replies 更新
-        return TurnResult(replies=replies, react=react, poke=poke)
+        try:
+            return await _look(session, unread, trigger, generation)
+        finally:
+            # 看过这段就放掉原图；失败也放：描述还在消息里，留着只会越攒越多
+            for message in unread:
+                message.image_inputs.clear()
     finally:
         await session.flush_persistence()
 
 
-async def search_stage(
+async def _look(
     session: Session,
-    messages_chunk: list[ChatMessage],
-    *,
-    use_rerank: bool,
-) -> MemoryContext:
+    unread: list[ChatMessage],
+    trigger: LookTrigger,
+    generation: int,
+) -> TurnResult | None:
+    """看一眼群：检索 → Feedback（沉淀 + willing）→ 说不说 → Chat。"""
+
+    state = session.state
+    state.last_look_time = datetime.now()
+    # 水位推到这一刻读到的最后一条：看群途中合并转发读完会把那条的时间改成现在（move_to_latest），
+    # 按读完时的最大时间推进，就会把它和途中新来的消息一起误标成已读
+    read_until = max(m.time for m in unread)
+    recent = session.short_term_memory.access()
+    self_share = sum(m.user_name == state.name for m in recent) / len(recent)
+    context = _read_context(session, unread)
+    is_relevant = trigger is LookTrigger.RELEVANT
+
+    memories = await search_stage(session, unread)
+    if session.stale(generation, "rag_search"):
+        return None
+
+    feedback = await feedback_stage(
+        session,
+        unread,
+        context,
+        read_until=read_until,
+        is_relevant=is_relevant,
+        memories=memories,
+        generation=generation,
+    )
+    if session.stale(generation, "feedback"):
+        return None
+
+    # 被点名也交给 willing 判断；Feedback 失败时只有被点名才回
+    if feedback is None:
+        speak = is_relevant
+    else:
+        speak = feedback.willing >= trigger.speak_threshold
+        # 频率归代码管：自己说多了就不主动插嘴；被点名、接话、被戳不受限
+        if trigger is LookTrigger.RHYTHM and self_share >= SELF_SHARE_LIMIT:
+            speak = False
+    focus = feedback.focus if feedback else None
+    log_event(
+        "speak_decision",
+        session_id=session.id,
+        trigger=trigger.value,
+        unread=unread_count(state, unread),
+        llm_willing=feedback.willing if feedback else None,
+        threshold=trigger.speak_threshold,
+        self_share=round(self_share, 2),
+        focus=f"{focus.user_name}: {focus.content[:30]}" if focus else None,
+        speak=speak,
+    )
+    react = feedback.react if feedback else None
+    poke = feedback.poke if feedback else None
+    if not speak:
+        return TurnResult(replies=[], react=react, poke=poke)
+
+    replies = await chat_stage(
+        session,
+        unread,
+        context,
+        focus,
+        need_history=feedback is not None and feedback.need_history,
+        memories=memories,
+        generation=generation,
+    )
+    if session.stale(generation, "chat"):
+        return None
+    # last_speak_time 在真正发出去之后由 dispatch_replies 更新
+    return TurnResult(replies=replies, react=react, poke=poke)
+
+
+async def search_stage(session: Session, unread: list[ChatMessage]) -> MemoryContext:
+    """按这段未读检索。每次看群都可能开口，所以都重排：不重排时只能按向量分取前 k，闲聊上它分不出相关和无关。"""
+
     started_at = time.perf_counter()
     state = session.state
 
     # Reranker 使用第一条 query 作为主 query，因此必须最新消息优先；
-    # 回复引用、表情、戳一戳这类群友没说什么的不拿去检索（见 ChatMessage.substantive）
-    queries = [
-        msg.content.strip() for msg in reversed(messages_chunk[-3:]) if msg.substantive
-    ]
+    # 回复引用、表情、戳一戳这类群友没说什么的不拿去检索（见 ChatMessage.substantive），
+    # 取最近 3 条说了东西的，免得一段以表情包结尾就没得查
+    queries = [msg.content.strip() for msg in reversed(unread) if msg.substantive][:3]
     if state.chat_summary.strip():
         queries.append(state.chat_summary.strip())
     queries = list(dict.fromkeys(queries))
@@ -497,13 +512,12 @@ async def search_stage(
         "session_id": session.id,
         "query_count": len(queries),
         "queries": queries,
-        "use_rerank": use_rerank,
         "skip_reason": "none",
     }
 
-    # 只翻这批发言人和被 @、被回复的人的记忆：拿闲聊原话在全群里撞，翻出来的多是字面巧合
-    speaker_ids = {msg.user_id for msg in messages_chunk if msg.user_id}
-    user_ids = speaker_ids.union(*(msg.mentions for msg in messages_chunk))
+    # 只翻这段的发言人和被 @、被回复的人的记忆：拿闲聊原话在全群里撞，翻出来的多是字面巧合
+    speaker_ids = {msg.user_id for msg in unread if msg.user_id}
+    user_ids = speaker_ids.union(*(msg.mentions for msg in unread))
     rag_stats["user_count"] = len(user_ids)
 
     records = []
@@ -516,7 +530,7 @@ async def search_stage(
             queries,
             k=RAG_FINAL_K,
             user_ids=user_ids,
-            use_rerank=use_rerank,
+            use_rerank=True,
             candidate_k=RAG_PER_QUERY_RECALL_K,
             merged_candidate_cap=RAG_MERGED_CANDIDATE_CAP,
             active_user_ids=speaker_ids,
@@ -535,7 +549,8 @@ async def search_stage(
 
 async def _ask_feedback(
     session: Session,
-    messages_chunk: list[ChatMessage],
+    unread: list[ChatMessage],
+    context: list[ChatMessage],
     is_relevant: bool,
     memories: MemoryContext,
 ) -> FeedbackOutput | None:
@@ -548,15 +563,20 @@ async def _ask_feedback(
         bot_name=state.name,
         self_life=state.self_life,
         self_in_group=state.self_in_group,
-        chat_state_value=chatting_state(state, now).value,
         summary=state.chat_summary,
-        recent_msgs=_history_context(session, messages_chunk),
+        recent_msgs=format_history(context),
+        # 带上时间：一段未读可能跨好几分钟，Feedback 要看出最后一句是多久前的
         new_msgs=[
-            {"id": msg.user_id, "name": msg.user_name, "content": msg.content}
-            for msg in messages_chunk
+            {
+                "time": msg.time.strftime("%H:%M"),
+                "id": msg.user_id,
+                "name": msg.user_name,
+                "content": msg.content,
+            }
+            for msg in unread
         ],
         emotion=state.global_emotion.vad(),
-        related_profiles=_related_profiles(session, messages_chunk, for_chat=False),
+        related_profiles=_related_profiles(session, unread, for_chat=False),
         search_result=memories.lines,
         is_relevant=is_relevant,
         time_info=get_time_description(now),
@@ -569,7 +589,7 @@ async def _ask_feedback(
                 "user_name": msg.user_name,
                 **({"mentioned": msg.mentions} if msg.mentions else {}),
             }
-            for index, msg in enumerate(messages_chunk)
+            for index, msg in enumerate(unread)
         ],
         group_heat=_group_heat(
             session.short_term_memory.messages_after(
@@ -585,17 +605,18 @@ async def _ask_feedback(
         temperature=FEEDBACK_TEMPERATURE,
         system_prompt=FEEDBACK_SYSTEM_PROMPT,
     )
-    return parse_feedback(data, messages_chunk, session)
+    return parse_feedback(data, unread, session)
 
 
 def _apply_sediment(
     session: Session,
     feedback: FeedbackOutput,
-    messages_chunk: list[ChatMessage],
+    unread: list[ChatMessage],
+    read_until: datetime,
     generation: int,
     refs: dict[str, str],
 ) -> None:
-    """应用 Feedback 的沉淀结果：情绪、画像、摘要、记忆更正，最后推进固化水位。
+    """应用 Feedback 的沉淀结果：情绪、画像、摘要、记忆更正，最后把已读水位推到 read_until。
 
     refs 是本轮检索行编号 → 记忆 id。
     """
@@ -605,9 +626,9 @@ def _apply_sediment(
     # 1. 心情：parse_feedback 已校验范围，apply 再限制每轮步长
     state.global_emotion.apply(feedback.emotion)
 
-    # 2. 互动计数按消息记；好感度只改 Feedback 点名的人（parse_feedback 只收本轮发言人）
+    # 2. 互动计数按消息记；好感度只改 Feedback 点名的人（parse_feedback 只收这段的发言人）
     now = datetime.now()
-    for msg in messages_chunk:
+    for msg in unread:
         if msg.user_name != state.name:
             uid = _user_key(msg)
             state.profiles.setdefault(uid, PersonProfile(user_id=uid)).record_interaction(now)
@@ -620,74 +641,52 @@ def _apply_sediment(
 
     # 4. 记忆更正（后台写入）；日常记忆由 memory/episodes.py 在一段聊完后整理
     if feedback.corrections:
-        # 上下文里每个 QQ 号的当前群名片：先放被 @/被回复的人，再放发言人（本批在后、以最新为准）
-        context = [*session.short_term_memory.access(), *messages_chunk]
+        # 上下文里每个 QQ 号的当前群名片：先放被 @/被回复的人，再放发言人（未读在后、以最新为准）
+        context = [*session.short_term_memory.access(), *unread]
         known_users = {uid: name for msg in context for uid, name in msg.mentions.items()}
         known_users.update({msg.user_id: msg.user_name for msg in context if msg.user_id})
         session.spawn(
             save_memory_candidates(
                 session,
                 feedback.corrections,
-                messages=messages_chunk,
+                messages=unread,
                 known_users=known_users,
                 refs=refs,
                 generation=generation,
             )
         )
 
-    # 5. 这批已经沉淀过，下次静默固化从这之后开始
-    _advance_consolidation_watermark(session, messages_chunk)
+    # 5. 这段读过了，下次看群从这之后开始
+    if state.last_read_time is None or read_until > state.last_read_time:
+        state.last_read_time = read_until
+    session.schedule_save()
 
 
 async def feedback_stage(
     session: Session,
-    messages_chunk: list[ChatMessage],
+    unread: list[ChatMessage],
+    context: list[ChatMessage],
     *,
+    read_until: datetime,
     is_relevant: bool,
     memories: MemoryContext,
     generation: int,
 ) -> FeedbackOutput | None:
-    """反馈阶段：分析情绪、记忆更正、更新摘要、给出接话意愿。
-    Feedback 失败或会话已作废时返回 None。"""
+    """反馈阶段：分析情绪、记忆更正、更新摘要、给出接话意愿，并沉淀。
+    Feedback 失败或会话已作废时返回 None，不推进水位，下次看群重读。"""
 
-    feedback = await _ask_feedback(session, messages_chunk, is_relevant, memories)
+    feedback = await _ask_feedback(session, unread, context, is_relevant, memories)
     if feedback is None or session.stale(generation, "feedback_sediment"):
         return None
-    _apply_sediment(session, feedback, messages_chunk, generation, memories.refs)
-
-    # 说不说由 willing 按场景门槛决定（见 process_chunk）；规则意愿只向它靠拢一半，
-    # 让模型觉得不想说时下一批不必再急着调用 Feedback
-    state = session.state
-    state.willingness = (state.willingness + feedback.willing) / 2
-    if is_relevant and state.willingness < RELEVANCE_WILLINGNESS_FLOOR:
-        state.willingness = RELEVANCE_WILLINGNESS_FLOOR
+    _apply_sediment(session, feedback, unread, read_until, generation, memories.refs)
     return feedback
-
-
-async def consolidate_stage(
-    session: Session,
-    messages_chunk: list[ChatMessage],
-    generation: int,
-) -> None:
-    """常驻记忆固化：分析+沉淀，但不改回复意愿、不做发言决策。"""
-
-    if not messages_chunk:
-        return
-    session.state.last_consolidation_attempt = datetime.now()
-    logger.debug(f"[Session {session.id}] >> 记忆固化 (Consolidate) {len(messages_chunk)} 条")
-    memories = await search_stage(session, messages_chunk, use_rerank=False)
-    if session.stale(generation, "consolidation_search"):
-        return
-    feedback = await _ask_feedback(session, messages_chunk, False, memories)
-    if feedback is None or session.stale(generation, "consolidation_sediment"):
-        return
-    _apply_sediment(session, feedback, messages_chunk, generation, memories.refs)
 
 
 async def chat_stage(
     session: Session,
-    messages_chunk: list[ChatMessage],
-    images: list[VisionInput],
+    unread: list[ChatMessage],
+    context: list[ChatMessage],
+    focus: ChatMessage | None,
     *,
     need_history: bool,
     memories: MemoryContext,
@@ -697,10 +696,10 @@ async def chat_stage(
 
     # Feedback 要求回溯时才翻更早的历史，只给 Chat 用
     recalled_history = []
-    current_msgs = session.short_term_memory.access()
-    if need_history and current_msgs:
+    if need_history:
+        earliest = (context or unread)[0].time
         recalled_msgs = await get_history_before(
-            session.id, current_msgs[0].time, limit=HISTORY_RECALL_LIMIT
+            session.id, earliest, limit=HISTORY_RECALL_LIMIT
         )
         recalled_history = [
             f"[{m.time:%H:%M}] {m.user_name}: {m.content}" for m in recalled_msgs
@@ -709,15 +708,15 @@ async def chat_stage(
 
     new_msgs = [
         {"id": msg.id, "name": msg.user_name, "content": msg.content}
-        for msg in messages_chunk
+        for msg in unread
     ]
-    recent_msgs = _history_context(session, messages_chunk)
+    recent_msgs = format_history(context)
     # 自己最近说过的话单独列出来，prompt 要求避免重复句式
     my_recent_replies = [
         m.content for m in session.short_term_memory.access() if m.user_name == state.name
     ][-MY_RECENT_REPLIES_LIMIT:]
     recalled_str = "\n".join(recalled_history) or "无"
-    related_profiles = _related_profiles(session, messages_chunk, for_chat=True)
+    related_profiles = _related_profiles(session, unread, for_chat=True)
     state.global_emotion.settle()
     prompt = get_chat_prompt(
         bot_name=state.name,
@@ -725,10 +724,14 @@ async def chat_stage(
         bottom_lines=state.bottom_lines,
         self_life=state.self_life,
         self_in_group=state.self_in_group,
-        chat_state_value=chatting_state(state, datetime.now()).value,
         summary=state.chat_summary,
         recent_msgs=recent_msgs,
         new_msgs=new_msgs,
+        focus=(
+            {"id": focus.id, "name": focus.user_name, "content": focus.content}
+            if focus
+            else None
+        ),
         mood=describe_mood(state.global_emotion),
         related_profiles=related_profiles,
         search_result=memories.lines,
@@ -762,41 +765,18 @@ async def chat_stage(
             session_id=session.id,
             temperature=CHAT_TEMPERATURE,
             system_prompt=CHAT_SYSTEM_PROMPT,
-            images=images,
+            # 只附想接的那条的图：一段未读里可能有好几张，全附上既占内存，也让模型分不清该接哪句
+            images=list(focus.image_inputs) if focus else [],
         )
     )
     if session.stale(generation, "chat_reply"):
         return []
 
     if replies:
-        state.willingness *= SPEAK_WILLINGNESS_RETAIN_FACTOR
-        # 这批人就是接下来对话窗口里的聊天对象
+        # 接下来对话窗口里的聊天对象：接的是谁就是谁；没指认就是这段的发言人。
+        # 不加区分地把一段里五六个人都算进来，3 分钟内谁开口都会马上看群、走低门槛
+        partners = [focus] if focus else unread
         state.conversation_partners = {
-            msg.user_id
-            for msg in messages_chunk
-            if msg.user_id and msg.user_name != state.name
+            msg.user_id for msg in partners if msg.user_id and msg.user_name != state.name
         }
     return replies
-
-
-def _advance_consolidation_watermark(session: Session, messages_chunk: list[ChatMessage]) -> None:
-    state = session.state
-    latest = max(msg.time for msg in messages_chunk)
-    if state.last_consolidated_time is None or latest > state.last_consolidated_time:
-        state.last_consolidated_time = latest
-    state.messages_since_consolidation = 0
-    state.last_consolidation_attempt = datetime.now()
-    session.schedule_save()
-
-
-def _consolidation_due(session: Session) -> bool:
-    """攒够消息或距上次尝试足够久，才在不参与时做一次固化。"""
-
-    state = session.state
-    if state.messages_since_consolidation >= CONSOLIDATION_MESSAGE_THRESHOLD:
-        return True
-    return (
-        state.messages_since_consolidation > 0
-        and (datetime.now() - state.last_consolidation_attempt).total_seconds()
-        >= CONSOLIDATION_INTERVAL_SECONDS
-    )

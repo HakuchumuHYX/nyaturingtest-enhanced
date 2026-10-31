@@ -79,13 +79,33 @@ class Memory:
         return False
 
     def messages_after(self, watermark: datetime | None, limit: int) -> list[ChatMessage]:
-        """固化水位之后的缓冲消息，最多 limit 条。"""
+        """水位之后的缓冲消息，最多 limit 条（取最新的）。"""
 
         messages = list(self.__messages)
         if watermark is not None:
             watermark_ts = watermark.timestamp()
             messages = [m for m in messages if m.time.timestamp() > watermark_ts]
         return messages[-limit:]
+
+    def messages_before(self, moment: datetime, limit: int) -> list[ChatMessage]:
+        """早于 moment 的缓冲消息，最多 limit 条（取最新的）。"""
+
+        moment_ts = moment.timestamp()
+        return [m for m in self.__messages if m.time.timestamp() < moment_ts][-limit:]
+
+    def move_to_latest(self, message: ChatMessage) -> None:
+        """内容补全后才算出现（合并转发读完摘要）：时间改成现在、挪到窗口末尾。
+
+        已读水位按时间算，不挪的话占位已经被读过，摘要就永远进不了未读。
+        """
+
+        message.time = datetime.now()
+        for index, existing in enumerate(self.__messages):
+            if existing is message:
+                del self.__messages[index]
+                self.__messages.append(message)
+                break
+        self.mark_dirty(message)
 
     def update(self, message_chunk: list[ChatMessage]) -> None:
         """追加到滚动窗口，按消息 ID 去重。"""

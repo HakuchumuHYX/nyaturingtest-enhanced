@@ -1,14 +1,10 @@
-"""发言意愿与参与判定。
+"""看群时机与说话门槛。
 
-两层决策：
-1. 规则层（本模块）决定这批消息「值不值得调用 Feedback 考虑说话」：被点名、聊天对象在接话、
-   或意愿值够高且自己最近没说太多。
-2. Feedback 的 willing 决定「说不说」，门槛按场景区分（被点名 0.3、聊天对象接话或被戳 0.45、主动插嘴 0.6）。
-   被点名也不强制回：两个 Bot 互相回复时，只有 Feedback 看着发言量压低 willing 才停得下来。
+一次 Feedback 就是「看一眼群」：读上次看过之后的全部未读，沉淀和「说不说」用同一次输出。
+本模块决定什么时候看：被点名、聊天对象在接话、被戳就马上看，否则按节奏攒着；以及这次开口的门槛。
+被点名也不强制回：两个 Bot 互相回复时，只有 Feedback 看着发言量压低 willing 才停得下来。
 """
 
-import re
-from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 
@@ -16,116 +12,78 @@ from ..messages.message import ChatMessage
 
 # 两次发送之间的最小间隔（在发送前等待，不再跳过整轮）
 SPEAK_COOLDOWN_SECONDS = 16.0
-# 按真实流逝时间衰减：0.6 在约 20 分钟无人理会后归零
-WILLINGNESS_DECAY_PER_MINUTE = 0.03
-# 被动增长：每条消息 × 兴趣系数；被动增长最多涨到上限，插嘴不至于满格
-PASSIVE_GROWTH_PER_MESSAGE = 0.05
-PASSIVE_GROWTH_CAP = 0.7
-INTEREST_MIN_FACTOR = 0.3
-INTEREST_MAX_FACTOR = 1.8
-# 意愿达到该值才调用 Feedback 考虑插嘴
-ENGAGE_THRESHOLD = 0.45
-# 最近 SHORT_CONTEXT_LIMIT 条消息里自己的发言占比达到该值，就不再主动插嘴（被点名/聊天对象接话不受限）
+# 看群节奏：未读攒够这么多条，或有未读且距上次看群满这么久，就看一次；一次最多读这么多条
+LOOK_UNREAD_THRESHOLD = 8
+LOOK_INTERVAL_SECONDS = 180.0
+LOOK_MAX_MESSAGES = 60
+# 最近 SHORT_CONTEXT_LIMIT 条消息里自己的发言占比达到该值，就不再主动插嘴（被点名/聊天对象接话/被戳不受限）
 SELF_SHARE_LIMIT = 0.2
-# Feedback willing 的接话门槛：被点名 / 聊天对象在接话 / 主动插嘴
+# Feedback willing 的开口门槛：被点名 / 聊天对象在接话或被戳 / 按节奏看群时主动插嘴。
+# 主动插嘴原为 0.6：试跑里「接得上但一般」的段落模型常给 0.42～0.55，卡在门槛下；先降到 0.5 跑几天看频率
 SPEAK_THRESHOLD_ADDRESSED = 0.3
 SPEAK_THRESHOLD_CONVERSATION = 0.45
-SPEAK_THRESHOLD_PASSIVE = 0.6
-# 图片、表情包（带描述或还没看清）、语音、视频的标记；去掉后什么都不剩就是纯媒体
-_MEDIA_TAG_RE = re.compile(r"\[(?:图片|表情包)(?:[:#][^\]]*)?\]|\[语音\]|\[视频\]")
-# 被点名（名字/别名、@、回复 Bot）时的意愿下限
-RELEVANCE_WILLINGNESS_FLOOR = 0.85
+SPEAK_THRESHOLD_PASSIVE = 0.5
 # Bot 说话后的对话窗口：窗口内只有上次接话的那批人（聊天对象）再说话才算对话在继续
 CONVERSATION_WINDOW_SECONDS = 180.0
-# 说话后保留的意愿比例（避免同一话题连续抢话，但不至于掉出对话）
-SPEAK_WILLINGNESS_RETAIN_FACTOR = 0.7
-# 重启后的初始意愿
-WILLINGNESS_LOAD_VALUE = 0.3
 
 
-class ChattingState(Enum):
-    """展示与 prompt 用的派生状态，不参与决策。"""
+class LookTrigger(Enum):
+    RELEVANT = "relevant"
+    CONVERSATION = "conversation"
+    POKE = "poke"
+    RHYTHM = "rhythm"
 
-    IDLE = 0
-    BUBBLE = 1
-    ACTIVE = 2
-
-    def __str__(self) -> str:
-        return {
-            ChattingState.IDLE: "潜水状态",
-            ChattingState.BUBBLE: "冒泡状态",
-            ChattingState.ACTIVE: "对话状态",
-        }[self]
+    @property
+    def speak_threshold(self) -> float:
+        if self is LookTrigger.RELEVANT:
+            return SPEAK_THRESHOLD_ADDRESSED
+        if self is LookTrigger.RHYTHM:
+            return SPEAK_THRESHOLD_PASSIVE
+        return SPEAK_THRESHOLD_CONVERSATION
 
 
 def in_conversation_window(state, now: datetime) -> bool:
     return (now - state.last_speak_time).total_seconds() < CONVERSATION_WINDOW_SECONDS
 
 
-def chatting_state(state, now: datetime) -> ChattingState:
-    if in_conversation_window(state, now):
-        return ChattingState.ACTIVE
-    if state.willingness >= ENGAGE_THRESHOLD:
-        return ChattingState.BUBBLE
-    return ChattingState.IDLE
+def unread_count(state, unread: list[ChatMessage]) -> int:
+    """未读里群友的消息条数；她自己刚发出去的不算。直接数，不另记计数器，免得和水位对不上。"""
+
+    return sum(message.user_name != state.name for message in unread)
 
 
-@dataclass(frozen=True)
-class EngagementDecision:
-    relevant: bool
-    in_conversation: bool
-    poked: bool
-    engaged: bool
+def seconds_until_look(state, unread: list[ChatMessage], now: datetime) -> float | None:
+    """按节奏还要多久该看群；没有群友的未读（或没设人设）返回 None。worker 用它给到点补看定时。"""
 
-    @property
-    def speak_threshold(self) -> float:
-        if self.relevant:
-            return SPEAK_THRESHOLD_ADDRESSED
-        if self.in_conversation or self.poked:
-            return SPEAK_THRESHOLD_CONVERSATION
-        return SPEAK_THRESHOLD_PASSIVE
+    if not state.name or unread_count(state, unread) == 0:
+        return None
+    elapsed = (now - state.last_look_time).total_seconds()
+    return max(0.0, LOOK_INTERVAL_SECONDS - elapsed)
 
 
-def evaluate_engagement(
-    *,
-    state,
-    messages: list[ChatMessage],
-    self_share: float,
-    now: datetime,
-) -> EngagementDecision:
-    """意愿值衰减/增长，并判断这批消息要不要交给 Feedback。
+def decide_look(state, unread: list[ChatMessage], now: datetime) -> LookTrigger | None:
+    """看全部未读决定这次看不看群；返回 None 就继续攒着。
 
-    self_share 是最近上下文里自己发言的占比，用来限制主动插嘴的话量。
+    按全部未读而不是这一批判断：Feedback 失败、水位没动时，那条点名不会因为下一批没点名就漏掉。
     """
 
-    elapsed_minutes = max(0.0, (now - state.last_decay_time).total_seconds()) / 60.0
-    state.willingness = max(
-        0.0, state.willingness - elapsed_minutes * WILLINGNESS_DECAY_PER_MINUTE
-    )
-    state.last_decay_time = now
-
-    relevant = check_relevance(state.name, state.aliases, messages)
+    if unread_count(state, unread) == 0:
+        return None
+    if check_relevance(state.name, state.aliases, unread):
+        return LookTrigger.RELEVANT
     # 只有上次接话的那批人再开口才算对话在继续；Bot 自己说话不会给窗口续命到其他人身上
-    conversing = in_conversation_window(state, now) and any(
-        message.user_id in state.conversation_partners for message in messages
-    )
-    if relevant:
-        state.willingness = max(state.willingness, RELEVANCE_WILLINGNESS_FLOOR)
-    elif state.willingness < PASSIVE_GROWTH_CAP:
-        interest = score_message_interest(messages)
-        growth = PASSIVE_GROWTH_PER_MESSAGE * interest * len(messages)
-        state.willingness = min(PASSIVE_GROWTH_CAP, state.willingness + growth)
-
-    wants_to_chime_in = (
-        state.willingness >= ENGAGE_THRESHOLD and self_share < SELF_SHARE_LIMIT
-    )
-    poked = any(message.poke and message.to_me for message in messages)
-    return EngagementDecision(
-        relevant=relevant,
-        in_conversation=conversing,
-        poked=poked,
-        engaged=relevant or conversing or poked or wants_to_chime_in,
-    )
+    if in_conversation_window(state, now) and any(
+        message.user_id in state.conversation_partners for message in unread
+    ):
+        return LookTrigger.CONVERSATION
+    if any(message.poke and message.to_me for message in unread):
+        return LookTrigger.POKE
+    if (
+        unread_count(state, unread) >= LOOK_UNREAD_THRESHOLD
+        or seconds_until_look(state, unread, now) == 0
+    ):
+        return LookTrigger.RHYTHM
+    return None
 
 
 def check_relevance(
@@ -133,14 +91,17 @@ def check_relevance(
     aliases: list[str],
     messages: list[ChatMessage],
 ) -> bool:
-    """@Bot、回复 Bot 的消息，或提到名字/别名（至少 2 个字）。
+    """群友 @Bot、回复 Bot 的消息，或提到名字/别名（至少 2 个字）。
 
+    角色自己的话不算：未读里有她刚发出去的消息。
     戳一戳记录不算：被戳了回不回话交给 Feedback，不必回。
     合并转发也不算：读完后是别人的聊天记录，里面出现名字不是在叫 bot。
     """
 
     messages = [
-        message for message in messages if not message.poke and not message.forward
+        message
+        for message in messages
+        if message.user_name != bot_name and not message.poke and not message.forward
     ]
     if any(message.to_me for message in messages):
         return True
@@ -154,43 +115,3 @@ def check_relevance(
         for message in messages
         for trigger in triggers
     )
-
-
-def _directed_at_others(message: ChatMessage) -> bool:
-    """@ 或回复了别的群友，是在点名对别人说。
-
-    回复自己接着说不算；@ bot 不进 mentions，回复 bot 时 to_me 为真，都不会算进来。
-    """
-
-    return (
-        not message.poke
-        and not message.to_me
-        and any(user_id != message.user_id for user_id in message.mentions)
-    )
-
-
-def score_message_interest(messages: list[ChatMessage]) -> float:
-    """这批消息有多值得插嘴：提问、有实质内容加分，纯复读/纯媒体、点名对别人说减分。"""
-
-    contents = [message.content for message in messages]
-    text = " ".join(contents).strip()
-    if not text:
-        return INTEREST_MIN_FACTOR
-    directed = [_directed_at_others(message) for message in messages]
-    score = 1.0
-    # 问别人的问题不是在给 bot 递话头
-    if any(
-        "?" in content or "？" in content
-        for content, is_directed in zip(contents, directed)
-        if not is_directed
-    ):
-        score += 0.6
-    if any(len(content.strip()) >= 15 for content in contents):
-        score += 0.2
-    if len(set(text)) <= 2 and len(text) >= 3:
-        score -= 0.6
-    if all(not _MEDIA_TAG_RE.sub("", content).strip() for content in contents):
-        score -= 0.5
-    if any(directed):
-        score -= 0.6
-    return max(INTEREST_MIN_FACTOR, min(INTEREST_MAX_FACTOR, score))

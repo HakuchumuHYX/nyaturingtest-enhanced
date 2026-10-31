@@ -144,7 +144,7 @@ async def digest_forward(
             outcome = "recalled"
         else:
             message.content = f"[合并转发 {node_count}条（{FORWARD_NOTE}）: {summary}]"
-            session.short_term_memory.mark_dirty(message)
+            session.short_term_memory.move_to_latest(message)
             session.schedule_save()
             await group.enqueue(message, bot, event)
             outcome = "ok"

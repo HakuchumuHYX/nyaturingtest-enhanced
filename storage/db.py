@@ -77,8 +77,7 @@ async def save_session_state(session_id: str, data: dict):
             "emotion_updated_at": data["emotion_updated_at"],
             "chat_summary": sanitize_text(data.get("chat_summary", "")),
             "last_speak_time": data.get("last_speak_time"),
-            "last_consolidated_time": data.get("last_consolidated_time"),
-            "chatting_state": data.get("chatting_state", 0),
+            "last_read_time": data.get("last_read_time"),
         },
     )
 
