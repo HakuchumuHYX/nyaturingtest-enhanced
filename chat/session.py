@@ -31,8 +31,6 @@ QUEUE_MAX_SIZE = 200
 
 @dataclass
 class SessionState:
-    """纯领域状态：不持有数据库、HTTP 或向量资源。"""
-
     preset: str = ""
     # 以下由 _apply_preset 从预设和每日整理结果填，只读，不随 save_session 回写；
     # name 为空说明没设人设或预设文件不在，这个群不说话
@@ -52,7 +50,7 @@ class SessionState:
     last_speak_time: datetime = datetime.min
     # 上次接话时那批消息的发言人；只在进程内保持，重启后对话窗口自然失效
     conversation_partners: set[str] = field(default_factory=set)
-    # 已读水位：Feedback 读到的最后一条消息时间，之后的都是未读；见 chat/engagement.py
+    # 已读水位：Feedback 读到的最后一条消息时间，之后的都是未读
     last_read_time: datetime | None = None
     last_look_time: datetime = datetime.min
     generation: int = 0
@@ -130,7 +128,6 @@ class Session:
         """心情回到基线、退出对话窗口；好感度是长期养成的，不在这里清"""
         self.bump_generation("calm_down")
         self.state.global_emotion = EmotionState()
-        # 退出对话窗口
         self.state.last_speak_time = datetime.min
         logger.info(f"[Session {self.id}] 已冷静：心情重置、退出对话")
         await self.save_session()
@@ -172,7 +169,6 @@ class Session:
 
     async def _save_session_locked(self) -> bool:
         try:
-            # 1. 保存基础状态
             await save_session_state(
                 self.id,
                 {
@@ -187,7 +183,7 @@ class Session:
                 },
             )
 
-            # 2. 更新变化过的画像，避免高频保存重复写全量 profiles。
+            # 只写变过的画像
             dirty_profiles = {
                 user_id: profile
                 for user_id, profile in self.state.profiles.items()
@@ -198,7 +194,7 @@ class Session:
                 for profile in dirty_profiles.values():
                     profile.dirty = False
 
-            # 3. 只同步新增或内容被图片观察丰富过的消息。
+            # 只写新增的和描述补全过的消息
             pending_messages = self.short_term_memory.pending_messages()
             if pending_messages:
                 await sync_messages(
@@ -246,7 +242,6 @@ class Session:
             if user_data["summary"]
         }
 
-        # 恢复用户画像
         for user_data in data["users"]:
             self.state.profiles[user_data["user_id"]] = PersonProfile(
                 user_id=user_data["user_id"],
@@ -305,9 +300,7 @@ class Session:
         self.state.self_life = life or preset.seed
 
     def append_self_message(self, content: str, msg_id: str, bot_user_id: str):
-        """
-        主动记录 Bot 自己的发言 (防止等待回显导致记忆延迟)
-        """
+        """自己发的消息直接写进短期记忆，不等平台回显。"""
         msg = ChatMessage(
             time=datetime.now(),
             user_name=self.state.name,

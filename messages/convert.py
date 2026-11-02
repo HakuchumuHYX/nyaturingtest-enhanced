@@ -80,7 +80,7 @@ def segment_text(seg_type: str, data: dict) -> str | None:
     """不用调接口就能转成文字的消息段；图片、@、回复交给调用方，返回 None。
 
     商城表情是带 emoji_id 的 image 段，summary 就是名字（如 [狗头]），不下载、不给视觉模型。
-    合并转发在这里只是占位，正文里的由 messages/forward.py 另行读完再改写。
+    合并转发在这里只是占位，读完后另行改写。
     """
 
     if seg_type == "text":

@@ -10,7 +10,7 @@ class SessionModel(Model):
     # 预设文件名，空串是没设人设（不说话）；名字、别名等运行时从预设读，不存快照，免得改了 json 不同步
     preset = fields.CharField(max_length=255, default="")
 
-    # 角色在群里的心情；读取前按 emotion_updated_at 结算回落，见 chat/domain.py
+    # 角色在群里的心情；读取前按 emotion_updated_at 结算回落
     valence = fields.FloatField(default=0.0)
     arousal = fields.FloatField(default=0.3)
     dominance = fields.FloatField(default=0.0)
@@ -23,7 +23,7 @@ class SessionModel(Model):
     # 群志只由每日整理任务写入；水位是已整理到的最新碎片 created_at
     group_notes = fields.TextField(default="")
     notes_summarized_until = fields.DatetimeField(null=True)
-    # 分段整理已读到的最后一条消息时间，只由 memory/episodes.py 写入
+    # 分段整理已读到的最后一条消息时间
     episodes_until = fields.DatetimeField(null=True)
 
     class Meta:
@@ -91,7 +91,7 @@ class MemoryModel(Model):
     importance = fields.FloatField(default=0.0)
     date = fields.IntField()  # YYYYMMDD，检索衰减按它算
     expires_at = fields.DatetimeField()
-    # 依据的新消息 msg_id，空格分隔；事后核对时据此找回原话（历史行为空）
+    # 依据的新消息 msg_id，空格分隔；事后核对时据此找回原话
     source_msg_ids = fields.TextField(default="")
     # 和这条记忆有关的 QQ 号，空格分隔：事实是主体和说话人，episode 是参与聊天的群友；按人检索只看它
     participant_ids = fields.TextField(default="")
@@ -112,7 +112,7 @@ class MemoryModel(Model):
 
 
 class PersonaLifeModel(Model):
-    """人生线：每个预设一份，各群共享，只由每日整理写入（memory/persona.py）。"""
+    """人生线：每个预设一份，各群共享，只由每日整理写入。"""
 
     preset = fields.CharField(pk=True, max_length=255)
     text = fields.TextField(default="")
@@ -185,8 +185,6 @@ class StickerModel(Model):
 
 
 class EnabledGroupModel(Model):
-    """存储启用的群组ID"""
-
     group_id = fields.BigIntField(pk=True)
 
     class Meta:
@@ -194,18 +192,16 @@ class EnabledGroupModel(Model):
 
 
 class TokenUsageModel(Model):
-    """记录 Token 消耗"""
-
     id = fields.IntField(pk=True)
-    session_id = fields.CharField(max_length=255)  # 群号
-    model_name = fields.CharField(max_length=255)  # 模型名称
+    session_id = fields.CharField(max_length=255)
+    model_name = fields.CharField(max_length=255)
     prompt_tokens = fields.IntField()
     completion_tokens = fields.IntField()
     prompt_cache_hit_tokens = fields.IntField(default=0)
     prompt_cache_miss_tokens = fields.IntField(default=0)
     reasoning_tokens = fields.IntField(default=0)
     finish_reason = fields.CharField(max_length=64, default="")
-    timestamp = fields.DatetimeField(auto_now_add=True)  # 自动记录时间
+    timestamp = fields.DatetimeField(auto_now_add=True)
 
     class Meta:
         table = "nyabot_token_usage"

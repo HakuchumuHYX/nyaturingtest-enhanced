@@ -1,4 +1,4 @@
-"""Token 用量卡片：数据由 storage.db.get_token_stats 聚合好，填进 token_stats.html 截图。"""
+"""Token 用量卡片：填进 token_stats.html 截图。"""
 
 from datetime import datetime
 from html import escape

@@ -47,8 +47,6 @@ _HTTP_CLIENT: httpx.AsyncClient | None = None
 
 
 def get_http_client() -> httpx.AsyncClient:
-    """Return the process-wide pooled HTTP client."""
-
     global _HTTP_CLIENT
     if _HTTP_CLIENT is None:
         ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLSv1_2)

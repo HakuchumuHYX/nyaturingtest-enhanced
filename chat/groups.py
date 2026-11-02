@@ -11,7 +11,7 @@ from .session import Session
 
 # 启用的群：group_id -> Session，在表里就是启用了
 sessions: dict[int, Session] = {}
-# Shutdown 标志：设置后所有新的消息处理都会提前退出
+# 关机时置位，之后进来的消息直接丢掉
 _shutting_down = False
 
 
@@ -78,16 +78,15 @@ async def disable_autochat(group_id: int) -> None:
 
 
 async def cleanup_global_resources():
-    """统一的资源清理逻辑 (关机时调用)"""
     global _shutting_down
     _shutting_down = True
     logger.info("正在执行资源清理（已设置 shutdown 标志）...")
 
-    # 1. 先停止所有可能继续使用 Session/Vector/Provider 的群 worker。
+    # 先停 worker，它们还在用会话、向量和 Provider
     for session in list(sessions.values()):
         await _stop_worker(session)
 
-    # 2. worker 停止后再排空后台写入，并在数据库仍可用时做最终保存。
+    # 再排空后台写入，趁数据库还开着做最后一次保存
     for session in list(sessions.values()):
         try:
             await session.drain_background_tasks()
@@ -111,7 +110,7 @@ async def cleanup_global_resources():
 
     await drain_usage_tasks()
 
-    # 3. Provider/usage 都已停止后关闭共享 HTTP，最后关闭数据库。
+    # 用量记录也写完了，最后关共享 HTTP 和数据库
     await close_http_client()
     await close_clients()
 

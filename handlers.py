@@ -104,9 +104,6 @@ def render_private_help() -> str:
     return "\n".join(lines)
 
 
-# ==================== 规则与公共函数 ====================
-
-
 async def is_group_message(event: Event) -> bool:
     return isinstance(event, GroupMessageEvent)
 
@@ -177,9 +174,6 @@ def _dual_command(cmd: str, aliases: set[str], handler):
     return matcher
 
 
-# ==================== 事件入口 ====================
-
-
 auto_chat = on_message(rule=is_group_message, priority=99, block=False)
 
 
@@ -191,7 +185,7 @@ async def handle_auto_chat(bot: Bot, event: GroupMessageEvent):
         return
     generation = session.state.generation
 
-    # Shutdown 检查：避免在关机时进入耗时的消息处理
+    # 关机途中不再接新消息
     if is_shutting_down():
         return
 
@@ -315,9 +309,6 @@ async def handle_group_recall(event: GroupRecallNoticeEvent):
         queued=bool(queued),
         in_buffer=in_buffer,
     )
-
-
-# ==================== 管理命令 ====================
 
 
 help_cmd = on_command(
@@ -577,7 +568,7 @@ async def _do_reset(matcher: type[Matcher], group_id: int, args: str):
         )
     session = await _session_or_finish(matcher, group_id)
     await matcher.send("即将重置，会先执行一次数据备份...")
-    # 先作废进行中的 turn 再备份；备份刻意放在 admin_lock 之外：它可能长时间打包整个数据目录
+    # 先作废进行中的 turn 再备份；备份放在 admin_lock 之外：它可能长时间打包整个数据目录
     async with session.admin_lock:
         session.bump_generation("reset_requested")
     if not await backup_task():
@@ -719,9 +710,6 @@ async def handle_rag_debug(
     else:
         lines.append("(none)")
     await rag_debug.finish("\n".join(lines))
-
-
-# ==================== 群友命令 ====================
 
 
 query_memory = on_command(

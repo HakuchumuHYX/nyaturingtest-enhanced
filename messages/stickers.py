@@ -1,5 +1,4 @@
 """表情包库：内存索引、收图、计数、挑图、拉黑、每晚清理。
-设计见 docs/nyaturingtest-sticker-2026-10-20.md，计数和清理见 docs/nyaturingtest-sticker-prune-2026-11-02.md。
 
 所有群共用一个库。启动时整表载入内存，之后收图、计数、发送、拉黑、清理同时改内存和库。
 """
@@ -124,11 +123,7 @@ async def _count_seen(sticker: Sticker) -> None:
 
 
 async def note_seen(digest: str) -> None:
-    """群友发了一张表情包：库里有就计一次数。
-
-    按 digest 找不到再按描述找：去重时没收的那份文件描述相同、digest 不同，计数要算到库里那张头上。
-    第一次出现的图还没有描述缓存，这里什么都不做，收进来时由 collect 记第一次。
-    """
+    """群友发了一张表情包：库里有就计一次数。按 digest 找不到再按描述找，去重时没收的那份也算到库里那张头上。"""
 
     sticker = _stickers.get(digest)
     if sticker is None:
@@ -141,8 +136,7 @@ async def note_seen(digest: str) -> None:
 async def collect(image_bytes: bytes, result: StickerCaption, source: str) -> bool:
     """收一张表情包：写原始字节、算向量、入库；返回是否真的收了。库里已有或拉黑过的跳过。
 
-    库里已有描述完全相同的（同一张图被重新压缩过）不另收，算那张又被发了一次。
-    向量没算成也照样入库，下次启动补算；这期间它只在 want 算不出向量时才可能被挑中。
+    描述完全相同的（同一张图被重新压缩过）不另收，算那张又被发了一次。向量没算成也照样入库，下次启动补算。
     """
 
     digest = hashlib.sha1(image_bytes).hexdigest()
@@ -236,8 +230,7 @@ async def mark_sent(sticker: Sticker) -> None:
 def _delete_files(digest: str) -> bool:
     """删文件和描述缓存，返回有没有文件。
 
-    按 digest 找文件而不是查内存：collect 先写文件再入库，入库失败时文件留下了、内存里却没有。
-    描述缓存也要删：缓存命中的图不再走 collect，留着它，这张图以后就再也收不回来。
+    按 digest 找文件：入库失败时文件已经写下、内存里却没有。描述缓存不删的话，这张图以后命中缓存就再也收不回来。
     """
 
     files = list(STICKER_DIR.glob(f"{digest}.*"))

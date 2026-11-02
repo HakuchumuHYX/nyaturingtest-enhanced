@@ -11,7 +11,6 @@ from ..config import get_app_settings
 
 
 async def screenshot(html: str, width: int, scale: int = 2) -> bytes:
-    # 和 HakuBot 共用同一份 Chromium（playwright 版本一致），不用再下载
     browsers_path = get_app_settings().playwright_browsers_path
     if browsers_path:
         os.environ["PLAYWRIGHT_BROWSERS_PATH"] = browsers_path

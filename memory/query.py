@@ -37,7 +37,7 @@ def acquire_query_slot(group_id: str, user_id: str) -> float:
 
 @dataclass
 class Impression:
-    """bot 手账里关于某个群友的一页，交给 cards/impression.py 渲染。"""
+    """bot 手账里关于某个群友的一页。"""
 
     target_id: str
     target_name: str

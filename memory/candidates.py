@@ -1,8 +1,6 @@
 """长期记忆候选（Feedback 的更正、分段整理的事实）：规范化、校验、去重落库。
 
-校验只做确定性过滤（长度、类别、置信度、主体），不做语义启发式——
-「是不是玩笑 / 有没有注入指令」交给模型的 prompt 与 confidence 判断。
-「好的」「哈哈哈」这类噪声都短于 MIN_CONTENT_CHARS，长度过滤已经覆盖，不再单列词表。
+这里只按长度、类别、置信度、主体过滤；是不是玩笑、有没有注入指令交给模型的 confidence。
 """
 
 from collections.abc import Iterable

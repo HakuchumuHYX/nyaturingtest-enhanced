@@ -1,7 +1,6 @@
 """QQ 系统表情目录。
 
 贴表情和收到的表情转文字都按 SnowLuma 的 fetch_sys_faces 来，不另写白名单。
-Chat 不再发 QQ 表情，改发表情包（messages/stickers.py）。
 """
 
 from dataclasses import dataclass

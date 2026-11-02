@@ -15,7 +15,6 @@ from tortoise.transactions import in_transaction
 from ..config import get_app_settings
 from ..storage.models import MemoryModel
 
-# RAG 检索参数
 RAG_FINAL_K = 20
 RAG_PER_QUERY_RECALL_K = 40
 RAG_MERGED_CANDIDATE_CAP = 64
@@ -27,7 +26,7 @@ EVENT_TTL_DAYS = 90
 FACT_TTL_DAYS = 180
 
 EMBEDDING_BATCH_SIZE = 32
-# Qwen3-Embedding 只给查询加任务指令、记忆正文不加；探针里加了比不加 AUC 高一截
+# Qwen3-Embedding 只给查询加任务指令、记忆正文不加
 QUERY_INSTRUCTION = (
     "Instruct: Given a group chat message, retrieve memories about the chat members "
     "that are relevant to it\nQuery: "
@@ -210,7 +209,6 @@ class VectorMemory:
     """一个群的长期记忆。
 
     向量存在 nyabot_memories 表；首次使用时把本群有效向量整体读成矩阵，检索是一次矩阵乘法。
-    万级数据下暴力检索只要十几毫秒，而且删除就是真删除，不会像 HNSW 那样留下墓碑。
     """
 
     def __init__(self, session_id: str):
@@ -295,9 +293,6 @@ class VectorMemory:
     ) -> RetrievalResult:
         """检索后按时间衰减/类型/置信度/作用域加权排序，取前 k 条。
 
-        流程：按人过滤 → 每条 query 召回 RAG_PER_QUERY_RECALL_K 条 → 融合去重，截到 RAG_MERGED_CANDIDATE_CAP
-        → rerank 加阈值 → 加权排序取前 k。
-
         user_ids 不为 None 时只在参与者含这些人的记忆里找；带 "" 时参与者为空的记忆也算。
         rerank 接口失败时回退到向量分；rerank 把候选全筛掉不回退：向量分在闲聊上挤在 0.5 上下分不出好坏，回退只会塞进无关记忆。
         """
@@ -328,7 +323,7 @@ class VectorMemory:
                 )
                 scores[:, ~mask] = -np.inf
 
-            # 第一步：每条 query 召回 top 条，多 query 命中同一条取最高分
+            # 每条 query 召回 top 条，多 query 命中同一条取最高分
             top_n = min(RAG_PER_QUERY_RECALL_K, len(self._ids))
             best_by_index: dict[int, float] = {}
             for row_scores in scores:
@@ -358,7 +353,7 @@ class VectorMemory:
             if not candidates:
                 return RetrievalResult([], _retrieval_stats([], []))
 
-            # 第二步：Rerank 加阈值，接口失败或未配置 rerank_model 时按向量分取前若干条。
+            # Rerank 加阈值；接口失败或没配 rerank_model 时按向量分取前若干条。
             # search_stage 已把最新有效消息排在第一位；summary query 只做补充召回。
             settings = get_app_settings()
             if not settings.rerank_model:
@@ -388,7 +383,7 @@ class VectorMemory:
                         )
                     fallback_reason = "none"
 
-            # 第三步：时间衰减与加权，取前 k
+            # 时间衰减与加权，取前 k
             active_scope_ids = set(active_user_ids)
             today_dt = datetime.now()
             scope_counts: dict[str, int] = {}

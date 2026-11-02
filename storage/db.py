@@ -30,7 +30,7 @@ def sanitize_text(text: str) -> str:
 
 
 async def load_enabled_group_ids() -> set[int]:
-    """加载启用群组；数据库是唯一来源，由 /autochat enable|disable 维护。"""
+    """启用的群，由 /autochat enable|disable 维护。"""
 
     return {g.group_id for g in await EnabledGroupModel.all()}
 
@@ -65,8 +65,6 @@ async def delete_session_data(session_id: str):
 
 
 async def save_session_state(session_id: str, data: dict):
-    """保存会话的基础状态"""
-
     await SessionModel.update_or_create(
         id=session_id,
         defaults={
@@ -100,8 +98,6 @@ async def skip_persona_absence(session_id: str, preset: str) -> None:
 
 
 async def load_full_session_data(session_id: str):
-    """加载完整的会话数据"""
-
     session_db = await SessionModel.filter(id=session_id).first()
     if not session_db:
         return None
@@ -171,8 +167,6 @@ def message_final_id(msg: ChatMessage) -> str:
 
 
 async def sync_messages(session_id: str, recent_msgs: list[ChatMessage]):
-    """增量同步消息到数据库"""
-
     session_db = await SessionModel.get_or_none(id=session_id)
     if not session_db:
         raise RuntimeError(f"session not found: {session_id}")
@@ -232,8 +226,6 @@ async def recall_message(session_id: str, msg_id: str, content: str) -> int:
 async def get_history_before(
     session_id: str, time_point: datetime, limit: int = 20
 ) -> list[ChatMessage]:
-    """获取指定时间之前的历史消息"""
-
     session_db = await SessionModel.get_or_none(id=session_id)
     if not session_db:
         return []
@@ -265,8 +257,6 @@ async def get_recent_messages_by_user(
     user_name: str = "",
     limit: int = 10,
 ) -> list[str]:
-    """获取用户最近的发言内容"""
-
     session_db = await SessionModel.get_or_none(id=session_id)
     if not session_db:
         return []
@@ -312,8 +302,6 @@ async def get_latest_user_names(session_id: str) -> dict[str, str]:
 
 
 async def update_user_profiles(session_id: str, profiles: dict):
-    """批量更新用户画像"""
-
     session_db = await SessionModel.get_or_none(id=session_id)
     if not session_db:
         raise RuntimeError(f"session not found: {session_id}")

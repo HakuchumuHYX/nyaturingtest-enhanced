@@ -1,14 +1,7 @@
 """角色自我成长：人生线（每个预设一份，各群共享）和群里的ta（每个群一份）。
 
-人生线是ta这个人：身份阶段、近况、性格与说话、喜好习惯、生活里的事，按日期推进，收各群抽出的自我陈述。
-群里的ta只管在这个群的说话方式、和群的关系、对群友说过的话，群里的事不出群，也改不了人生事实。
-群层每天还写一条观察日记，留最近 JOURNAL_DAYS 天：单看一天什么都收不进来，跨天反复出现才算数，证据靠日记攒。
-
-性格变化只认外部证据（群友的影响、生活里的事）：ta说的话是按档案生成的，拿来证明性格会自我强化，
-档案写「说话冲」→ ta说话冲 → 整理看到ta说话冲 → 更冲。ta的话只用来固定事实。
-
-「旧文本 + 材料 → 新文本」的整理函数不碰数据库（prompt 在 prompts.py），回放脚本（persona_replay/）和线上共用；
-线上每日整理 maintain_personas 在文件末尾，天循环和回放脚本一致。
+群里的事不出群，也改不了人生事实。群层每天写一条观察日记，跨天反复出现的才收进群层。
+性格变化只认外部证据：ta说的话是按档案生成的，拿来证明性格会自我强化。ta的话只用来固定事实。
 """
 
 from collections import defaultdict
@@ -214,9 +207,6 @@ def group_style(group_text: str) -> str:
         return ""
     end = group_text.find("【", start + 1)
     return group_text[start : end if end > 0 else None].strip()
-
-
-# ==================== 线上每日整理 ====================
 
 
 async def _retry(make_call: Callable[[], Awaitable]):

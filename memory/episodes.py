@@ -1,7 +1,6 @@
 """分段整理：一段群聊聊完后，读整段原始消息，记成几条小结（episode）和少量长期事实。
 
-以前碎片由 Feedback 每轮顺手抽，一轮只看约 8 条新消息，看不出哪件事以后还重要，
-于是每轮都挑点什么记下来，一件事被拆成好几条流水账。现在 Feedback 只管更正，日常记忆在这里记。
+Feedback 一轮只看几条新消息，看不出哪件事以后还重要，所以日常记忆等一段聊完再记，Feedback 只管更正。
 """
 
 from datetime import datetime, timedelta
@@ -30,7 +29,7 @@ from .vector import NewMemory  # noqa: E402
 SCAN_INTERVAL_MINUTES = 5
 # 最后一条消息距今这么久，算一段聊完了
 SEGMENT_IDLE = timedelta(minutes=15)
-# 群友消息不到这么多的小段先不整理、并进下一段：试跑里两三句的小段只写得出零碎插话
+# 群友消息不到这么多的小段先不整理、并进下一段：两三句的小段只写得出零碎插话
 SEGMENT_MIN_MEMBER_MESSAGES = 5
 # 一批最多这么多条：主群很少停，攒够就切，上一条小结会带给下一批接着写
 SEGMENT_MAX_MESSAGES = 80

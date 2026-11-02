@@ -213,9 +213,6 @@ def _related_profiles(
     return profiles
 
 
-# ==================== 解析模型输出 ====================
-
-
 def _parse_emotion(raw, current: EmotionState) -> tuple[dict[str, float] | None, str]:
     """校验、限幅 new_emotion；缺的轴沿用当前值，一个轴都没有算无效。返回 (心情, 失败原因)。"""
 
@@ -304,7 +301,7 @@ def _parse_focus(raw, unread: list[ChatMessage], bot_name: str) -> ChatMessage |
 def parse_feedback(
     data: dict | None, unread: list[ChatMessage], session: Session
 ) -> FeedbackOutput | None:
-    """Feedback 输出的唯一校验入口；心情无效就整份丢弃，其余字段缺了或不对按没给处理。"""
+    """校验 Feedback 输出：心情无效就整份丢弃，其余字段缺了或不对按没给处理。"""
 
     state = session.state
     emotion, failure_reason = (
@@ -348,7 +345,7 @@ def parse_feedback(
 
 
 def parse_reply(data: dict | None) -> list[Reply]:
-    """Chat 输出的唯一校验入口：reply 里的每个对象一项，引用 id 和表情包标签在这里核对。"""
+    """校验 Chat 输出：reply 里的每个对象一项，引用 id 和表情包标签在这里核对。"""
 
     items = data.get("reply") if data else None
     replies = []
@@ -374,9 +371,6 @@ def parse_reply(data: dict | None) -> list[Reply]:
             Reply(text=str(item.get("content") or ""), target_id=target_id, sticker=sticker)
         )
     return replies
-
-
-# ==================== 一轮对话 ====================
 
 
 async def process_chunk(
@@ -500,7 +494,7 @@ async def search_stage(session: Session, unread: list[ChatMessage]) -> MemoryCon
     state = session.state
 
     # Reranker 使用第一条 query 作为主 query，因此必须最新消息优先；
-    # 回复引用、表情、戳一戳这类群友没说什么的不拿去检索（见 ChatMessage.substantive），
+    # 回复引用、表情、戳一戳这类群友没说什么的不拿去检索，
     # 取最近 3 条说了东西的，免得一段以表情包结尾就没得查
     queries = [msg.content.strip() for msg in reversed(unread) if msg.substantive][:3]
     if state.chat_summary.strip():
@@ -618,10 +612,10 @@ def _apply_sediment(
 
     state = session.state
 
-    # 1. 心情：parse_feedback 已校验范围，apply 再限制每轮步长
+    # parse_feedback 已校验范围，apply 再限制每轮步长
     state.global_emotion.apply(feedback.emotion)
 
-    # 2. 互动计数按消息记；好感度只改 Feedback 点名的人（parse_feedback 只收这段的发言人）
+    # 互动计数按消息记；好感度只改 Feedback 点名的人（parse_feedback 只收这段的发言人）
     now = datetime.now()
     for msg in unread:
         if msg.user_name != state.name:
@@ -630,11 +624,9 @@ def _apply_sediment(
     for uid, delta in feedback.affinity_changes.items():
         state.profiles[uid].add_affinity(delta)
 
-    # 3. 摘要
     if feedback.summary is not None:
         state.chat_summary = feedback.summary
 
-    # 4. 记忆更正（后台写入）；日常记忆由 memory/episodes.py 在一段聊完后整理
     if feedback.corrections:
         # 上下文里每个 QQ 号的当前群名片：先放被 @/被回复的人，再放发言人（未读在后、以最新为准）
         context = [*session.short_term_memory.access(), *unread]
@@ -651,7 +643,6 @@ def _apply_sediment(
             )
         )
 
-    # 5. 这段读过了，下次看群从这之后开始
     if state.last_read_time is None or read_until > state.last_read_time:
         state.last_read_time = read_until
     session.schedule_save()

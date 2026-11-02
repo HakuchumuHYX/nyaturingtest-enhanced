@@ -1,10 +1,8 @@
-# __init__.py
-
 from nonebot import get_driver, logger
 from nonebot.adapters import Bot
 from tortoise import Tortoise
 
-from . import handlers  # 导入即注册所有 matcher
+from . import handlers  # 导入时注册 matcher
 from .chat.groups import cleanup_global_resources, init_enabled_groups
 from .chat.initiative import setup_initiative_job
 from .config import get_data_dir
@@ -32,11 +30,9 @@ async def init_db():
     await Tortoise.generate_schemas()
     logger.info(f"数据库已连接: {db_path}")
 
-    # 初始化群组列表
     await init_enabled_groups()
     await load_stickers()
 
-    # 注册定时任务：分段整理、主动话题、图片缓存清理、表情包清理、长期记忆维护、备份
     setup_episode_job()
     setup_initiative_job()
     setup_image_cache_job()
@@ -57,6 +53,4 @@ async def log_bot_disconnect(bot: Bot):
 
 @driver.on_shutdown
 async def cleanup_tasks():
-    """生命周期钩子：关机清理"""
-    # 委托给 chat/groups 处理，确保顺序正确
     await cleanup_global_resources()

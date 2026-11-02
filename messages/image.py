@@ -1,5 +1,3 @@
-# 图片下载、压缩与原生多模态输入准备
-
 import asyncio
 import base64
 import hashlib

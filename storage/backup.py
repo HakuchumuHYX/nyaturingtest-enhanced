@@ -1,5 +1,3 @@
-# 数据备份、保留期清理
-
 import asyncio
 import os
 import shutil
@@ -31,10 +29,7 @@ async def _delete_older_than(model, field_name: str, days: int) -> int:
 
 
 async def cleanup_raw_data_retention() -> dict[str, int]:
-    """按保留期清理原始数据库行。
-
-    刻意不触碰长期记忆：它的生命周期由 03:30 的记忆维护负责。
-    """
+    """按保留期清理原始数据库行；长期记忆归 03:30 的记忆维护管，这里不删。"""
 
     try:
         result = {
@@ -89,7 +84,6 @@ def _copy_data_to_staging(data_dir: Path, staging_dir: Path):
 
 
 def _backup_data_sync() -> bool:
-    """同步的备份执行函数"""
     data_dir = get_data_dir()
     backup_dir = BACKUP_DIR
 
@@ -145,7 +139,7 @@ def _clean_old_backups_sync():
 
 
 async def backup_task() -> bool:
-    """执行一次数据备份；仅备份文件创建成功时返回 ``True``。"""
+    """备份一次；备份文件写成功就返回 True，之后的保留期清理失败不影响结果。"""
 
     if not await asyncio.to_thread(_backup_data_sync):
         return False
@@ -153,14 +147,13 @@ async def backup_task() -> bool:
     try:
         await cleanup_raw_data_retention()
     except Exception as e:
-        # 备份文件已经成功落盘。Retention 是独立的后置维护任务，失败不应
-        # 把一次有效备份重新标记为失败，也不应阻止管理员随后执行 reset。
+        # 备份已经落盘，清理失败不算备份失败，也不该拦住随后的 reset
         logger.error(f"备份后清理原始数据库行失败: {e}")
     return True
 
 
 def setup_backup_job():
-    """注册定时备份（顺带清理保留期外的原始明细）"""
+    """每天 04:00 备份，顺带清理保留期外的原始明细。"""
 
     scheduler.add_job(
         backup_task,
@@ -168,7 +161,7 @@ def setup_backup_job():
         hour=4,
         minute=0,
         id="nyaturingtest_daily_backup",
-        misfire_grace_time=3600,  # 允许误差一小时（比如刚好四点时机器人没开机）
+        misfire_grace_time=3600,  # 四点刚好没开机的话，一小时内补跑
         replace_existing=True,
     )
     logger.info("已注册自动备份定时任务: 每天凌晨 04:00")

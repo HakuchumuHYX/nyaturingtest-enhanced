@@ -17,7 +17,7 @@ PAGE_WIDTH = 680
 PAGE_SCALE = 3
 AVATAR_TIMEOUT_SECONDS = 5.0
 _WEEKDAYS = "一二三四五六日"
-# 荧光笔颜色跟着关系档位走，档位见 prompts.describe_relation
+# 荧光笔颜色跟着关系档位走
 _HIGHLIGHTS = {
     "很讨厌": "#cfcfd4",
     "有点反感": "#b9d3ea",

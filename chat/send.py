@@ -114,7 +114,7 @@ async def dispatch_replies(
 ) -> int:
     if not replies:
         return 0
-    # 发言冷却在发送前等待，而不是在轮次开头跳过：对方秒回时不会因为冷却把对话掐断
+    # 发言冷却在发送前等：对方秒回时不会因为冷却把对话掐断
     since_last = (datetime.now() - session.state.last_speak_time).total_seconds()
     if since_last < SPEAK_COOLDOWN_SECONDS:
         await asyncio.sleep(SPEAK_COOLDOWN_SECONDS - since_last)

@@ -1,7 +1,6 @@
 """看群时机与说话门槛。
 
-一次 Feedback 就是「看一眼群」：读上次看过之后的全部未读，沉淀和「说不说」用同一次输出。
-本模块决定什么时候看：被点名、聊天对象在接话、被戳就马上看，否则按节奏攒着；以及这次开口的门槛。
+被点名、聊天对象在接话、被戳就马上看，否则按节奏攒着。
 被点名也不强制回：两个 Bot 互相回复时，只有 Feedback 看着发言量压低 willing 才停得下来。
 """
 
@@ -10,16 +9,15 @@ from enum import Enum
 
 from ..messages.message import ChatMessage
 
-# 两次发送之间的最小间隔（在发送前等待，不再跳过整轮）
+# 两次发送之间的最小间隔，在发送前等
 SPEAK_COOLDOWN_SECONDS = 16.0
 # 看群节奏：未读攒够这么多条，或有未读且距上次看群满这么久，就看一次；一次最多读这么多条
 LOOK_UNREAD_THRESHOLD = 8
 LOOK_INTERVAL_SECONDS = 180.0
 LOOK_MAX_MESSAGES = 60
-# 最近 SHORT_CONTEXT_LIMIT 条消息里自己的发言占比达到该值，就不再主动插嘴（被点名/聊天对象接话/被戳不受限）
+# 最近 SHORT_CONTEXT_LIMIT 条消息里自己的发言占比达到该值，就不主动插嘴（被点名/聊天对象接话/被戳不受限）
 SELF_SHARE_LIMIT = 0.2
-# Feedback willing 的开口门槛：被点名 / 聊天对象在接话或被戳 / 按节奏看群时主动插嘴。
-# 主动插嘴原为 0.6：试跑里「接得上但一般」的段落模型常给 0.42～0.55，卡在门槛下；先降到 0.5 跑几天看频率
+# Feedback willing 的开口门槛：被点名 / 聊天对象在接话或被戳 / 按节奏看群时主动插嘴
 SPEAK_THRESHOLD_ADDRESSED = 0.3
 SPEAK_THRESHOLD_CONVERSATION = 0.45
 SPEAK_THRESHOLD_PASSIVE = 0.5

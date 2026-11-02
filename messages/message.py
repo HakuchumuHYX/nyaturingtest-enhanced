@@ -14,19 +14,19 @@ class ChatMessage:
     content: str
     id: str = ""
     user_id: str = ""
-    # 原生多模态输入，仅当前进程短期持有；不序列化、不写数据库。
+    # 以下只在进程内用，不落库
     image_inputs: list[Any] = field(default_factory=list, repr=False, compare=False)
-    # 被 @ 和被回复的人（QQ 号 -> 群名片），让没发言的人也能在写记忆时挂上号；不落库
+    # 被 @ 和被回复的人（QQ 号 -> 群名片），让没发言的人也能在写记忆时挂上号
     mentions: dict[str, str] = field(default_factory=dict, repr=False, compare=False)
-    # 是否 @Bot 或回复了 Bot 的消息；只用于本轮相关性判断，不落库
+    # 是否 @Bot 或回复了 Bot 的消息；只用于本轮相关性判断
     to_me: bool = field(default=False, repr=False, compare=False)
-    # 戳一戳通知转成的记录；被戳不算点名，只让 bot 看一眼、自己决定理不理。不落库
+    # 戳一戳通知转成的记录；被戳不算点名，只让 bot 看一眼、自己决定理不理
     poke: bool = field(default=False, repr=False, compare=False)
-    # 合并转发：读完后内容是别人的聊天记录，里面出现 bot 的名字不算点名。不落库
+    # 合并转发：读完后内容是别人的聊天记录，里面出现 bot 的名字不算点名
     forward: bool = field(default=False, repr=False, compare=False)
-    # 后台看图的任务（convert.fill_caption）；处理这批消息前先等它们。不落库
+    # 后台看图的任务，处理这批消息前先等它们
     caption_tasks: list[Any] = field(default_factory=list, repr=False, compare=False)
-    # 群友自己说了东西（convert.read_message 按消息段算），只有这种才拿去检索记忆。不落库
+    # 群友自己说了东西，只有这种才拿去检索记忆
     substantive: bool = field(default=False, repr=False, compare=False)
     revision: int = field(default=0, repr=False, compare=False)
     _persistence_id: str = field(default="", repr=False, compare=False)
@@ -40,7 +40,7 @@ class ChatMessage:
 
 
 class Memory:
-    """短时消息窗口；话题摘要只存在 SessionState.chat_summary，这里不再保留副本。"""
+    """短时消息窗口。"""
 
     def __init__(self, messages: list[ChatMessage] | None = None):
         # 保留缓冲区，access 只返回最近 SHORT_CONTEXT_LIMIT 条
