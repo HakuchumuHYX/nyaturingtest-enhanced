@@ -22,12 +22,7 @@ from ..prompts import (  # noqa: E402
     is_rest_day,
 )
 from .domain import PersonProfile  # noqa: E402
-from .groups import (  # noqa: E402
-    GroupState,
-    group_states,
-    is_shutting_down,
-    runtime_enabled_groups,
-)
+from .groups import is_shutting_down, sessions  # noqa: E402
 from .orchestrator import (  # noqa: E402
     CHAT_TEMPERATURE,
     MY_RECENT_REPLIES_LIMIT,
@@ -35,6 +30,7 @@ from .orchestrator import (  # noqa: E402
     format_history,
 )
 from .send import dispatch_replies  # noqa: E402
+from .session import Session  # noqa: E402
 
 SCAN_INTERVAL_MINUTES = 10
 # 群里最后一条消息距今至少这么久才算冷场
@@ -60,12 +56,12 @@ def _in_window(now: datetime) -> bool:
     return any(start <= now.time() < end for start, end in windows)
 
 
-def _silence_minutes(group: GroupState, now: datetime) -> int | None:
+def _silence_minutes(session: Session, now: datetime) -> int | None:
     """最后一条是群友的消息时返回安静了多少分钟；没有消息或最后一条是自己说的返回 None，
     这样发起后没人理就一直等到有人说话，不会对着空气连说两次。"""
 
-    messages = group.session.short_term_memory.access()
-    if not messages or messages[-1].user_name == group.session.state.name:
+    messages = session.short_term_memory.access()
+    if not messages or messages[-1].user_name == session.state.name:
         return None
     return int((now - messages[-1].time).total_seconds() // 60)
 
@@ -80,32 +76,28 @@ async def scan_groups() -> None:
     now = datetime.now()
     if is_shutting_down() or not _in_window(now):
         return
-    for group_id in list(runtime_enabled_groups):
-        group = group_states.get(group_id)
-        # 本次启动后群里说过话才有 bot/event 可用来发送
+    for group_id, session in list(sessions.items()):
+        # 本次启动后群里说过话才有 bot/event 可用来发送；循环途中被停用的群不再发言
         if (
-            group is None
-            or group.bot is None
-            or group.event is None
-            or not group.session.state.loaded
-            or not group.session.state.name  # 没设人设不说话
+            sessions.get(group_id) is not session
+            or session.bot is None
+            or session.event is None
+            or not session.state.name  # 没设人设不说话
         ):
             continue
-        silence = _silence_minutes(group, now)
+        silence = _silence_minutes(session, now)
         if silence is None or silence < SILENCE_MINUTES or not _quota_left(group_id, now):
             continue
         if random.random() >= TRIGGER_PROBABILITY:
             continue
         _attempts[group_id].append(now)
         try:
-            await _initiate(group, silence)
+            await _initiate(session, silence)
         except Exception as e:
             logger.warning(f"群 {group_id} 主动发起话题失败: {e}")
 
 
-async def _initiate(group: GroupState, silence: int) -> None:
-    session = group.session
-    await group.load()
+async def _initiate(session: Session, silence: int) -> None:
     state = session.state
     generation = state.generation
 
@@ -169,14 +161,14 @@ async def _initiate(group: GroupState, silence: int) -> None:
         outcome = "stale"
     elif not content:
         outcome = "skipped_by_llm"
-    elif (_silence_minutes(group, datetime.now()) or 0) < SILENCE_MINUTES:
+    elif (_silence_minutes(session, datetime.now()) or 0) < SILENCE_MINUTES:
         outcome = "spoken_meanwhile"
     else:
         sent = await dispatch_replies(
-            group=group,
+            session=session,
             replies=[Reply(text=content)],
-            bot=group.bot,
-            event=group.event,
+            bot=session.bot,
+            event=session.event,
             generation=generation,
         )
         outcome = "sent" if sent else "send_failed"

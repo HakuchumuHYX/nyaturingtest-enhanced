@@ -8,11 +8,7 @@ from ..chat.session import Session
 from ..llm import chat_client
 from ..prompts import describe_relation, get_impression_prompt
 from ..storage.db import get_recent_messages_by_user
-from .vector import (
-    RAG_ITEM_CHARS,
-    RAG_MEMORY_CHAR_BUDGET,
-    RAG_MERGED_CANDIDATE_CAP,
-)
+from .vector import RAG_ITEM_CHARS, RAG_MEMORY_CHAR_BUDGET
 
 MEMORY_QUERY_USER_COOLDOWN_SECONDS = 30.0
 MEMORY_QUERY_GROUP_COOLDOWN_SECONDS = 3.0
@@ -167,7 +163,7 @@ async def _retrieve(
     days_since_first = (
         (datetime.now() - first_interaction_at).days if first_interaction_at else 0
     )
-    result = await vector_memory.retrieve_with_decay(
+    result = await vector_memory.retrieve(
         [
             f"关于{target_name}的记忆",
             f"我对{target_name}的看法",
@@ -176,8 +172,6 @@ async def _retrieve(
         ],
         k=calculate_dynamic_k(interactions, memory_count, days_since_first),
         user_ids={target_id, ""},
-        use_rerank=True,
-        merged_candidate_cap=RAG_MERGED_CANDIDATE_CAP,
         active_user_ids={target_id},
     )
 

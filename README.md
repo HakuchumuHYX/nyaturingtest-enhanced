@@ -97,8 +97,8 @@
 `chat` 和 `feedback` 的 `base_url`、`model` 必填，其余缺省有默认值。改配置后要重启。
 也可以用环境变量 `NYATURINGTEST_CONFIG_FILE` 指定别的配置文件，用 `NYATURINGTEST_DATA_DIR` 指定数据目录。
 
-**角色预设**放在 `config/nyaturingtest/nya_presets/*.json`，用 `/set_preset <文件名>` 加载。
-没设人设的群只记消息、不说话；目录里一个可用的人设文件都没有时，启动会报 warning。格式：
+**角色预设**放在 `config/nyaturingtest/nya_presets/*.json`。群里第一次 `/autochat enable <预设>` 时选定人设，之后换人设用 `/set_preset <文件名>`。
+预设文件被删或写坏时，这个群只记消息、不说话；目录里一个可用的人设文件都没有时，启动会报 warning。格式：
 
 ```json
 {
@@ -134,15 +134,14 @@
 
 | 命令 | 别名 | 说明 |
 | --- | --- | --- |
-| `/autochat enable` / `disable` | | 在本群启用或停用 |
+| `/autochat enable <预设>` / `disable` | | 在本群启用或停用。第一次启用要带预设；停用过的群再 `enable` 可以不带 |
 | `/查询记忆 [@某人]` | `/memory` | 看看它手账里关于某人的那一页（印象、记得的事、好感度），发图片，**所有群员都能用** |
 | `/群志` | `/group_notes` `/查看群志` | 把本群群志做成图片发出来；新记忆攒够 10 条会先整理一遍 |
-| `/status` | `/状态` | 当前状态、意愿值、队列和模型调用情况 |
+| `/status` | `/状态` | 当前状态、未读条数、队列和模型调用情况 |
 | `/presets` | `/preset` | 列出可用预设 |
 | `/set_preset <文件名>` | `/set_presets` | 加载预设 |
 | `/persona` | `/人设` | 把人生线、本群的它和最近的改动做成图片发出来 |
-| `/calm` | `/冷静` | 让它冷静下来：心情回到平静，暂时不主动说话 |
-| `/reset_emotion` | `/重置情绪` | 只重置心情，不动好感度 |
+| `/calm` | `/冷静` | 心情回到平静，退出当前对话 |
 | `/reset confirm` | `/重置 confirm` | 先备份，再清空本群的消息、记忆、档案、群志和群里的它，人设保留，**不可撤销** |
 | `/rag_debug <内容>` | `/记忆诊断` | 看某句话能检索出哪些记忆 |
 | `/token统计` | `/autochat token统计` | 当前 chat / feedback 模型的 Token 用量卡片 |

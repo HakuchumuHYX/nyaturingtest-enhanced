@@ -1,13 +1,15 @@
 import asyncio
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 
 from nonebot import logger
+from nonebot.adapters.onebot.v11 import Bot, Event
 
 from ..memory.vector import VectorMemory
 from ..messages.message import ChatMessage, Memory
 from ..metrics import log_event
-from ..prompts import PRESETS, reload_presets
+from ..prompts import PRESETS, resolve_preset
 from ..storage.db import (
     delete_session_data,
     load_full_session_data,
@@ -23,6 +25,8 @@ from .engagement import LOOK_MAX_MESSAGES
 # 后台任务排空超时、保存去抖
 MEMORY_DRAIN_TIMEOUT_SECONDS = 10.0
 SAVE_DEBOUNCE_SECONDS = 0.05
+# 待处理队列：满了丢最旧的，2s 防抖下几乎不可能积压到上限
+QUEUE_MAX_SIZE = 200
 
 
 @dataclass
@@ -51,12 +55,11 @@ class SessionState:
     # 已读水位：Feedback 读到的最后一条消息时间，之后的都是未读；见 chat/engagement.py
     last_read_time: datetime | None = None
     last_look_time: datetime = datetime.min
-    loaded: bool = False
     generation: int = 0
 
 
 class Session:
-    """群聊会话：领域状态 state，加上它持有的 I/O 资源与后台任务。"""
+    """群聊会话：领域状态 state，加上它持有的 I/O 资源、后台任务，以及 worker 的收件箱和冷却。"""
 
     def __init__(self, id: str):
         self.id = id
@@ -68,6 +71,22 @@ class Session:
         # 保存请求去抖 + 单飞：频繁的 schedule_save 合并成一次后台写库
         self._save_pending = False
         self._save_task: asyncio.Task | None = None
+
+        # 群 worker 任务，由 chat/groups.py 启动和取消
+        self.worker: asyncio.Task | None = None
+        # 最近一次收到消息时的 bot / event，worker 发送时用；启动后还没收到过就是 None
+        self.bot: Bot | None = None
+        self.event: Event | None = None
+        self.messages_chunk: deque[ChatMessage] = deque(maxlen=QUEUE_MAX_SIZE)
+        self.data_lock = asyncio.Lock()
+        # 管理命令（load_preset / reset / calm_down）之间互斥；
+        # 一轮对话不持锁，靠 generation 判断过期
+        self.admin_lock = asyncio.Lock()
+        self.new_message_signal = asyncio.Event()
+        # 贴表情、戳一戳、表情包的冷却只存内存，重启后重新计时
+        self.last_react_time: datetime = datetime.min
+        self.last_poke_time: datetime = datetime.min
+        self.last_sticker_time: datetime = datetime.min
 
     def bump_generation(self, reason: str) -> int:
         self.state.generation += 1
@@ -96,7 +115,7 @@ class Session:
     async def reset(self):
         generation = self.bump_generation("reset")
         # 重置的是本群的数据，不是换人：人设留着，群层随 delete_session_data 清掉
-        self.state = SessionState(loaded=True, generation=generation, preset=self.state.preset)
+        self.state = SessionState(generation=generation, preset=self.state.preset)
         self.short_term_memory.clear()
         await self.vector_memory.clear()
         # 清理数据库中的所有关联数据，并与后台持久化共用同一把锁：
@@ -108,17 +127,12 @@ class Session:
         logger.info(f"[Session {self.id}] 已完全重置（含数据库清理）")
 
     async def calm_down(self):
+        """心情回到基线、退出对话窗口；好感度是长期养成的，不在这里清"""
         self.bump_generation("calm_down")
         self.state.global_emotion = EmotionState()
         # 退出对话窗口
         self.state.last_speak_time = datetime.min
-        await self.save_session()
-
-    async def reset_emotion(self):
-        """仅把心情重置回基线；好感度是长期养成的，不在这里清"""
-        self.bump_generation("reset_emotion")
-        self.state.global_emotion = EmotionState()
-        logger.info(f"[Session {self.id}] 心情已重置")
+        logger.info(f"[Session {self.id}] 已冷静：心情重置、退出对话")
         await self.save_session()
 
     def spawn(self, coro) -> asyncio.Task:
@@ -199,14 +213,10 @@ class Session:
             return False
 
     async def load_session(self):
-        if self.state.loaded:
-            return
-
         data = await load_full_session_data(self.id)
 
         if not data:
             logger.info(f"[Session {self.id}] 初始化新会话")
-            self.state.loaded = True
             return
 
         session_db = data["session"]
@@ -250,14 +260,11 @@ class Session:
 
         self.short_term_memory = Memory(messages=data["messages"])
 
-        self.state.loaded = True
         logger.info(f"[Session {self.id}] 加载完成")
 
     async def load_preset(self, filename: str) -> bool:
-        reload_presets()
-        if not filename.endswith(".json") and f"{filename}.json" in PRESETS.keys():
-            filename = f"{filename}.json"
-        if filename not in PRESETS:
+        filename = resolve_preset(filename)
+        if filename is None:
             return False
 
         self.bump_generation("load_preset")
@@ -340,6 +347,20 @@ class Session:
         """已读水位之后的消息，最多 LOOK_MAX_MESSAGES 条（取最新的）。"""
 
         return self.short_term_memory.messages_after(self.state.last_read_time, LOOK_MAX_MESSAGES)
+
+    async def enqueue(self, message: ChatMessage, bot: Bot, event: Event) -> None:
+        """放进待处理队列并唤醒 worker。
+
+        同一条已在队列里就什么都不做：转发读得比防抖还快时占位还在队列里，改写过的内容会随那一轮一起处理。
+        """
+
+        async with self.data_lock:
+            if any(m is message for m in self.messages_chunk):
+                return
+            self.event = event
+            self.bot = bot
+            self.messages_chunk.append(message)
+            self.new_message_signal.set()
 
     async def drain_background_tasks(self):
         pending = [task for task in self.background_tasks if not task.done()]

@@ -14,8 +14,8 @@ from ..messages.faces import Reaction
 from ..messages.stickers import Sticker, mark_sent, pick
 from ..metrics import log_event
 from .engagement import SPEAK_COOLDOWN_SECONDS
-from .groups import GroupState
 from .orchestrator import Poke, Reply
+from .session import Session
 
 MAX_REPLY_MESSAGES = 2
 REACT_COOLDOWN_SECONDS = 60
@@ -51,7 +51,7 @@ def _delay_seconds(part: str) -> float:
 
 async def send_one(
     *,
-    group: GroupState,
+    session: Session,
     bot: Bot,
     event: Event,
     message: Message,
@@ -64,11 +64,11 @@ async def send_one(
         if isinstance(result, dict) and "message_id" in result:
             message_id = str(result["message_id"])
             SELF_SENT_MSG_IDS.append(message_id)
-        log_event("reply", session_id=group.session.id, content=memory_text)
+        log_event("reply", session_id=session.id, content=memory_text)
 
-        # 同步写入短时记忆，中间没有 await，不需要再拿 session_lock
-        if not group.session.stale(generation, "append_self_message"):
-            group.session.append_self_message(
+        # 同步写入短时记忆，中间没有 await，不需要再拿 admin_lock
+        if not session.stale(generation, "append_self_message"):
+            session.append_self_message(
                 memory_text,
                 message_id,
                 str(bot.self_id),
@@ -86,11 +86,11 @@ async def send_one(
 
 
 async def _pick_sticker(
-    group: GroupState, tag: str, want: str
+    session: Session, tag: str, want: str
 ) -> tuple[Sticker, float | None] | None:
     """挑一张要发的表情包和它的分数；冷却中或标签下没图返回 None。"""
 
-    since_last = (datetime.now() - group.last_sticker_time).total_seconds()
+    since_last = (datetime.now() - session.last_sticker_time).total_seconds()
     if since_last < STICKER_COOLDOWN_SECONDS:
         outcome = "cooldown"
     else:
@@ -99,14 +99,14 @@ async def _pick_sticker(
             return picked
         outcome = "empty"
     log_event(
-        "sticker", session_id=group.session.id, tag=tag, want=want, outcome=outcome
+        "sticker", session_id=session.id, tag=tag, want=want, outcome=outcome
     )
     return None
 
 
 async def dispatch_replies(
     *,
-    group: GroupState,
+    session: Session,
     replies: list[Reply],
     bot: Bot,
     event: Event,
@@ -115,10 +115,10 @@ async def dispatch_replies(
     if not replies:
         return 0
     # 发言冷却在发送前等待，而不是在轮次开头跳过：对方秒回时不会因为冷却把对话掐断
-    since_last = (datetime.now() - group.session.state.last_speak_time).total_seconds()
+    since_last = (datetime.now() - session.state.last_speak_time).total_seconds()
     if since_last < SPEAK_COOLDOWN_SECONDS:
         await asyncio.sleep(SPEAK_COOLDOWN_SECONDS - since_last)
-    if group.session.stale(generation, "pre_send"):
+    if session.stale(generation, "pre_send"):
         return 0
 
     total = len(replies)
@@ -136,7 +136,7 @@ async def dispatch_replies(
             ]
         if reply.sticker is not None and not sticker_requested:
             sticker_requested = True
-            picked = await _pick_sticker(group, *reply.sticker)
+            picked = await _pick_sticker(session, *reply.sticker)
             if picked is not None:
                 sticker = picked[0]
                 # sub_type=1 让 QQ 按表情包显示；SnowLuma 容器挂载了同一路径，直接给本地文件
@@ -146,13 +146,13 @@ async def dispatch_replies(
                 outgoing.append((Message(segment), f"[表情包: {sticker.caption}]", picked))
 
         for part_index, (message, memory_text, picked_sticker) in enumerate(outgoing):
-            if group.session.stale(generation, "send_loop"):
+            if session.stale(generation, "send_loop"):
                 break
             if reply.target_id is not None and reply_index == 0 and part_index == 0:
                 message.insert(0, MessageSegment.reply(reply.target_id))
 
             sent = await send_one(
-                group=group,
+                session=session,
                 bot=bot,
                 event=event,
                 message=message,
@@ -164,14 +164,14 @@ async def dispatch_replies(
                 if picked_sticker is None:
                     text_count += 1
                 else:
-                    group.last_sticker_time = datetime.now()
+                    session.last_sticker_time = datetime.now()
                     await mark_sent(picked_sticker[0])
             if picked_sticker is not None:
                 sticker, score = picked_sticker
                 tag, want = reply.sticker
                 log_event(
                     "sticker",
-                    session_id=group.session.id,
+                    session_id=session.id,
                     tag=tag,
                     want=want,
                     digest=sticker.digest[:8],
@@ -184,23 +184,23 @@ async def dispatch_replies(
                 await asyncio.sleep(_delay_seconds(memory_text))
 
     if sent_count:
-        group.session.state.last_speak_time = datetime.now()
-        group.session.schedule_save()
+        session.state.last_speak_time = datetime.now()
+        session.schedule_save()
     return sent_count
 
 
 async def send_reaction(
-    group: GroupState, bot: Bot, react: Reaction, generation: int
+    session: Session, bot: Bot, react: Reaction, generation: int
 ) -> None:
     """贴表情不等发言冷却；同一个群两次之间至少隔 REACT_COOLDOWN_SECONDS。"""
 
     now = datetime.now()
-    if (now - group.last_react_time).total_seconds() < REACT_COOLDOWN_SECONDS:
+    if (now - session.last_react_time).total_seconds() < REACT_COOLDOWN_SECONDS:
         outcome = "cooldown"
-    elif group.session.stale(generation, "react"):
+    elif session.stale(generation, "react"):
         return
     else:
-        group.last_react_time = now
+        session.last_react_time = now
         try:
             await bot.call_api(
                 "set_msg_emoji_like",
@@ -214,7 +214,7 @@ async def send_reaction(
             outcome = "failed"
     log_event(
         "react",
-        session_id=group.session.id,
+        session_id=session.id,
         target_id=react.target_id,
         emoji=react.name,
         emoji_id=react.emoji_id,
@@ -223,7 +223,7 @@ async def send_reaction(
 
 
 async def send_poke(
-    group: GroupState, bot: Bot, event: Event, target: Poke, generation: int
+    session: Session, bot: Bot, event: Event, target: Poke, generation: int
 ) -> None:
     """戳一戳不等发言冷却；同一个群两次之间至少隔 POKE_COOLDOWN_SECONDS。
 
@@ -233,12 +233,12 @@ async def send_poke(
     now = datetime.now()
     if target.user_id == str(bot.self_id):
         return
-    if (now - group.last_poke_time).total_seconds() < POKE_COOLDOWN_SECONDS:
+    if (now - session.last_poke_time).total_seconds() < POKE_COOLDOWN_SECONDS:
         outcome = "cooldown"
-    elif group.session.stale(generation, "poke"):
+    elif session.stale(generation, "poke"):
         return
     else:
-        group.last_poke_time = now
+        session.last_poke_time = now
         try:
             await bot.call_api(
                 "group_poke", group_id=event.group_id, user_id=int(target.user_id)
@@ -249,7 +249,7 @@ async def send_poke(
             outcome = "failed"
     log_event(
         "poke",
-        session_id=group.session.id,
+        session_id=session.id,
         user_id=target.user_id,
         outcome=outcome,
     )

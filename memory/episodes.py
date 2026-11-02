@@ -11,12 +11,8 @@ from nonebot import logger, require
 require("nonebot_plugin_apscheduler")
 from nonebot_plugin_apscheduler import scheduler  # noqa: E402  必须在 require 之后导入
 
-from ..chat.groups import (  # noqa: E402
-    GroupState,
-    group_states,
-    is_shutting_down,
-    runtime_enabled_groups,
-)
+from ..chat.groups import is_shutting_down, sessions  # noqa: E402
+from ..chat.session import Session  # noqa: E402
 from ..llm import feedback_client  # noqa: E402
 from ..messages.message import ChatMessage  # noqa: E402
 from ..metrics import log_event  # noqa: E402
@@ -92,11 +88,10 @@ def _episode_memories(
 
 
 async def _digest_batch(
-    group: GroupState, rows: list[GlobalMessageModel], trigger: str
+    session: Session, rows: list[GlobalMessageModel], trigger: str
 ) -> bool:
     """整理一批并推进水位；模型输出无效或会话已作废返回 False，水位不动，下轮重试。"""
 
-    session = group.session
     state = session.state
     generation = state.generation
     bot_name = state.name
@@ -192,29 +187,28 @@ async def _digest_batch(
     return True
 
 
-async def _digest_pending(group: GroupState) -> None:
+async def _digest_pending(session: Session) -> None:
     """水位之后的消息按批整理，直到剩下的还不够一段。"""
 
-    session_id = group.session.id
+    session_id = session.id
     while not is_shutting_down():
         until = (await SessionModel.get(id=session_id)).episodes_until
         query = GlobalMessageModel.filter(session_id=session_id)
         if until is not None:
             query = query.filter(time__gt=until)
         rows = await query.order_by("time").limit(SEGMENT_MAX_MESSAGES)
-        trigger = _trigger(rows, group.session.state.name, datetime.now())
-        if trigger is None or not await _digest_batch(group, rows, trigger):
+        trigger = _trigger(rows, session.state.name, datetime.now())
+        if trigger is None or not await _digest_batch(session, rows, trigger):
             return
 
 
 async def scan_groups() -> None:
-    for group_id in list(runtime_enabled_groups):
-        group = group_states.get(group_id)
-        # 用已加载的 vector_memory 写入，矩阵缓存才一致；没加载说明重启后还没人说话，也就没有新消息
-        if is_shutting_down() or group is None or not group.session.state.loaded:
+    for group_id, session in list(sessions.items()):
+        # 用会话自己的 vector_memory 写入，它的矩阵缓存才跟库一致；循环途中被停用的群不再整理
+        if is_shutting_down() or sessions.get(group_id) is not session:
             continue
         try:
-            await _digest_pending(group)
+            await _digest_pending(session)
         except Exception as e:
             logger.warning(f"群 {group_id} 分段整理失败: {e}")
 

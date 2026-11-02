@@ -1,6 +1,5 @@
 import asyncio
 import json
-from dataclasses import dataclass
 
 from nonebot import logger
 
@@ -30,14 +29,6 @@ def _format_value(value) -> str:
         return json.dumps(text, ensure_ascii=False)
     return text
 
-
-@dataclass
-class RuntimeMetrics:
-    llm_success: int = 0
-    llm_failure: int = 0
-
-
-metrics = RuntimeMetrics()
 
 _PENDING_USAGE_TASKS: set[asyncio.Task] = set()
 USAGE_DRAIN_TIMEOUT_SECONDS = 10.0

@@ -11,7 +11,7 @@ from nonebot import logger
 from openai import APIConnectionError, APITimeoutError, AsyncOpenAI
 
 from .config import EndpointSettings, get_app_settings
-from .metrics import log_event, metrics, record_token_usage
+from .metrics import log_event, record_token_usage
 from .prompts import JSON_SYSTEM_PROMPT
 
 
@@ -143,34 +143,6 @@ class LLMClient:
         self.provider_status.last_error_type = error_type
         self.provider_status.last_error_message = message[:300]
 
-    async def generate(
-        self,
-        prompt: str,
-        *,
-        session_id: str,
-        temperature: float,
-        system_prompt: str = JSON_SYSTEM_PROMPT,
-        images: list[VisionInput] | None = None,
-    ) -> str:
-        """返回模型文本；失败返回空串，原因记在 provider_status。"""
-
-        started_at = time.perf_counter()
-        content = await self._request(
-            prompt, session_id, temperature, system_prompt, images or []
-        )
-        if content:
-            metrics.llm_success += 1
-        else:
-            metrics.llm_failure += 1
-        log_event(
-            "llm_success" if content else "llm_failure",
-            "DEBUG" if content else "WARNING",
-            model=self.settings.model,
-            latency_ms=int((time.perf_counter() - started_at) * 1000),
-            decision="content" if content else self.provider_status.last_error_type,
-        )
-        return content
-
     async def generate_json(
         self,
         prompt: str,
@@ -180,14 +152,18 @@ class LLMClient:
         system_prompt: str = JSON_SYSTEM_PROMPT,
         images: list[VisionInput] | None = None,
     ) -> dict | None:
-        """返回模型输出的 JSON 对象；调用失败或输出不是对象返回 None。"""
+        """返回模型输出的 JSON 对象；调用失败或输出不是对象返回 None，原因记在 provider_status。"""
 
-        content = await self.generate(
-            prompt,
-            session_id=session_id,
-            temperature=temperature,
-            system_prompt=system_prompt,
-            images=images,
+        started_at = time.perf_counter()
+        content = await self._request(
+            prompt, session_id, temperature, system_prompt, images or []
+        )
+        log_event(
+            "llm_success" if content else "llm_failure",
+            "DEBUG" if content else "WARNING",
+            model=self.settings.model,
+            latency_ms=int((time.perf_counter() - started_at) * 1000),
+            decision="content" if content else self.provider_status.last_error_type,
         )
         return _parse_json_object(content) if content else None
 

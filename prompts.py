@@ -83,6 +83,16 @@ def reload_presets() -> None:
 # 启动时加载一次，命令执行时还会刷新以支持新增和修改文件。
 reload_presets()
 
+
+def resolve_preset(name: str) -> str | None:
+    """预设名转成文件名（可以省略 .json），找不到返回 None。每次都重新扫描目录。"""
+
+    reload_presets()
+    if not name.endswith(".json") and f"{name}.json" in PRESETS:
+        name = f"{name}.json"
+    return name if name in PRESETS else None
+
+
 DYNAMIC_INPUT_MARKER = "---- DYNAMIC INPUT ----"
 
 

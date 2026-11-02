@@ -13,8 +13,6 @@ from ..memory.vector import (
     RAG_FINAL_K,
     RAG_ITEM_CHARS,
     RAG_MEMORY_CHAR_BUDGET,
-    RAG_MERGED_CANDIDATE_CAP,
-    RAG_PER_QUERY_RECALL_K,
     RetrievedMemory,
 )
 from ..messages.faces import Reaction, reaction_emoji
@@ -526,13 +524,10 @@ async def search_stage(session: Session, unread: list[ChatMessage]) -> MemoryCon
     elif not user_ids:
         rag_stats["skip_reason"] = "no_users"
     else:
-        retrieval = await session.vector_memory.retrieve_with_decay(
+        retrieval = await session.vector_memory.retrieve(
             queries,
             k=RAG_FINAL_K,
             user_ids=user_ids,
-            use_rerank=True,
-            candidate_k=RAG_PER_QUERY_RECALL_K,
-            merged_candidate_cap=RAG_MERGED_CANDIDATE_CAP,
             active_user_ids=speaker_ids,
         )
         records = retrieval.records

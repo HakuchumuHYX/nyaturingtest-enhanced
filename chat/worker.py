@@ -10,9 +10,10 @@ from nonebot.adapters.onebot.v11 import Bot, Event
 from ..messages.message import ChatMessage
 from ..metrics import log_event
 from .engagement import seconds_until_look
-from .groups import GroupState, is_shutting_down
+from .groups import is_shutting_down
 from .orchestrator import process_chunk
 from .send import SELF_SENT_MSG_IDS, dispatch_replies, send_poke, send_reaction
+from .session import Session
 
 DEBOUNCE_SECONDS = 2.0
 # 一批消息处理前最多等多久图片描述；超时带着占位继续，描述出来后照样补上
@@ -27,32 +28,31 @@ class InboxBatch:
     event: Event
 
 
-async def next_inbox_batch(group: GroupState) -> InboxBatch | None:
+async def next_inbox_batch(session: Session) -> InboxBatch | None:
     """等到静默窗口结束，再一次性取走积压的消息。
 
     有未读时最多等到该看群的时候：群里安静下来，「距上次看群满 180s」早就成立了，只是没有新消息来触发检查。
     """
 
-    session = group.session
-    # 还没收到过消息就没有可用的 bot / event，不定时（/status 之类的命令也会加载会话）
+    # 启动后还没收到过消息就没有 bot / event，不定时
     timeout = None
-    if group.bot is not None and group.event is not None:
+    if session.bot is not None and session.event is not None:
         timeout = seconds_until_look(session.state, session.unread(), datetime.now())
     try:
-        await asyncio.wait_for(group.new_message_signal.wait(), timeout)
+        await asyncio.wait_for(session.new_message_signal.wait(), timeout)
     except asyncio.TimeoutError:
-        return InboxBatch(messages=[], bot=group.bot, event=group.event)
+        return InboxBatch(messages=[], bot=session.bot, event=session.event)
     await asyncio.sleep(DEBOUNCE_SECONDS)
-    group.new_message_signal.clear()
-    async with group.data_lock:
-        if group.bot is None or group.event is None or not group.messages_chunk:
+    session.new_message_signal.clear()
+    async with session.data_lock:
+        if session.bot is None or session.event is None or not session.messages_chunk:
             return None
         batch = InboxBatch(
-            messages=list(group.messages_chunk),
-            bot=group.bot,
-            event=group.event,
+            messages=list(session.messages_chunk),
+            bot=session.bot,
+            event=session.event,
         )
-        group.messages_chunk.clear()
+        session.messages_chunk.clear()
         return batch
 
 
@@ -70,28 +70,27 @@ def _filter_local_self_echoes(
     return filtered, local_echoes
 
 
-async def _process_inbox_batch(group: GroupState, batch: InboxBatch) -> None:
+async def _process_inbox_batch(session: Session, batch: InboxBatch) -> None:
     current_chunk = []
     if batch.messages:
-        current_chunk = await _prepare_messages(group, batch)
+        current_chunk = await _prepare_messages(session, batch)
         if not current_chunk:
             return
     if is_shutting_down():
         return
 
-    await group.load()
-    generation = group.session.state.generation
+    generation = session.state.generation
 
-    turn = await process_chunk(group.session, current_chunk, generation)
+    turn = await process_chunk(session, current_chunk, generation)
     if turn is None:
         return
 
     if turn.react is not None:
-        await send_reaction(group, batch.bot, turn.react, generation)
+        await send_reaction(session, batch.bot, turn.react, generation)
     if turn.poke is not None:
-        await send_poke(group, batch.bot, batch.event, turn.poke, generation)
+        await send_poke(session, batch.bot, batch.event, turn.poke, generation)
     await dispatch_replies(
-        group=group,
+        session=session,
         replies=turn.replies,
         bot=batch.bot,
         event=batch.event,
@@ -99,7 +98,7 @@ async def _process_inbox_batch(group: GroupState, batch: InboxBatch) -> None:
     )
 
 
-async def _prepare_messages(group: GroupState, batch: InboxBatch) -> list[ChatMessage]:
+async def _prepare_messages(session: Session, batch: InboxBatch) -> list[ChatMessage]:
     """滤掉自身回显、等这批图片描述、记 message 事件；全是自己发的就返回空。"""
 
     bot_self_id = str(batch.bot.self_id)
@@ -126,24 +125,24 @@ async def _prepare_messages(group: GroupState, batch: InboxBatch) -> list[ChatMe
         log_event(
             "message",
             "DEBUG",
-            session_id=group.session.id,
+            session_id=session.id,
             user=message.user_name,
             content=message.content,
         )
     return current_chunk
 
 
-async def run_worker(group: GroupState):
+async def run_worker(session: Session):
     """群 worker 的主循环：防抖取一批、跑一轮；单轮异常记日志后继续，不让任务退出。"""
 
     while True:
         try:
-            batch = await next_inbox_batch(group)
+            batch = await next_inbox_batch(session)
             if batch is None:
                 continue
-            await _process_inbox_batch(group, batch)
+            await _process_inbox_batch(session, batch)
         except asyncio.CancelledError:
-            logger.info(f"后台任务被取消: {id(group)}")
+            logger.info(f"群 {session.id} 的后台任务已取消")
             break
         except Exception as e:
             logger.exception(f"群 worker 异常: {e}")

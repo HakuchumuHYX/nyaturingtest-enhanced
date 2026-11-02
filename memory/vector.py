@@ -63,7 +63,7 @@ class RetrievedMemory:
     row: MemoryModel
     retrieval_score: float
     rerank_score: float | None = None
-    # 以下由 retrieve_with_decay 加权排序时填
+    # 以下由 retrieve 加权排序时填
     adjusted_score: float = 0.0
     scope: str = ""
 
@@ -100,30 +100,6 @@ def _retrieval_stats(
         "candidate_count": len(candidates),
         "returned_count": len(results),
         "fallback_reason": fallback_reason,
-    }
-
-
-def _score_distribution(values: list[float]) -> dict[str, float | None]:
-    """调整后分数的 min/p50/p90/max（最近秩法）。"""
-
-    if not values:
-        return {
-            "adjusted_score_min": None,
-            "adjusted_score_p50": None,
-            "adjusted_score_p90": None,
-            "adjusted_score_max": None,
-        }
-    ordered = sorted(values)
-    last = len(ordered) - 1
-
-    def nearest_rank(ratio: float) -> float:
-        return ordered[max(0, min(last, int(last * ratio + 0.5)))]
-
-    return {
-        "adjusted_score_min": ordered[0],
-        "adjusted_score_p50": nearest_rank(0.50),
-        "adjusted_score_p90": nearest_rank(0.90),
-        "adjusted_score_max": ordered[last],
     }
 
 
@@ -309,20 +285,21 @@ class VectorMemory:
             session_id=self.session_id, subject_user_id=user_id
         ).count()
 
-    async def _retrieve(
+    async def retrieve(
         self,
         queries: list[str],
         *,
         k: int,
-        user_ids: set[str] | None,
-        use_rerank: bool,
-        merged_candidate_cap: int | None,
+        user_ids: set[str] | None = None,
+        active_user_ids: set[str] = frozenset(),
     ) -> RetrievalResult:
-        """k 既是每条 query 的召回数，也是最终返回上限；rerank 接口失败时回退到初筛。
+        """检索后按时间衰减/类型/置信度/作用域加权排序，取前 k 条。
 
-        rerank 把候选全筛掉不回退：向量分在闲聊上挤在 0.5 上下分不出好坏，回退只会塞进 k 条无关记忆。
+        流程：按人过滤 → 每条 query 召回 RAG_PER_QUERY_RECALL_K 条 → 融合去重，截到 RAG_MERGED_CANDIDATE_CAP
+        → rerank 加阈值 → 加权排序取前 k。
 
         user_ids 不为 None 时只在参与者含这些人的记忆里找；带 "" 时参与者为空的记忆也算。
+        rerank 接口失败时回退到向量分；rerank 把候选全筛掉不回退：向量分在闲聊上挤在 0.5 上下分不出好坏，回退只会塞进无关记忆。
         """
 
         unique_queries = _dedupe_preserve_order([q for q in queries if q.strip()])
@@ -351,8 +328,8 @@ class VectorMemory:
                 )
                 scores[:, ~mask] = -np.inf
 
-            # 第一步：每条 query 取 top-k，多 query 命中同一条取最高分
-            top_n = min(max(1, k), len(self._ids))
+            # 第一步：每条 query 召回 top 条，多 query 命中同一条取最高分
+            top_n = min(RAG_PER_QUERY_RECALL_K, len(self._ids))
             best_by_index: dict[int, float] = {}
             for row_scores in scores:
                 for index in np.argpartition(-row_scores, top_n - 1)[:top_n]:
@@ -377,115 +354,72 @@ class VectorMemory:
                 candidate_by_content.values(),
                 key=lambda item: item.retrieval_score,
                 reverse=True,
-            )
-            if merged_candidate_cap is not None:
-                candidates = candidates[:merged_candidate_cap]
-
+            )[:RAG_MERGED_CANDIDATE_CAP]
             if not candidates:
                 return RetrievalResult([], _retrieval_stats([], []))
+
+            # 第二步：Rerank 加阈值，接口失败或未配置 rerank_model 时按向量分取前若干条。
+            # search_stage 已把最新有效消息排在第一位；summary query 只做补充召回。
             settings = get_app_settings()
-            if not use_rerank or not settings.rerank_model:
-                fallback = candidates[:k]
-                return RetrievalResult(
-                    fallback, _retrieval_stats(candidates, fallback, "rerank_disabled")
+            if not settings.rerank_model:
+                picked = candidates[:RAG_PER_QUERY_RECALL_K]
+                fallback_reason = "rerank_disabled"
+            else:
+                rerank_results = await _rerank(
+                    unique_queries[0], [item.row.content for item in candidates]
                 )
+                if not rerank_results:
+                    picked = candidates[:RAG_PER_QUERY_RECALL_K]
+                    fallback_reason = "rerank_api_empty"
+                else:
+                    picked = []
+                    for res in rerank_results:
+                        score = res.get("relevance_score", 0.0)
+                        if score < settings.rerank_threshold:
+                            continue
+                        item = candidates[res["index"]]
+                        item.rerank_score = score
+                        picked.append(item)
+                        if len(picked) >= RAG_PER_QUERY_RECALL_K:
+                            break
+                    if not picked:
+                        return RetrievalResult(
+                            [], _retrieval_stats(candidates, [], "rerank_all_filtered")
+                        )
+                    fallback_reason = "none"
 
-            # 第二步：Rerank。search_stage 已把最新有效消息排在第一位；summary query 只做补充召回。
-            rerank_results = await _rerank(
-                unique_queries[0], [item.row.content for item in candidates]
-            )
-            if not rerank_results:
-                fallback = candidates[:k]
-                return RetrievalResult(
-                    fallback, _retrieval_stats(candidates, fallback, "rerank_api_empty")
+            # 第三步：时间衰减与加权，取前 k
+            active_scope_ids = set(active_user_ids)
+            today_dt = datetime.now()
+            scope_counts: dict[str, int] = {}
+            for item in picked:
+                row = item.row
+                scope, scope_weight = _memory_scope(row, active_scope_ids, queries)
+                scope_counts[scope] = scope_counts.get(scope, 0) + 1
+
+                days_ago = max(0, (today_dt - _parse_date(row.date)).days)
+                decay_rate = MEMORY_TYPE_DECAY_RATE[row.category]
+                original_score = (
+                    item.retrieval_score if item.rerank_score is None else item.rerank_score
                 )
-
-            threshold = settings.rerank_threshold
-            final_results = []
-            for res in rerank_results:
-                score = res.get("relevance_score", 0.0)
-                if score < threshold:
-                    continue
-                item = candidates[res["index"]]
-                item.rerank_score = score
-                final_results.append(item)
-                if len(final_results) >= k:
-                    break
-
-            if not final_results:
-                return RetrievalResult(
-                    [], _retrieval_stats(candidates, [], "rerank_all_filtered")
+                item.adjusted_score = (
+                    original_score
+                    * math.exp(-decay_rate * days_ago)
+                    * MEMORY_TYPE_WEIGHT[row.category]
+                    * (0.7 + row.confidence * 0.3)
+                    * (1.0 + row.importance * 0.15)
+                    * scope_weight
                 )
-            return RetrievalResult(
-                final_results, _retrieval_stats(candidates, final_results)
-            )
+                item.scope = scope
+
+            final_results = sorted(picked, key=lambda x: x.adjusted_score, reverse=True)[:k]
+            stats = _retrieval_stats(candidates, final_results, fallback_reason)
+            stats["scope_counts"] = scope_counts
+            return RetrievalResult(final_results, stats)
 
         except Exception as e:
             logger.error(f"Vector retrieve failed: {e}")
             return RetrievalResult([], _retrieval_stats([], [], "retrieve_error"))
-
-    async def retrieve_with_decay(
-        self,
-        queries: list[str],
-        k: int = 5,
-        user_ids: set[str] | None = None,
-        use_rerank: bool = True,
-        candidate_k: int | None = None,
-        merged_candidate_cap: int | None = None,
-        active_user_ids: set[str] = frozenset(),
-    ) -> RetrievalResult:
-        """带时间衰减的检索：语义召回（每条 query 取 candidate_k），
-        再按衰减/类型/置信度/作用域加权排序取前 k。"""
-
-        active_scope_ids = set(active_user_ids)
-        retrieval_result = await self._retrieve(
-            queries,
-            k=candidate_k or k,
-            user_ids=user_ids,
-            use_rerank=use_rerank,
-            merged_candidate_cap=merged_candidate_cap,
-        )
-        raw_results = list(retrieval_result.records)
-        stats = {"use_rerank": use_rerank, **retrieval_result.stats}
-        if not raw_results:
-            return RetrievalResult([], stats)
-
-        # 时间衰减与加权
-        today_dt = datetime.now()
-        other_subject_downweighted_count = 0
-        scope_counts: dict[str, int] = {}
-
-        for item in raw_results:
-            row = item.row
-            scope, scope_weight = _memory_scope(row, active_scope_ids, queries)
-            scope_counts[scope] = scope_counts.get(scope, 0) + 1
-            if scope == "other_subject":
-                other_subject_downweighted_count += 1
-
-            days_ago = max(0, (today_dt - _parse_date(row.date)).days)
-            decay_rate = MEMORY_TYPE_DECAY_RATE.get(
-                row.category, MEMORY_TYPE_DECAY_RATE["event"]
-            )
-            original_score = (
-                item.retrieval_score if item.rerank_score is None else item.rerank_score
-            )
-            item.adjusted_score = (
-                original_score
-                * math.exp(-decay_rate * days_ago)
-                * MEMORY_TYPE_WEIGHT.get(row.category, 1.0)
-                * (0.7 + row.confidence * 0.3)
-                * (1.0 + row.importance * 0.15)
-                * scope_weight
-            )
-            item.scope = scope
-
-        sorted_results = sorted(raw_results, key=lambda x: x.adjusted_score, reverse=True)
-        final_results = sorted_results[:k]
-        stats.update(_score_distribution([item.adjusted_score for item in raw_results]))
-        stats["returned_count"] = len(final_results)
-        stats["other_subject_downweighted_count"] = other_subject_downweighted_count
-        stats["scope_counts"] = scope_counts
-        return RetrievalResult(final_results, stats)
 
     async def add_memories(
         self,

@@ -14,7 +14,7 @@ from nonebot.adapters.onebot.v11 import Bot, Event
 from nonebot.adapters.onebot.v11.exception import ActionFailed
 from nonebot.exception import NetworkError
 
-from ..chat.groups import GroupState
+from ..chat.session import Session
 from ..llm import VisionInput, feedback_client
 from ..metrics import log_event
 from ..prompts import get_forward_prompt
@@ -105,7 +105,7 @@ async def _expand(bot: Bot, forward_id: str, depth: int, out: _Expansion) -> int
 
 
 async def digest_forward(
-    group: GroupState,
+    session: Session,
     bot: Bot,
     event: Event,
     message: ChatMessage,
@@ -114,7 +114,6 @@ async def digest_forward(
 ) -> None:
     """读完一份转发，把占位改写成摘要，再放回队列触发一轮。"""
 
-    session = group.session
     started_at = time.perf_counter()
     out = _Expansion()
     node_count = 0
@@ -146,7 +145,7 @@ async def digest_forward(
             message.content = f"[合并转发 {node_count}条（{FORWARD_NOTE}）: {summary}]"
             session.short_term_memory.move_to_latest(message)
             session.schedule_save()
-            await group.enqueue(message, bot, event)
+            await session.enqueue(message, bot, event)
             outcome = "ok"
     except (ActionFailed, NetworkError) as e:
         logger.warning(f"[Forward] 群 {session.id} 拉取转发内容失败，留着占位: {e}")

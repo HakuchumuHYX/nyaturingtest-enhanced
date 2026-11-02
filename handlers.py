@@ -30,21 +30,16 @@ from .chat.engagement import unread_count
 from .chat.groups import (
     disable_autochat,
     enable_autochat,
+    get_session,
     is_shutting_down,
-    loaded_group_state,
-    runtime_enabled_groups,
+    sessions,
 )
 from .config import get_app_settings, get_token_stats_model_names
 from .llm import chat_client, feedback_client
 from .memory.digest import GROUP_NOTES_REFRESH_MIN_NEW, count_new_group_fragments
 from .memory.maintenance import refresh_group_notes
 from .memory.query import acquire_query_slot, impression_text, query_memory_profile
-from .memory.vector import (
-    RAG_FINAL_K,
-    RAG_MERGED_CANDIDATE_CAP,
-    RAG_PER_QUERY_RECALL_K,
-    RetrievedMemory,
-)
+from .memory.vector import RAG_FINAL_K, RetrievedMemory
 from .messages.convert import (
     forward_id,
     member_name,
@@ -57,8 +52,7 @@ from .messages.forward import digest_forward
 from .messages.image import fetch_image_input
 from .messages.stickers import block as block_sticker
 from .metrics import log_event
-from .metrics import metrics
-from .prompts import PRESETS, reload_presets
+from .prompts import PRESETS, reload_presets, resolve_preset
 from .storage.backup import backup_task
 from .storage.db import get_token_stats, recall_message
 from .storage.models import PersonaHistoryModel, SessionModel
@@ -84,8 +78,7 @@ COMMANDS: tuple[CommandMeta, ...] = (
     CommandMeta("persona", "查看人生线、本群的她和最近的改动", "persona <群号>"),
     CommandMeta("rag_debug <query>", "诊断 RAG 记忆检索"),
     CommandMeta("group_notes", "查看本群群志原文", "group_notes <群号>"),
-    CommandMeta("calm", "冷静并重置短期状态", "calm <群号>"),
-    CommandMeta("reset_emotion", "仅重置心情（不动好感度）", "reset_emotion <群号>"),
+    CommandMeta("calm", "重置心情并退出当前对话", "calm <群号>"),
     CommandMeta("reset confirm", "先备份再完全重置本群", "reset <群号> confirm"),
     CommandMeta("token统计", "查看当前 chat / feedback 模型的 Token 用量"),
     CommandMeta("stickerdel", "回复一张图：从表情包库删掉并拉黑，以后只描述不收"),
@@ -135,11 +128,20 @@ async def _group_name(group_id: int) -> str:
     return group_info.get("group_name") or f"群 {group_id}"
 
 
-async def _group_state_or_finish(matcher: type[Matcher], group_id: int):
-    group = await loaded_group_state(group_id)
-    if not group:
+async def _session_or_finish(matcher: type[Matcher], group_id: int):
+    session = get_session(group_id)
+    if session is None:
         await matcher.finish("本群 Autochat 未启用，请先使用 autochat enable")
-    return group
+    return session
+
+
+def _preset_list() -> str:
+    reload_presets()
+    return "可选的预设:\n" + "".join(
+        f"- {filename}: {preset.name} {preset.seed.split('。')[0]}\n"
+        for filename, preset in PRESETS.items()
+        if not preset.hidden
+    )
 
 
 def _dual_command(cmd: str, aliases: set[str], handler):
@@ -184,10 +186,9 @@ auto_chat = on_message(rule=is_group_message, priority=99, block=False)
 @auto_chat.handle()
 async def handle_auto_chat(bot: Bot, event: GroupMessageEvent):
     group_id = event.group_id
-    group = await loaded_group_state(group_id)
-    if not group:
+    session = get_session(group_id)
+    if session is None:
         return
-    session = group.session
     generation = session.state.generation
 
     # Shutdown 检查：避免在关机时进入耗时的消息处理
@@ -201,11 +202,11 @@ async def handle_auto_chat(bot: Bot, event: GroupMessageEvent):
     if message.forward and session.state.name:
         session.spawn(
             digest_forward(
-                group, bot, event, message, forward_id(event.original_message), generation
+                session, bot, event, message, forward_id(event.original_message), generation
             )
         )
 
-    await group.enqueue(message, bot, event)
+    await session.enqueue(message, bot, event)
 
 
 async def is_emoji_like_added(event: Event) -> bool:
@@ -228,11 +229,10 @@ async def handle_emoji_like(bot: Bot, event: NoticeEvent):
     # 自己贴的表情也会上报
     if user_id == str(bot.self_id) or is_shutting_down():
         return
-    group = await loaded_group_state(group_id)
-    if not group:
+    session = get_session(group_id)
+    if session is None:
         return
 
-    session = group.session
     message_id = str(data["message_id"])
     # 只关心 bot 自己的消息；群友互相贴的、太旧不在短期记忆里的都不管
     target = next(
@@ -266,16 +266,16 @@ async def handle_group_poke(bot: Bot, event: PokeNotifyEvent):
 
     if is_shutting_down():
         return
-    group = await loaded_group_state(event.group_id)
-    if not group:
+    session = get_session(event.group_id)
+    if session is None:
         return
 
-    message = await read_poke(bot, event, group.session.state.name)
+    message = await read_poke(bot, event, session.state.name)
     if message.user_id == str(bot.self_id):
         # bot 自己戳的：和自己发的消息一样直接进短期记忆，不触发新一轮
-        group.session.append_self_message(message.content, "", message.user_id)
+        session.append_self_message(message.content, "", message.user_id)
         return
-    await group.enqueue(message, bot, event)
+    await session.enqueue(message, bot, event)
 
 
 async def is_group_recall(event: Event) -> bool:
@@ -294,23 +294,23 @@ async def handle_group_recall(event: GroupRecallNoticeEvent):
 
     if is_shutting_down():
         return
-    group = await loaded_group_state(event.group_id)
-    if not group:
+    session = get_session(event.group_id)
+    if session is None:
         return
 
     msg_id = str(event.message_id)
     by_author = event.operator_id == event.user_id
     content = recall_text(by_author)
-    async with group.data_lock:
-        queued = [m for m in group.messages_chunk if m.id == msg_id]
+    async with session.data_lock:
+        queued = [m for m in session.messages_chunk if m.id == msg_id]
         for message in queued:
             message.recall(content)
-    in_buffer = group.session.recall_message(msg_id, content)
-    await recall_message(group.session.id, msg_id, content)
+    in_buffer = session.recall_message(msg_id, content)
+    await recall_message(session.id, msg_id, content)
     log_event(
         "recall",
         "DEBUG",
-        session_id=group.session.id,
+        session_id=session.id,
         by_author=by_author,
         queued=bool(queued),
         in_buffer=in_buffer,
@@ -351,10 +351,10 @@ list_groups_pm = on_command(
 
 @list_groups_pm.handle()
 async def handle_list_groups_pm():
-    if not runtime_enabled_groups:
+    if not sessions:
         await list_groups_pm.finish("没有启用的群组")
     msg = "启用的群组:\n" + "".join(
-        f"- {group_id}\n" for group_id in runtime_enabled_groups
+        f"- {group_id}\n" for group_id in sessions
     )
     await list_groups_pm.finish(msg)
 
@@ -386,34 +386,52 @@ manage_cmd = on_command(
 async def handle_manage_autochat(
     event: GroupMessageEvent, args: Message = CommandArg()
 ):
-    arg = args.extract_plain_text().strip().lower()
+    parts = args.extract_plain_text().split(maxsplit=1)
+    sub = parts[0].lower() if parts else ""
+    # 预设名是文件名，保留大小写
+    preset_arg = parts[1].strip() if len(parts) > 1 else ""
     group_id = event.group_id
 
-    if arg == "enable":
-        if group_id in runtime_enabled_groups:
-            await manage_cmd.finish("本群 Autochat 已处于启用状态")
+    if sub == "enable":
+        if group_id in sessions:
+            hint = "\n换人设请用 set_preset <文件名>" if preset_arg else ""
+            await manage_cmd.finish(f"本群 Autochat 已处于启用状态{hint}")
+        # 第一次启用必须选人设：没设过的群启用后会照常记消息、跑整理，却不说话
+        if preset_arg:
+            filename = resolve_preset(preset_arg)
+            if filename is None:
+                await manage_cmd.finish(f"不存在的预设: {preset_arg}\n{_preset_list()}")
+            await enable_autochat(group_id, filename)
+            await manage_cmd.finish(f"Autochat 已在本群启用，人设：{filename}")
+        session_db = await SessionModel.get_or_none(id=str(group_id))
+        if session_db is None or not session_db.preset:
+            await manage_cmd.finish(
+                "第一次启用要先选人设。\n"
+                f"{_preset_list()}"
+                "用法: autochat enable <预设>"
+            )
         await enable_autochat(group_id)
-        await manage_cmd.finish("Autochat 已在本群启用 (已保存至数据库)")
+        await manage_cmd.finish(f"Autochat 已在本群启用，人设：{session_db.preset}")
 
-    elif arg == "disable":
-        if group_id not in runtime_enabled_groups:
+    elif sub == "disable":
+        if group_id not in sessions:
             await manage_cmd.finish("本群 Autochat 未启用")
         await disable_autochat(group_id)
         await manage_cmd.finish("Autochat 已在本群禁用")
 
     else:
         await manage_cmd.finish(
-            "指令格式错误。请使用: autochat enable 或 autochat disable"
+            "指令格式错误。请使用: autochat enable [预设] 或 autochat disable"
         )
 
 
 async def _do_status(matcher: type[Matcher], group_id: int, _args: str):
-    group = await _group_state_or_finish(matcher, group_id)
-    state = group.session.state
+    session = await _session_or_finish(matcher, group_id)
+    state = session.state
     state.global_emotion.settle()
     emotion = state.global_emotion
     recent = "\n".join(
-        f"{m.user_name}: {m.content}" for m in group.session.short_term_memory.access()
+        f"{m.user_name}: {m.content}" for m in session.short_term_memory.access()
     )
     last_look = "（本次启动还没看过）"
     if state.last_look_time != datetime.min:
@@ -422,9 +440,9 @@ async def _do_status(matcher: type[Matcher], group_id: int, _args: str):
     lines = [
         "",
         f"人设：{state.preset or '未设（不说话）'}",
-        f"未读：{unread_count(state, group.session.unread())} 条，上次看群 {last_look}",
+        f"未读：{unread_count(state, session.unread())} 条，上次看群 {last_look}",
         f"心情：V{emotion.valence:.2f} A{emotion.arousal:.2f} D{emotion.dominance:.2f}",
-        f"后台任务数: {len(group.session.background_tasks)}",
+        f"后台任务数: {len(session.background_tasks)}",
         f"摘要：{state.chat_summary}",
         "最近消息：",
         recent or "无",
@@ -432,8 +450,7 @@ async def _do_status(matcher: type[Matcher], group_id: int, _args: str):
         "Provider:",
         f"- Chat reasoning_effort: {settings.chat.reasoning_effort or '未指定（由上游决定）'}",
         f"- Feedback reasoning_effort: {settings.feedback.reasoning_effort or '未指定（由上游决定）'}",
-        f"- Queue length: {len(group.messages_chunk)}",
-        f"- Metrics: llm={metrics.llm_success}/{metrics.llm_failure}",
+        f"- Queue length: {len(session.messages_chunk)}",
     ]
     for name, client in (("Chat", chat_client), ("Feedback", feedback_client)):
         provider_status = client.provider_status
@@ -450,14 +467,8 @@ get_status = _dual_command("status", {"状态"}, _do_status)
 
 
 async def _do_get_presets(matcher: type[Matcher], group_id: int, _args: str):
-    await _group_state_or_finish(matcher, group_id)
-    reload_presets()
-    msg = "可选的预设:\n" + "".join(
-        f"- {filename}: {preset.name} {preset.seed.split('。')[0]}\n"
-        for filename, preset in PRESETS.items()
-        if not preset.hidden
-    )
-    await matcher.finish(msg + "使用方法: set_presets <预设名称>\n")
+    await _session_or_finish(matcher, group_id)
+    await matcher.finish(_preset_list() + "使用方法: set_presets <预设名称>\n")
 
 
 get_presets = _dual_command("presets", {"preset"}, _do_get_presets)
@@ -466,9 +477,9 @@ get_presets = _dual_command("presets", {"preset"}, _do_get_presets)
 async def _do_set_presets(matcher: type[Matcher], group_id: int, args: str):
     if not args:
         await matcher.finish("请提供<预设文件名>")
-    group = await _group_state_or_finish(matcher, group_id)
-    async with group.session_lock:
-        loaded = await group.session.load_preset(filename=args)
+    session = await _session_or_finish(matcher, group_id)
+    async with session.admin_lock:
+        loaded = await session.load_preset(filename=args)
     await matcher.finish(f"预设已加载: {args}" if loaded else f"不存在的预设: {args}")
 
 
@@ -476,8 +487,8 @@ set_presets = _dual_command("set_preset", {"set_presets"}, _do_set_presets)
 
 
 async def _do_persona(matcher: type[Matcher], group_id: int, _args: str):
-    group = await _group_state_or_finish(matcher, group_id)
-    state = group.session.state
+    session = await _session_or_finish(matcher, group_id)
+    state = session.state
     preset, name = state.preset, state.name
     self_life, self_in_group = state.self_life, state.self_in_group
     if not name:
@@ -521,7 +532,7 @@ get_persona = _dual_command("persona", {"人设"}, _do_persona)
 
 
 async def _do_group_notes(matcher: type[Matcher], group_id: int, _args: str):
-    await _group_state_or_finish(matcher, group_id)
+    await _session_or_finish(matcher, group_id)
     pending = await count_new_group_fragments(str(group_id))
     if pending >= GROUP_NOTES_REFRESH_MIN_NEW:
         await matcher.send(f"有 {pending} 条新记忆还没整理进群志，正在整理，稍等一下")
@@ -550,23 +561,13 @@ get_group_notes = _dual_command("group_notes", {"群志", "查看群志"}, _do_g
 
 
 async def _do_calm_down(matcher: type[Matcher], group_id: int, _args: str):
-    group = await _group_state_or_finish(matcher, group_id)
-    async with group.session_lock:
-        await group.session.calm_down()
+    session = await _session_or_finish(matcher, group_id)
+    async with session.admin_lock:
+        await session.calm_down()
     await matcher.finish("已老实")
 
 
 calm_down = _dual_command("calm", {"冷静"}, _do_calm_down)
-
-
-async def _do_reset_emotion(matcher: type[Matcher], group_id: int, _args: str):
-    group = await _group_state_or_finish(matcher, group_id)
-    async with group.session_lock:
-        await group.session.reset_emotion()
-    await matcher.finish("心情已重置")
-
-
-reset_emotion = _dual_command("reset_emotion", {"重置情绪"}, _do_reset_emotion)
 
 
 async def _do_reset(matcher: type[Matcher], group_id: int, args: str):
@@ -574,15 +575,15 @@ async def _do_reset(matcher: type[Matcher], group_id: int, args: str):
         await matcher.finish(
             "危险操作：将清空本群会话、记忆和画像。确认执行请发送：reset confirm"
         )
-    group = await _group_state_or_finish(matcher, group_id)
+    session = await _session_or_finish(matcher, group_id)
     await matcher.send("即将重置，会先执行一次数据备份...")
-    # 先作废进行中的 turn 再备份；备份刻意放在 session_lock 之外：它可能长时间打包整个数据目录
-    async with group.session_lock:
-        group.session.bump_generation("reset_requested")
+    # 先作废进行中的 turn 再备份；备份刻意放在 admin_lock 之外：它可能长时间打包整个数据目录
+    async with session.admin_lock:
+        session.bump_generation("reset_requested")
     if not await backup_task():
         await matcher.finish("备份失败，已中止重置；会话、记忆和画像均未清除。")
-    async with group.session_lock:
-        await group.session.reset()
+    async with session.admin_lock:
+        await session.reset()
     await matcher.finish("已重置会话")
 
 
@@ -697,15 +698,9 @@ async def handle_rag_debug(
     query = args.extract_plain_text().strip()
     if not query:
         await rag_debug.finish("用法: rag_debug <query>")
-    group = await _group_state_or_finish(rag_debug, event.group_id)
+    session = await _session_or_finish(rag_debug, event.group_id)
 
-    result = await group.session.vector_memory.retrieve_with_decay(
-        [query],
-        k=RAG_FINAL_K,
-        use_rerank=True,
-        candidate_k=RAG_PER_QUERY_RECALL_K,
-        merged_candidate_cap=RAG_MERGED_CANDIDATE_CAP,
-    )
+    result = await session.vector_memory.retrieve([query], k=RAG_FINAL_K)
     lines = [
         "RAG debug",
         f"query: {query}",
@@ -749,8 +744,8 @@ async def handle_query_memory(
         if segment.type == "at" and str(segment.data.get("qq", "")):
             target_id = str(segment.data["qq"])
             break
-    group = await loaded_group_state(event.group_id)
-    if not group:
+    session = get_session(event.group_id)
+    if session is None:
         await query_memory.finish("本群尚未启用 AI 功能。")
     target_name = await member_name(bot, event.group_id, target_id) or target_id
 
@@ -763,7 +758,7 @@ async def handle_query_memory(
 
     try:
         page = await query_memory_profile(
-            group.session,
+            session,
             target_id=target_id,
             target_name=target_name,
             sender_id=str(event.user_id),
