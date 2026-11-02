@@ -27,5 +27,10 @@
         "timeout": 10,
         "threshold": 0.1
     },
+    "web_search": {
+        "api_key": "YOUR_DEEPSEEK_API_KEY",
+        "base_url": "https://api.deepseek.com/v1/tools",
+        "timeout": 5
+    },
     "playwright_browsers_path": ""
 }

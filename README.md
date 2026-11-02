@@ -92,6 +92,7 @@
 | `siliconflow_api_key` | Embedding 和 Rerank 共用的 Key |
 | `embedding` | 记忆检索用的向量模型 |
 | `rerank` | 检索结果重排，`threshold` 以下的结果丢弃 |
+| `web_search` | 联网搜索（DeepSeek Search），`api_key` 留空就不搜 |
 | `playwright_browsers_path` | 卡片截图用的 Chromium 所在目录，留空用 playwright 默认位置 |
 
 `chat` 和 `feedback` 的 `base_url`、`model` 必填，其余缺省有默认值。改配置后要重启。

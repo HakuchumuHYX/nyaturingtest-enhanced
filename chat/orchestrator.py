@@ -1,13 +1,15 @@
 """一轮对话的编排：短时记忆 → 看不看群 → RAG → Feedback（沉淀 + 说不说）→ Chat。"""
 
 import math
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 from nonebot import logger
 
-from ..llm import chat_client, feedback_client
+from ..config import get_app_settings
+from ..llm import chat_client, feedback_client, web_search
 from ..memory.candidates import clamp01, save_memory_candidates
 from ..memory.vector import (
     RAG_FINAL_K,
@@ -82,6 +84,8 @@ class FeedbackOutput:
     poke: Poke | None
     # 角色想接的那条（不会是她自己的）；Chat 回应它、附它的图，聊天对象也按它定
     focus: ChatMessage | None
+    # 开口前要上网查的词；没开联网搜索时提示词里没有这一项，总是 None
+    web_query: str | None
 
 
 @dataclass(frozen=True)
@@ -329,6 +333,8 @@ def parse_feedback(
 
     summary = data.get("summary")
     corrections = data.get("corrections")
+    web_query = data.get("web_query")
+    web_query = web_query.strip() if isinstance(web_query, str) else ""
     return FeedbackOutput(
         emotion=emotion,
         willing=clamp01(data.get("willing"), 0.0),
@@ -341,6 +347,7 @@ def parse_feedback(
         react=_parse_reaction(data.get("react"), unread, state.name),
         poke=_parse_poke(data.get("poke"), unread, state.name),
         focus=_parse_focus(data.get("focus"), unread, state.name),
+        web_query=web_query or None,
     )
 
 
@@ -472,6 +479,13 @@ async def _look(
     if not speak:
         return TurnResult(replies=[], react=react, poke=poke)
 
+    # 决定开口了才搜：不开口就用不上，也不花钱
+    web_results = []
+    if feedback is not None and feedback.web_query:
+        # 方括号里是图片描述、回复引用这类标记，不是群友问的话
+        ori_question = re.sub(r"\[[^\]]*\]", "", focus.content).strip() if focus else ""
+        web_results = await web_search(feedback.web_query, ori_question, session_id=session.id)
+
     replies = await chat_stage(
         session,
         unread,
@@ -479,6 +493,7 @@ async def _look(
         focus,
         need_history=feedback is not None and feedback.need_history,
         memories=memories,
+        web_results=web_results,
         generation=generation,
     )
     if session.stale(generation, "chat"):
@@ -587,6 +602,7 @@ async def _ask_feedback(
             ),
             state.name,
         ),
+        web_search=bool(get_app_settings().web_search.api_key),
     )
     data = await feedback_client.generate_json(
         prompt,
@@ -676,6 +692,7 @@ async def chat_stage(
     *,
     need_history: bool,
     memories: MemoryContext,
+    web_results: list[str],
     generation: int,
 ) -> list[Reply]:
     state = session.state
@@ -725,6 +742,7 @@ async def chat_stage(
         group_notes=state.group_notes,
         recalled_history=recalled_str,
         my_recent_replies=my_recent_replies,
+        web_results=web_results,
         time_info=get_time_description(datetime.now()),
     )
     log_event(
@@ -742,6 +760,7 @@ async def chat_stage(
         + sum(len(item["content"]) for item in recent_msgs),
         recent_chars=sum(len(item["content"]) for item in new_msgs),
         recalled_history_chars=len(recalled_str),
+        web_results_chars=sum(len(item) for item in web_results),
         persona_chars=len(state.self_life) + len(state.self_in_group),
     )
 

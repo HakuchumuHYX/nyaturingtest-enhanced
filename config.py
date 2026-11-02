@@ -49,12 +49,21 @@ class MemoryEndpointSettings:
 
 
 @dataclass(frozen=True)
+class WebSearchSettings:
+    api_key: str
+    # DeepSeek Search API 的前缀，请求时再接 /search
+    base_url: str
+    timeout: float
+
+
+@dataclass(frozen=True)
 class AppSettings:
     chat: EndpointSettings
     feedback: EndpointSettings
     rerank_model: str
     rerank_threshold: float
     memory: MemoryEndpointSettings
+    web_search: WebSearchSettings
     siliconflow_api_key: str
     playwright_browsers_path: str
 
@@ -87,6 +96,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "base_url": "https://api.siliconflow.cn/v1/rerank",
         "timeout": 10,
         "threshold": 0.1,
+    },
+    "web_search": {
+        "api_key": "",
+        "base_url": "https://api.deepseek.com/v1/tools",
+        "timeout": 5,
     },
     # 群志卡片截图用的 Chromium 目录；留空用 playwright 默认位置
     "playwright_browsers_path": "",
@@ -126,6 +140,7 @@ def build_settings(config: dict[str, Any]) -> AppSettings:
     cfg = _deep_merge(DEFAULT_CONFIG, config)
     embedding = cfg["embedding"]
     rerank = cfg["rerank"]
+    web_search = cfg["web_search"]
     return AppSettings(
         chat=_endpoint(cfg, "chat"),
         feedback=_endpoint(cfg, "feedback"),
@@ -137,6 +152,11 @@ def build_settings(config: dict[str, Any]) -> AppSettings:
             timeout=float(embedding["timeout"]),
             rerank_base_url=str(rerank["base_url"]).rstrip("/"),
             rerank_timeout=float(rerank["timeout"]),
+        ),
+        web_search=WebSearchSettings(
+            api_key=str(web_search["api_key"] or ""),
+            base_url=_require(web_search, "web_search", "base_url").rstrip("/"),
+            timeout=float(web_search["timeout"]),
         ),
         siliconflow_api_key=str(cfg["siliconflow_api_key"] or ""),
         playwright_browsers_path=str(cfg["playwright_browsers_path"] or ""),
@@ -153,6 +173,8 @@ def _load_settings() -> AppSettings:
             f"{name}: model={endpoint.model}, base_url={endpoint.base_url}, "
             f"api_key={key_state}"
         )
+    key_state = "set" if settings.web_search.api_key else "missing"
+    logger.info(f"web_search: base_url={settings.web_search.base_url}, api_key={key_state}")
     return settings
 
 

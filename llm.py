@@ -178,7 +178,8 @@ class LLMClient:
             user_content = [{"type": "text", "text": prompt}]
             for image in images:
                 user_content.extend(image.to_openai_content())
-        extra = {}
+        # 按群固定：grok 按这个值把请求分到同一台机器，前缀缓存才命中；不传时每次请求分到哪台都不定，线上量小几乎命中不了
+        extra: dict[str, Any] = {"prompt_cache_key": f"nyaturingtest-{session_id}"}
         if self.settings.reasoning_effort:
             extra["reasoning_effort"] = self.settings.reasoning_effort
 
@@ -251,6 +252,55 @@ class LLMClient:
 # 所有群共用：限流与熔断本来就是按 API key 算的
 chat_client = LLMClient(get_app_settings().chat)
 feedback_client = LLMClient(get_app_settings().feedback)
+
+WEB_SEARCH_COUNT = 5
+WEB_RESULT_CHARS = 400
+
+
+async def web_search(query: str, ori_question: str, *, session_id: str) -> list[str]:
+    """DeepSeek Search，每条结果一行「标题（站点，日期）：摘要」；失败当没搜到，Chat 照常回。"""
+
+    settings = get_app_settings().web_search
+    body: dict[str, Any] = {"query": query[:128], "count": WEB_SEARCH_COUNT}
+    # 原问题帮它给结果排序；接口限 128 字
+    if ori_question:
+        body["ori_question"] = ori_question[:128]
+    started = time.perf_counter()
+    try:
+        response = await get_http_client().post(
+            f"{settings.base_url}/search",
+            headers={"Authorization": f"Bearer {settings.api_key}"},
+            json=body,
+            timeout=settings.timeout,
+        )
+        response.raise_for_status()
+        results = response.json()["results"]
+    except Exception as e:
+        log_event(
+            "web_search_failed",
+            "WARNING",
+            session_id=session_id,
+            query=query,
+            error=f"{type(e).__name__}: {e}"[:200],
+        )
+        return []
+    log_event(
+        "web_search",
+        session_id=session_id,
+        query=query,
+        latency_ms=int((time.perf_counter() - started) * 1000),
+        results=len(results),
+        top_score=round(results[0]["rerank_score"], 2) if results else None,
+    )
+    lines = []
+    for item in results:
+        date = (item.get("date") or "")[:10] or "日期不明"
+        text = " ".join((item.get("summary") or item.get("snippet") or "").split())
+        lines.append(
+            f"{item.get('title') or ''}（{item.get('site_name') or ''}，{date}）："
+            f"{text[:WEB_RESULT_CHARS]}"
+        )
+    return lines
 
 
 def _parse_json_object(text: str) -> dict | None:
