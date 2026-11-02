@@ -1,5 +1,5 @@
 """把 OneBot 事件读成 ChatMessage：各类消息段的文字标记、被回复的原文、图片占位与后台描述，
-以及戳一戳、贴表情、撤回标记的写法。"""
+以及戳一戳、贴表情、撤回、进群退群禁言的写法。"""
 
 import asyncio
 import json
@@ -11,6 +11,9 @@ from datetime import datetime
 from nonebot import logger
 from nonebot.adapters.onebot.v11 import (
     Bot,
+    GroupBanNoticeEvent,
+    GroupDecreaseNoticeEvent,
+    GroupIncreaseNoticeEvent,
     GroupMessageEvent,
     Message,
     MessageSegment,
@@ -23,6 +26,7 @@ from ..chat.session import Session
 from ..llm import VisionInput
 from ..metrics import log_event
 from ..prompts import truncate_text
+from ..storage.db import get_latest_user_names
 from .faces import ensure_faces, face_name
 from .image import cached_caption, caption_image, caption_sticker, fetch_image_input
 from .message import ChatMessage, Reacted
@@ -447,6 +451,73 @@ async def read_reaction(
         content += f"，共 {count} 人：{'、'.join(reactors.values())}"
     record.content = content + "]"
     return record
+
+
+def _duration_text(seconds: int) -> str:
+    minutes = max(1, seconds // 60)
+    if minutes < 60:
+        return f"{minutes} 分钟"
+    if minutes < 1440:
+        return f"{minutes // 60} 小时"
+    return f"{minutes // 1440} 天"
+
+
+async def read_group_notice(
+    bot: Bot,
+    event: GroupIncreaseNoticeEvent | GroupDecreaseNoticeEvent | GroupBanNoticeEvent,
+    session: Session,
+) -> ChatMessage | None:
+    """进群、退群、踢人、禁言通知读成一条记录，发言人是做这件事的人，被做的人记进 mentions。
+
+    她自己进群、被踢出群返回 None：前者会话还没启用，后者群都不在了。
+    """
+
+    self_id = str(bot.self_id)
+    user_id, operator_id = str(event.user_id), str(event.operator_id)
+    # 退群的人已经查不到名片了，先用消息库里最后的名字
+    known = await get_latest_user_names(session.id)
+
+    async def name(uid: str) -> str:
+        if uid == self_id:
+            return session.state.name
+        return known.get(uid) or await member_name(bot, event.group_id, uid) or uid
+
+    async def target(uid: str) -> str:
+        return "你" if uid == self_id else await name(uid)
+
+    speaker, mentions = user_id, {}
+    if isinstance(event, GroupIncreaseNoticeEvent):
+        if user_id == self_id:
+            return None
+        content = "[加入了群聊]"
+        if event.sub_type == "invite" and operator_id not in ("0", user_id):
+            mentions = {operator_id: await name(operator_id)}
+            content = f"[被 {mentions[operator_id]} 邀请进群]"
+    elif isinstance(event, GroupDecreaseNoticeEvent):
+        if event.sub_type == "kick_me":
+            return None
+        content = "[退群了]"
+        if event.sub_type == "kick":
+            speaker, mentions = operator_id, {user_id: await name(user_id)}
+            content = f"[把 {await target(user_id)} 移出了群聊]"
+    else:
+        speaker = operator_id
+        ban = event.sub_type == "ban"
+        if user_id == "0":
+            content = "[开启了全员禁言]" if ban else "[关闭了全员禁言]"
+        else:
+            if user_id != self_id:
+                mentions = {user_id: await name(user_id)}
+            who = await target(user_id)
+            content = f"[禁言了 {who} {_duration_text(event.duration)}]" if ban else f"[解除了 {who} 的禁言]"
+    return ChatMessage(
+        time=datetime.now(),
+        user_name=await name(speaker),
+        content=content,
+        user_id=speaker,
+        mentions=mentions,
+        notice=True,
+    )
 
 
 def recall_text(by_author: bool) -> str:

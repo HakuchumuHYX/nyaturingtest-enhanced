@@ -5,6 +5,7 @@ from tortoise import Tortoise
 from . import handlers  # 导入时注册 matcher
 from .chat.groups import cleanup_global_resources, init_enabled_groups
 from .chat.initiative import setup_initiative_job
+from .chat.status import setup_status_job
 from .config import get_data_dir
 from .memory.episodes import setup_episode_job
 from .memory.maintenance import setup_maintenance_job
@@ -35,6 +36,7 @@ async def init_db():
 
     setup_episode_job()
     setup_initiative_job()
+    setup_status_job()
     setup_image_cache_job()
     setup_sticker_prune_job()
     setup_maintenance_job()

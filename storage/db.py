@@ -11,8 +11,10 @@ from .models import (
     DailyTokenUsageModel,
     EnabledGroupModel,
     GlobalMessageModel,
+    MemoryModel,
     PersonaGroupModel,
     PersonaLifeModel,
+    PersonaStatusModel,
     SessionModel,
     StickerModel,
     TokenUsageModel,
@@ -88,6 +90,54 @@ async def load_persona_texts(session_id: str, preset: str) -> tuple[str, str]:
     return (life.text if life else "", group.text if group else "")
 
 
+def _parse_times(items: list[dict], keys: tuple[str, ...]) -> list[dict]:
+    return [
+        {**item, **{key: datetime.fromisoformat(item[key]) for key in keys if item.get(key)}}
+        for item in items
+    ]
+
+
+def _dump_times(items: list[dict]) -> list[dict]:
+    return [
+        {key: value.isoformat() if isinstance(value, datetime) else value for key, value in item.items()}
+        for item in items
+    ]
+
+
+async def load_persona_status(preset: str) -> dict | None:
+    """她的时间线；时间字段读成 datetime。还没定过状态返回 None。"""
+
+    row = await PersonaStatusModel.get_or_none(preset=preset)
+    if row is None:
+        return None
+    return {
+        "timeline": _parse_times(row.timeline, ("start",)),
+        "until": row.until,
+        "nights": _parse_times(row.nights, ("sleep", "wake")),
+        "diary": row.diary,
+        "diary_until": row.diary_until,
+    }
+
+
+async def save_persona_status(
+    preset: str, timeline: list[dict], until: datetime, nights: list[dict]
+) -> None:
+    """只写状态这几列，日记由每日整理写，不碰：整行 save 会把读出来那一刻的旧日记写回去。"""
+
+    values = {"timeline": _dump_times(timeline), "until": until, "nights": _dump_times(nights)}
+    if not await PersonaStatusModel.filter(preset=preset).update(**values):
+        await PersonaStatusModel.create(preset=preset, **values)
+
+
+async def save_persona_diary(preset: str, diary: list[dict], diary_until: date) -> None:
+    await PersonaStatusModel.filter(preset=preset).update(diary=diary, diary_until=diary_until)
+
+
+async def load_life_text(preset: str) -> str:
+    life = await PersonaLifeModel.get_or_none(preset=preset)
+    return life.text if life else ""
+
+
 async def skip_persona_absence(session_id: str, preset: str) -> None:
     """切回以前用过的预设：换走期间说话的是别的人设，那段聊天不是 ta 的经历，整理进度直接跳到昨天。"""
 
@@ -127,6 +177,7 @@ async def load_full_session_data(session_id: str):
             content=msg_db.content,
             id=msg_db.msg_id,
             user_id=msg_db.user_id or "",
+            to_me=msg_db.to_me,
         )
         for msg_db in reversed(msgs_db)
     ]
@@ -177,7 +228,7 @@ async def sync_messages(session_id: str, recent_msgs: list[ChatMessage]):
         existing_rows = await GlobalMessageModel.filter(
             session=session_db,
             msg_id__in=final_msg_ids,
-        ).values("msg_id", "user_name", "user_id", "content", "time")
+        ).values("msg_id", "user_name", "user_id", "content", "time", "to_me")
         existing_by_id = {str(row["msg_id"]): row for row in existing_rows}
 
     bulk_msgs = []
@@ -189,6 +240,7 @@ async def sync_messages(session_id: str, recent_msgs: list[ChatMessage]):
             "user_id": str(msg.user_id) if msg.user_id else "",
             "content": sanitize_text(msg.content),
             "time": msg.time,
+            "to_me": msg.to_me,
         }
         existing = existing_by_id.get(final_msg_id)
 
@@ -246,9 +298,36 @@ async def get_history_before(
             content=m.content,
             id=m.msg_id,
             user_id=m.user_id or "",
+            to_me=m.to_me,
         )
         for m in sorted(history_rows, key=lambda x: x.time)
     ]
+
+
+async def get_catch_up(
+    session_id: str, after: datetime, before: datetime, *, calls_limit: int, episodes_limit: int
+) -> tuple[list[ChatMessage], list[str], int]:
+    """已读水位到 before 之间被挤出未读的那段：找过她的消息（最近几条）、水位之后写成的分段小结、这段一共多少条。"""
+
+    rows = GlobalMessageModel.filter(session_id=session_id, time__gt=after, time__lt=before)
+    calls = await rows.filter(to_me=True).order_by("-time").limit(calls_limit)
+    episodes = (
+        await MemoryModel.filter(session_id=session_id, category="episode", created_at__gt=after)
+        .order_by("-created_at")
+        .limit(episodes_limit)
+        .values_list("content", flat=True)
+    )
+    return (
+        [
+            ChatMessage(
+                time=m.time, user_name=m.user_name, content=m.content, id=m.msg_id,
+                user_id=m.user_id, to_me=True,
+            )
+            for m in reversed(calls)
+        ],
+        list(reversed(episodes)),
+        await rows.count(),
+    )
 
 
 async def get_recent_messages_by_user(

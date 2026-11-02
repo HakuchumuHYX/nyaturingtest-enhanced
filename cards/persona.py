@@ -1,4 +1,4 @@
-"""人设卡片：人生线、本群的 ta 和最近的改动，填进 persona.html，用 Chromium 截图。"""
+"""人设卡片：人生线、最近的日记、本群的 ta 和最近的改动，填进 persona.html，用 Chromium 截图。"""
 
 import re
 from dataclasses import dataclass
@@ -148,6 +148,19 @@ def _ruler_html(start: date, today: date, marks: list[Change]) -> str:
     )
 
 
+def _diary_html(diary: list[str]) -> str:
+    """最近几天的日记，每条以 MM-DD 开头（prompts.diary_line），旧的在前。"""
+
+    if not diary:
+        return ""
+    rows = []
+    for line in diary:
+        match = _DATED_RE.match(line)
+        when = f"{int(match[1])}.{int(match[2])}" if match else ""
+        rows.append(f"<li><time>{when}</time><span>{escape(match[3] if match else line)}</span></li>")
+    return _list("最近的日记", "".join(rows), "dated diary")
+
+
 def _changes_html(changes: list[Change]) -> str:
     if not changes:
         return ""
@@ -169,8 +182,9 @@ async def render_persona_card(
     group_name: str,
     changes: list[Change],
     marks: list[Change],
+    diary: list[str],
 ) -> bytes:
-    """changes 是最近几次改动（新的在前），marks 是所有真改了东西的日子，画在尺子上。"""
+    """changes 是最近几次改动（新的在前），marks 是所有真改了东西的日子，画在尺子上；diary 是最近几天的日记。"""
 
     today = datetime.now().date()
     start = datetime.strptime(as_of, "%Y-%m").date()
@@ -179,7 +193,7 @@ async def render_persona_card(
         "name": escape(name),
         "since": f"从 {start.year} 年 {start.month} 月出发，现在是第 {months} 个月",
         "ruler": _ruler_html(start, today, marks),
-        "life": _life_html(life),
+        "life": _life_html(life) + _diary_html(diary),
         "group_name": escape(group_name),
         "group": _group_html(group_text),
         "changes": _changes_html(changes),

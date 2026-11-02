@@ -1,11 +1,14 @@
 import hashlib
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from nonebot import get_bot, logger, on_command, on_message, on_notice
 from nonebot.adapters.onebot.v11 import (
     Bot,
     Event,
+    GroupBanNoticeEvent,
+    GroupDecreaseNoticeEvent,
+    GroupIncreaseNoticeEvent,
     GroupMessageEvent,
     GroupRecallNoticeEvent,
     Message,
@@ -34,6 +37,7 @@ from .chat.groups import (
     is_shutting_down,
     sessions,
 )
+from .chat.status import recent_diary, redecide, status_text
 from .config import get_app_settings, get_token_stats_model_names
 from .llm import chat_client, feedback_client
 from .memory.digest import GROUP_NOTES_REFRESH_MIN_NEW, count_new_group_fragments
@@ -43,6 +47,7 @@ from .memory.vector import RAG_FINAL_K, RetrievedMemory
 from .messages.convert import (
     forward_id,
     member_name,
+    read_group_notice,
     read_message,
     read_poke,
     read_reaction,
@@ -57,8 +62,9 @@ from .storage.backup import backup_task
 from .storage.db import get_token_stats, recall_message
 from .storage.models import PersonaHistoryModel, SessionModel
 
-# persona 命令列出的最近改动条数（人生线和本群合计）
+# persona 命令列出的最近改动条数（人生线和本群合计）、最近几天的日记
 PERSONA_HISTORY_LIMIT = 4
+PERSONA_DIARY_DAYS = 3
 
 
 @dataclass(frozen=True)
@@ -71,14 +77,14 @@ class CommandMeta:
 COMMANDS: tuple[CommandMeta, ...] = (
     CommandMeta("autochat <enable/disable>", "在本群启用或禁用 Autochat"),
     CommandMeta(
-        "status", "查看 Bot 状态、provider 错误和基础 metrics", "status <群号>"
+        "status", "查看她现在在做什么、今天的时间线、Bot 状态和 provider 错误", "status <群号>"
     ),
     CommandMeta("presets", "查看可用预设", "presets <群号>"),
     CommandMeta("set_preset <文件名>", "加载预设", "set_preset <群号> <文件名>"),
     CommandMeta("persona", "查看人生线、本群的她和最近的改动", "persona <群号>"),
     CommandMeta("rag_debug <query>", "诊断 RAG 记忆检索"),
     CommandMeta("group_notes", "查看本群群志原文", "group_notes <群号>"),
-    CommandMeta("calm", "重置心情并退出当前对话", "calm <群号>"),
+    CommandMeta("calm", "重置心情、退出当前对话，并重新定一次她在做什么", "calm <群号>"),
     CommandMeta("reset confirm", "先备份再完全重置本群", "reset <群号> confirm"),
     CommandMeta("token统计", "查看当前 chat / feedback 模型的 Token 用量"),
     CommandMeta("stickerdel", "回复一张图：从表情包库删掉并拉黑，以后只描述不收"),
@@ -236,7 +242,7 @@ async def handle_emoji_like(bot: Bot, event: NoticeEvent):
         return
 
     like = data["likes"][0]
-    session.record_reaction(
+    session.record_action(
         await read_reaction(
             bot,
             session,
@@ -271,6 +277,56 @@ async def handle_group_poke(bot: Bot, event: PokeNotifyEvent):
         session.record_incoming([message])
         return
     await session.enqueue(message, bot, event)
+
+
+async def is_group_change(event: Event) -> bool:
+    return isinstance(
+        event, (GroupIncreaseNoticeEvent, GroupDecreaseNoticeEvent, GroupBanNoticeEvent)
+    )
+
+
+group_change = on_notice(rule=is_group_change, priority=99, block=False)
+
+
+@group_change.handle()
+async def handle_group_change(
+    bot: Bot, event: GroupIncreaseNoticeEvent | GroupDecreaseNoticeEvent | GroupBanNoticeEvent
+):
+    """进群、退群、禁言：读成记录进短期记忆，和贴表情一样不进队列。
+
+    她被禁言就记到会话上，期间不开口；有人进出群，群人数下次看群时重新拉。
+    """
+
+    if is_shutting_down():
+        return
+    session = get_session(event.group_id)
+    if session is None:
+        return
+
+    if isinstance(event, GroupBanNoticeEvent):
+        if str(event.user_id) in (str(bot.self_id), "0"):
+            if event.sub_type == "ban":
+                session.muted_until = (
+                    datetime.max
+                    if event.user_id == 0
+                    else datetime.now() + timedelta(seconds=event.duration)
+                )
+            else:
+                session.muted_until = None
+    else:
+        session.group_info_at = datetime.min
+
+    message = await read_group_notice(bot, event, session)
+    if message is None:
+        logger.warning(f"群 {event.group_id} 的通知 {event.notice_type}/{event.sub_type} 涉及她自己，只记日志")
+        return
+    session.record_action(message)
+    log_event(
+        "group_notice",
+        session_id=session.id,
+        user=message.user_name,
+        content=message.content,
+    )
 
 
 async def is_group_recall(event: Event) -> bool:
@@ -429,9 +485,11 @@ async def _do_status(matcher: type[Matcher], group_id: int, _args: str):
     if state.last_look_time != datetime.min:
         last_look = f"{state.last_look_time:%H:%M:%S}"
     settings = get_app_settings()
+    muted = f"，禁言到 {session.muted_until:%m-%d %H:%M}" if session.muted else ""
     lines = [
         "",
-        f"人设：{state.preset or '未设（不说话）'}",
+        f"人设：{state.preset or '未设（不说话）'}{muted}",
+        *status_text(state.preset),
         f"未读：{unread_count(state, session.unread())} 条，上次看群 {last_look}",
         f"心情：V{emotion.valence:.2f} A{emotion.arousal:.2f} D{emotion.dominance:.2f}",
         f"后台任务数: {len(session.background_tasks)}",
@@ -504,6 +562,7 @@ async def _do_persona(matcher: type[Matcher], group_id: int, _args: str):
             group_name=await _group_name(group_id),
             changes=recent,
             marks=history,
+            diary=recent_diary(preset, PERSONA_DIARY_DAYS),
         )
     except Exception as e:
         logger.error(f"渲染人设卡片失败: {e}")
@@ -511,9 +570,11 @@ async def _do_persona(matcher: type[Matcher], group_id: int, _args: str):
             f"- {change.day:%m-%d} {'人生线' if change.scope == 'life' else '本群'}：{change.text}"
             for change in recent
         )
+        diary = "\n".join(recent_diary(preset, PERSONA_DIARY_DAYS))
         await matcher.finish(
             f"人设：{preset}（{name}）\n\n"
             f"[人生线]\n{self_life}\n\n"
+            f"[最近的日记]\n{diary or '还没有'}\n\n"
             f"[在这个群]\n{self_in_group or '还没整理过（每天 03:30 整理）'}\n\n"
             f"[最近的改动]\n{changes or '无'}"
         )
@@ -556,6 +617,9 @@ async def _do_calm_down(matcher: type[Matcher], group_id: int, _args: str):
     session = await _session_or_finish(matcher, group_id)
     async with session.admin_lock:
         await session.calm_down()
+    # 状态按人存，重新定一次各群一起生效
+    if session.state.name:
+        session.spawn(redecide(session.state.preset))
     await matcher.finish("已老实")
 
 

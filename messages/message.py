@@ -14,11 +14,11 @@ class ChatMessage:
     content: str
     id: str = ""
     user_id: str = ""
-    # 以下只在进程内用，不落库
+    # 以下除 to_me 外只在进程内用，不落库
     image_inputs: list[Any] = field(default_factory=list, repr=False, compare=False)
     # 被 @ 和被回复的人（QQ 号 -> 群名片），让没发言的人也能在写记忆时挂上号
     mentions: dict[str, str] = field(default_factory=dict, repr=False, compare=False)
-    # 是否 @Bot 或回复了 Bot 的消息；只用于本轮相关性判断
+    # 是否 @Bot 或回复了 Bot 的消息；落库，补看时据此捞回谁找过她
     to_me: bool = field(default=False, repr=False, compare=False)
     # 戳一戳通知转成的记录；被戳不算点名，只让 bot 看一眼、自己决定理不理
     poke: bool = field(default=False, repr=False, compare=False)
@@ -26,6 +26,8 @@ class ChatMessage:
     reacted: "Reacted | None" = field(default=None, repr=False, compare=False)
     # 合并转发：读完后内容是别人的聊天记录，里面出现 bot 的名字不算点名
     forward: bool = field(default=False, repr=False, compare=False)
+    # 进群、退群、禁言这类群通知读成的记录
+    notice: bool = field(default=False, repr=False, compare=False)
     # 后台看图的任务，处理这批消息前先等它们
     caption_tasks: list[Any] = field(default_factory=list, repr=False, compare=False)
     # 群友自己说了东西，只有这种才拿去检索记忆
@@ -35,9 +37,9 @@ class ChatMessage:
 
     @property
     def is_action(self) -> bool:
-        """贴表情、戳一戳这类动作记录，不是说的话。"""
+        """贴表情、戳一戳、群通知这类记录，不是说的话。"""
 
-        return self.reacted is not None or self.poke
+        return self.reacted is not None or self.poke or self.notice
 
     def recall(self, content: str) -> None:
         """撤回：内容原地改成撤回标记。图片一并清掉，免得进行中这一轮的图片观察再把内容写回去。"""

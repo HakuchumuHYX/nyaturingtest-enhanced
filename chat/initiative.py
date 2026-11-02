@@ -1,6 +1,7 @@
 """群里安静久了，在合适的时段主动开个话题。
 
 要不要发起全由代码判断（时间窗、安静时长、频率、随机），都满足后才调一次角色模型写内容，模型也可以放弃。
+她 away（手机不在手上）或被禁言时不发起。
 """
 
 import random
@@ -24,6 +25,7 @@ from ..prompts import (  # noqa: E402
 from .domain import PersonProfile  # noqa: E402
 from .groups import is_shutting_down, sessions  # noqa: E402
 from .orchestrator import (  # noqa: E402
+    CHAT_DIARY_DAYS,
     CHAT_TEMPERATURE,
     MY_RECENT_REPLIES_LIMIT,
     Reply,
@@ -31,6 +33,7 @@ from .orchestrator import (  # noqa: E402
 )
 from .send import dispatch_replies  # noqa: E402
 from .session import Session  # noqa: E402
+from .status import describe_now, is_away, recent_diary, today_lines  # noqa: E402
 
 SCAN_INTERVAL_MINUTES = 10
 # 群里最后一条消息距今至少这么久才算冷场
@@ -83,6 +86,8 @@ async def scan_groups() -> None:
             or session.bot is None
             or session.event is None
             or not session.state.name  # 没设人设不说话
+            or is_away(session.state.preset)
+            or session.muted
         ):
             continue
         silence = _silence_minutes(session, now)
@@ -148,6 +153,10 @@ async def _initiate(session: Session, silence: int) -> None:
         mood=describe_mood(state.global_emotion),
         silence_minutes=silence,
         time_info=get_time_description(datetime.now()),
+        diary=recent_diary(state.preset, CHAT_DIARY_DAYS),
+        group_info=await session.refresh_group_info(),
+        today=today_lines(state.preset),
+        now=describe_now(state.preset, max(state.last_look_time, state.last_read_time or datetime.min)),
     )
     parsed = await chat_client.generate_json(
         prompt,

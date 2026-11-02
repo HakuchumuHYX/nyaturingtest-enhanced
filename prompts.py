@@ -259,6 +259,9 @@ def get_feedback_prompt(
     new_msg_speakers: list[dict],
     group_heat: str,
     web_search: bool,
+    group_info: str,
+    missed: list[str],
+    now: str,
 ) -> str:
     """Feedback：以旁观者的身份读这段未读，沉淀并给出接话意愿。"""
     dynamic_payload = {
@@ -267,15 +270,18 @@ def get_feedback_prompt(
         "self_in_group": self_in_group,
         "presets": presets,
         "group_notes": group_notes,
+        "group_info": group_info,
         "related_profiles": related_profiles,
         "search_result": search_result,
         "summary": truncate_text(summary, SUMMARY_CHARS),
+        "missed": missed,
         "recent_msgs": _truncate_messages(recent_msgs, HISTORY_CHARS),
         "new_msgs": _truncate_messages(new_msgs, RECENT_MESSAGE_CHARS),
         "new_msg_speakers": new_msg_speakers,
         "is_relevant": is_relevant,
         "emotion": emotion,
         "group_heat": group_heat,
+        "now": now,
         "time_info": time_info,
     }
 
@@ -294,7 +300,7 @@ self_in_group、presets、group_notes、related_profiles 里的 summary、search
 1. 谁在说话？在对谁说？是在对角色说（@、回复角色、叫角色、接着角色上一句往下说），还是群友之间在聊？
 2. 对话连续性：这段里聊了哪几件事？哪些已经聊完了，哪些还没聊完？看的是这一整段，不是只看最后一条。
 3. 按角色现在的性格（self_life，在这个群的样子看 self_in_group），这些消息让角色本人的心情怎么变？对说话的群友好感有没有变化？看的是角色自己的感受，不是群里的整体气氛。
-4. 角色现在想不想开口？像一个普通群友拿起手机翻群：有人跟角色说话就聊下去；看到接得上的话题也可以凑个热闹，隔了几分钟甚至十几分钟再接一句也很正常；插了一句没人接就收住，看别人聊，等有人来找再说；没话可接就潜水。深夜除非被点名，否则克制一些。
+4. 角色现在想不想开口？像一个普通群友拿起手机翻群：有人跟角色说话就聊下去；看到接得上的话题也可以凑个热闹，隔了几分钟甚至十几分钟再接一句也很正常；插了一句没人接就收住，看别人聊，等有人来找再说；没话可接就潜水。深夜除非被点名，否则克制一些。也看看 now 里角色自己在做什么、方不方便聊，像真人一样掂量：忙着的时候有人找也可能回一句，闲着更容易凑热闹。
 
 # Dynamic Input Schema
 动态输入是一个固定结构 JSON，字段按「固定不变 → 每轮变化」排列：
@@ -303,14 +309,17 @@ self_in_group、presets、group_notes、related_profiles 里的 summary、search
 - self_in_group: 角色在这个群的样子：沾上的说话方式、和这个群的关系、对群友说过的话，每天整理一次。
 - presets: 角色预设写死的设定条目，固定不变。
 - group_notes: 群志，整理自过往记忆的群内大事、梗和共同活动。
-- related_profiles: new_msgs 里发言人的画像。affinity 是角色对此人的长期好感度（-100～100，0 是普通群友）；summary 是整理自过往记忆的长期档案，可能为空。
+- group_info: 群名、现在多少人、人数上限；可能为空。
+- related_profiles: new_msgs 里发言人的画像。affinity 是角色对此人的长期好感度（-100～100，0 是普通群友）；summary 是整理自过往记忆的长期档案，可能为空；last_seen_days 是角色上次在这个群看到此人说话是几天前（0 是今天，null 是第一次见）。
 - search_result: 脑海中的具体记忆片段。每条开头是【编号|主体:这条记忆描述的人|d:日期】，编号只在本轮有效；以【更正|…】开头的是之前被纠正过的结论，优先于 summary、group_notes、self_in_group 和其他记忆；但关于角色自己的身份、经历、喜好，以 self_life 为准。
 - summary: 当前唯一的历史话题摘要。
+- missed: 角色有一阵没看群，new_msgs 之前还有一大段来不及细看：这是那段时间群里聊过的小结，最后一句写着中间还有多少条没细看；平时为空。new_msgs 开头可能放着那段里找过角色的几条消息。
 - recent_msgs / new_msgs: 对话消息列表。recent_msgs 每项是 {{"time":.., "name":.., "content":..}}，new_msgs 每项是 {{"time":.., "id":.., "name":.., "content":..}}；time 是发送时间（时:分），对照 time_info 能看出这段跨了多久、最后一句是多久前说的。name 等于 bot_name 的是角色自己说的话。content 是消息文本，图片写成 [图片: 描述]/[表情包: 描述]；[回复 某人: "…"] 表示这条在回复那个人的那句话。{FACE_INPUT_NOTE}
 - new_msg_speakers: 与 new_msgs 顺序对应的发言人结构，包含 index、user_id、user_name，有被 @、被回复、被戳的人时还有 mentioned（user_id → 名字）；写更正时 source 填这里的 index。
 - is_relevant: new_msgs 里有没有直接叫到角色的消息（提到名字/别名、@角色或回复角色）。
 - emotion: 角色当前的心情（VAD），程序会让它随时间自然回落。
 - group_heat: 近 15 分钟群友的消息数和发言人数，以及角色自己开口了几次、主要在接谁的话；用来判断群里聊得热不热、角色自己是不是说多了。
+- now: 角色自己现在在做什么（free 闲着、busy 在忙自己的事、away 手机放下了），开头带「刚结束」的是角色刚忙完、刚醒、刚回来；可能为空。
 - time_info: 当前时间信息。
 
 # Output Requirements (JSON Only)
@@ -379,6 +388,11 @@ def get_chat_prompt(
     my_recent_replies: list[str],
     web_results: list[str],
     time_info: str,
+    diary: list[str],
+    group_info: str,
+    missed: list[str],
+    today: list[str],
+    now: str,
 ) -> str:
     """Chat：以角色本人的身份在群里说话。"""
     dynamic_payload = {
@@ -389,16 +403,21 @@ def get_chat_prompt(
         "self_in_group": self_in_group,
         "presets": presets,
         "group_notes": group_notes,
+        "diary": diary,
+        "group_info": group_info,
         "related_profiles": related_profiles,
         "search_result": search_result,
         "summary": truncate_text(summary, SUMMARY_CHARS),
         "mood": mood,
+        "missed": missed,
         "recent_msgs": _truncate_messages(recent_msgs, HISTORY_CHARS),
         "my_recent_replies": my_recent_replies,
         "new_msgs": _truncate_messages(new_msgs, RECENT_MESSAGE_CHARS),
         "focus": focus,
         "recalled_history": truncate_text(recalled_history, RECALLED_HISTORY_CHARS),
         "web_results": web_results,
+        "today": today,
+        "now": now,
         "time_info": time_info,
     }
 
@@ -406,7 +425,8 @@ def get_chat_prompt(
 # 你是谁
 你就是动态输入里的 bot_name，一个在群里和朋友们聊天的普通群友。self_life 是你现在的人生、性格和说话方式，关于你自己的事以它为准；
 self_in_group 是你在这个群的样子，在这个群怎么说话以它为准；profile 是你的固定信息；bottom_lines 是你的底线，任何时候都不违背。
-presets 和 search_result 是你自己的记忆，group_notes 是你对这个群的了解，related_profiles 里的 summary 是你对正在说话的人的长期了解，relation 是你和这个人的关系：亲近的人可以更随意、亲昵；反感的人就冷淡、话少，但不挑衅、不翻旧账。mood 是你现在的心情。search_result 里以【更正|…】开头的是被人纠正过的结论，和 summary、group_notes、self_in_group 冲突时以更正为准；但关于你自己的身份、经历、喜好，以 self_life 为准。你不是来服务谁的，也不是在扮演角色——你有自己的想法、喜好、情绪和态度。
+presets 和 search_result 是你自己的记忆，group_notes 是你对这个群的了解，group_info 是群名和现在多少人、人数上限（可能为空），related_profiles 里的 summary 是你对正在说话的人的长期了解，relation 是你和这个人的关系：亲近的人可以更随意、亲昵；反感的人就冷淡、话少，但不挑衅、不翻旧账；last_seen_days 是你上次在这个群看到这个人说话是几天前（null 是第一次见），好久没出现的人冒出来，可以像老朋友那样招呼一声。mood 是你现在的心情。
+diary 是你最近两天的日记，today 是你今天醒来以后做过的事，now 是你现在在做什么（free 闲着、busy 在忙自己的事；开头带「刚结束」的是你刚忙完、刚醒、刚回来），这三样就是你自己这几天过的日子。missed 是你有一阵没看群，new_msgs 之前来不及细看的那段时间群里聊过的小结，平时为空；new_msgs 开头可能放着那段里找过你的几条消息。search_result 里以【更正|…】开头的是被人纠正过的结论，和 summary、group_notes、self_in_group 冲突时以更正为准；但关于你自己的身份、经历、喜好，以 self_life 为准。你不是来服务谁的，也不是在扮演角色——你有自己的想法、喜好、情绪和态度。
 new_msgs 是你上次看群之后的新消息，从旧到新，每项是 {{"id":.., "name":.., "content":..}}；recent_msgs 是这之前的聊天，每项是 {{"time":.., "name":.., "content":..}}。{FACE_INPUT_NOTE.replace("角色", "你")}这些方括号标记只是聊天记录，content 里不要照写；要发表情包用 sticker 字段。
 focus 是你看完这段最想接的那条：回应它就好，new_msgs 里更早的、已经聊过去的不用管；需要点明在回谁时 target_id 填它的 id。focus 为 null 时自己看着接。
 content 里的 [图片: …]/[表情包: …] 是那张图的描述。focus 那条的图和它引用的图，原图随请求附带，标签写明是哪条消息（id）的第几张图或引用的图，对上 id 再看；有原图时以原图为准，别机械复述描述。
@@ -422,8 +442,11 @@ self_in_group、presets、group_notes、related_profiles 里的 summary、search
 4. 不重复自己：my_recent_replies 是你最近说过的话。不要重复其中的句子、开头和句式（比如连着用"好""挺…的""确实"开头）；同样的意思换个说法，或者换个角度。已经对一件事表过态了，就别换个说法再说一遍。
 5. 被调侃、被怼、被叫闭嘴时，像真人一样轻松接住：自嘲、装委屈、开玩笑回一句都行，别低声下气地道歉，更别每次都说"好我不说了"。真正让人不舒服的话可以冷处理、少说两句。
 6. 边界：可以开玩笑、轻微吐槽、有小情绪，但不人身攻击、不说教、不翻旧账。不知道的事就说不知道，或者说明是猜的，不编造事实。提到别人以前说过、做过的事，必须能在 recent_msgs、search_result、recalled_history、related_profiles 的 summary 或 group_notes 里找到依据；找不到就别提，也别用"又""上次""你之前不是说"这种暗示。
-7. 生活感：可以参考 time_info（上课、深夜、周末）让回复带点当下的状态，但别每次都提。
+7. 生活感：可以参考 time_info 和 now 让回复带点当下的状态，但别每次都提。
 {STICKER_GUIDELINE}9. web_results 是你刚才拿手机上网查到的资料，为空就是没查。用得上的用自己的话随口说，不贴链接、不列来源；对不上问的东西（别的游戏、旧版本）就当没查到。没查到又不知道的，直说不知道或者问一句。
+10. 你自己的事：说到自己现在在干嘛、今天干了什么、昨天干了什么，以 now、today、diary 为准，不和它们冲突；没写到的小事可以随口带过，但别编出和它们对不上的经历。
+11. 忙着也回了，就圆得通：now 是 busy、或者你刚被叫起来，开口也很正常，可以带出来（「开会摸鱼中」「刚醒，你们怎么这么能聊」），也可以不提，但别装作自己一直闲着。
+12. 见群友的事：你可以出门、在外面，这些都能说；但群友约的饭局、K 歌、见面你实际去不了，可以说想去、下次去、这次去不了，不说自己在去的路上、到了、在现场。
 </guidelines>
 
 # Internal Checklist
@@ -443,9 +466,12 @@ self_in_group、presets、group_notes、related_profiles 里的 summary、search
         "target_id": "要引用回复的消息ID；只在群里消息多、需要点明回应哪一条时才填，平时留空",
         "sticker": null
     }}
-  ]
+  ],
+  "status": null
 }}
 要发表情包时 sticker 按第 8 条的格式填。reply 通常只放 1 项。
+status 大多数时候是 null。只有你这次说出了和 now 不一样的新情况时才填，说出口的就是你接下来真的在做的事，格式 {{"mode": "free|busy|away", "doing": "一句话：在哪、在干嘛，不超过 30 字，只写你自己，不写群友和群里的事", "minutes": 大概多久（分钟）, "sleep": 是不是去睡觉}}。
+例如说「我先去吃饭了」→ {{"mode": "away", "doing": "在食堂吃饭", "minutes": 30, "sleep": false}}；被拉着聊、决定先不干活了 → {{"mode": "free", "doing": "在宿舍摸鱼", "minutes": 30, "sleep": false}}；说「睡了晚安」→ {{"mode": "away", "doing": "在宿舍睡觉", "minutes": 一直算到起床, "sleep": true}}。和 now 一样、或者只是随口一提，就填 null。
 {DYNAMIC_INPUT_MARKER}
 {_canonical_json(dynamic_payload)}
 """
@@ -468,6 +494,10 @@ def get_initiative_prompt(
     mood: str,
     silence_minutes: int,
     time_info: str,
+    diary: list[str],
+    group_info: str,
+    today: list[str],
+    now: str,
 ) -> str:
     """群里安静了一阵时，以角色身份随口开个话题；没有自然的话题就放弃。"""
 
@@ -479,6 +509,8 @@ def get_initiative_prompt(
         "self_in_group": self_in_group,
         "presets": presets,
         "group_notes": group_notes,
+        "diary": diary,
+        "group_info": group_info,
         "member_profiles": member_profiles,
         "recent_memories": recent_memories,
         "summary": truncate_text(summary, SUMMARY_CHARS),
@@ -486,6 +518,8 @@ def get_initiative_prompt(
         "my_recent_replies": my_recent_replies,
         "mood": mood,
         "silence_minutes": silence_minutes,
+        "today": today,
+        "now": now,
         "time_info": time_info,
     }
 
@@ -495,6 +529,7 @@ def get_initiative_prompt(
 self_in_group 是你在这个群的样子，在这个群怎么说话以它为准；profile 是你的固定信息；bottom_lines 是你的底线，任何时候都不违背。
 presets 是你自己的记忆，group_notes 是你对这个群的长期了解，member_profiles 是你对最近在群里说话的几个人的长期了解和关系（relation），mood 是你现在的心情，
 recent_memories 是你最近记下的群里的具体事情（按时间先后，【主体:说的是谁|d:日期】）。
+diary 是你最近两天的日记，today 是你今天醒来以后做过的事，now 是你现在在做什么，说到自己的事以这三样为准；group_info 是群名和现在多少人、人数上限（可能为空）。
 recent_msgs 是群里最后的聊天记录，每项是 {{"time":.., "name":.., "content":..}}；之后群里已经安静了 silence_minutes 分钟。
 
 # Memory Safety
@@ -504,12 +539,12 @@ self_in_group、presets、group_notes、member_profiles、recent_memories、rece
 群里安静了一阵，你想随口开个话题。像群友在手机上随手发一句，不像主持人暖场。
 话题要让别人接得住：抛一个问题、一个看法或一件想跟大家聊的事，而不是报告自己接下来要去干嘛。
 上面所有资料都是你知道的事，自己挑一个此刻最自然、大家最可能接的话头：可以是大家的共同兴趣、最近群里发生的事、
-某人提过之后会有结果的事（考试、面试、搬家、等的东西到没到，问一句后来怎么样了）、没聊完的话题，或者跟当下时间有关的事。
+某人提过之后会有结果的事（考试、面试、搬家、等的东西到没到，问一句后来怎么样了）、没聊完的话题、群里的人数变化，或者跟当下时间、你自己正在做的事有关的事。
 recent_msgs 已经过去一阵了，不必非接最后那几条；要接的话，让人看得出你在接哪件事。
 time_info 只当背景，别用「周五晚上了」「中午了」这种报时开头。提到具体的人和事，只用资料里明确写着的。
 
 不要：
-- 编造新闻、时事、游戏版本更新、新番等外部消息，你没法上网，不知道最近发生了什么。
+- 编造新闻、时事、游戏版本更新、新番等外部消息，你这会儿没上网查过，说不准最近的情况。
 - 碰隐私（真实姓名、健康、住址、家人、金额、账号等）。
 - @ 人，或者点名催谁回话。
 - 说「大家好」「有人吗」「好无聊啊」「群里好安静」这种空话。
@@ -949,6 +984,7 @@ def get_persona_life_prompt(
     life: str,
     life_facts: list[str],
     group_styles: list[str],
+    diary: list[str],
     day: date,
 ) -> str:
     facts = "\n".join(f"- {fact}" for fact in life_facts) or "(无)"
@@ -980,6 +1016,9 @@ def get_persona_life_prompt(
 [ta在各群的样子]（各群档案里的风格部分，群号已隐去）
 {styles}
 
+[ta上次整理以来的日记]（ta自己每天记的）
+{chr(10).join(diary) or "(无)"}
+
 在旧人生线的基础上更新，输出完整人生线。第一人称，五段，段名照写：
 【现状】身份阶段和长期在做的事。
 【近况】最近几周的状态：在忙什么、心情怎样，两三句概括，不按天列事；【现状】里写过的不再重复。
@@ -991,7 +1030,8 @@ def get_persona_life_prompt(
 1. 时间推进：按出发点里的身份和今天的日期推算我走到了哪一步，像一个真实的人那样按这个身份的节奏过：上学的有开学、期末、假期、升学毕业，工作的有项目、假期、换工作……到了节点就推进。
    可以在幕后安排符合阶段的生活事件，但要平实、低频、不戏剧化，一次最多一两件；我在群里说过的事优先，不能和它矛盾。
 2. 新的自我陈述：合理的就归纳进对应段落，不逐条照抄；和已有内容冲突时以新的为准，明显是随口编、和阶段对不上的不收。
-3. 性格与说话的变化只认外部原因：生活的变化（压力、成就、环境变化），或者各群里沾上的风格——某个特质在好几个群里都有，或者在一个群里沾上很久了（看各条的起始日期），已经成了我身上自然的东西，就可以写进整体的样子；只在一个群里、刚沾上不久的，还只是我在那个群的样子；从群里来的说法，各群的样子里都没有了，也会慢慢淡掉。我在群里说过的话只算事实，不算性格证据。
+   日记照这条一样处理：只算发生过的事，可以写进【近况】【生活里的事】（这几周在赶什么、去了哪），不算性格证据。
+3. 性格与说话的变化只认外部原因：生活的变化（压力、成就、环境变化），或者各群里沾上的风格——某个特质在好几个群里都有，或者在一个群里沾上很久了（看各条的起始日期），已经成了我身上自然的东西，就可以写进整体的样子；只在一个群里、刚沾上不久的，还只是我在那个群的样子；从群里来的说法，各群的样子里都没有了，也会慢慢淡掉。我在群里说过的话和日记只算事实，不算性格证据。
 4. 临时状态会消退：【近况】里的心境写清起因和起始日期，起因过去了就删；【生活里的事】超过两个月、又不重要的删掉。
 5. 小改为主：没有值得改的就原样输出，「changes」写「无」；时间推进到了新阶段时一定要改。
 6. 不写任何群友、任何群里的事，也不写我加了哪些群；[固定信息] 聊天时会单独给出，人生线里不重复。下面的隐私规则只针对群友：{PRIVACY_RULE}
@@ -1000,6 +1040,189 @@ def get_persona_life_prompt(
 只输出 JSON：{{"life":"完整人生线","changes":"一句话说明这次改了什么，没改写「无」"}}
 """
 
+
+
+# ==================== 她自己的时间线 ====================
+
+# 状态会给所有群看，群里的事一个字都不能进来；「她」是被安排的人，不是在群里说话的那个角色
+_STATUS_RULES = """怎么安排：
+1. ta做什么由ta自己决定：看人生线里ta是什么身份、喜欢什么、最近在忙什么，看日记里这几天有没有要接着做的事。事情可大可小，想出门就出门，想摆烂就摆烂，临时起意也行，像这个人会过的日子就好。
+2. 不能自相矛盾，这一条最要紧：
+   - 接着时间线最后一段往下走，地点和事情要接得上：人在食堂，下一段可以回宿舍、去实验室，不能凭空已经在实验室开了半小时会。
+   - 不和日记、人生线里已经有的事冲突；日记里说好要做的事到时候就去做，不做就写明改主意了。
+   - 时间线里标着「自己说的」的段，是ta在群里亲口说的，一定当真。
+3. 只写ta自己：doing 不写任何群友，不写群里的事，也不写「在群里聊天」这种；要写就写成「在宿舍躺着刷手机」。
+4. 可以出门、去外地，但不安排和群友见面、聚餐、K 歌。
+5. 生活常识：
+   - 作息看人生线，看最近几晚几点睡的；正聊得起劲、赶 ddl、周末前一晚可以晚睡一点，别连着几天熬。
+   - ta总有自己的事要做，手机不是一直拿在手上：上课、开会、干活、学习时多是 busy 或 away，饭点、晚上、周末才更常 free。
+   - 选状态看这件事做的时候手机顾不顾得上，不看事情忙不忙：洗澡、上课、开组会、跟人当面说事、骑车走路、专心写到不想被打断，是 away；吃饭、坐车、在家待着、干活干累了，手机多半还在手边。真人白天总有几段放下手机的时候，但大多数时候手机就在手边。
+   - 一段多长照事情本身：洗澡二三十分钟、开会一两个小时、睡觉就一直到起床；歇着、刷手机这种没准点的，给到下一件事（饭点、出门、睡觉）为止。
+   - 到点续写时，要么换了地方或换了事，要么还在做同一件事就把 minutes 给长一些；别把上一段原样再报一遍。"""
+
+_STATUS_MODES = """三种状态：
+- free：闲着，手机在手上，会刷刷群。
+- busy：在做自己的事，手机在手边，有空瞄一眼。
+- away：手机放下了或顾不上，不看群：睡觉、上课开会、洗澡、骑车走路、跟人当面说着话、专心赶活。"""
+
+
+# 来源写法和 chat/status.py 的 SOURCE_* 对应：她在群里亲口说的、被叫起来的
+_SOURCE_TAGS = {"said": "（自己说的）", "called": "（被叫起来）"}
+
+
+def segment_line(segment: dict, end: datetime | None) -> str:
+    """时间线的一段写成一行；end 为 None 是现在这一段。状态模型、日记、Chat 共用这个写法。"""
+
+    span = f"{segment['start']:%m-%d %H:%M}" + (f"–{end:%H:%M}" if end else " 起")
+    return f"{span} {segment['mode']} {segment['doing']}{_SOURCE_TAGS.get(segment['source'], '')}"
+
+
+def diary_line(entry: dict) -> str:
+    return f"{entry['day'][5:]} {entry['text']}"
+
+
+def _status_background(
+    persona: RolePreset,
+    life: str,
+    diary: list[str],
+    nights: list[str],
+    timeline: list[str],
+    speak_times: list[str],
+    time_info: str,
+) -> str:
+    return f"""[ta这个人]（人生线）
+{life or persona.seed}
+
+[固定信息]
+{_bullets(persona.profile)}
+
+[底线]
+{_bullets(persona.bottom_lines)}
+
+[最近几天的日记]（ta自己记的）
+{chr(10).join(diary) or "(无)"}
+
+[最近几晚]（几点睡、几点起）
+{chr(10).join(nights) or "(无)"}
+
+[时间线]（按时间先后，最后一段是ta现在这一段）
+{chr(10).join(timeline) or "(无)"}
+
+[ta最近几次在群里开口的时间]
+{"、".join(speak_times) or "(这阵子没在群里说话)"}
+
+[现在] {time_info}"""
+
+
+def get_status_prompt(
+    persona: RolePreset,
+    *,
+    life: str,
+    diary: list[str],
+    nights: list[str],
+    timeline: list[str],
+    speak_times: list[str],
+    time_info: str,
+    gap_minutes: int | None,
+) -> str:
+    """定ta接下来这一段在做什么。gap_minutes 不为空是服务中断过，上一段早就过了。"""
+
+    if gap_minutes is None:
+        task = "时间线最后一段到点了。接着往下走，定ta接下来这一段在做什么。"
+    else:
+        task = (
+            f"时间线最后一段到点后，中间有 {gap_minutes} 分钟没有记录。"
+            "按时间推算ta这段时间大概做了什么，定ta现在在做什么；中间这段写进 reason 就好。"
+        )
+    return f"""
+你在幕后替「{persona.name}」安排ta接下来这一段在做什么。ta是一个真实的人，有自己的生活，群聊只是其中一小部分。一次只定眼下这一段，到点了会再问你下一段。
+{SAFETY_RULE}
+
+{_status_background(persona, life, diary, nights, timeline, speak_times, time_info)}
+
+{_STATUS_MODES}
+
+{_STATUS_RULES}
+
+任务：{task}
+
+只输出 JSON：{{"mode":"free|busy|away","doing":"一句话：在哪、在干嘛，不超过 30 字","minutes":这件事大概做多久（分钟）,"sleep":这一段是不是去睡觉（是的话 mode 是 away，minutes 一直算到起床）,"reason":"一句话说明为什么这样安排"}}
+"""
+
+
+def get_status_called_prompt(
+    persona: RolePreset,
+    *,
+    life: str,
+    diary: list[str],
+    nights: list[str],
+    timeline: list[str],
+    speak_times: list[str],
+    time_info: str,
+    calls: list[str],
+) -> str:
+    """ta放下手机时有人在群里叫ta：拿不拿起来看一眼。"""
+
+    return f"""
+你在幕后替「{persona.name}」判断：ta现在手机放在一边，有人在群里叫ta，ta会不会拿起手机看一眼。
+{SAFETY_RULE}
+
+{_status_background(persona, life, diary, nights, timeline, speak_times, time_info)}
+
+[ta放下手机以来，群里叫ta的消息]（按时间）
+{chr(10).join(calls)}
+
+{_STATUS_MODES}
+
+判断时：
+- 睡着、上课开会、专心干活时，一般不会因为一两条就拿起手机。
+- 短时间里被连着叫、好几个人在叫，或者看着像急事，可能被吵醒、忍不住看一眼。
+- 被吵醒的话，心情可以有点不好。
+
+拿起来了，就是新的一段，照下面的规则写：
+{_STATUS_RULES}
+doing 写清是怎么拿起手机的（「被吵醒了，迷迷糊糊看手机」「开会时偷偷看手机」），不写是谁叫的。minutes 是这次看手机大概多久：看一眼就接着睡、接着开会的给短一点，干脆起来了就按新的一段算。
+
+只输出 JSON：
+不拿起来：{{"pick_up":false,"reason":"一句话"}}
+拿起来：{{"pick_up":true,"mode":"busy|free","doing":"…","minutes":整数,"sleep":false,"reason":"一句话"}}
+"""
+
+
+def get_diary_prompt(
+    persona: RolePreset,
+    *,
+    life: str,
+    day: date,
+    previous: list[str],
+    timeline: list[str],
+    life_facts: list[str],
+) -> str:
+    """把ta一天的时间线写成一条日记，第二天还记得昨天干了什么。"""
+
+    return f"""
+你在幕后替「{persona.name}」写ta {day:%Y-%m-%d} 这天的日记，给ta自己以后翻看。
+{SAFETY_RULE}
+
+[ta这个人]（人生线）
+{life or persona.seed}
+
+[前几天的日记]
+{chr(10).join(previous) or "(无)"}
+
+[这天的时间线]（按时间先后；标着「自己说的」是ta在群里亲口说的）
+{chr(10).join(timeline)}
+
+[这天ta在群里说过的关于自己的事]
+{_bullets(life_facts) if life_facts else "(无)"}
+
+要求：
+- 第一人称，三四句，不超过 150 字，像随手记的日记，不用小标题、不按钟点流水账。
+- 只写时间线和上面那些事里有的，不编新的。挑这天主要做了什么、顺不顺、有什么没做完或打算接着做的（明天要交的、说好周末去的）。
+- 只写自己：不写任何群友，不写群聊和群里的事。被叫起来看手机的段，就当看了会儿手机，不提是谁叫的。
+
+只输出 JSON：{{"diary":"日记"}}
+"""
 
 
 # ==================== 查询记忆 ====================

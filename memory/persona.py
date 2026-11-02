@@ -2,6 +2,7 @@
 
 群里的事不出群，也改不了人生事实。群层每天写一条观察日记，跨天反复出现的才收进群层。
 性格变化只认外部证据：ta说的话是按档案生成的，拿来证明性格会自我强化。ta的话只用来固定事实。
+ta自己的日记（时间线写成的）同理：是ta自己生成的，只算发生过的事。
 """
 
 from collections import defaultdict
@@ -17,9 +18,13 @@ from ..prompts import (
     MAX_LIFE_FACTS,
     PRESETS,
     RolePreset,
+    diary_line,
+    get_diary_prompt,
     get_persona_group_prompt,
     get_persona_life_prompt,
+    segment_line,
 )
+from ..storage.db import load_persona_status, save_persona_diary
 from ..storage.models import (
     GlobalMessageModel,
     PersonaGroupModel,
@@ -39,6 +44,9 @@ GROUP_MIN_MESSAGES = 30
 # 没有新的自我陈述时，隔这么久也要整理一次人生线，让时间推进
 LIFE_INTERVAL = timedelta(days=7)
 PERSONA_TEMPERATURE = 0.4
+# ta自己的日记留几天、写日记时看前几天
+DIARY_DAYS = 14
+DIARY_PREVIOUS = 2
 
 _NOISE = {"[图片]", "[表情包]"}
 
@@ -181,13 +189,14 @@ async def digest_life(
     life: str,
     life_facts: list[str],
     group_styles: list[str],
+    diary: list[str],
     day: date,
     session_id: str,
 ) -> LifeDigest | None:
-    """整理人生线，失败返回 None。"""
+    """整理人生线，失败返回 None。diary 是上次整理以来ta自己的日记。"""
 
     data = await feedback_client.generate_json(
-        get_persona_life_prompt(persona, life, life_facts, group_styles, day),
+        get_persona_life_prompt(persona, life, life_facts, group_styles, diary, day),
         session_id=session_id,
         temperature=PERSONA_TEMPERATURE,
     )
@@ -197,6 +206,43 @@ async def digest_life(
     return LifeDigest(
         text=data["life"].strip(), changes=str(data.get("changes") or "").strip()
     )
+
+
+def day_segments(timeline: list[dict], until: datetime, day: date) -> list[str]:
+    """时间线里这一天开始的各段；每段到下一段开始为止，最后一段到 until。"""
+
+    lines = []
+    for index, segment in enumerate(timeline):
+        if segment["start"].date() != day:
+            continue
+        end = timeline[index + 1]["start"] if index + 1 < len(timeline) else until
+        lines.append(segment_line(segment, end))
+    return lines
+
+
+async def write_diary(
+    persona: RolePreset,
+    *,
+    life: str,
+    day: date,
+    previous: list[str],
+    timeline: list[str],
+    life_facts: list[str],
+    session_id: str,
+) -> str | None:
+    """把ta一天的时间线写成一条日记，失败返回 None。"""
+
+    data = await feedback_client.generate_json(
+        get_diary_prompt(
+            persona, life=life, day=day, previous=previous, timeline=timeline, life_facts=life_facts
+        ),
+        session_id=session_id,
+        temperature=PERSONA_TEMPERATURE,
+    )
+    if data is None or not isinstance(data.get("diary"), str) or not data["diary"].strip():
+        logger.warning(f"[Persona] {persona.name} {day} 日记输出无效")
+        return None
+    return data["diary"].strip()
 
 
 def group_style(group_text: str) -> str:
@@ -259,11 +305,19 @@ async def _maintain_preset(
         for session_id in session_ids
     }
     joined = {session_id: await _joined(session_id) for session_id in session_ids}
+    # 还没定过状态（这个预设从没启用过）就没有日记可写
+    status = await load_persona_status(filename)
 
     if not life.text:
         result = await _retry(
             lambda: digest_life(
-                persona, life="", life_facts=[], group_styles=[], day=yesterday, session_id=life_session
+                persona,
+                life="",
+                life_facts=[],
+                group_styles=[],
+                diary=[],
+                day=yesterday,
+                session_id=life_session,
             )
         )
         if result is None:
@@ -278,9 +332,11 @@ async def _maintain_preset(
 
     # 某个群某天整理失败就停在那天，后面几天等下一晚，保证日记和水位按天连续
     blocked: set[str] = set()
+    diary_blocked = False
     updated: dict[str, PersonaGroupModel] = {}
     day = min((next_day(layer) for layer in layers.values()), default=yesterday + timedelta(days=1))
     while day <= yesterday:
+        day_facts: list[str] = []
         for session_id, layer in layers.items():
             if session_id in blocked or next_day(layer) > day:
                 continue
@@ -305,21 +361,35 @@ async def _maintain_preset(
                 layer.text = result.text
                 layer.journal = (layer.journal + [result.observation])[-JOURNAL_DAYS:]
                 life.pending_facts = life.pending_facts + result.life_facts
+                day_facts += result.life_facts
                 await life.save()
                 await _history("group", f"{session_id}:{filename}", day, result.text, result.changes)
                 updated[session_id] = layer
             layer.digested_until = day
             await layer.save()
 
+        # 日记在群层之后：要用这天各群抽出的自我陈述；在人生线之前：人生线要读它。失败就停在这天，下一晚接着写
+        if status is not None and not diary_blocked and (
+            status["diary_until"] is None or day > status["diary_until"]
+        ):
+            diary_blocked = not await _write_day_diary(persona, filename, status, life.text, day, day_facts)
+
         if life_due(life.last_digest, day, bool(life.pending_facts)):
             # 风格提升只看现在启用的群：停用、退出的群里沾上的说法不该继续「变老」被提升
             styles = [style for style in (group_style(layer.text) for layer in layers.values()) if style]
+            since = life.last_digest.isoformat() if life.last_digest else ""
+            diary = [
+                diary_line(entry)
+                for entry in (status["diary"] if status else [])
+                if since < entry["day"] <= day.isoformat()
+            ]
             result = await _retry(
                 lambda: digest_life(
                     persona,
                     life=life.text,
                     life_facts=life.pending_facts,
                     group_styles=styles,
+                    diary=diary,
                     day=day,
                     session_id=life_session,
                 )
@@ -335,6 +405,32 @@ async def _maintain_preset(
         f"整理失败停在半路的群 {sorted(blocked) or '无'}"
     )
     return life, updated
+
+
+async def _write_day_diary(
+    persona: RolePreset, filename: str, status: dict, life: str, day: date, facts: list[str]
+) -> bool:
+    """写这一天的日记并推进日记水位；这天一段时间线都没有（服务停了一整天）就跳过。失败返回 False。"""
+
+    timeline = day_segments(status["timeline"], status["until"], day)
+    if timeline:
+        text = await _retry(
+            lambda: write_diary(
+                persona,
+                life=life,
+                day=day,
+                previous=[diary_line(entry) for entry in status["diary"][-DIARY_PREVIOUS:]],
+                timeline=timeline,
+                life_facts=facts,
+                session_id=f"persona:{filename}",
+            )
+        )
+        if text is None:
+            return False
+        status["diary"] = (status["diary"] + [{"day": day.isoformat(), "text": text}])[-DIARY_DAYS:]
+    status["diary_until"] = day
+    await save_persona_diary(filename, status["diary"], day)
+    return True
 
 
 async def maintain_personas(

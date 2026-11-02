@@ -59,6 +59,8 @@ class GlobalMessageModel(Model):
     content = fields.TextField()
     time = fields.DatetimeField()
     msg_id = fields.CharField(max_length=255, default="")
+    # @ 她或回复她的消息；补看时从被挤出未读的那段里捞回谁找过她
+    to_me = fields.BooleanField(default=False)
 
     class Meta:
         table = "nyabot_global_messages"
@@ -139,6 +141,28 @@ class PersonaGroupModel(Model):
     class Meta:
         table = "nyabot_persona_group"
         unique_together = (("session", "preset"),)
+
+
+class PersonaStatusModel(Model):
+    """她自己的时间线：每个预设一份，各群共享。
+
+    timeline、until、nights 由 chat/status.py 随时写；diary、diary_until 只由每日整理写，两边各写各的列。
+    """
+
+    preset = fields.CharField(pk=True, max_length=255)
+    # 还没写进日记的各段，最后一段是现在：{"start": ISO 时间, "mode", "doing", "sleep", "source"}
+    timeline = fields.JSONField(default=list)
+    # 现在这一段大概到几点
+    until = fields.DatetimeField(null=True)
+    # 最近几晚：{"sleep": ISO 时间, "wake": ISO 时间或 null}
+    nights = fields.JSONField(default=list)
+    # 每天一条日记：{"day": "YYYY-MM-DD", "text"}
+    diary = fields.JSONField(default=list)
+    # 日记写到的最后一个自然日
+    diary_until = fields.DateField(null=True)
+
+    class Meta:
+        table = "nyabot_persona_status"
 
 
 class PersonaHistoryModel(Model):

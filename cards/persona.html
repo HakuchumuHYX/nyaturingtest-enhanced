@@ -99,6 +99,9 @@ h1 { font-weight: 500; font-size: 40px; line-height: 1.15; overflow-wrap: anywhe
 }
 .styles time { margin-left: 8px; }
 .dated li { display: grid; grid-template-columns: 40px 1fr; align-items: baseline; }
+/* 最近的日记跟在人生线后面，日期用人生线的蓝 */
+.diary time { color: var(--life); }
+.diary li + li { margin-top: 6px; }
 
 /* 最近的改动：一条一行，放不下就省略 */
 .changes { padding: 16px 28px 22px; border-top: 3px solid var(--sea); }

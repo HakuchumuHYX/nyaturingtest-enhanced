@@ -2,6 +2,7 @@
 
 被点名、聊天对象在接话、被戳就马上看，否则按节奏攒着。
 被点名也不强制回：两个 Bot 互相回复时，只有 Feedback 看着发言量压低 willing 才停得下来。
+她 away（手机放下了）时不自己看群，有人叫她交给 chat/status.py 判断拿不拿起手机。
 """
 
 from datetime import datetime
@@ -50,22 +51,26 @@ def unread_count(state, unread: list[ChatMessage]) -> int:
     return sum(message.user_name != state.name for message in unread)
 
 
-def seconds_until_look(state, unread: list[ChatMessage], now: datetime) -> float | None:
-    """按节奏还要多久该看群；没有群友的未读（或没设人设）返回 None。worker 用它给到点补看定时。"""
+def seconds_until_look(
+    state, unread: list[ChatMessage], now: datetime, away: bool
+) -> float | None:
+    """按节奏还要多久该看群；没有群友的未读、没设人设或 away 时返回 None。worker 用它给到点补看定时。"""
 
-    if not state.name or unread_count(state, unread) == 0:
+    if away or not state.name or unread_count(state, unread) == 0:
         return None
     elapsed = (now - state.last_look_time).total_seconds()
     return max(0.0, LOOK_INTERVAL_SECONDS - elapsed)
 
 
-def decide_look(state, unread: list[ChatMessage], now: datetime) -> LookTrigger | None:
+def decide_look(
+    state, unread: list[ChatMessage], now: datetime, away: bool
+) -> LookTrigger | None:
     """看全部未读决定这次看不看群；返回 None 就继续攒着。
 
     按全部未读而不是这一批判断：Feedback 失败、水位没动时，那条点名不会因为下一批没点名就漏掉。
     """
 
-    if unread_count(state, unread) == 0:
+    if away or unread_count(state, unread) == 0:
         return None
     if check_relevance(state.name, state.aliases, unread):
         return LookTrigger.RELEVANT
@@ -78,10 +83,16 @@ def decide_look(state, unread: list[ChatMessage], now: datetime) -> LookTrigger 
         return LookTrigger.POKE
     if (
         unread_count(state, unread) >= LOOK_UNREAD_THRESHOLD
-        or seconds_until_look(state, unread, now) == 0
+        or seconds_until_look(state, unread, now, away) == 0
     ):
         return LookTrigger.RHYTHM
     return None
+
+
+def calls_me(state, message: ChatMessage) -> bool:
+    """这条是在叫她：点名（同 check_relevance）或者戳她。away 时据此判断有没有人找她。"""
+
+    return check_relevance(state.name, state.aliases, [message]) or (message.poke and message.to_me)
 
 
 def check_relevance(
@@ -92,7 +103,7 @@ def check_relevance(
     """群友 @Bot、回复 Bot 的消息，或提到名字/别名（至少 2 个字）。
 
     角色自己的话不算：未读里有她刚发出去的消息。
-    戳一戳、贴表情记录不算：被戳了回不回话交给 Feedback，不必回；贴表情记录里引的原文带名字也不是在叫 bot。
+    戳一戳、贴表情、群通知记录不算：被戳了回不回话交给 Feedback，不必回；贴表情记录里引的原文带名字也不是在叫 bot。
     合并转发也不算：读完后是别人的聊天记录，里面出现名字不是在叫 bot。
     """
 

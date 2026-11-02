@@ -1,10 +1,12 @@
 import asyncio
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from nonebot import logger
 from nonebot.adapters.onebot.v11 import Bot, Event
+from nonebot.adapters.onebot.v11.exception import ActionFailed
+from nonebot.exception import NetworkError
 
 from ..memory.vector import VectorMemory
 from ..messages.message import ChatMessage, Memory
@@ -27,6 +29,8 @@ MEMORY_DRAIN_TIMEOUT_SECONDS = 10.0
 SAVE_DEBOUNCE_SECONDS = 0.05
 # 待处理队列：满了丢最旧的，2s 防抖下几乎不可能积压到上限
 QUEUE_MAX_SIZE = 200
+# 群名和人数看群时超过这么久就重新拉；有人进群、退群时作废
+GROUP_INFO_TTL = timedelta(hours=1)
 
 
 @dataclass
@@ -85,6 +89,11 @@ class Session:
         self.last_react_time: datetime = datetime.min
         self.last_poke_time: datetime = datetime.min
         self.last_sticker_time: datetime = datetime.min
+        # 她被禁言到什么时候（全员禁言记到解除为止），只存内存：重启后禁言期内发送会失败，失败记日志
+        self.muted_until: datetime | None = None
+        # 「群名 X；现在 N 人，上限 M」和拉取时间；拉取失败也记时间，空串就是省略
+        self.group_info: str = ""
+        self.group_info_at: datetime = datetime.min
 
     def bump_generation(self, reason: str) -> int:
         self.state.generation += 1
@@ -310,10 +319,33 @@ class Session:
         )
         self.short_term_memory.update([msg])
 
-    def record_reaction(self, record: ChatMessage) -> None:
-        """贴表情记录只进短期记忆、不进队列；并进旧记录的挪到末尾，重新算未读。
+    @property
+    def muted(self) -> bool:
+        return self.muted_until is not None and datetime.now() < self.muted_until
 
-        群友贴的算未读，要唤醒 worker：它没有未读时不定时，不叫醒的话群里安静时要等下一个人说话才看得到。
+    async def refresh_group_info(self) -> str:
+        """群名和人数，看群时调用；超过 GROUP_INFO_TTL 才重新拉。"""
+
+        now = datetime.now()
+        if self.bot is None or now - self.group_info_at < GROUP_INFO_TTL:
+            return self.group_info
+        self.group_info_at = now
+        try:
+            info = await self.bot.get_group_info(group_id=int(self.id), no_cache=True)
+        except (ActionFailed, NetworkError) as e:
+            logger.warning(f"[Session {self.id}] 拉取群信息失败: {e}")
+            self.group_info = ""
+            return ""
+        self.group_info = (
+            f"群名 {info.get('group_name', '')}；"
+            f"现在 {info.get('member_count')} 人，上限 {info.get('max_member_count')}"
+        )
+        return self.group_info
+
+    def record_action(self, record: ChatMessage) -> None:
+        """贴表情、群通知这类记录只进短期记忆、不进队列；贴表情并进旧记录的挪到末尾，重新算未读。
+
+        群友的记录算未读，要唤醒 worker：它没有未读时不定时，不叫醒的话群里安静时要等下一个人说话才看得到。
         队列是空的，worker 醒来只会按新的未读重新定时，到点照常看群。
         """
 

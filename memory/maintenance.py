@@ -8,6 +8,7 @@ require("nonebot_plugin_apscheduler")
 from nonebot_plugin_apscheduler import scheduler  # noqa: E402  必须在 require 之后导入
 
 from ..chat.groups import sessions  # noqa: E402
+from ..chat.status import reload_diaries  # noqa: E402
 from .digest import digest_group_notes, digest_user_profiles  # noqa: E402
 from .persona import maintain_personas  # noqa: E402
 from .vector import maintain_memories  # noqa: E402
@@ -72,6 +73,8 @@ async def _maintain_personas() -> None:
     except Exception as e:
         logger.warning(f"人设成长整理失败: {e}")
         return
+    # 日记只由每日整理写，时间线那边的内存副本要同步
+    await reload_diaries()
     # 人生线和群层不随 save_session 回写，要同步内存副本
     for group_id in group_ids:
         session = sessions.get(group_id)
