@@ -12,7 +12,7 @@ from ..metrics import log_event
 from .engagement import seconds_until_look
 from .groups import is_shutting_down
 from .orchestrator import process_chunk
-from .send import SELF_SENT_MSG_IDS, dispatch_replies, send_poke, send_reaction
+from .send import dispatch_replies, send_poke, send_reaction
 from .session import Session
 
 DEBOUNCE_SECONDS = 2.0
@@ -56,26 +56,8 @@ async def next_inbox_batch(session: Session) -> InboxBatch | None:
         return batch
 
 
-def _filter_local_self_echoes(
-    messages: list[ChatMessage], bot_self_id: str
-) -> tuple[list[ChatMessage], list[ChatMessage]]:
-    """按本地已发送消息 ID 分离自身回显。"""
-
-    filtered, local_echoes = [], []
-    for msg in messages:
-        if msg.id and msg.user_id == bot_self_id and msg.id in SELF_SENT_MSG_IDS:
-            local_echoes.append(msg)
-        else:
-            filtered.append(msg)
-    return filtered, local_echoes
-
-
 async def _process_inbox_batch(session: Session, batch: InboxBatch) -> None:
-    current_chunk = []
-    if batch.messages:
-        current_chunk = await _prepare_messages(session, batch)
-        if not current_chunk:
-            return
+    current_chunk = await _prepare_messages(session, batch)
     if is_shutting_down():
         return
 
@@ -99,15 +81,9 @@ async def _process_inbox_batch(session: Session, batch: InboxBatch) -> None:
 
 
 async def _prepare_messages(session: Session, batch: InboxBatch) -> list[ChatMessage]:
-    """滤掉自身回显、等这批图片描述、记 message 事件；全是自己发的就返回空。"""
+    """等这批图片描述、记 message 事件。"""
 
-    bot_self_id = str(batch.bot.self_id)
-    current_chunk, local_echoes = _filter_local_self_echoes(batch.messages, bot_self_id)
-    if local_echoes:
-        logger.debug(f"过滤本机自身回显消息 {len(local_echoes)} 条")
-    if all(message.user_id == bot_self_id for message in current_chunk):
-        # 自身账号发出的消息已由 append_self_message 写入记忆，这里直接丢弃
-        return []
+    current_chunk = batch.messages
 
     pending = [
         task

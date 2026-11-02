@@ -217,32 +217,33 @@ emoji_like = on_notice(rule=is_emoji_like_added, priority=99, block=False)
 
 @emoji_like.handle()
 async def handle_emoji_like(bot: Bot, event: NoticeEvent):
+    """群里的贴表情都记，包括她自己贴的（SnowLuma 会上报）和群友之间互贴的。"""
+
     data = event.model_dump()
-    user_id = str(data["user_id"])
-    group_id = int(data["group_id"])
-    # 自己贴的表情也会上报
-    if user_id == str(bot.self_id) or is_shutting_down():
+    if is_shutting_down() or not data.get("likes"):
         return
-    session = get_session(group_id)
+    session = get_session(int(data["group_id"]))
     if session is None:
         return
 
     message_id = str(data["message_id"])
-    # 只关心 bot 自己的消息；群友互相贴的、太旧不在短期记忆里的都不管
+    # 被贴的那条要还在最近的上下文里，太旧的不管
     target = next(
-        (
-            m
-            for m in session.short_term_memory.access()
-            if m.id == message_id and m.user_name == session.state.name
-        ),
+        (m for m in session.short_term_memory.access() if m.id == message_id),
         None,
     )
-    if target is None or not data.get("likes"):
+    if target is None:
         return
 
+    like = data["likes"][0]
     session.record_reaction(
         await read_reaction(
-            bot, group_id, user_id, target, str(data["likes"][0]["emoji_id"])
+            bot,
+            session,
+            target,
+            str(data["user_id"]),
+            str(like["emoji_id"]),
+            int(like.get("count") or 1),
         )
     )
 
@@ -266,8 +267,8 @@ async def handle_group_poke(bot: Bot, event: PokeNotifyEvent):
 
     message = await read_poke(bot, event, session.state.name)
     if message.user_id == str(bot.self_id):
-        # bot 自己戳的：和自己发的消息一样直接进短期记忆，不触发新一轮
-        session.append_self_message(message.content, "", message.user_id)
+        # bot 自己戳的：直接进短期记忆，不触发新一轮；用读出来的这条，poke 标记才在
+        session.record_incoming([message])
         return
     await session.enqueue(message, bot, event)
 

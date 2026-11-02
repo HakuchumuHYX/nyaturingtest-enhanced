@@ -300,7 +300,7 @@ class Session:
         self.state.self_life = life or preset.seed
 
     def append_self_message(self, content: str, msg_id: str, bot_user_id: str):
-        """自己发的消息直接写进短期记忆，不等平台回显。"""
+        """自己发的消息直接写进短期记忆：平台把它作为 message_sent 上报，适配器没有这个事件模型，收不到。"""
         msg = ChatMessage(
             time=datetime.now(),
             user_name=self.state.name,
@@ -310,17 +310,21 @@ class Session:
         )
         self.short_term_memory.update([msg])
 
-    def record_reaction(self, msg: ChatMessage) -> None:
-        """群友给 bot 的消息贴了表情：只进短期记忆，不触发新一轮对话；算一条未读，等下次看群一起读。
+    def record_reaction(self, record: ChatMessage) -> None:
+        """贴表情记录只进短期记忆、不进队列；并进旧记录的挪到末尾，重新算未读。
 
-        一条消息常被好几个人贴同一个表情，已有相同记录就跳过，免得挤满上下文窗口。
+        群友贴的算未读，要唤醒 worker：它没有未读时不定时，不叫醒的话群里安静时要等下一个人说话才看得到。
+        队列是空的，worker 醒来只会按新的未读重新定时，到点照常看群。
         """
 
         memory = self.short_term_memory
-        if any(m.content == msg.content for m in memory.access()):
-            return
-        memory.update([msg])
+        if any(m is record for m in memory.access()):
+            memory.move_to_latest(record)
+        else:
+            memory.update([record])
         self.schedule_save()
+        if record.user_name != self.state.name:
+            self.new_message_signal.set()
 
     def recall_message(self, msg_id: str, content: str) -> bool:
         """群友撤回消息：缓冲里那条原地改成撤回标记，随下次保存写回消息库。"""

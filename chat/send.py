@@ -3,7 +3,6 @@
 import asyncio
 import random
 import re
-from collections import deque
 from datetime import datetime
 
 from nonebot import logger
@@ -22,9 +21,6 @@ REACT_COOLDOWN_SECONDS = 60
 # 戳一戳会给对方弹提醒，比贴表情打扰人，间隔放长些
 POKE_COOLDOWN_SECONDS = 120
 STICKER_COOLDOWN_SECONDS = 120
-
-# 本机发出的消息 id，worker 据此过滤平台推回来的自身回显
-SELF_SENT_MSG_IDS = deque(maxlen=50)
 
 _SPLIT_PATTERN = re.compile(
     r"(?<=[。！？!?~\n])\s*|(?<!\.)\.(?!\.)(?=\s|$|[\u4e00-\u9fff])\s*"
@@ -63,7 +59,6 @@ async def send_one(
         message_id = ""
         if isinstance(result, dict) and "message_id" in result:
             message_id = str(result["message_id"])
-            SELF_SENT_MSG_IDS.append(message_id)
         log_event("reply", session_id=session.id, content=memory_text)
 
         # 同步写入短时记忆，中间没有 await，不需要再拿 admin_lock

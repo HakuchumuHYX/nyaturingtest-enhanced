@@ -263,7 +263,10 @@ def _parse_affinity_changes(raw, speaker_ids: set[str]) -> dict[str, int]:
 
 
 def _parse_reaction(raw, unread: list[ChatMessage], bot_name: str) -> Reaction | None:
-    """react：只能贴这段未读里群友的消息，表情要在目录里。"""
+    """react：只能贴这段未读里群友的消息，表情要在目录里。
+
+    选中贴表情记录就是跟着贴，贴到它贴的那条上。
+    """
 
     if not isinstance(raw, dict):
         return None
@@ -271,6 +274,8 @@ def _parse_reaction(raw, unread: list[ChatMessage], bot_name: str) -> Reaction |
     if not isinstance(index, int) or not 0 <= index < len(unread):
         return None
     target = unread[index]
+    if target.reacted is not None:
+        target = target.reacted.target
     if not target.id or target.user_name == bot_name:
         return None
     emoji = reaction_emoji(str(raw.get("emoji") or ""))
@@ -433,8 +438,9 @@ async def _look(
     # 水位推到这一刻读到的最后一条：看群途中合并转发读完会把那条的时间改成现在（move_to_latest），
     # 按读完时的最大时间推进，就会把它和途中新来的消息一起误标成已读
     read_until = max(m.time for m in unread)
-    recent = session.short_term_memory.access()
-    self_share = sum(m.user_name == state.name for m in recent) / len(recent)
+    # 只数说的话：贴表情、戳一戳记录算进来，她动一下手占比就被抬高，群友互贴又把占比拉低
+    recent = [m for m in session.short_term_memory.access() if not m.is_action]
+    self_share = sum(m.user_name == state.name for m in recent) / max(len(recent), 1)
     context = _read_context(session, unread)
     is_relevant = trigger is LookTrigger.RELEVANT
 
@@ -716,7 +722,9 @@ async def chat_stage(
     recent_msgs = format_history(context)
     # 自己最近说过的话单独列出来，prompt 要求避免重复句式
     my_recent_replies = [
-        m.content for m in session.short_term_memory.access() if m.user_name == state.name
+        m.content
+        for m in session.short_term_memory.access()
+        if m.user_name == state.name and not m.is_action
     ][-MY_RECENT_REPLIES_LIMIT:]
     recalled_str = "\n".join(recalled_history) or "无"
     related_profiles = _related_profiles(session, unread, for_chat=True)

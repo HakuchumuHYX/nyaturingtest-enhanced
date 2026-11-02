@@ -92,14 +92,14 @@ def check_relevance(
     """群友 @Bot、回复 Bot 的消息，或提到名字/别名（至少 2 个字）。
 
     角色自己的话不算：未读里有她刚发出去的消息。
-    戳一戳记录不算：被戳了回不回话交给 Feedback，不必回。
+    戳一戳、贴表情记录不算：被戳了回不回话交给 Feedback，不必回；贴表情记录里引的原文带名字也不是在叫 bot。
     合并转发也不算：读完后是别人的聊天记录，里面出现名字不是在叫 bot。
     """
 
     messages = [
         message
         for message in messages
-        if message.user_name != bot_name and not message.poke and not message.forward
+        if message.user_name != bot_name and not message.is_action and not message.forward
     ]
     if any(message.to_me for message in messages):
         return True

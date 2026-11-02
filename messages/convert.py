@@ -25,7 +25,7 @@ from ..metrics import log_event
 from ..prompts import truncate_text
 from .faces import ensure_faces, face_name
 from .image import cached_caption, caption_image, caption_sticker, fetch_image_input
-from .message import ChatMessage
+from .message import ChatMessage, Reacted
 from .stickers import collect, note_seen
 
 CARD_CHARS = 120
@@ -337,19 +337,16 @@ async def read_message(bot: Bot, event: GroupMessageEvent, session: Session) -> 
         )
     )
 
-    user_id, self_id = str(event.user_id), str(bot.self_id)
-    if user_id == self_id:
-        user_name = bot_name
-    else:
-        user_name = (
-            str(event.sender.card or "").strip()
-            or str(event.sender.nickname or "").strip()
-            or user_id
-        )
-        # 群友发的表情包给库里那张计数；bot 自己的消息会被上报回来，回复里引用的图也不算又发了一次
-        for seg, part in zip(message, parts):
-            if seg.type == "image" and is_sticker_segment(seg.data) and part.images:
-                await note_seen(part.images[0].digest)
+    user_id = str(event.user_id)
+    user_name = (
+        str(event.sender.card or "").strip()
+        or str(event.sender.nickname or "").strip()
+        or user_id
+    )
+    # 群友发的表情包给库里那张计数；回复里引用的图不算又发了一次
+    for seg, part in zip(message, parts):
+        if seg.type == "image" and is_sticker_segment(seg.data) and part.images:
+            await note_seen(part.images[0].digest)
     chat_message = ChatMessage(
         time=datetime.now(),
         user_name=user_name,
@@ -358,7 +355,7 @@ async def read_message(bot: Bot, event: GroupMessageEvent, session: Session) -> 
         user_id=user_id,
         image_inputs=[image for part in parts for image in part.images],
         mentions={uid: name for part in parts for uid, name in part.mentions.items()},
-        to_me=user_id != self_id and _addresses_bot(bot, event),
+        to_me=_addresses_bot(bot, event),
         forward=bool(forward_id(message)),
         substantive=_is_substantive(parts),
     )
@@ -399,18 +396,57 @@ async def read_poke(bot: Bot, event: PokeNotifyEvent, bot_name: str) -> ChatMess
 
 
 async def read_reaction(
-    bot: Bot, group_id: int, user_id: str, target: ChatMessage, emoji_id: str
+    bot: Bot,
+    session: Session,
+    target: ChatMessage,
+    user_id: str,
+    emoji_id: str,
+    count: int,
 ) -> ChatMessage:
-    """群友给 bot 的消息贴了表情，读成一条消息。"""
+    """贴表情通知读成一条记录。
+
+    群友给同一条消息贴同一个表情并成一条：名单加上这个人，人数用通知给的，发言人换成他
+    （新来的人得在 new_msg_speakers 里才能被调好感、被戳，之前的人放进 mentions）。
+    她自己贴的单独一条、记在她名下，不并进群友那条。
+    """
 
     await ensure_faces(bot)
-    emoji = face_name(emoji_id)
-    return ChatMessage(
-        time=datetime.now(),
-        user_name=await member_name(bot, group_id, user_id) or user_id,
-        content=f"[给你的消息「{target.content[:20]}」贴了表情:{emoji or '未知'}]",
-        user_id=user_id,
-    )
+    bot_name = session.state.name
+    by_bot = user_id == str(bot.self_id)
+    record = None
+    if not by_bot:
+        record = next(
+            (
+                m
+                for m in session.short_term_memory.access()
+                if m.reacted
+                and m.reacted.target is target
+                and m.reacted.emoji_id == emoji_id
+                and m.user_name != bot_name
+            ),
+            None,
+        )
+    if record is None:
+        record = ChatMessage(
+            time=datetime.now(),
+            user_name=bot_name,
+            content="",
+            user_id=user_id,
+            reacted=Reacted(target, emoji_id),
+        )
+    reactors = record.reacted.reactors
+    if not by_bot:
+        name = await member_name(bot, int(session.id), user_id) or user_id
+        reactors[user_id] = name
+        record.user_name, record.user_id = name, user_id
+        record.mentions = {uid: n for uid, n in reactors.items() if uid != user_id}
+
+    owner = "你" if target.user_name == bot_name else f" {target.user_name} "
+    content = f"[给{owner}的消息「{target.content[:20]}」贴了表情:{face_name(emoji_id) or '未知'}"
+    if not by_bot and count > 1:
+        content += f"，共 {count} 人：{'、'.join(reactors.values())}"
+    record.content = content + "]"
+    return record
 
 
 def recall_text(by_author: bool) -> str:

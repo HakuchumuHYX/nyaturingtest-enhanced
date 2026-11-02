@@ -22,6 +22,8 @@ class ChatMessage:
     to_me: bool = field(default=False, repr=False, compare=False)
     # 戳一戳通知转成的记录；被戳不算点名，只让 bot 看一眼、自己决定理不理
     poke: bool = field(default=False, repr=False, compare=False)
+    # 贴表情记录：贴的是哪条、哪个表情、谁贴的；合并同一条同一表情、跟着贴都靠它
+    reacted: "Reacted | None" = field(default=None, repr=False, compare=False)
     # 合并转发：读完后内容是别人的聊天记录，里面出现 bot 的名字不算点名
     forward: bool = field(default=False, repr=False, compare=False)
     # 后台看图的任务，处理这批消息前先等它们
@@ -31,12 +33,26 @@ class ChatMessage:
     revision: int = field(default=0, repr=False, compare=False)
     _persistence_id: str = field(default="", repr=False, compare=False)
 
+    @property
+    def is_action(self) -> bool:
+        """贴表情、戳一戳这类动作记录，不是说的话。"""
+
+        return self.reacted is not None or self.poke
+
     def recall(self, content: str) -> None:
         """撤回：内容原地改成撤回标记。图片一并清掉，免得进行中这一轮的图片观察再把内容写回去。"""
 
         self.content = content
         self.image_inputs = []
         self.substantive = False
+
+
+@dataclass
+class Reacted:
+    target: ChatMessage
+    emoji_id: str
+    # 看到的贴过的群友（QQ 号 -> 群名片），按先后；重启前贴的只算在通知给的人数里
+    reactors: dict[str, str] = field(default_factory=dict)
 
 
 class Memory:
