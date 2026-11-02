@@ -363,6 +363,7 @@ async def add_sticker(
     source: str,
     embedding: bytes | None,
     embedding_model: str,
+    seen_at: datetime,
 ) -> StickerModel:
     return await StickerModel.create(
         digest=digest,
@@ -373,6 +374,8 @@ async def add_sticker(
         source=source,
         embedding=embedding,
         embedding_model=embedding_model,
+        seen_count=1,
+        last_seen_at=seen_at,
     )
 
 
@@ -386,6 +389,18 @@ async def save_sticker_embedding(
 
 async def mark_sticker_sent(digest: str, sent_at: datetime) -> None:
     await StickerModel.filter(digest=digest).update(last_sent_at=sent_at)
+
+
+async def mark_sticker_seen(digest: str, seen_count: int, seen_at: datetime) -> None:
+    await StickerModel.filter(digest=digest).update(
+        seen_count=seen_count, last_seen_at=seen_at
+    )
+
+
+async def delete_stickers(digests: list[str]) -> None:
+    """删行不拉黑：清理掉的图以后再有人发还能重新收。"""
+
+    await StickerModel.filter(digest__in=digests).delete()
 
 
 async def block_sticker(digest: str) -> None:

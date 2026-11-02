@@ -26,7 +26,7 @@ from ..prompts import truncate_text
 from .faces import ensure_faces, face_name
 from .image import cached_caption, caption_image, caption_sticker, fetch_image_input
 from .message import ChatMessage
-from .stickers import collect
+from .stickers import collect, note_seen
 
 CARD_CHARS = 120
 FORWARD_PLACEHOLDER = "[合并转发]"
@@ -346,6 +346,10 @@ async def read_message(bot: Bot, event: GroupMessageEvent, session: Session) -> 
             or str(event.sender.nickname or "").strip()
             or user_id
         )
+        # 群友发的表情包给库里那张计数；bot 自己的消息会被上报回来，回复里引用的图也不算又发了一次
+        for seg, part in zip(message, parts):
+            if seg.type == "image" and is_sticker_segment(seg.data) and part.images:
+                await note_seen(part.images[0].digest)
     chat_message = ChatMessage(
         time=datetime.now(),
         user_name=user_name,

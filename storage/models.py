@@ -176,6 +176,9 @@ class StickerModel(Model):
     blocked = fields.BooleanField(default=False)
     created_at = fields.DatetimeField(auto_now_add=True)
     last_sent_at = fields.DatetimeField(null=True)
+    # 群友发过几次（收进来那次算 1）和最后一次的时间，每晚清理按这两列判断；素材库导入的为 0 / NULL
+    seen_count = fields.IntField(default=0)
+    last_seen_at = fields.DatetimeField(null=True)
 
     class Meta:
         table = "nyabot_stickers"
