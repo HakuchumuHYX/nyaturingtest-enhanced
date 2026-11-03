@@ -9,7 +9,7 @@ from datetime import datetime
 from nonebot import logger
 
 from ..chat.session import Session
-from ..messages.message import ChatMessage
+from ..messages.message import GROUP_BOT_ID, ChatMessage
 from ..metrics import log_event
 from ..storage.db import message_final_id
 from .vector import NewMemory
@@ -197,6 +197,9 @@ async def save_memory_candidates(
         if not reason and memory.speaker_user_name == session.state.name:
             # 角色自己说的话只是上下文，不当事实来源
             reason = "bot_source"
+        if not reason and GROUP_BOT_ID in (memory.speaker_user_id, memory.subject_user_id):
+            # 群里的bot 发的是命令结果、复读、推送，不是谁的事；记忆只挂在群友身上
+            reason = "group_bot"
         if reason:
             skipped_quality += 1
             log_event(

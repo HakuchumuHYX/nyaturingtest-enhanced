@@ -13,7 +13,7 @@ from nonebot_plugin_apscheduler import scheduler  # noqa: E402  必须在 requir
 from ..chat.groups import is_shutting_down, sessions  # noqa: E402
 from ..chat.session import Session  # noqa: E402
 from ..llm import background_client  # noqa: E402
-from ..messages.message import ChatMessage  # noqa: E402
+from ..messages.message import GROUP_BOT_ID, ChatMessage  # noqa: E402
 from ..metrics import log_event  # noqa: E402
 from ..prompts import get_episode_prompt, truncate_text  # noqa: E402
 from ..storage.db import get_latest_user_names  # noqa: E402
@@ -48,7 +48,7 @@ def _trigger(rows: list[GlobalMessageModel], bot_name: str, now: datetime) -> st
         return None
     if len(rows) >= SEGMENT_MAX_MESSAGES:
         return "full"
-    members = sum(row.user_name != bot_name for row in rows)
+    members = sum(row.user_name != bot_name and row.user_id != GROUP_BOT_ID for row in rows)
     if now - rows[-1].time >= SEGMENT_IDLE and members >= SEGMENT_MIN_MEMBER_MESSAGES:
         return "idle"
     if now - rows[0].time >= SEGMENT_MAX_WAIT:
@@ -78,7 +78,9 @@ def _episode_memories(
                 importance=clamp01(item.get("importance"), 0.2),
                 sources=sources,
                 participant_ids=(
-                    m.user_id for m in sources if m.user_id and m.user_name != bot_name
+                    m.user_id
+                    for m in sources
+                    if m.user_id and m.user_name != bot_name and not m.by_group_bot
                 ),
             )
         )
@@ -103,7 +105,8 @@ async def _digest_batch(
         )
         for row in rows
     ]
-    members = [m for m in messages if m.user_name != bot_name]
+    # 群里的bot 的消息留在素材里当上下文，但不算群友
+    members = [m for m in messages if m.user_name != bot_name and not m.by_group_bot]
 
     episodes: list[NewMemory] = []
     facts_result = {"added": 0, "rejected": 0}

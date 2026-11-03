@@ -5,6 +5,10 @@ from typing import Any
 
 SHORT_CONTEXT_LIMIT = 20
 SHORT_TERM_BUFFER_SIZE = 200
+# 同一个号上其他程序（主 HakuBot 的功能、手动发言等）发的消息记在这个名下：对她来说是群里另一个人，
+# 但不是群友，不建档案、不算好感、不当记忆主体；按 id 认，群友改名片冒充不了
+GROUP_BOT_ID = "group_bot"
+GROUP_BOT_NAME = "群里的bot"
 
 
 @dataclass
@@ -40,6 +44,10 @@ class ChatMessage:
         """贴表情、戳一戳、群通知这类记录，不是说的话。"""
 
         return self.reacted is not None or self.poke or self.notice
+
+    @property
+    def by_group_bot(self) -> bool:
+        return self.user_id == GROUP_BOT_ID
 
     def recall(self, content: str) -> None:
         """撤回：内容原地改成撤回标记。图片一并清掉，免得进行中这一轮的图片观察再把内容写回去。"""

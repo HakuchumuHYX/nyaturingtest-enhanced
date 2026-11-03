@@ -85,6 +85,8 @@ class Session:
         # 一轮对话不持锁，靠 generation 判断过期
         self.admin_lock = asyncio.Lock()
         self.new_message_signal = asyncio.Event()
+        # 发送到写进短期记忆之间持有：这个号的 message_sent 上报可能比发送返回早到，等它放开再按 id 认是不是她发的
+        self.send_lock = asyncio.Lock()
         # 贴表情、戳一戳、表情包的冷却只存内存，重启后重新计时
         self.last_react_time: datetime = datetime.min
         self.last_poke_time: datetime = datetime.min
@@ -309,7 +311,7 @@ class Session:
         self.state.self_life = life or preset.seed
 
     def append_self_message(self, content: str, msg_id: str, bot_user_id: str):
-        """自己发的消息直接写进短期记忆：平台把它作为 message_sent 上报，适配器没有这个事件模型，收不到。"""
+        """自己发的消息在发送返回时直接写进短期记忆；之后到的 message_sent 上报按 id 认出来跳过。"""
         msg = ChatMessage(
             time=datetime.now(),
             user_name=self.state.name,

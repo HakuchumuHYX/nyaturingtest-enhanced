@@ -1,9 +1,11 @@
 import hashlib
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from typing import Literal
 
-from nonebot import get_bot, logger, on_command, on_message, on_notice
+from nonebot import get_bot, logger, on, on_command, on_message, on_notice
 from nonebot.adapters.onebot.v11 import (
+    Adapter,
     Bot,
     Event,
     GroupBanNoticeEvent,
@@ -37,6 +39,7 @@ from .chat.groups import (
     is_shutting_down,
     sessions,
 )
+from .chat.session import Session
 from .chat.status import recent_diary, redecide, status_text
 from .config import get_app_settings, get_token_stats_model_names
 from .llm import background_client, chat_client, feedback_client
@@ -180,22 +183,13 @@ def _dual_command(cmd: str, aliases: set[str], handler):
     return matcher
 
 
-auto_chat = on_message(rule=is_group_message, priority=99, block=False)
+async def _take_in(
+    bot: Bot, event: GroupMessageEvent, session: Session, *, group_bot: bool = False
+) -> None:
+    """读一条群消息放进队列；群友的和群里的bot 的走同一条路。"""
 
-
-@auto_chat.handle()
-async def handle_auto_chat(bot: Bot, event: GroupMessageEvent):
-    group_id = event.group_id
-    session = get_session(group_id)
-    if session is None:
-        return
     generation = session.state.generation
-
-    # 关机途中不再接新消息
-    if is_shutting_down():
-        return
-
-    message = await read_message(bot, event, session)
+    message = await read_message(bot, event, session, group_bot=group_bot)
     if not message.content:
         return
     # 合并转发：先以占位进队列，后台读完改写成摘要再放回来（没设人设的群不读）
@@ -207,6 +201,54 @@ async def handle_auto_chat(bot: Bot, event: GroupMessageEvent):
         )
 
     await session.enqueue(message, bot, event)
+
+
+auto_chat = on_message(rule=is_group_message, priority=99, block=False)
+
+
+@auto_chat.handle()
+async def handle_auto_chat(bot: Bot, event: GroupMessageEvent):
+    session = get_session(event.group_id)
+    # 关机途中不再接新消息
+    if session is None or is_shutting_down():
+        return
+    await _take_in(bot, event, session)
+
+
+class GroupMessageSentEvent(GroupMessageEvent):
+    """这个号自己发出的群消息。
+
+    平台以 post_type=message_sent 上报，适配器没有这个模型，会落到通用 Event、读不出消息段。
+    get_type() 是 message_sent，on_message / on_command 收不到它，原有命令不受影响。
+    """
+
+    post_type: Literal["message_sent"]
+
+
+Adapter.add_custom_model(GroupMessageSentEvent)
+
+
+async def is_group_message_sent(event: Event) -> bool:
+    return isinstance(event, GroupMessageSentEvent)
+
+
+group_message_sent = on("message_sent", rule=is_group_message_sent, priority=99, block=False)
+
+
+@group_message_sent.handle()
+async def handle_group_message_sent(bot: Bot, event: GroupMessageSentEvent):
+    """她自己发的已经在短期记忆里，跳过；其余是同一个号上其他程序发的，记在群里的bot 名下。"""
+
+    session = get_session(event.group_id)
+    if session is None or is_shutting_down():
+        return
+    # 上报可能比发送接口返回还早：等这个群正在进行的发送写完短期记忆再认
+    async with session.send_lock:
+        pass
+    msg_id = str(event.message_id)
+    if any(m.id == msg_id for m in session.short_term_memory.access()):
+        return
+    await _take_in(bot, event, session, group_bot=True)
 
 
 async def is_emoji_like_added(event: Event) -> bool:
@@ -805,7 +847,9 @@ async def handle_query_memory(
     session = get_session(event.group_id)
     if session is None:
         await query_memory.finish("本群尚未启用 AI 功能。")
-    target_name = await member_name(bot, event.group_id, target_id) or target_id
+    target_name = (
+        await member_name(bot, event.group_id, target_id, session.state.name) or target_id
+    )
 
     retry_after = acquire_query_slot(str(event.group_id), str(event.user_id))
     if retry_after > 0:

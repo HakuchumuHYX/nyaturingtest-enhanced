@@ -35,19 +35,20 @@ async def send_one(
     generation: int,
 ) -> bool:
     try:
-        result = await bot.send(message=message, event=event)
-        message_id = ""
-        if isinstance(result, dict) and "message_id" in result:
-            message_id = str(result["message_id"])
-        log_event("reply", session_id=session.id, content=memory_text)
+        async with session.send_lock:
+            result = await bot.send(message=message, event=event)
+            message_id = ""
+            if isinstance(result, dict) and "message_id" in result:
+                message_id = str(result["message_id"])
+            log_event("reply", session_id=session.id, content=memory_text)
 
-        # 同步写入短时记忆，中间没有 await，不需要再拿 admin_lock
-        if not session.stale(generation, "append_self_message"):
-            session.append_self_message(
-                memory_text,
-                message_id,
-                str(bot.self_id),
-            )
+            # 同步写入短时记忆，中间没有 await，不需要再拿 admin_lock
+            if not session.stale(generation, "append_self_message"):
+                session.append_self_message(
+                    memory_text,
+                    message_id,
+                    str(bot.self_id),
+                )
         return True
     except ActionFailed as e:
         if getattr(e, "retcode", 0) == 1200 or "120" in str(e):

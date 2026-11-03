@@ -26,10 +26,10 @@ from ..chat.session import Session
 from ..llm import VisionInput
 from ..metrics import log_event
 from ..prompts import truncate_text
-from ..storage.db import get_latest_user_names
+from ..storage.db import get_latest_user_names, message_sender_name
 from .faces import ensure_faces, face_name
 from .image import cached_caption, caption_image, caption_sticker, fetch_image_input
-from .message import ChatMessage, Reacted
+from .message import GROUP_BOT_ID, GROUP_BOT_NAME, ChatMessage, Reacted
 from .stickers import collect, note_seen
 
 CARD_CHARS = 120
@@ -45,7 +45,15 @@ def is_sticker_segment(data: dict) -> bool:
     return str(data.get("sub_type", "")) == "1"
 
 
-async def member_name(bot: Bot, group_id: int, user_id: str) -> str | None:
+def distinct_name(name: str, user_id: str, bot_name: str) -> str:
+    """群友名片和她或群里的bot 撞名时带上 QQ 号：好几处按名字认她，不区分的话这个群友会被当成她本人。"""
+
+    if name in (bot_name, GROUP_BOT_NAME):
+        return f"{name}（{user_id}）"
+    return name
+
+
+async def member_name(bot: Bot, group_id: int, user_id: str, bot_name: str) -> str | None:
     """群名片，没有就用 QQ 昵称；查不到（退群、接口失败、@全体成员的 all）返回 None。"""
 
     try:
@@ -53,7 +61,7 @@ async def member_name(bot: Bot, group_id: int, user_id: str) -> str | None:
     except (ActionFailed, NetworkError, ValueError) as e:
         logger.debug(f"查群 {group_id} 成员 {user_id} 的名片失败: {e}")
         return None
-    return info.get("card") or info.get("nickname") or user_id
+    return distinct_name(info.get("card") or info.get("nickname") or user_id, user_id, bot_name)
 
 
 def _card_text(raw) -> str:
@@ -197,32 +205,51 @@ async def _at_part(bot: Bot, data: dict, group_id: int, bot_name: str) -> _Part:
         return _Part("")
     if target == str(bot.self_id):
         return _Part(f" @{bot_name} ")
-    name = await member_name(bot, group_id, str(target))
+    name = await member_name(bot, group_id, str(target), bot_name)
     if name is None:
         return _Part(f" @{target} ")
     return _Part(f" @{name} ", mentions={str(target): name})
 
 
+async def _own_account_sender(session: Session, msg_id: str) -> str:
+    """这个号发的一条消息是她说的还是群里的bot 发的：先查短期记忆，再查库；都没有的是上线前其他程序发的。"""
+
+    found = next((m for m in session.short_term_memory.access() if m.id == msg_id), None)
+    if found is not None:
+        return found.user_name
+    return await message_sender_name(session.id, msg_id) or GROUP_BOT_NAME
+
+
 async def _reply_part(
-    bot: Bot, data: dict, message_scope: str, group_id: int, caption: bool
+    bot: Bot, data: dict, message_scope: str, session: Session, caption: bool
 ) -> _Part:
     """被回复的原文，引用的图和正文的图一样放进附图。"""
 
     reply_id = data.get("id")
     if not reply_id:
         return _Part("")
+    group_id = int(session.id)
     try:
         source_msg = await bot.get_msg(message_id=int(reply_id))
     except (ActionFailed, NetworkError, ValueError) as e:
         logger.warning(f"获取回复内容失败: {e}")
         return _Part(" [回复] ")
 
-    # 优先群名片，与 @ 和发言人名字保持同一套称呼，否则模型会把昵称当成另一个人
     sender_info = source_msg.get("sender", {})
-    sender = sender_info.get("card") or sender_info.get("nickname", "未知")
+    sender_id = str(sender_info.get("user_id") or "")
     part = _Part("")
-    if sender_info.get("user_id"):
-        part.mentions[str(sender_info["user_id"])] = sender
+    if sender_id == str(bot.self_id):
+        # 这个号的名片是她和群里的bot 共用的，按这条是谁发的称呼；也不进 mentions，免得被当成可以戳的群友
+        sender = await _own_account_sender(session, str(reply_id))
+    else:
+        # 优先群名片，与 @ 和发言人名字保持同一套称呼，否则模型会把昵称当成另一个人
+        sender = distinct_name(
+            sender_info.get("card") or sender_info.get("nickname", "未知"),
+            sender_id,
+            session.state.name,
+        )
+        if sender_id:
+            part.mentions[sender_id] = sender
     content_data = source_msg.get("message", [])
     source_text = ""
 
@@ -258,11 +285,11 @@ async def _segment_part(
     image_number: int,
     *,
     bot: Bot,
-    group_id: int,
-    bot_name: str,
+    session: Session,
     message_scope: str,
     caption: bool,
 ) -> _Part:
+    group_id = int(session.id)
     text = segment_text(seg.type, seg.data)
     if text is not None:
         return _Part(text, own=text if seg.type in _OWN_WORD_SEGMENTS else "")
@@ -273,9 +300,9 @@ async def _segment_part(
             part.own = part.text
         return part
     if seg.type == "at":
-        return await _at_part(bot, seg.data, group_id, bot_name)
+        return await _at_part(bot, seg.data, group_id, session.state.name)
     if seg.type == "reply":
-        return await _reply_part(bot, seg.data, message_scope, group_id, caption)
+        return await _reply_part(bot, seg.data, message_scope, session, caption)
     logger.debug(f"未处理的消息段: {seg.type}")
     return _Part("")
 
@@ -309,11 +336,16 @@ def _is_substantive(parts: list[_Part]) -> bool:
     return len(own) >= SUBSTANTIVE_MIN_CHARS and not _PUNCTUATION_ONLY_RE.fullmatch(own)
 
 
-async def read_message(bot: Bot, event: GroupMessageEvent, session: Session) -> ChatMessage:
+async def read_message(
+    bot: Bot, event: GroupMessageEvent, session: Session, *, group_bot: bool = False
+) -> ChatMessage:
     """把一条群消息读成 ChatMessage：可读文本、原图、被 @/被回复的人（QQ 号 -> 群名片），并起后台看图任务。
 
     图片写在它原本的位置：描述缓存命中就是 [图片: 描述]，没命中先写占位、由 fill_caption 后台补上。
     没设人设的群不看图，只写 [图片]。
+
+    group_bot 是这个号上其他程序发的：记在群里的bot 名下，永远不算点名（它 @ 这个号、回复她、
+    带她的名字都不算，否则她接一句又可能引出它，转起来没完），也不拿去检索记忆。
     """
 
     bot_name = session.state.name
@@ -332,8 +364,7 @@ async def read_message(bot: Bot, event: GroupMessageEvent, session: Session) -> 
                 seg,
                 image_numbers.get(index, 0),
                 bot=bot,
-                group_id=event.group_id,
-                bot_name=bot_name,
+                session=session,
                 message_scope=str(event.message_id),
                 caption=bool(bot_name),
             )
@@ -341,12 +372,17 @@ async def read_message(bot: Bot, event: GroupMessageEvent, session: Session) -> 
         )
     )
 
-    user_id = str(event.user_id)
-    user_name = (
-        str(event.sender.card or "").strip()
-        or str(event.sender.nickname or "").strip()
-        or user_id
-    )
+    if group_bot:
+        user_id, user_name = GROUP_BOT_ID, GROUP_BOT_NAME
+    else:
+        user_id = str(event.user_id)
+        user_name = distinct_name(
+            str(event.sender.card or "").strip()
+            or str(event.sender.nickname or "").strip()
+            or user_id,
+            user_id,
+            bot_name,
+        )
     # 群友发的表情包给库里那张计数；回复里引用的图不算又发了一次
     for seg, part in zip(message, parts):
         if seg.type == "image" and is_sticker_segment(seg.data) and part.images:
@@ -359,9 +395,9 @@ async def read_message(bot: Bot, event: GroupMessageEvent, session: Session) -> 
         user_id=user_id,
         image_inputs=[image for part in parts for image in part.images],
         mentions={uid: name for part in parts for uid, name in part.mentions.items()},
-        to_me=_addresses_bot(bot, event),
+        to_me=not group_bot and _addresses_bot(bot, event),
         forward=bool(forward_id(message)),
-        substantive=_is_substantive(parts),
+        substantive=not group_bot and _is_substantive(parts),
     )
     chat_message.caption_tasks = [
         session.spawn(fill_caption(session, chat_message, job, generation))
@@ -379,12 +415,12 @@ async def read_poke(bot: Bot, event: PokeNotifyEvent, bot_name: str) -> ChatMess
     poker = (
         bot_name
         if poker_id == self_id
-        else await member_name(bot, event.group_id, poker_id) or poker_id
+        else await member_name(bot, event.group_id, poker_id, bot_name) or poker_id
     )
     target = (
         bot_name
         if target_id == self_id
-        else await member_name(bot, event.group_id, target_id) or target_id
+        else await member_name(bot, event.group_id, target_id, bot_name) or target_id
     )
     # 动作文字各人自定义（戳了戳、拍了拍、捏了捏…），照通知里的 action / suffix 原样拼
     data = event.model_dump()
@@ -440,7 +476,7 @@ async def read_reaction(
         )
     reactors = record.reacted.reactors
     if not by_bot:
-        name = await member_name(bot, int(session.id), user_id) or user_id
+        name = await member_name(bot, int(session.id), user_id, bot_name) or user_id
         reactors[user_id] = name
         record.user_name, record.user_id = name, user_id
         record.mentions = {uid: n for uid, n in reactors.items() if uid != user_id}
@@ -480,7 +516,11 @@ async def read_group_notice(
     async def name(uid: str) -> str:
         if uid == self_id:
             return session.state.name
-        return known.get(uid) or await member_name(bot, event.group_id, uid) or uid
+        return (
+            known.get(uid)
+            or await member_name(bot, event.group_id, uid, session.state.name)
+            or uid
+        )
 
     async def target(uid: str) -> str:
         return "你" if uid == self_id else await name(uid)

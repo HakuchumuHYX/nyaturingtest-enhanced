@@ -275,6 +275,13 @@ async def recall_message(session_id: str, msg_id: str, content: str) -> int:
     )
 
 
+async def message_sender_name(session_id: str, msg_id: str) -> str | None:
+    """消息库里这条的发言人名字；不在库里返回 None。"""
+
+    row = await GlobalMessageModel.get_or_none(session_id=session_id, msg_id=msg_id)
+    return row.user_name if row else None
+
+
 async def get_history_before(
     session_id: str, time_point: datetime, limit: int = 20
 ) -> list[ChatMessage]:

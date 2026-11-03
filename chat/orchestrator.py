@@ -201,10 +201,14 @@ def _memory_lines(records: list[RetrievedMemory]) -> MemoryContext:
 
 
 def _speaker_ids(unread: list[ChatMessage], bot_name: str) -> list[str]:
-    """这段未读里发言的群友，不含角色自己。"""
+    """这段未读里发言的群友，不含角色自己和群里的bot。"""
 
     return list(
-        dict.fromkeys(_user_key(msg) for msg in unread if msg.user_name != bot_name)
+        dict.fromkeys(
+            _user_key(msg)
+            for msg in unread
+            if msg.user_name != bot_name and not msg.by_group_bot
+        )
     )
 
 
@@ -306,7 +310,8 @@ def _parse_reaction(raw, unread: list[ChatMessage], bot_name: str) -> Reaction |
     target = unread[index]
     if target.reacted is not None:
         target = target.reacted.target
-    if not target.id or target.user_name == bot_name:
+    # 群里的bot 的消息在群友眼里是她发的，贴上去就成了给自己贴
+    if not target.id or target.user_name == bot_name or target.by_group_bot:
         return None
     emoji = reaction_emoji(str(raw.get("emoji") or ""))
     if emoji is None:
@@ -319,7 +324,9 @@ def _parse_poke(raw, unread: list[ChatMessage], bot_name: str) -> Poke | None:
     """poke 是 QQ 号：只能戳这段未读里说话的人，或被 @、被回复、被戳的人。"""
 
     user_id = str(raw or "").strip()
-    candidates = {msg.user_id: msg.user_name for msg in unread if msg.user_id}
+    candidates = {
+        msg.user_id: msg.user_name for msg in unread if msg.user_id and not msg.by_group_bot
+    }
     for msg in unread:
         candidates.update(msg.mentions)
     name = candidates.get(user_id)
@@ -634,7 +641,7 @@ async def search_stage(session: Session, unread: list[ChatMessage]) -> MemoryCon
     }
 
     # 只翻这段的发言人和被 @、被回复的人的记忆：拿闲聊原话在全群里撞，翻出来的多是字面巧合
-    speaker_ids = {msg.user_id for msg in unread if msg.user_id}
+    speaker_ids = {msg.user_id for msg in unread if msg.user_id and not msg.by_group_bot}
     user_ids = speaker_ids.union(*(msg.mentions for msg in unread))
     rag_stats["user_count"] = len(user_ids)
 
@@ -747,7 +754,7 @@ def _apply_sediment(
     # 互动计数按消息记；好感度只改 Feedback 点名的人（parse_feedback 只收这段的发言人）
     now = datetime.now()
     for msg in unread:
-        if msg.user_name != state.name:
+        if msg.user_name != state.name and not msg.by_group_bot:
             uid = _user_key(msg)
             state.profiles.setdefault(uid, PersonProfile(user_id=uid)).record_interaction(now)
     for uid, delta in feedback.affinity_changes.items():
@@ -899,9 +906,12 @@ async def chat_stage(
         # 她说出口的新情况就是她接下来真的在做的事，各群共用
         await apply_said(state.preset, data.get("status"))
         # 接下来对话窗口里的聊天对象：接的是谁就是谁；没指认就是这段的发言人。
-        # 不加区分地把一段里五六个人都算进来，3 分钟内谁开口都会马上看群、走低门槛
+        # 不加区分地把一段里五六个人都算进来，3 分钟内谁开口都会马上看群、走低门槛；
+        # 群里的bot 不会接她的话，不算
         partners = [focus] if focus else unread
         state.conversation_partners = {
-            msg.user_id for msg in partners if msg.user_id and msg.user_name != state.name
+            msg.user_id
+            for msg in partners
+            if msg.user_id and msg.user_name != state.name and not msg.by_group_bot
         }
     return replies
