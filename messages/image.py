@@ -37,7 +37,6 @@ _IMG_SEMAPHORE = asyncio.Semaphore(3)
 # 原图缓存从写入起留 48 小时；描述缓存命中续租，30 天没被命中才删
 RAW_RETENTION_SECONDS = 48 * 3600
 CAPTION_RETENTION_SECONDS = 30 * 24 * 3600
-CAPTION_TEMPERATURE = 0.1
 CAPTION_CHARS = 120
 _CAPTION_SEMAPHORE = asyncio.Semaphore(4)
 STICKER_MAX_TAGS = 3
@@ -247,7 +246,6 @@ async def caption_image(vision_input: VisionInput, session_id: str) -> str:
         parsed = await feedback_client.generate_json(
             get_image_caption_prompt(),
             session_id=session_id,
-            temperature=CAPTION_TEMPERATURE,
             images=[vision_input],
         )
     caption = _clean_caption(parsed.get("caption") if parsed else "")
@@ -280,7 +278,6 @@ async def describe_sticker(
         parsed = await feedback_client.generate_json(
             get_sticker_caption_prompt(),
             session_id=session_id,
-            temperature=CAPTION_TEMPERATURE,
             images=[vision_input],
         )
     if parsed is None:

@@ -12,7 +12,6 @@ from .vector import RAG_ITEM_CHARS, RAG_MEMORY_CHAR_BUDGET
 
 MEMORY_QUERY_USER_COOLDOWN_SECONDS = 30.0
 MEMORY_QUERY_GROUP_COOLDOWN_SECONDS = 3.0
-IMPRESSION_TEMPERATURE = 0.8
 
 _last_user_query: dict[tuple[str, str], float] = {}
 _last_group_query: dict[str, float] = {}
@@ -123,9 +122,7 @@ async def query_memory_profile(
         unscoped_text=unscoped_text,
         recent=recent,
     )
-    result = await chat_client.generate_json(
-        prompt, session_id=session.id, temperature=IMPRESSION_TEMPERATURE
-    )
+    result = await chat_client.generate_json(prompt, session_id=session.id)
     if not result or not result.get("headline") or not result.get("impression"):
         logger.warning("印象生成 JSON 解析失败")
         return "大脑处理过载，记忆读取失败，请稍后再试。"

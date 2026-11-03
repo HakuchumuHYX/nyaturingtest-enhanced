@@ -48,7 +48,6 @@ SPEAK_TIMES_WINDOW = timedelta(hours=2)
 # 时间线写进日记后只留最近这么久；还没写日记的那几天整段留着
 TIMELINE_KEEP = timedelta(hours=18)
 NIGHTS_KEEP = 7
-STATUS_TEMPERATURE = 0.5
 
 SOURCE_DUE = "due"
 SOURCE_SAID = "said"
@@ -325,7 +324,6 @@ async def _decide(status: PersonaStatus, source: str) -> None:
     data = await feedback_client.generate_json(
         get_status_prompt(persona, **await _status_background(status, now), gap_minutes=gap),
         session_id=f"status:{status.preset}",
-        temperature=STATUS_TEMPERATURE,
     )
     if status.version != version:
         log_event("status_discarded", "DEBUG", preset=status.preset, source=source)
@@ -361,7 +359,6 @@ async def _answer_calls(status: PersonaStatus) -> None:
                 persona, **await _status_background(status, now), calls=list(status.calls)
             ),
             session_id=f"status:{status.preset}",
-            temperature=STATUS_TEMPERATURE,
         )
         if status.version != version:
             return

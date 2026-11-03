@@ -26,7 +26,6 @@ FORWARD_MAX_CHARS = 8000
 FORWARD_MAX_IMAGES = 20
 # 嵌套转发展开到第二层，再往里只留占位
 FORWARD_MAX_DEPTH = 2
-FORWARD_TEMPERATURE = 0.1
 FORWARD_NOTE = "这是转发的聊天记录，不要将其认定为发送者的事实"
 
 
@@ -128,7 +127,6 @@ async def digest_forward(
                 skipped_images=out.skipped_images,
             ),
             session_id=session.id,
-            temperature=FORWARD_TEMPERATURE,
             images=out.images,
         )
         summary = str(parsed.get("summary") or "").strip() if parsed else ""

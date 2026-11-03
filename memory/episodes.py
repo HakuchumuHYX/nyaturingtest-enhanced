@@ -39,7 +39,6 @@ MESSAGE_CHARS = 300
 MEMBER_PROFILE_LIMIT = 8
 EPISODE_MIN_CHARS = 10
 EPISODE_CONFIDENCE = 0.8
-EPISODE_TEMPERATURE = 0.2
 
 
 def _trigger(rows: list[GlobalMessageModel], bot_name: str, now: datetime) -> str | None:
@@ -142,9 +141,7 @@ async def _digest_batch(
                 for index, m in enumerate(messages)
             ],
         )
-        parsed = await feedback_client.generate_json(
-            prompt, session_id=session.id, temperature=EPISODE_TEMPERATURE
-        )
+        parsed = await feedback_client.generate_json(prompt, session_id=session.id)
         if parsed is None:
             logger.warning(f"[Episode] 群 {session.id} 整理输出无效，下轮重试")
             return False

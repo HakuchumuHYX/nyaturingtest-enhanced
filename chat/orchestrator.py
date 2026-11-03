@@ -56,9 +56,6 @@ CALL_LINE_CHARS = 100
 CHAT_DIARY_DAYS = 2
 MY_RECENT_REPLIES_LIMIT = 6
 GROUP_HEAT_SECONDS = 900
-# 略高的温度换取用词和句式的变化；0.9 时会开始编造群友说过的话
-CHAT_TEMPERATURE = 0.8
-FEEDBACK_TEMPERATURE = 0.1
 FEEDBACK_FIELDS = (
     "corrections",
     "willing",
@@ -723,7 +720,6 @@ async def _ask_feedback(
     data = await feedback_client.generate_json(
         prompt,
         session_id=session.id,
-        temperature=FEEDBACK_TEMPERATURE,
         system_prompt=FEEDBACK_SYSTEM_PROMPT,
     )
     return parse_feedback(data, unread, session)
@@ -890,7 +886,6 @@ async def chat_stage(
     data = await chat_client.generate_json(
         prompt,
         session_id=session.id,
-        temperature=CHAT_TEMPERATURE,
         system_prompt=CHAT_SYSTEM_PROMPT,
         # 只附想接的那条的图：一段未读里可能有好几张，全附上既占内存，也让模型分不清该接哪句
         images=list(focus.image_inputs) if focus else [],

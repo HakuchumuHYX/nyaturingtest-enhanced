@@ -26,7 +26,6 @@ from .domain import PersonProfile  # noqa: E402
 from .groups import is_shutting_down, sessions  # noqa: E402
 from .orchestrator import (  # noqa: E402
     CHAT_DIARY_DAYS,
-    CHAT_TEMPERATURE,
     MY_RECENT_REPLIES_LIMIT,
     Reply,
     format_history,
@@ -161,7 +160,6 @@ async def _initiate(session: Session, silence: int) -> None:
     parsed = await chat_client.generate_json(
         prompt,
         session_id=session.id,
-        temperature=CHAT_TEMPERATURE,
         system_prompt=CHAT_SYSTEM_PROMPT,
     )
     content = str(parsed.get("content") or "").strip() if parsed else ""

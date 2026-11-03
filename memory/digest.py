@@ -30,7 +30,6 @@ GROUP_NOTES_REFRESH_MIN_NEW = 10
 DIGEST_INTERVAL = timedelta(days=7)
 PROFILE_CHUNK_CHARS = 8000
 GROUP_NOTES_CHUNK_CHARS = 12000
-DIGEST_TEMPERATURE = 0.2
 POINTS_CONCURRENCY = 4
 
 # 夜间整理和手动查看可能撞上，同一群排队；后到的进来时水位已推进，不会重复整理
@@ -103,9 +102,7 @@ def _due(
 
 
 async def _generate(session_id: str, prompt: str, key: str) -> str | None:
-    data = await feedback_client.generate_json(
-        prompt, session_id=session_id, temperature=DIGEST_TEMPERATURE
-    )
+    data = await feedback_client.generate_json(prompt, session_id=session_id)
     if data is None or not isinstance(data.get(key), str):
         logger.warning(f"[Digest] 群 {session_id} 整理输出无效，跳过，下次再试")
         return None

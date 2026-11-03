@@ -43,7 +43,6 @@ LINE_CHARS = 120
 GROUP_MIN_MESSAGES = 30
 # 没有新的自我陈述时，隔这么久也要整理一次人生线，让时间推进
 LIFE_INTERVAL = timedelta(days=7)
-PERSONA_TEMPERATURE = 0.4
 # ta自己的日记留几天、写日记时看前几天
 DIARY_DAYS = 14
 DIARY_PREVIOUS = 2
@@ -163,7 +162,6 @@ async def digest_group(
             day,
         ),
         session_id=session_id,
-        temperature=PERSONA_TEMPERATURE,
     )
     if (
         data is None
@@ -198,7 +196,6 @@ async def digest_life(
     data = await feedback_client.generate_json(
         get_persona_life_prompt(persona, life, life_facts, group_styles, diary, day),
         session_id=session_id,
-        temperature=PERSONA_TEMPERATURE,
     )
     if data is None or not isinstance(data.get("life"), str):
         logger.warning(f"[Persona] {persona.name} {day} 人生线整理输出无效")
@@ -237,7 +234,6 @@ async def write_diary(
             persona, life=life, day=day, previous=previous, timeline=timeline, life_facts=life_facts
         ),
         session_id=session_id,
-        temperature=PERSONA_TEMPERATURE,
     )
     if data is None or not isinstance(data.get("diary"), str) or not data["diary"].strip():
         logger.warning(f"[Persona] {persona.name} {day} 日记输出无效")

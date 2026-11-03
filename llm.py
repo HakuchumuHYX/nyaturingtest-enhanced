@@ -146,16 +146,13 @@ class LLMClient:
         prompt: str,
         *,
         session_id: str,
-        temperature: float,
         system_prompt: str = JSON_SYSTEM_PROMPT,
         images: list[VisionInput] | None = None,
     ) -> dict | None:
         """返回模型输出的 JSON 对象；调用失败或输出不是对象返回 None，原因记在 provider_status。"""
 
         started_at = time.perf_counter()
-        content = await self._request(
-            prompt, session_id, temperature, system_prompt, images or []
-        )
+        content = await self._request(prompt, session_id, system_prompt, images or [])
         log_event(
             "llm_success" if content else "llm_failure",
             "DEBUG" if content else "WARNING",
@@ -169,7 +166,6 @@ class LLMClient:
         self,
         prompt: str,
         session_id: str,
-        temperature: float,
         system_prompt: str,
         images: list[VisionInput],
     ) -> str:
@@ -195,7 +191,6 @@ class LLMClient:
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": user_content},
                     ],
-                    temperature=temperature,
                     max_tokens=self.settings.max_tokens,
                     timeout=self.settings.timeout,
                     response_format={"type": "json_object"},
