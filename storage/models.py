@@ -113,6 +113,32 @@ class MemoryModel(Model):
         )
 
 
+class ThreadModel(Model):
+    """悬着的事：之后可以接上的话头（对方的事、状况、她答应的、群里约好的），只由分段整理写入和了结。
+
+    了结就删行；到了 forget_at 还没了结的由每日维护删掉，算她忘了。
+    """
+
+    id = fields.CharField(pk=True, max_length=36)
+    session = fields.ForeignKeyField("models.SessionModel", related_name="threads")
+    kind = fields.CharField(max_length=16)
+    # 关于谁；群里约好的事为空
+    user_id = fields.CharField(max_length=255, default="")
+    user_name = fields.CharField(max_length=255, default="")
+    content = fields.TextField()
+    # 有日子的事是哪天，YYYYMMDD
+    due = fields.IntField(null=True)
+    # 从什么时候起看群时会提起、什么时候忘掉：写入时按类型和日子算好，看群时只按这两个时间查
+    ask_from = fields.DatetimeField()
+    forget_at = fields.DatetimeField()
+    source_msg_ids = fields.TextField(default="")
+    created_at = fields.DatetimeField(auto_now_add=True)
+
+    class Meta:
+        table = "nyabot_threads"
+        indexes = (Index(fields=("session_id", "forget_at"), name="idx_threads_session_forget"),)
+
+
 class PersonaLifeModel(Model):
     """人生线：每个预设一份，各群共享，只由每日整理写入。"""
 

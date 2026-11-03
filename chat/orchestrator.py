@@ -11,6 +11,7 @@ from nonebot import logger
 from ..config import get_app_settings
 from ..llm import chat_client, feedback_client, web_search
 from ..memory.candidates import clamp01, save_memory_candidates
+from ..memory.threads import close_threads, open_threads, thread_items
 from ..memory.vector import (
     RAG_FINAL_K,
     RAG_ITEM_CHARS,
@@ -33,6 +34,7 @@ from ..prompts import (
     truncate_text,
 )
 from ..storage.db import get_catch_up, get_history_before
+from ..storage.models import ThreadModel
 from .domain import EmotionState, PersonProfile
 from .engagement import (
     LOOK_MAX_MESSAGES,
@@ -511,13 +513,14 @@ async def _catch_up(
 
 @dataclass(frozen=True)
 class LookContext:
-    """这次看群时 Feedback 和 Chat 共用的背景：上下文、补看、她自己在干嘛、群信息、发言人多久没见。"""
+    """这次看群时 Feedback 和 Chat 共用的背景：上下文、补看、她自己在干嘛、群信息、发言人多久没见、到了时候的悬着的事。"""
 
     recent: list[ChatMessage]
     missed: list[str]
     now: str
     group_info: str
     last_seen: dict[str, int | None]
+    threads: list[ThreadModel]
 
 
 async def _look(
@@ -550,6 +553,9 @@ async def _look(
         now=describe_now(state.preset, previous_look),
         group_info=await session.refresh_group_info(),
         last_seen=_last_seen_days(session, unread),
+        threads=await open_threads(
+            session.id, _speaker_ids(unread, state.name), datetime.now()
+        ),
     )
 
     memories = await search_stage(session, unread)
@@ -700,6 +706,7 @@ async def _ask_feedback(
         emotion=state.global_emotion.vad(),
         related_profiles=_related_profiles(session, look.last_seen, for_chat=False),
         search_result=memories.lines,
+        threads=thread_items(look.threads),
         is_relevant=is_relevant,
         time_info=get_time_description(now),
         presets=state.preset_lines,
@@ -860,6 +867,7 @@ async def chat_stage(
         mood=describe_mood(state.global_emotion),
         related_profiles=related_profiles,
         search_result=memories.lines,
+        threads=thread_items(look.threads),
         presets=state.preset_lines,
         group_notes=state.group_notes,
         recalled_history=recalled_str,
@@ -905,6 +913,10 @@ async def chat_stage(
     if replies:
         # 她说出口的新情况就是她接下来真的在做的事，各群共用
         await apply_said(state.preset, data.get("status"))
+        # 这次接上了的当场了结：等分段整理来了结，中间她会看不到自己问过、再问一遍
+        closed = await close_threads(look.threads, data.get("threads"))
+        if closed:
+            log_event("threads_closed", session_id=session.id, by="chat", count=closed)
         # 接下来对话窗口里的聊天对象：接的是谁就是谁；没指认就是这段的发言人。
         # 不加区分地把一段里五六个人都算进来，3 分钟内谁开口都会马上看群、走低门槛；
         # 群里的bot 不会接她的话，不算

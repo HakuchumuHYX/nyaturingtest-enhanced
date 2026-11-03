@@ -11,6 +11,7 @@ from ..chat.groups import sessions  # noqa: E402
 from ..chat.status import reload_diaries  # noqa: E402
 from .digest import digest_group_notes, digest_user_profiles  # noqa: E402
 from .persona import maintain_personas  # noqa: E402
+from .threads import drop_forgotten  # noqa: E402
 from .vector import maintain_memories  # noqa: E402
 
 
@@ -38,7 +39,7 @@ async def refresh_group_notes(group_id: int, *, min_new: int = 1) -> str | None:
 
 
 async def maintain_long_term_memory() -> None:
-    """长期记忆每日维护：先把新碎片整理进档案与群志，再整理人设成长，最后删过期碎片，
+    """长期记忆每日维护：先把新碎片整理进档案与群志，再整理人设成长，最后删过期碎片和忘掉的悬着的事，
     这样即将过期的碎片一定先被归纳过；最后让所有群下次重新读矩阵。"""
 
     for group_id in list(sessions):
@@ -61,6 +62,10 @@ async def maintain_long_term_memory() -> None:
         await maintain_memories()
     except Exception as e:
         logger.warning(f"长期记忆定时维护失败: {e}")
+    try:
+        logger.info(f"忘掉了 {await drop_forgotten()} 件悬着的事")
+    except Exception as e:
+        logger.warning(f"清理悬着的事失败: {e}")
     for session in sessions.values():
         session.vector_memory.drop_cache()
 

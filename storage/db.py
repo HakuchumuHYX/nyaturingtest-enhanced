@@ -17,6 +17,7 @@ from .models import (
     PersonaStatusModel,
     SessionModel,
     StickerModel,
+    ThreadModel,
     TokenUsageModel,
     UserProfileModel,
 )
@@ -48,7 +49,7 @@ async def disable_group(group_id: int):
 
 
 async def delete_session_data(session_id: str):
-    """删除会话的所有关联数据（消息、用户画像与档案、群志、群层），不删除会话本身；人生线各群共享，不动"""
+    """删除会话的所有关联数据（消息、用户画像与档案、群志、群层、悬着的事），不删除会话本身；人生线各群共享，不动"""
 
     session_db = await SessionModel.get_or_none(id=session_id)
     if not session_db:
@@ -60,9 +61,11 @@ async def delete_session_data(session_id: str):
     )
     msg_count = await GlobalMessageModel.filter(session=session_db).delete()
     persona_count = await PersonaGroupModel.filter(session=session_db).delete()
+    thread_count = await ThreadModel.filter(session=session_db).delete()
     logger.info(
         f"[Repo] 会话 {session_id} 数据已清除: "
-        f"profiles={profile_count}, messages={msg_count}, persona_groups={persona_count}"
+        f"profiles={profile_count}, messages={msg_count}, persona_groups={persona_count}, "
+        f"threads={thread_count}"
     )
 
 

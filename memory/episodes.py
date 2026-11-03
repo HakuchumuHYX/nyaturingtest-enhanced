@@ -24,6 +24,13 @@ from .candidates import (  # noqa: E402
     save_memory_candidates,
     source_messages,
 )
+from .threads import (  # noqa: E402
+    add_threads,
+    close_threads,
+    parse_threads,
+    pending_threads,
+    thread_items,
+)
 from .vector import NewMemory  # noqa: E402
 
 SCAN_INTERVAL_MINUTES = 5
@@ -110,10 +117,14 @@ async def _digest_batch(
 
     episodes: list[NewMemory] = []
     facts_result = {"added": 0, "rejected": 0}
+    new_threads, pending, done_refs = [], [], []
     # 只有角色自己说话的一批没什么可记，直接推进水位
     if members:
         latest_names = await get_latest_user_names(session.id)
         speakers = dict.fromkeys(m.user_id for m in members if m.user_id)
+        # 这段发言的群友（QQ 号 -> 这段里最后用的名字），悬着的事只挂在他们身上
+        member_names = {m.user_id: m.user_name for m in members if m.user_id}
+        pending = await pending_threads(session.id, member_names, datetime.now())
         member_profiles = [
             {
                 "user_id": uid,
@@ -133,6 +144,7 @@ async def _digest_batch(
             group_notes=state.group_notes,
             member_profiles=member_profiles,
             previous_episode=previous.content if previous else "",
+            open_threads=thread_items(pending),
             messages=[
                 {
                     "index": index,
@@ -170,9 +182,13 @@ async def _digest_batch(
             )
             if stored is None:
                 return False
+        new_threads = parse_threads(parsed.get("threads"), messages, session.id, member_names)
+        done_refs = parsed.get("threads_done")
 
     if session.stale(generation, "episode_watermark"):
         return False
+    threads_done = await close_threads(pending, done_refs)
+    await add_threads(new_threads)
     await SessionModel.filter(id=session.id).update(episodes_until=rows[-1].time)
     log_event(
         "episode_digest",
@@ -182,6 +198,8 @@ async def _digest_batch(
         episodes=len(episodes),
         facts_added=facts_result["added"],
         facts_rejected=facts_result["rejected"],
+        threads_added=len(new_threads),
+        threads_done=threads_done,
     )
     return True
 
