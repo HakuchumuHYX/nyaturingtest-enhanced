@@ -14,7 +14,7 @@ from nonebot.utils import run_sync
 from PIL import Image
 
 from ..config import IMAGE_CACHE_DIR
-from ..llm import VisionInput, feedback_client, get_http_client
+from ..llm import VisionInput, background_client, get_http_client
 from ..metrics import log_event
 from ..prompts import (
     STICKER_TAGS,
@@ -243,7 +243,7 @@ async def caption_image(vision_input: VisionInput, session_id: str) -> str:
 
     started_at = time.perf_counter()
     async with _CAPTION_SEMAPHORE:
-        parsed = await feedback_client.generate_json(
+        parsed = await background_client.generate_json(
             get_image_caption_prompt(),
             session_id=session_id,
             images=[vision_input],
@@ -275,7 +275,7 @@ async def describe_sticker(
     """看一张表情包；模型没给出可用结果时返回 None。"""
 
     async with _CAPTION_SEMAPHORE:
-        parsed = await feedback_client.generate_json(
+        parsed = await background_client.generate_json(
             get_sticker_caption_prompt(),
             session_id=session_id,
             images=[vision_input],

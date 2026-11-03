@@ -247,6 +247,7 @@ class LLMClient:
 # 所有群共用：限流与熔断本来就是按 API key 算的
 chat_client = LLMClient(get_app_settings().chat)
 feedback_client = LLMClient(get_app_settings().feedback)
+background_client = LLMClient(get_app_settings().background)
 
 WEB_SEARCH_COUNT = 5
 WEB_RESULT_CHARS = 400

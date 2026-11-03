@@ -88,7 +88,7 @@
 性格只跟着群友的影响和生活里的事变，不拿它自己说过的话当证据，免得越说越极端。
 在一个群里沾上很久、或者好几个群都有的说话方式，会慢慢变成它整体的样子。
 底线和固定信息（比如生日）写在预设里，整理改不了。`/persona` 会发一张图：这两层、最近的日记、最近的改动，还有一把从出发点量到今天的成长尺。
-整理用的是 `feedback` 模型，换模型会改变它长大的方式（有的模型学得太快、会记混事），换之前先用回放脚本试跑一个月。
+整理用的是 `background` 模型，换模型会改变它长大的方式（有的模型学得太快、会记混事），换之前先用回放脚本试跑一个月。
 
 ## 安装
 
@@ -109,14 +109,15 @@
 | 段 | 用途 |
 | --- | --- |
 | `chat` | 角色模型：负责说话 |
-| `feedback` | 观察者模型：负责判断、记忆和每晚整理 |
+| `feedback` | 看群模型：每轮看群判断说不说、心情好感、摘要和更正，用量最大 |
+| `background` | 后台模型：识图、转发摘要、当天状态、记忆整理和人设成长 |
 | `siliconflow_api_key` | Embedding 和 Rerank 共用的 Key |
 | `embedding` | 记忆检索用的向量模型 |
 | `rerank` | 检索结果重排，`threshold` 以下的结果丢弃 |
 | `web_search` | 联网搜索（DeepSeek Search），`api_key` 留空就不搜 |
 | `playwright_browsers_path` | 卡片截图用的 Chromium 所在目录，留空用 playwright 默认位置 |
 
-`chat` 和 `feedback` 的 `base_url`、`model` 必填，其余缺省有默认值。改配置后要重启。
+`chat`、`feedback`、`background` 的 `base_url`、`model` 必填，其余缺省有默认值。改配置后要重启。
 也可以用环境变量 `NYATURINGTEST_CONFIG_FILE` 指定别的配置文件，用 `NYATURINGTEST_DATA_DIR` 指定数据目录。
 
 **角色预设**放在 `config/nyaturingtest/nya_presets/*.json`。群里第一次 `/autochat enable <预设>` 时选定人设，之后换人设用 `/set_preset <文件名>`。
@@ -166,7 +167,7 @@
 | `/calm` | `/冷静` | 心情回到平静，退出当前对话，并重新定一次它现在在做什么（各群一起生效） |
 | `/reset confirm` | `/重置 confirm` | 先备份，再清空本群的消息、记忆、档案、群志和群里的它，人设保留，**不可撤销** |
 | `/rag_debug <内容>` | `/记忆诊断` | 看某句话能检索出哪些记忆 |
-| `/token统计` | `/autochat token统计` | 当前 chat / feedback 模型的 Token 用量卡片 |
+| `/token统计` | `/autochat token统计` | 当前 chat / feedback / background 模型的 Token 用量卡片 |
 | `stickerdel` | | 回复一条带图的消息：把图从表情包库删掉并拉黑，以后见到只看不收 |
 | `/backup_data` | `/备份数据` | 立刻备份一次 |
 | `/help` | `/帮助` | 帮助 |

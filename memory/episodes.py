@@ -12,7 +12,7 @@ from nonebot_plugin_apscheduler import scheduler  # noqa: E402  必须在 requir
 
 from ..chat.groups import is_shutting_down, sessions  # noqa: E402
 from ..chat.session import Session  # noqa: E402
-from ..llm import feedback_client  # noqa: E402
+from ..llm import background_client  # noqa: E402
 from ..messages.message import ChatMessage  # noqa: E402
 from ..metrics import log_event  # noqa: E402
 from ..prompts import get_episode_prompt, truncate_text  # noqa: E402
@@ -141,7 +141,7 @@ async def _digest_batch(
                 for index, m in enumerate(messages)
             ],
         )
-        parsed = await feedback_client.generate_json(prompt, session_id=session.id)
+        parsed = await background_client.generate_json(prompt, session_id=session.id)
         if parsed is None:
             logger.warning(f"[Episode] 群 {session.id} 整理输出无效，下轮重试")
             return False

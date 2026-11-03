@@ -12,7 +12,7 @@ from datetime import date, datetime, timedelta
 
 from nonebot import logger
 
-from ..llm import feedback_client
+from ..llm import background_client
 from ..prompts import (
     JOURNAL_DAYS,
     MAX_LIFE_FACTS,
@@ -151,7 +151,7 @@ async def digest_group(
     days_in_group 从本群群友档案里最早的 first_interaction_at 算起（和查询记忆的认识天数同一口径）。
     """
 
-    data = await feedback_client.generate_json(
+    data = await background_client.generate_json(
         get_persona_group_prompt(
             persona,
             life,
@@ -193,7 +193,7 @@ async def digest_life(
 ) -> LifeDigest | None:
     """整理人生线，失败返回 None。diary 是上次整理以来ta自己的日记。"""
 
-    data = await feedback_client.generate_json(
+    data = await background_client.generate_json(
         get_persona_life_prompt(persona, life, life_facts, group_styles, diary, day),
         session_id=session_id,
     )
@@ -229,7 +229,7 @@ async def write_diary(
 ) -> str | None:
     """把ta一天的时间线写成一条日记，失败返回 None。"""
 
-    data = await feedback_client.generate_json(
+    data = await background_client.generate_json(
         get_diary_prompt(
             persona, life=life, day=day, previous=previous, timeline=timeline, life_facts=life_facts
         ),

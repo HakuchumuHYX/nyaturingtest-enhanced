@@ -15,7 +15,7 @@ from nonebot import logger, require
 require("nonebot_plugin_apscheduler")
 from nonebot_plugin_apscheduler import scheduler  # noqa: E402  必须在 require 之后导入
 
-from ..llm import feedback_client  # noqa: E402
+from ..llm import background_client  # noqa: E402
 from ..metrics import log_event  # noqa: E402
 from ..prompts import (  # noqa: E402
     PRESETS,
@@ -321,7 +321,7 @@ async def _decide(status: PersonaStatus, source: str) -> None:
     gap = None
     if status.current is not None and (now - status.until) > timedelta(minutes=GAP_NOTE_MINUTES):
         gap = int((now - status.until).total_seconds() // 60)
-    data = await feedback_client.generate_json(
+    data = await background_client.generate_json(
         get_status_prompt(persona, **await _status_background(status, now), gap_minutes=gap),
         session_id=f"status:{status.preset}",
     )
@@ -354,7 +354,7 @@ async def _answer_calls(status: PersonaStatus) -> None:
         status.calls_asked = len(status.calls)
         status.last_call_ask = now = datetime.now()
         version = status.version
-        data = await feedback_client.generate_json(
+        data = await background_client.generate_json(
             get_status_called_prompt(
                 persona, **await _status_background(status, now), calls=list(status.calls)
             ),

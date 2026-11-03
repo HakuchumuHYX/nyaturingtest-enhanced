@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 
 from nonebot import logger
 
-from ..llm import feedback_client
+from ..llm import background_client
 from ..prompts import (
     fragments_material,
     get_group_notes_prompt,
@@ -102,7 +102,7 @@ def _due(
 
 
 async def _generate(session_id: str, prompt: str, key: str) -> str | None:
-    data = await feedback_client.generate_json(prompt, session_id=session_id)
+    data = await background_client.generate_json(prompt, session_id=session_id)
     if data is None or not isinstance(data.get(key), str):
         logger.warning(f"[Digest] 群 {session_id} 整理输出无效，跳过，下次再试")
         return None

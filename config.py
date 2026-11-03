@@ -60,6 +60,7 @@ class WebSearchSettings:
 class AppSettings:
     chat: EndpointSettings
     feedback: EndpointSettings
+    background: EndpointSettings
     rerank_model: str
     rerank_threshold: float
     memory: MemoryEndpointSettings
@@ -78,6 +79,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "timeout": 180,
     },
     "feedback": {
+        "api_key": "",
+        "base_url": "",
+        "model": "",
+        "reasoning_effort": "",
+        "max_tokens": 2048,
+        "timeout": 60,
+    },
+    "background": {
         "api_key": "",
         "base_url": "",
         "model": "",
@@ -144,6 +153,7 @@ def build_settings(config: dict[str, Any]) -> AppSettings:
     return AppSettings(
         chat=_endpoint(cfg, "chat"),
         feedback=_endpoint(cfg, "feedback"),
+        background=_endpoint(cfg, "background"),
         rerank_model=str(rerank["model"] or ""),
         rerank_threshold=float(rerank["threshold"]),
         memory=MemoryEndpointSettings(
@@ -167,7 +177,11 @@ def _load_settings() -> AppSettings:
     with open(CONFIG_FILE, "r", encoding="utf-8") as f:
         settings = build_settings(json.load(f))
     logger.info(f"已加载插件配置: {CONFIG_FILE}")
-    for name, endpoint in (("chat", settings.chat), ("feedback", settings.feedback)):
+    for name, endpoint in (
+        ("chat", settings.chat),
+        ("feedback", settings.feedback),
+        ("background", settings.background),
+    ):
         key_state = "set" if endpoint.api_key else "missing"
         logger.info(
             f"{name}: model={endpoint.model}, base_url={endpoint.base_url}, "
@@ -186,5 +200,9 @@ def get_app_settings() -> AppSettings:
 
 
 def get_token_stats_model_names() -> list[str]:
-    models = [_app_settings.chat.model, _app_settings.feedback.model]
+    models = [
+        _app_settings.chat.model,
+        _app_settings.feedback.model,
+        _app_settings.background.model,
+    ]
     return list(dict.fromkeys(model.strip() for model in models))

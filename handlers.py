@@ -39,7 +39,7 @@ from .chat.groups import (
 )
 from .chat.status import recent_diary, redecide, status_text
 from .config import get_app_settings, get_token_stats_model_names
-from .llm import chat_client, feedback_client
+from .llm import background_client, chat_client, feedback_client
 from .memory.digest import GROUP_NOTES_REFRESH_MIN_NEW, count_new_group_fragments
 from .memory.maintenance import refresh_group_notes
 from .memory.query import acquire_query_slot, impression_text, query_memory_profile
@@ -86,7 +86,7 @@ COMMANDS: tuple[CommandMeta, ...] = (
     CommandMeta("group_notes", "查看本群群志原文", "group_notes <群号>"),
     CommandMeta("calm", "重置心情、退出当前对话，并重新定一次她在做什么", "calm <群号>"),
     CommandMeta("reset confirm", "先备份再完全重置本群", "reset <群号> confirm"),
-    CommandMeta("token统计", "查看当前 chat / feedback 模型的 Token 用量"),
+    CommandMeta("token统计", "查看当前 chat / feedback / background 模型的 Token 用量"),
     CommandMeta("stickerdel", "回复一张图：从表情包库删掉并拉黑，以后只描述不收"),
     CommandMeta("backup_data", "手动触发数据备份", "backup_data"),
     CommandMeta("help", "显示帮助", "help"),
@@ -500,9 +500,14 @@ async def _do_status(matcher: type[Matcher], group_id: int, _args: str):
         "Provider:",
         f"- Chat reasoning_effort: {settings.chat.reasoning_effort or '未指定（由上游决定）'}",
         f"- Feedback reasoning_effort: {settings.feedback.reasoning_effort or '未指定（由上游决定）'}",
+        f"- Background reasoning_effort: {settings.background.reasoning_effort or '未指定（由上游决定）'}",
         f"- Queue length: {len(session.messages_chunk)}",
     ]
-    for name, client in (("Chat", chat_client), ("Feedback", feedback_client)):
+    for name, client in (
+        ("Chat", chat_client),
+        ("Feedback", feedback_client),
+        ("Background", background_client),
+    ):
         provider_status = client.provider_status
         if provider_status.last_error_type:
             lines.append(

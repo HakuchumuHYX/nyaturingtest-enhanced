@@ -14,7 +14,7 @@ from nonebot.adapters.onebot.v11.exception import ActionFailed
 from nonebot.exception import NetworkError
 
 from ..chat.session import Session
-from ..llm import VisionInput, feedback_client
+from ..llm import VisionInput, background_client
 from ..metrics import log_event
 from ..prompts import get_forward_prompt
 from .convert import FORWARD_PLACEHOLDER, is_sticker_segment, segment_text
@@ -117,7 +117,7 @@ async def digest_forward(
     node_count = 0
     try:
         node_count = await _expand(bot, forward_id, 1, out)
-        parsed = await feedback_client.generate_json(
+        parsed = await background_client.generate_json(
             get_forward_prompt(
                 bot_name=session.state.name,
                 sender_name=message.user_name,
