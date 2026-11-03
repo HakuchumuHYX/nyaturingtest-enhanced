@@ -1,8 +1,7 @@
-"""回复切分与发送、表情包、贴表情、戳一戳，以及各自的冷却。"""
+"""回复发送、表情包、贴表情、戳一戳，以及各自的冷却。"""
 
 import asyncio
 import random
-import re
 from datetime import datetime
 
 from nonebot import logger
@@ -16,29 +15,10 @@ from .engagement import SPEAK_COOLDOWN_SECONDS
 from .orchestrator import Poke, Reply
 from .session import Session
 
-MAX_REPLY_MESSAGES = 2
 REACT_COOLDOWN_SECONDS = 60
 # 戳一戳会给对方弹提醒，比贴表情打扰人，间隔放长些
 POKE_COOLDOWN_SECONDS = 120
 STICKER_COOLDOWN_SECONDS = 120
-
-_SPLIT_PATTERN = re.compile(
-    r"(?<=[。！？!?~\n])\s*|(?<!\.)\.(?!\.)(?=\s|$|[\u4e00-\u9fff])\s*"
-)
-_SINGLE_TRAILING_PERIOD = re.compile(r"(?<!\.)\.$")
-
-
-def build_send_parts(text: str, max_messages: int = MAX_REPLY_MESSAGES) -> list[str]:
-    """按句切开、去掉句末句号；超过 max_messages 条时，多出的并进最后一条。"""
-
-    parts = []
-    for part in _SPLIT_PATTERN.split(text.strip()):
-        part = _SINGLE_TRAILING_PERIOD.sub("", part.strip().rstrip("。")).strip()
-        if part:
-            parts.append(part)
-    if len(parts) > max_messages:
-        return [*parts[: max_messages - 1], " ".join(parts[max_messages - 1 :])]
-    return parts
 
 
 def _delay_seconds(part: str) -> float:
@@ -118,17 +98,14 @@ async def dispatch_replies(
 
     total = len(replies)
     sent_count = 0
-    text_count = 0
-    # 一轮最多一张表情包，不占文字的 MAX_REPLY_MESSAGES 名额
+    # 一轮最多一张表情包
     sticker_requested = False
     for reply_index, reply in enumerate(replies):
-        # (消息, 写进短期记忆的文本, 表情包和挑图分数)；模型写的文字一律按纯文本发，不解析 CQ 码
+        # (消息, 写进短期记忆的文本, 表情包和挑图分数)；reply 的一项就是一条消息，
+        # 文字原样按纯文本发，不切分、不解析 CQ 码
         outgoing: list[tuple[Message, str, tuple[Sticker, float | None] | None]] = []
-        if text_count < MAX_REPLY_MESSAGES:
-            parts = build_send_parts(reply.text, MAX_REPLY_MESSAGES - text_count)
-            outgoing = [
-                (Message(MessageSegment.text(part)), part, None) for part in parts
-            ]
+        if reply.text:
+            outgoing.append((Message(MessageSegment.text(reply.text)), reply.text, None))
         if reply.sticker is not None and not sticker_requested:
             sticker_requested = True
             picked = await _pick_sticker(session, *reply.sticker)
@@ -143,7 +120,7 @@ async def dispatch_replies(
         for part_index, (message, memory_text, picked_sticker) in enumerate(outgoing):
             if session.stale(generation, "send_loop"):
                 break
-            if reply.target_id is not None and reply_index == 0 and part_index == 0:
+            if reply.target_id is not None and part_index == 0:
                 message.insert(0, MessageSegment.reply(reply.target_id))
 
             sent = await send_one(
@@ -156,9 +133,7 @@ async def dispatch_replies(
             )
             if sent:
                 sent_count += 1
-                if picked_sticker is None:
-                    text_count += 1
-                else:
+                if picked_sticker is not None:
                     session.last_sticker_time = datetime.now()
                     await mark_sent(picked_sticker[0])
             if picked_sticker is not None:

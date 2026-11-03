@@ -387,7 +387,7 @@ def parse_feedback(
 
 
 def parse_reply(data: dict | None) -> list[Reply]:
-    """校验 Chat 输出：reply 里的每个对象一项，引用 id 和表情包标签在这里核对。"""
+    """校验 Chat 输出：reply 里的每个对象发成一条消息，发几条由模型定；引用 id 和表情包标签在这里核对。"""
 
     items = data.get("reply") if data else None
     replies = []
@@ -409,9 +409,10 @@ def parse_reply(data: dict | None) -> list[Reply]:
                 sticker = (tag, str(raw_sticker.get("want") or "").strip())
             else:
                 logger.debug(f"表情包标签不在词表里，丢弃: {tag}")
-        replies.append(
-            Reply(text=str(item.get("content") or ""), target_id=target_id, sticker=sticker)
-        )
+        text = str(item.get("content") or "").strip()
+        if not text and sticker is None:
+            continue
+        replies.append(Reply(text=text, target_id=target_id, sticker=sticker))
     return replies
 
 
