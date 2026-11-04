@@ -292,7 +292,9 @@ async def _maintain_preset(
     session_ids: list[str],
     yesterday: date,
     guards: dict[str, Callable[[], bool]],
-) -> tuple[PersonaLifeModel, dict[str, PersonaGroupModel]]:
+) -> tuple[PersonaLifeModel, dict[str, PersonaGroupModel], dict]:
+    """返回（人生线, 这次更新的群层, 这个预设的整理结果）；结果只给控制台看。"""
+
     persona = PRESETS[filename]
     life_session = f"persona:{filename}"
     life, _ = await PersonaLifeModel.get_or_create(preset=filename)
@@ -317,7 +319,13 @@ async def _maintain_preset(
             )
         )
         if result is None:
-            return life, {}
+            return life, {}, {
+                "life_until": None,
+                "life_failed": True,
+                "groups_updated": [],
+                "groups_blocked": [],
+                "diary_failed": False,
+            }
         life.text, life.last_digest = result.text, yesterday
         await life.save()
         await _history("life", filename, yesterday, result.text, f"[初始化] {result.changes}")
@@ -329,6 +337,7 @@ async def _maintain_preset(
     # 某个群某天整理失败就停在那天，后面几天等下一晚，保证日记和水位按天连续
     blocked: set[str] = set()
     diary_blocked = False
+    life_failed = False
     updated: dict[str, PersonaGroupModel] = {}
     day = min((next_day(layer) for layer in layers.values()), default=yesterday + timedelta(days=1))
     while day <= yesterday:
@@ -394,13 +403,21 @@ async def _maintain_preset(
                 life.text, life.last_digest, life.pending_facts = result.text, day, []
                 await life.save()
                 await _history("life", filename, day, result.text, result.changes)
+            else:
+                life_failed = True
         day += timedelta(days=1)
 
     logger.info(
         f"[Persona] {filename} 整理到 {yesterday}：群层更新 {len(updated)} 个群，"
         f"整理失败停在半路的群 {sorted(blocked) or '无'}"
     )
-    return life, updated
+    return life, updated, {
+        "life_until": life.last_digest.isoformat() if life.last_digest else None,
+        "life_failed": life_failed,
+        "groups_updated": sorted(updated),
+        "groups_blocked": sorted(blocked),
+        "diary_failed": diary_blocked,
+    }
 
 
 async def _write_day_diary(
@@ -431,10 +448,10 @@ async def _write_day_diary(
 
 async def maintain_personas(
     group_ids: list[int], guards: dict[str, Callable[[], bool]]
-) -> tuple[dict[str, str], dict[str, str]]:
+) -> tuple[dict[str, str], dict[str, str], dict[str, dict]]:
     """每日整理：设了人设的启用群把群层推到昨天，再整理对应预设的人生线。
 
-    返回（{预设文件名: 人生线}, {群号: 群层}），外层用来同步已加载 session 的只读副本。
+    返回（{预设文件名: 人生线}, {群号: 群层}, {预设文件名: 整理结果}），前两个外层用来同步已加载 session 的只读副本。
     guards 是 {群号: 会话还没被作废的检查}，整理途中作废的群结果丢弃。
     """
 
@@ -448,8 +465,11 @@ async def maintain_personas(
     yesterday = date.today() - timedelta(days=1)
     lives: dict[str, str] = {}
     groups: dict[str, str] = {}
+    reports: dict[str, dict] = {}
     for filename, session_ids in by_preset.items():
-        life, updated = await _maintain_preset(filename, session_ids, yesterday, guards)
+        life, updated, reports[filename] = await _maintain_preset(
+            filename, session_ids, yesterday, guards
+        )
         lives[filename] = life.text
         groups.update({session_id: layer.text for session_id, layer in updated.items()})
-    return lives, groups
+    return lives, groups, reports

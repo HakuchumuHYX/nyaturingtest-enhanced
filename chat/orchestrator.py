@@ -35,6 +35,7 @@ from ..prompts import (
 )
 from ..storage.db import get_catch_up, get_history_before
 from ..storage.models import ThreadModel
+from ..webconsole_store import record_look
 from .domain import EmotionState, PersonProfile
 from .engagement import (
     LOOK_MAX_MESSAGES,
@@ -600,6 +601,19 @@ async def _look(
     )
     react = feedback.react if feedback else None
     poke = feedback.poke if feedback else None
+    record_look(
+        group_id=session.id,
+        trigger=trigger.value,
+        unread=unread_count(state, unread),
+        willing=feedback.willing if feedback else None,
+        threshold=trigger.speak_threshold,
+        self_share=self_share,
+        muted=muted,
+        speak=speak,
+        focus=f"{focus.user_name}: {focus.content[:100]}" if focus else None,
+        react=react.name if react else None,
+        poke=poke.user_name if poke else None,
+    )
     if not speak:
         return TurnResult(replies=[], react=react, poke=poke)
 

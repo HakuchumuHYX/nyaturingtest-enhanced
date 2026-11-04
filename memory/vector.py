@@ -1,5 +1,6 @@
 import asyncio
 import math
+import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -14,6 +15,7 @@ from tortoise.transactions import in_transaction
 
 from ..config import get_app_settings
 from ..storage.models import MemoryModel
+from ..webconsole_store import record_llm_call
 
 RAG_FINAL_K = 20
 RAG_PER_QUERY_RECALL_K = 40
@@ -145,6 +147,10 @@ _embedding_client: AsyncOpenAI | None = None
 _rerank_client: httpx.AsyncClient | None = None
 
 
+def _elapsed_ms(started: float) -> int:
+    return int((time.perf_counter() - started) * 1000)
+
+
 async def embed_texts(texts: list[str], *, instruction: str = "") -> np.ndarray:
     """返回逐行 L2 归一化的 float32 矩阵，余弦相似度直接用点积。
 
@@ -160,11 +166,19 @@ async def embed_texts(texts: list[str], *, instruction: str = "") -> np.ndarray:
             timeout=settings.memory.timeout,
             max_retries=0,
         )
-    response = await _embedding_client.embeddings.create(
-        model=settings.memory.model,
-        input=[instruction + text.replace("\n", " ") for text in texts],
-        encoding_format="float",
-    )
+    started = time.perf_counter()
+    try:
+        response = await _embedding_client.embeddings.create(
+            model=settings.memory.model,
+            input=[instruction + text.replace("\n", " ") for text in texts],
+            encoding_format="float",
+        )
+    except Exception as e:
+        record_llm_call(
+            "embedding", settings.memory.model, None, False, _elapsed_ms(started), type(e).__name__
+        )
+        raise
+    record_llm_call("embedding", settings.memory.model, None, True, _elapsed_ms(started))
     vectors = np.asarray([item.embedding for item in response.data], dtype=np.float32)
     return vectors / np.linalg.norm(vectors, axis=1, keepdims=True)
 
@@ -176,6 +190,7 @@ async def _rerank(query: str, documents: list[str]) -> list[dict[str, Any]]:
         _rerank_client = httpx.AsyncClient(
             timeout=settings.memory.rerank_timeout, trust_env=False
         )
+    started = time.perf_counter()
     try:
         response = await _rerank_client.post(
             settings.memory.rerank_base_url,
@@ -189,10 +204,15 @@ async def _rerank(query: str, documents: list[str]) -> list[dict[str, Any]]:
             },
         )
         response.raise_for_status()
-        return response.json().get("results", [])
+        results = response.json().get("results", [])
     except Exception as e:
+        record_llm_call(
+            "rerank", settings.rerank_model, None, False, _elapsed_ms(started), type(e).__name__
+        )
         logger.error(f"Rerank API Error: {e}")
         return []
+    record_llm_call("rerank", settings.rerank_model, None, True, _elapsed_ms(started))
+    return results
 
 
 async def close_clients() -> None:
@@ -504,8 +524,8 @@ class VectorMemory:
         return result
 
 
-async def maintain_memories() -> None:
-    """每日维护：删除过期记忆，补算写入时 embedding 失败的行。"""
+async def maintain_memories() -> dict:
+    """每日维护：删除过期记忆，补算写入时 embedding 失败的行。返回 {deleted, filled, pending}，pending 是还没补上的。"""
 
     deleted = await MemoryModel.filter(expires_at__lt=datetime.now()).delete()
     pending = await MemoryModel.filter(embedding__isnull=True)
@@ -524,4 +544,5 @@ async def maintain_memories() -> None:
             await row.save(update_fields=["embedding", "embedding_model", "updated_at"])
         filled += len(batch)
     logger.info(f"[Memory] 维护完成：删除过期 {deleted} 条，补算向量 {filled}/{len(pending)} 条")
+    return {"deleted": deleted, "filled": filled, "pending": len(pending) - filled}
 

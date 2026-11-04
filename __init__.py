@@ -12,12 +12,15 @@ from .memory.maintenance import setup_maintenance_job
 from .messages.image import setup_image_cache_job
 from .messages.stickers import load_stickers, setup_sticker_prune_job
 from .storage.backup import setup_backup_job
+from .webconsole_api import setup_console_api
+from .webconsole_store import close_store, open_store
 
 driver = get_driver()
 
 
 @driver.on_startup
 async def init_db():
+    open_store()
     data_dir = get_data_dir()
     data_dir.mkdir(parents=True, exist_ok=True)
     db_path = data_dir / "nyabot.sqlite"
@@ -41,6 +44,7 @@ async def init_db():
     setup_sticker_prune_job()
     setup_maintenance_job()
     setup_backup_job()
+    setup_console_api()
 
 
 @driver.on_bot_connect
@@ -56,3 +60,4 @@ async def log_bot_disconnect(bot: Bot):
 @driver.on_shutdown
 async def cleanup_tasks():
     await cleanup_global_resources()
+    close_store()

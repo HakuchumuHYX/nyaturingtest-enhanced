@@ -177,8 +177,8 @@ def profile_name(user_id: str, rows: list[dict], latest_names: dict[str, str]) -
 
 async def digest_user_profiles(
     session_id: str, still_current: Callable[[], bool]
-) -> dict[str, str]:
-    """整理到期的用户档案，返回 {user_id: 新档案}。
+) -> tuple[dict[str, str], int]:
+    """整理到期的用户档案，返回（{user_id: 新档案}, 整理失败的人数）。
 
     到期条件：新碎片 ≥10 条，或有新碎片且有更正 / 从没整理过 / 水位已满 7 天。
     """
@@ -191,6 +191,7 @@ async def digest_user_profiles(
     latest_names = await get_latest_user_names(session_id)
 
     updated: dict[str, str] = {}
+    failed = 0
     calls = 0
     for user_id, rows in rows_by_user.items():
         profile = profiles.get(user_id)
@@ -216,9 +217,10 @@ async def digest_user_profiles(
             key="summary",
         )
         if summary is None:
+            failed += 1
             continue
         if not still_current():
-            return {}
+            return {}, failed
         await UserProfileModel.update_or_create(
             session_id=session_id,
             user_id=user_id,
@@ -229,7 +231,7 @@ async def digest_user_profiles(
     logger.info(
         f"[Digest] 群 {session_id} 用户档案：更新 {len(updated)} 人，调用 {calls} 次"
     )
-    return updated
+    return updated, failed
 
 
 def _new_group_fragments(session_id: str, until: datetime | None):
@@ -247,13 +249,13 @@ async def count_new_group_fragments(session_id: str) -> int:
 
 async def digest_group_notes(
     session_id: str, still_current: Callable[[], bool], *, min_new: int = 1
-) -> str | None:
-    """新碎片不少于 min_new 条就合进群志，返回新群志；不到期或失败返回 None。"""
+) -> tuple[str | None, bool]:
+    """新碎片不少于 min_new 条就合进群志，返回（新群志, 整理是否失败）；不到期是 (None, False)。"""
 
     async with _group_notes_locks[session_id]:
         session_db = await SessionModel.get_or_none(id=session_id)
         if session_db is None:
-            return None
+            return None, False
         until = session_db.notes_summarized_until
         rows = (
             await _new_group_fragments(session_id, until)
@@ -261,7 +263,7 @@ async def digest_group_notes(
             .values(*_MEMORY_FIELDS)
         )
         if not _due(len(rows), until, min_new=min_new):
-            return None
+            return None, False
 
         chunks = _chunks(rows, GROUP_NOTES_CHUNK_CHARS)
         notes = await _condense(
@@ -278,9 +280,11 @@ async def digest_group_notes(
             f"[Digest] 群 {session_id} 群志：调用 {calls} 次，"
             f"{'失败，下次再试' if notes is None else f'{len(notes)} 字'}"
         )
-        if notes is None or not still_current():
-            return None
+        if notes is None:
+            return None, True
+        if not still_current():
+            return None, False
         await SessionModel.filter(id=session_id).update(
             group_notes=notes, notes_summarized_until=rows[-1]["created_at"]
         )
-        return notes
+        return notes, False

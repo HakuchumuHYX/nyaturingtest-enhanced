@@ -118,6 +118,8 @@
 | `rerank` | 检索结果重排，`threshold` 以下的结果丢弃 |
 | `web_search` | 联网搜索（DeepSeek Search），`api_key` 留空就不搜 |
 | `playwright_browsers_path` | 卡片截图用的 Chromium 所在目录，留空用 playwright 默认位置 |
+| `webconsole_db` | WebConsole 的库；留空就不记录 LLM 请求、看群决策、每日整理和警告，聊天不受影响 |
+| `console_token` | WebConsole 拉当前状态时带的 Bearer token；留空就不开放接口 |
 
 `chat`、`feedback`、`background` 的 `base_url`、`model` 必填，其余缺省有默认值。改配置后要重启。
 也可以用环境变量 `NYATURINGTEST_CONFIG_FILE` 指定别的配置文件，用 `NYATURINGTEST_DATA_DIR` 指定数据目录。

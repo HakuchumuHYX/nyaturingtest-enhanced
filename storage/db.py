@@ -13,6 +13,7 @@ from .models import (
     GlobalMessageModel,
     MemoryModel,
     PersonaGroupModel,
+    PersonaHistoryModel,
     PersonaLifeModel,
     PersonaStatusModel,
     SessionModel,
@@ -538,6 +539,118 @@ async def log_token_usage(session_id: str, model_name: str, usage: dict):
             )
     except Exception as e:
         logger.error(f"[Repo] 记录 Token 消耗失败: {e}")
+
+
+async def token_usage_by_session(since: datetime) -> list[dict]:
+    """各会话从 since 起的 Token 和请求数；按明细表算滑动窗口，日汇总表只有自然日。"""
+
+    return await Tortoise.get_connection("default").execute_query_dict(
+        """
+        SELECT session_id, SUM(prompt_tokens + completion_tokens) AS total, COUNT(*) AS requests
+        FROM nyabot_token_usage
+        WHERE timestamp >= ?
+        GROUP BY session_id
+        """,
+        [since.isoformat(" ")],
+    )
+
+
+async def token_usage_by_model(session_id: str, since: datetime, model_names: list[str]) -> list[dict]:
+    """这个会话从 since 起按模型分的 Token，同一模型的不同写法并成一条。"""
+
+    rows = await Tortoise.get_connection("default").execute_query_dict(
+        """
+        SELECT model_name, SUM(prompt_tokens) AS prompt, SUM(completion_tokens) AS completion,
+               SUM(reasoning_tokens) AS reasoning, COUNT(*) AS requests
+        FROM nyabot_token_usage
+        WHERE session_id = ? AND timestamp >= ?
+        GROUP BY model_name
+        """,
+        [session_id, since.isoformat(" ")],
+    )
+    names = {_model_key(name): name for name in model_names}
+    merged: dict[str, dict] = {}
+    for row in rows:
+        key = _model_key(row["model_name"])
+        entry = merged.setdefault(
+            key,
+            {"model": names.get(key, row["model_name"]), "prompt": 0, "completion": 0, "reasoning": 0, "requests": 0},
+        )
+        for field in ("prompt", "completion", "reasoning", "requests"):
+            entry[field] += row[field]
+    return sorted(merged.values(), key=lambda e: e["prompt"] + e["completion"], reverse=True)
+
+
+async def message_buckets(since: datetime) -> list[dict]:
+    """从 since（当天零点）起各群每 30 分钟的消息数；bucket 是当天第几个 30 分钟。"""
+
+    return await Tortoise.get_connection("default").execute_query_dict(
+        """
+        SELECT session_id,
+               CAST(strftime('%H', time) AS INTEGER) * 2 + CAST(strftime('%M', time) AS INTEGER) / 30 AS bucket,
+               COUNT(*) AS count
+        FROM nyabot_global_messages
+        WHERE time >= ?
+        GROUP BY session_id, bucket
+        """,
+        [since.isoformat(" ")],
+    )
+
+
+async def self_speak_times(session_id: str, name: str, since: datetime) -> list[datetime]:
+    """她从 since 起开口的时刻。她名下还有戳一戳、贴表情的记录，那些不是说的话；表情包算开口。"""
+
+    return await (
+        GlobalMessageModel.filter(session_id=session_id, user_name=name, time__gte=since)
+        .exclude(content__startswith="[戳一戳:")
+        .exclude(content__startswith="[给")
+        .order_by("time")
+        .values_list("time", flat=True)
+    )
+
+
+async def load_life(preset: str) -> dict:
+    """人生线和还没整理进去的自我陈述；还没整理过时文本是空串。"""
+
+    life = await PersonaLifeModel.get_or_none(preset=preset)
+    if life is None:
+        return {"text": "", "last_digest": None, "pending_facts": []}
+    return {
+        "text": life.text,
+        "last_digest": life.last_digest.isoformat() if life.last_digest else None,
+        "pending_facts": life.pending_facts,
+    }
+
+
+async def load_digest_day(day: date) -> dict:
+    """这一天的整理内容：人生线和各群的改动说明、日记、观察日记。日记和观察日记只留最近几天，再早就没有了。"""
+
+    rows = await PersonaHistoryModel.filter(date=day).order_by("id").values("scope", "key", "changes")
+    prefix = f"{day:%m-%d} "
+    return {
+        "life": [
+            {"preset": row["key"], "changes": row["changes"]}
+            for row in rows
+            if row["scope"] == "life"
+        ],
+        "groups": [
+            {"session_id": row["key"].partition(":")[0], "changes": row["changes"]}
+            for row in rows
+            if row["scope"] == "group"
+        ],
+        "diary": [
+            {"preset": status.preset, "text": entry["text"]}
+            for status in await PersonaStatusModel.all()
+            for entry in status.diary
+            if entry["day"] == day.isoformat()
+        ],
+        "journals": [
+            {"session_id": layer.session_id, "text": entry.removeprefix(prefix)}
+            for layer in await PersonaGroupModel.all()
+            for entry in layer.journal
+            if entry.startswith(prefix)
+        ],
+    }
 
 
 async def get_token_stats(group_id: str | int, model_names: list[str]) -> dict:

@@ -67,6 +67,8 @@ class AppSettings:
     web_search: WebSearchSettings
     siliconflow_api_key: str
     playwright_browsers_path: str
+    webconsole_db: str
+    console_token: str
 
 
 DEFAULT_CONFIG: dict[str, Any] = {
@@ -113,6 +115,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     # 群志卡片截图用的 Chromium 目录；留空用 playwright 默认位置
     "playwright_browsers_path": "",
+    # WebConsole 的库；留空就不记录 LLM 请求、看群决策、每日整理和警告，聊天不受影响
+    "webconsole_db": "",
+    # WebConsole 拉当前状态时带的 Bearer token；留空就不开放接口
+    "console_token": "",
 }
 
 
@@ -170,6 +176,8 @@ def build_settings(config: dict[str, Any]) -> AppSettings:
         ),
         siliconflow_api_key=str(cfg["siliconflow_api_key"] or ""),
         playwright_browsers_path=str(cfg["playwright_browsers_path"] or ""),
+        webconsole_db=str(cfg["webconsole_db"] or ""),
+        console_token=str(cfg["console_token"] or ""),
     )
 
 

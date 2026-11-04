@@ -13,6 +13,7 @@ from openai import APIConnectionError, APITimeoutError, AsyncOpenAI
 from .config import EndpointSettings, get_app_settings
 from .metrics import log_event, record_token_usage
 from .prompts import JSON_SYSTEM_PROMPT
+from .webconsole_store import record_llm_call
 
 
 @dataclass(frozen=True)
@@ -127,7 +128,8 @@ def _classify_exception(exc: Exception) -> str:
 class LLMClient:
     """一个端点的 OpenAI 兼容客户端：JSON 输出、重试、429 熔断、指标与 Token 记录。"""
 
-    def __init__(self, settings: EndpointSettings):
+    def __init__(self, name: str, settings: EndpointSettings):
+        self.name = name
         self.settings = settings
         self.openai_client = AsyncOpenAI(
             api_key=settings.api_key,
@@ -153,14 +155,22 @@ class LLMClient:
 
         started_at = time.perf_counter()
         content = await self._request(prompt, session_id, system_prompt, images or [])
+        latency_ms = int((time.perf_counter() - started_at) * 1000)
         log_event(
             "llm_success" if content else "llm_failure",
             "DEBUG" if content else "WARNING",
             model=self.settings.model,
-            latency_ms=int((time.perf_counter() - started_at) * 1000),
+            latency_ms=latency_ms,
             decision="content" if content else self.provider_status.last_error_type,
         )
-        return _parse_json_object(content) if content else None
+        parsed = _parse_json_object(content) if content else None
+        error_type = None
+        if parsed is None:
+            error_type = "invalid_json" if content else self.provider_status.last_error_type
+        record_llm_call(
+            self.name, self.settings.model, session_id, parsed is not None, latency_ms, error_type
+        )
+        return parsed
 
     async def _request(
         self,
@@ -245,9 +255,9 @@ class LLMClient:
 
 
 # 所有群共用：限流与熔断本来就是按 API key 算的
-chat_client = LLMClient(get_app_settings().chat)
-feedback_client = LLMClient(get_app_settings().feedback)
-background_client = LLMClient(get_app_settings().background)
+chat_client = LLMClient("chat", get_app_settings().chat)
+feedback_client = LLMClient("feedback", get_app_settings().feedback)
+background_client = LLMClient("background", get_app_settings().background)
 
 WEB_SEARCH_COUNT = 5
 WEB_RESULT_CHARS = 400
@@ -272,6 +282,8 @@ async def web_search(query: str, ori_question: str, *, session_id: str) -> list[
         response.raise_for_status()
         results = response.json()["results"]
     except Exception as e:
+        latency_ms = int((time.perf_counter() - started) * 1000)
+        record_llm_call("web_search", "search", session_id, False, latency_ms, type(e).__name__)
         log_event(
             "web_search_failed",
             "WARNING",
@@ -280,11 +292,13 @@ async def web_search(query: str, ori_question: str, *, session_id: str) -> list[
             error=f"{type(e).__name__}: {e}"[:200],
         )
         return []
+    latency_ms = int((time.perf_counter() - started) * 1000)
+    record_llm_call("web_search", "search", session_id, True, latency_ms)
     log_event(
         "web_search",
         session_id=session_id,
         query=query,
-        latency_ms=int((time.perf_counter() - started) * 1000),
+        latency_ms=latency_ms,
         results=len(results),
         top_score=round(results[0]["rerank_score"], 2) if results else None,
     )

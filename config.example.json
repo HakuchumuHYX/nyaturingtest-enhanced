@@ -40,5 +40,7 @@
         "base_url": "https://api.deepseek.com/v1/tools",
         "timeout": 5
     },
-    "playwright_browsers_path": ""
+    "playwright_browsers_path": "",
+    "webconsole_db": "",
+    "console_token": ""
 }
