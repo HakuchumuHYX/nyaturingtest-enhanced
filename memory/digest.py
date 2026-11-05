@@ -13,6 +13,7 @@ from nonebot import logger
 
 from ..llm import background_client
 from ..prompts import (
+    MAX_IMPRESSIONS,
     fragments_material,
     get_group_notes_prompt,
     get_group_points_prompt,
@@ -22,6 +23,7 @@ from ..prompts import (
 )
 from ..storage.db import get_latest_user_names
 from ..storage.models import MemoryModel, SessionModel, UserProfileModel
+from .vector import IMPRESSION_CATEGORY, VectorMemory
 
 PROFILE_MIN_NEW_MEMORIES = 10
 # 手动查看群志时新碎片攒到这么多才重新整理：群志只在旧稿上小改，几条新碎片通常改不动什么
@@ -45,6 +47,7 @@ _MEMORY_FIELDS = (
     "date",
     "created_at",
     "is_correction",
+    "participant_ids",
 )
 
 
@@ -101,12 +104,12 @@ def _due(
     return datetime.now() - until >= DIGEST_INTERVAL
 
 
-async def _generate(session_id: str, prompt: str, key: str) -> str | None:
+async def _generate(session_id: str, prompt: str, key: str) -> dict | None:
     data = await background_client.generate_json(prompt, session_id=session_id)
     if data is None or not isinstance(data.get(key), str):
         logger.warning(f"[Digest] 群 {session_id} 整理输出无效，跳过，下次再试")
         return None
-    return data[key].strip()
+    return data
 
 
 async def _condense(
@@ -116,8 +119,8 @@ async def _condense(
     rewrite_prompt: Callable[[str], str],
     points_prompt: Callable[[str, str], str],
     key: str,
-) -> str | None:
-    """一块直接重写；多块先并行提炼各段要点再合并。任一步失败返回 None，水位不动。
+) -> dict | None:
+    """一块直接重写；多块先并行提炼各段要点再合并。返回模型输出的整个对象，任一步失败返回 None，水位不动。
 
     rewrite_prompt(材料)、points_prompt(时间跨度, 碎片行) 由档案和群志各自给出模板。
     """
@@ -129,7 +132,7 @@ async def _condense(
 
     limit = asyncio.Semaphore(POINTS_CONCURRENCY)
 
-    async def points_of(chunk: list[dict]) -> str | None:
+    async def points_of(chunk: list[dict]) -> dict | None:
         async with limit:
             prompt = points_prompt(_span(chunk), _chunk_lines(chunk))
             return await _generate(session_id, prompt, "points")
@@ -137,22 +140,29 @@ async def _condense(
     points = await asyncio.gather(*(points_of(chunk) for chunk in chunks))
     if any(item is None for item in points):
         return None
-    segments = [(_span(chunk), item) for chunk, item in zip(chunks, points)]
+    segments = [(_span(chunk), item["points"].strip()) for chunk, item in zip(chunks, points)]
     return await _generate(session_id, rewrite_prompt(points_material(segments)), key)
 
 
 async def profile_rows_by_user(session_id: str) -> dict[str, list[dict]]:
-    """每个人的档案材料：主体是此人的碎片，加上此人说到别人的碎片（标 said_about_others），按时间排。
+    """每个人的档案材料：主体是此人的碎片，加上此人说到别人的碎片（标 said_about_others），
+    和此人参与的小结，按时间排。
 
     「A 说/对 B 怎样」主体记 B、说话人记 A；只按主体归属的话，A 的档案会缺掉他怎么对待别人。
+    事实碎片不收玩笑，有人拿此人开的玩笑只留在小结里，是印象的来源。
     """
 
     rows_by_user: dict[str, list[dict]] = defaultdict(list)
     for row in (
         await MemoryModel.filter(session_id=session_id)
+        .exclude(category=IMPRESSION_CATEGORY)
         .order_by("created_at")
         .values(*_MEMORY_FIELDS)
     ):
+        if row["category"] == "episode":
+            for user_id in row["participant_ids"].split():
+                rows_by_user[user_id].append(row)
+            continue
         subject, speaker = row["subject_user_id"], row["speaker_user_id"]
         if subject:
             rows_by_user[subject].append(row)
@@ -176,13 +186,16 @@ def profile_name(user_id: str, rows: list[dict], latest_names: dict[str, str]) -
 
 
 async def digest_user_profiles(
-    session_id: str, still_current: Callable[[], bool]
+    session_id: str, bot_name: str, still_current: Callable[[], bool]
 ) -> tuple[dict[str, str], int]:
-    """整理到期的用户档案，返回（{user_id: 新档案}, 整理失败的人数）。
+    """整理到期的用户档案和印象，返回（{user_id: 新档案}, 整理失败的人数）。
 
-    到期条件：新碎片 ≥10 条，或有新碎片且有更正 / 从没整理过 / 水位已满 7 天。
+    到期条件：新事实碎片 ≥10 条，或有新事实碎片且有更正 / 从没整理过 / 水位已满 7 天。
+    小结只作素材不算到期：一段聊天就是一条，算上的话活跃的人每晚都要重写。
+    印象写在这个临时实例上，矩阵缓存由每日维护结束时统一丢掉。
     """
 
+    vector_memory = VectorMemory(session_id)
     profiles = {
         profile.user_id: profile
         for profile in await UserProfileModel.filter(session_id=session_id)
@@ -197,34 +210,44 @@ async def digest_user_profiles(
         profile = profiles.get(user_id)
         until = profile.summarized_until if profile else None
         new_rows = [row for row in rows if until is None or row["created_at"] > until]
+        new_facts = sum(row["category"] != "episode" for row in new_rows)
         urgent = any(row["is_correction"] for row in new_rows)
-        if not _due(len(new_rows), until, min_new=PROFILE_MIN_NEW_MEMORIES, urgent=urgent):
+        if not _due(new_facts, until, min_new=PROFILE_MIN_NEW_MEMORIES, urgent=urgent):
             continue
 
         name = profile_name(user_id, rows, latest_names)
         old_summary = profile.summary if profile else ""
+        old_impressions = await vector_memory.impressions_of(user_id)
         chunks = _chunks(new_rows, PROFILE_CHUNK_CHARS)
         calls += 1 if len(chunks) == 1 else len(chunks) + 1
-        summary = await _condense(
+        result = await _condense(
             session_id,
             chunks,
             rewrite_prompt=lambda material: get_profile_prompt(
-                name, user_id, old_summary, material
+                name, user_id, old_summary, old_impressions, material, bot_name
             ),
             points_prompt=lambda span, lines: get_profile_points_prompt(
                 name, user_id, span, lines
             ),
             key="summary",
         )
-        if summary is None:
+        impressions = result.get("impressions") if result else None
+        if not isinstance(impressions, list):
             failed += 1
             continue
         if not still_current():
             return {}, failed
+        summary = result["summary"].strip()
         await UserProfileModel.update_or_create(
             session_id=session_id,
             user_id=user_id,
             defaults={"summary": summary, "summarized_until": new_rows[-1]["created_at"]},
+        )
+        await vector_memory.replace_impressions(
+            user_id,
+            name,
+            [str(item).strip() for item in impressions if str(item).strip()][:MAX_IMPRESSIONS],
+            still_current=still_current,
         )
         updated[user_id] = summary
 
@@ -235,7 +258,7 @@ async def digest_user_profiles(
 
 
 def _new_group_fragments(session_id: str, until: datetime | None):
-    query = MemoryModel.filter(session_id=session_id)
+    query = MemoryModel.filter(session_id=session_id).exclude(category=IMPRESSION_CATEGORY)
     return query if until is None else query.filter(created_at__gt=until)
 
 
@@ -266,7 +289,7 @@ async def digest_group_notes(
             return None, False
 
         chunks = _chunks(rows, GROUP_NOTES_CHUNK_CHARS)
-        notes = await _condense(
+        result = await _condense(
             session_id,
             chunks,
             rewrite_prompt=lambda material: get_group_notes_prompt(
@@ -275,6 +298,7 @@ async def digest_group_notes(
             points_prompt=get_group_points_prompt,
             key="group_notes",
         )
+        notes = result["group_notes"].strip() if result else None
         calls = 1 if len(chunks) == 1 else len(chunks) + 1
         logger.info(
             f"[Digest] 群 {session_id} 群志：调用 {calls} 次，"

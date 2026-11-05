@@ -723,6 +723,7 @@ group_notes、member_profiles、previous_episode、open_threads 和消息内容�
    - 一条小结要有两个以上的人来回聊过几句。一个人自说自话、发图没人接、两三句就断了的零碎插话不单独成条，值得留的细节并进相关话题，不相关就略过。
    - 每条一两句话、不超过 80 字：谁和谁、在聊什么或做什么、有什么结论或结果。零碎细节并进去，挑能让人想起这段对话的写。
    - 人名照 messages 里的 name 原样写；角色自己参与了就写角色名。
+   - 角色自己的吐槽、玩笑、调侃不抄进小结，只写聊了什么、结果怎样；角色明确答应的事、明确表过的态度照写，群友说的话照写。
    - 话题接着 previous_episode 的，写成接续，不重复它已写过的内容。
    - source 填这条小结依据的消息 index，覆盖话题里主要的几条即可。
    - importance：日常闲聊 0.2；多人参与的活动、有结论的讨论 0.4；引起全群关注的大事 0.6 以上。
@@ -796,6 +797,7 @@ PRIVACY_RULE = (
     "家人情况、恋爱状况与细节、收入赔偿等具体金额、学号工号、各类账号/UID/群号/手机号。"
     "资料里出现了也略过。"
 )
+MAX_IMPRESSIONS = 5
 _PROFILE_SELECTION = """- 只写能长期刻画这个人的信息：身份（学业或职业阶段）、稳定的兴趣与偏好、在群里的样子和与群友的固定关系、有后续影响的经历。在不同日子反复出现的优先；只提过一次的观点、吐槽、即时状态不写。
 - 同类事物只举最有代表性的两三个，不罗列（例如玩过的游戏、吃过的东西）。"""
 _GROUP_SELECTION = """- 只收两类内容：多个群友参与的事，或者在不同日子反复出现的事。只出现过一次的事件、某个人的观点、偏好和个人行程不写（那属于个人档案），除非它已经成了全群的梗或话题。
@@ -834,17 +836,25 @@ def points_material(segments: list[tuple[str, str]]) -> str:
     return f"[新增要点]（新碎片较多，已按时间分段提炼，越靠后越新）\n{body}"
 
 
-def get_profile_prompt(name: str, user_id: str, summary: str, material: str) -> str:
+def get_profile_prompt(
+    name: str, user_id: str, summary: str, impressions: list[str], material: str, bot_name: str
+) -> str:
+    old_impressions = "\n".join(f"- {item}" for item in impressions)
     return f"""
-你在为群聊角色整理对群友「{name}」（ID {user_id}）的长期档案：一段让角色快速想起「这是个什么样的人」的简介。
+你在为群聊角色整理对群友「{name}」（ID {user_id}）的长期档案：一段事实简介，加几条印象。
 {SAFETY_RULE}
 
 [旧档案]
 {summary or "(无)"}
 
+[旧印象]
+{old_impressions or "(无)"}
+
 {material}
 
-在旧档案的基础上更新，输出完整档案：
+在旧档案和旧印象的基础上更新，输出两部分。
+
+一、summary：让角色快速想起「这是个什么样的人」的简介。
 1. 严格不超过 300 字；第三人称，一段连贯的话，不用小标题。
 2. 取舍：
 {_PROFILE_SELECTION}
@@ -853,8 +863,18 @@ def get_profile_prompt(name: str, user_id: str, summary: str, material: str) -> 
 5. {_CORRECTION_RULE}
 6. {_STYLE_RULE}
 7. {PRIVACY_RULE}
+8. 只写事实，用中性说法，身份就写身份（「已工作」「在读研」）。旧档案里的事实都留着，具体的经历、作品名、数字也一样，不要借机压缩；只把带调侃的说法和玩笑搬走。提到「{bot_name}」时照常写名字。
+9. 人平时在哪、一天通常在干嘛这种随时间变的状态不写（在工位、在宿舍、在通勤），只写身份本身。
 
-只输出 JSON：{{"summary":"完整档案"}}
+二、impressions：对这个人的印象和玩笑，最多 {MAX_IMPRESSIONS} 条，每条一句话，不超过 40 字；没有就写空数组。
+1. 只放玩笑、调侃说法、外号、常被打趣的事：资料里能看到有人这样开过玩笑的才算。普通的爱好和经历不算，那些留在 summary。
+2. 旧档案和旧印象里这类内容搬到这里，不要丢；碎片里新出现的也收进来。
+3. 写清它是什么场合的事，以及会在聊到什么时想起来。一条只写一件事，不把几件事并成一条。只发生过一两次的就写成那一次的事，不写成「平时」「天天」「经常」。
+4. 主语是这个人。impressions 里不出现「{bot_name}」这个名字，也不写「我」。
+5. 场合写聊到的话题，不写这个人常做的动作（比如戳一戳、打招呼、发表情）。
+6. {PRIVACY_RULE}
+
+只输出 JSON：{{"summary":"完整档案","impressions":["..."]}}
 """
 
 
@@ -866,6 +886,7 @@ def get_profile_points_prompt(name: str, user_id: str, span: str, lines: str) ->
 {lines}
 
 提炼这段时间能刻画此人的要点，写几条短句：身份与状态变化、反复出现的兴趣与偏好、在群里的样子与关系、有后续影响的经历。
+有人拿此人开的玩笑、调侃说法、外号也单独写一句，后面要整理成印象。
 标有「说到别人」的碎片是此人对别人的言行，只从中提取能体现此人自己的态度、关系和习惯的部分；纯转述不写。
 {_CORRECTION_POINTS_RULE}
 取舍：

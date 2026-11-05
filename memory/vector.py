@@ -34,12 +34,18 @@ QUERY_INSTRUCTION = (
     "that are relevant to it\nQuery: "
 )
 
+# 印象（玩笑、调侃）不放进每轮都给的档案，走检索：话题碰到才想起，不用另外判断该不该提
+IMPRESSION_CATEGORY = "impression"
+IMPRESSION_CONFIDENCE = 0.8
+IMPRESSION_IMPORTANCE = 0.5
+
 MEMORY_TYPE_WEIGHT = {
     "episode": 1.0,
     "event": 1.0,
     "preference": 1.05,
     "profile": 1.05,
     "relationship": 1.0,
+    IMPRESSION_CATEGORY: 1.05,
 }
 MEMORY_TYPE_DECAY_RATE = {
     "episode": 0.02,
@@ -47,6 +53,7 @@ MEMORY_TYPE_DECAY_RATE = {
     "preference": 0.003,
     "profile": 0.003,
     "relationship": 0.003,
+    IMPRESSION_CATEGORY: 0.003,
 }
 SCOPE_WEIGHT = {
     "active_subject": 1.10,
@@ -290,10 +297,12 @@ class VectorMemory:
         self._ids = None
 
     async def recent(self, limit: int) -> list[MemoryModel]:
-        """最近写入的记忆，新的在前；主动发起话题时当素材，不需要 query。"""
+        """最近写入的记忆，新的在前；主动发起话题时当素材，不需要 query。
+        印象每次整理都重写，算不上最近发生的事。"""
 
         return (
             await MemoryModel.filter(session_id=self.session_id)
+            .exclude(category=IMPRESSION_CATEGORY)
             .order_by("-created_at")
             .limit(limit)
         )
@@ -522,6 +531,52 @@ class VectorMemory:
 
         result["added"] = len(new_rows)
         return result
+
+    async def impressions_of(self, user_id: str) -> list[str]:
+        return await (
+            MemoryModel.filter(
+                session_id=self.session_id,
+                subject_user_id=user_id,
+                category=IMPRESSION_CATEGORY,
+            )
+            .order_by("created_at")
+            .values_list("content", flat=True)
+        )
+
+    async def replace_impressions(
+        self,
+        user_id: str,
+        user_name: str,
+        contents: list[str],
+        *,
+        still_current: Callable[[], bool],
+    ) -> None:
+        """整组换掉此人的印象：每次整理都是在旧印象上重写的完整一份。"""
+
+        await MemoryModel.filter(
+            session_id=self.session_id,
+            subject_user_id=user_id,
+            category=IMPRESSION_CATEGORY,
+        ).delete()
+        self.drop_cache()
+        date = int(f"{datetime.now():%Y%m%d}")
+        await self.add_memories(
+            [
+                NewMemory(
+                    content=content,
+                    category=IMPRESSION_CATEGORY,
+                    date=date,
+                    confidence=IMPRESSION_CONFIDENCE,
+                    importance=IMPRESSION_IMPORTANCE,
+                    source_msg_ids="",
+                    participant_ids=user_id,
+                    subject_user_id=user_id,
+                    subject_user_name=user_name,
+                )
+                for content in contents
+            ],
+            still_current=still_current,
+        )
 
 
 async def maintain_memories() -> dict:

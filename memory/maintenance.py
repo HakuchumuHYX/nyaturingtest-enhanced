@@ -63,7 +63,7 @@ async def maintain_long_term_memory() -> None:
         }
         try:
             summaries, result["profiles_failed"] = await digest_user_profiles(
-                session_id, still_current
+                session_id, sessions[group_id].state.name, still_current
             )
             result["profiles"] = len(summaries)
             notes, result["notes_failed"] = await refresh_group_notes(group_id)
