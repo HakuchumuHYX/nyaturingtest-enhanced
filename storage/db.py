@@ -16,6 +16,7 @@ from .models import (
     PersonaHistoryModel,
     PersonaLifeModel,
     PersonaStatusModel,
+    PhotoModel,
     SessionModel,
     StickerModel,
     ThreadModel,
@@ -281,6 +282,13 @@ async def recall_message(session_id: str, msg_id: str, content: str) -> int:
     )
 
 
+async def message_content(session_id: str, msg_id: str) -> str | None:
+    """消息库里这条的内容；不在库里返回 None。"""
+
+    row = await GlobalMessageModel.get_or_none(session_id=session_id, msg_id=msg_id)
+    return row.content if row else None
+
+
 async def message_sender_name(session_id: str, msg_id: str) -> str | None:
     """消息库里这条的发言人名字；不在库里返回 None。"""
 
@@ -499,6 +507,44 @@ async def delete_stickers(digests: list[str]) -> None:
     """删行不拉黑：清理掉的图以后再有人发还能重新收。"""
 
     await StickerModel.filter(digest__in=digests).delete()
+
+
+async def add_photo(**values) -> PhotoModel:
+    return await PhotoModel.create(**values)
+
+
+async def load_photos(session_id: str, preset: str) -> list[PhotoModel]:
+    return await PhotoModel.filter(session_id=session_id, preset=preset)
+
+
+async def get_photo(session_id: str, photo_id: int) -> PhotoModel | None:
+    return await PhotoModel.get_or_none(session_id=session_id, id=photo_id)
+
+
+async def find_photo_by_caption(session_id: str, caption: str) -> PhotoModel | None:
+    return await PhotoModel.filter(session_id=session_id, caption=caption).first()
+
+
+async def mark_photo_sent(photo_id: int, sent_at: datetime) -> None:
+    await PhotoModel.filter(id=photo_id).update(last_sent_at=sent_at)
+
+
+async def save_photo_embedding(photo_id: int, embedding: bytes, embedding_model: str) -> None:
+    await PhotoModel.filter(id=photo_id).update(
+        embedding=embedding, embedding_model=embedding_model
+    )
+
+
+async def expired_photos(before: datetime) -> list[PhotoModel]:
+    return await PhotoModel.filter(last_sent_at__lt=before)
+
+
+async def session_photos(session_id: str) -> list[PhotoModel]:
+    return await PhotoModel.filter(session_id=session_id)
+
+
+async def delete_photos(photo_ids: list[int]) -> None:
+    await PhotoModel.filter(id__in=photo_ids).delete()
 
 
 async def block_sticker(digest: str) -> None:

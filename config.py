@@ -57,6 +57,16 @@ class WebSearchSettings:
 
 
 @dataclass(frozen=True)
+class ImageSettings:
+    # model 留空就是不发照片：提示词里没有生图内容，也不查相册
+    api_key: str
+    base_url: str
+    model: str
+    quality: str
+    timeout: float
+
+
+@dataclass(frozen=True)
 class AppSettings:
     chat: EndpointSettings
     feedback: EndpointSettings
@@ -65,6 +75,7 @@ class AppSettings:
     rerank_threshold: float
     memory: MemoryEndpointSettings
     web_search: WebSearchSettings
+    image: ImageSettings
     siliconflow_api_key: str
     playwright_browsers_path: str
     webconsole_db: str
@@ -113,6 +124,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "base_url": "https://api.deepseek.com/v1/tools",
         "timeout": 5,
     },
+    # 她发照片用的生图模型；model 留空就关掉这个功能
+    "image": {
+        "api_key": "",
+        "base_url": "",
+        "model": "",
+        "quality": "medium",
+        # 上游超过约 120s 会被 Cloudflare 以 524 断开，再多等没有意义
+        "timeout": 130,
+    },
     # 群志卡片截图用的 Chromium 目录；留空用 playwright 默认位置
     "playwright_browsers_path": "",
     # WebConsole 的库；留空就不记录 LLM 请求、看群决策、每日整理和警告，聊天不受影响
@@ -156,6 +176,7 @@ def build_settings(config: dict[str, Any]) -> AppSettings:
     embedding = cfg["embedding"]
     rerank = cfg["rerank"]
     web_search = cfg["web_search"]
+    image = cfg["image"]
     return AppSettings(
         chat=_endpoint(cfg, "chat"),
         feedback=_endpoint(cfg, "feedback"),
@@ -173,6 +194,13 @@ def build_settings(config: dict[str, Any]) -> AppSettings:
             api_key=str(web_search["api_key"] or ""),
             base_url=_require(web_search, "web_search", "base_url").rstrip("/"),
             timeout=float(web_search["timeout"]),
+        ),
+        image=ImageSettings(
+            api_key=str(image["api_key"] or ""),
+            base_url=str(image["base_url"] or "").rstrip("/"),
+            model=str(image["model"] or ""),
+            quality=str(image["quality"] or ""),
+            timeout=float(image["timeout"]),
         ),
         siliconflow_api_key=str(cfg["siliconflow_api_key"] or ""),
         playwright_browsers_path=str(cfg["playwright_browsers_path"] or ""),
@@ -197,6 +225,12 @@ def _load_settings() -> AppSettings:
         )
     key_state = "set" if settings.web_search.api_key else "missing"
     logger.info(f"web_search: base_url={settings.web_search.base_url}, api_key={key_state}")
+    image = settings.image
+    if image.model:
+        key_state = "set" if image.api_key else "missing"
+        logger.info(f"image: model={image.model}, base_url={image.base_url}, api_key={key_state}")
+    else:
+        logger.warning("配置里没有生图模型（image.model），她不会发照片")
     return settings
 
 

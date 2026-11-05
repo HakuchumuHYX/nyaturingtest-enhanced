@@ -238,6 +238,32 @@ class StickerModel(Model):
         table = "nyabot_stickers"
 
 
+class PhotoModel(Model):
+    """她的相册，每个（群, 预设）一份；文件在 data 目录的 photos/<digest>.jpg。发送成功才入库。"""
+
+    id = fields.IntField(pk=True)
+    session_id = fields.CharField(max_length=255, index=True)
+    preset = fields.CharField(max_length=255)
+    # selfie / scene
+    kind = fields.CharField(max_length=16)
+    # Chat 写的拍摄内容
+    request = fields.TextField()
+    # 看图写的描述，发出去的图实际是什么样以它为准
+    caption = fields.TextField()
+    # JPEG 字节的 SHA-1，和图片描述缓存同一个 key
+    digest = fields.CharField(max_length=40)
+    # 归一化后的 float32 字节，按拍摄月份加描述算；NULL 表示算失败，检索前补算
+    embedding = fields.BinaryField(null=True)
+    embedding_model = fields.CharField(max_length=255, default="")
+    # 拍摄日期
+    created_at = fields.DatetimeField()
+    # 到期按它算
+    last_sent_at = fields.DatetimeField()
+
+    class Meta:
+        table = "nyabot_photos"
+
+
 class EnabledGroupModel(Model):
     group_id = fields.BigIntField(pk=True)
 

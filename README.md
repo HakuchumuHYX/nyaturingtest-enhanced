@@ -33,6 +33,7 @@
 - **会回头接上之前的事。** 有人说过后天面试、这两天感冒了，过后它会想起来问一句；它答应过别人的事也记得，做不到会老实说忘了。问过一次就不会再追着问。
 - **会发表情包。** 群友发的表情包，能拿来回应人的它会自己收藏起来（截图、照片之类的不收），所有群共用一个库，群友不常发的过几天会自动清掉；
   聊天时可以只甩一张，也可以说完话再补一张，同一个群两分钟最多一张。发错了图，超级用户回复那张图发 `stickerdel` 就能删掉并拉黑。
+- **会发照片。** 它有自己的手机相册：可以拍张自拍或眼前的东西，也可以翻出以前拍的旧照片，说明这是什么时候拍的。不是聊到就发，有想给人看的、或者有人想看才发。没配生图模型就没有这个功能。
 - **懂 QQ 表情。** 看得懂群友发的 QQ 表情和商城表情；会给群友的消息贴表情回应（同一个群一分钟最多一次），
   群里谁给谁贴了表情、一共几个人贴，它都知道，大家一起贴时也可能跟着贴。
 - **会戳一戳。** 看得到群里所有人的戳一戳（拍一拍），被戳了可能戳回去、回句话或者不理，
@@ -119,6 +120,7 @@
 | `embedding` | 记忆检索用的向量模型 |
 | `rerank` | 检索结果重排，`threshold` 以下的结果丢弃 |
 | `web_search` | 联网搜索（DeepSeek Search），`api_key` 留空就不搜 |
+| `image` | 发照片用的生图模型（`api_key`、`base_url`、`model`、`quality`、`timeout`），`model` 留空就不发照片，启动时打一条警告 |
 | `playwright_browsers_path` | 卡片截图用的 Chromium 所在目录，留空用 playwright 默认位置 |
 | `webconsole_db` | WebConsole 的库；留空就不记录 LLM 请求、看群决策、每日整理和警告，聊天不受影响 |
 | `console_token` | WebConsole 拉当前状态时带的 Bearer token；留空就不开放接口 |
@@ -175,6 +177,7 @@
 | `/rag_debug <内容>` | `/记忆诊断` | 看某句话能检索出哪些记忆 |
 | `/token统计` | `/autochat token统计` | 当前 chat / feedback / background 模型的 Token 用量卡片 |
 | `stickerdel` | | 回复一条带图的消息：把图从表情包库删掉并拉黑，以后见到只看不收 |
+| `photodel` | | 回复它发的照片：从本群相册删掉 |
 | `/backup_data` | `/备份数据` | 立刻备份一次 |
 | `/help` | `/帮助` | 帮助 |
 
@@ -184,7 +187,7 @@
 ## 数据与备份
 
 数据存在一个 SQLite 文件 `data/nyaturingtest/nyabot.sqlite` 里，包括聊天记录、记忆、档案、表情包标签和 Token 用量；
-表情包图片在 `data/nyaturingtest/stickers/`，和数据库一起备份。
+表情包图片在 `data/nyaturingtest/stickers/`，照片在 `data/nyaturingtest/photos/`，都和数据库一起备份。
 
 每天的定时任务：
 

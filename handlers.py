@@ -58,11 +58,12 @@ from .messages.convert import (
 )
 from .messages.forward import digest_forward
 from .messages.image import fetch_image_input
+from .messages.photos import remove_by_message as remove_photo_by_message
 from .messages.stickers import block as block_sticker
 from .metrics import log_event
 from .prompts import PRESETS, reload_presets, resolve_preset
 from .storage.backup import backup_task
-from .storage.db import get_token_stats, recall_message
+from .storage.db import get_token_stats, message_content, recall_message
 from .storage.models import PersonaHistoryModel, SessionModel
 
 # persona 命令列出的最近改动条数（人生线和本群合计）、最近几天的日记
@@ -91,6 +92,7 @@ COMMANDS: tuple[CommandMeta, ...] = (
     CommandMeta("reset confirm", "先备份再完全重置本群", "reset <群号> confirm"),
     CommandMeta("token统计", "查看当前 chat / feedback / background 模型的 Token 用量"),
     CommandMeta("stickerdel", "回复一张图：从表情包库删掉并拉黑，以后只描述不收"),
+    CommandMeta("photodel", "回复她发的照片：从本群相册删掉"),
     CommandMeta("backup_data", "手动触发数据备份", "backup_data"),
     CommandMeta("help", "显示帮助", "help"),
 )
@@ -761,6 +763,33 @@ async def handle_sticker_del(event: GroupMessageEvent):
         if count
     ]
     await sticker_del.finish("，".join(parts))
+
+
+photo_del = on_command(
+    rule=is_group_message,
+    permission=SUPERUSER,
+    cmd="photodel",
+    priority=1,
+    block=True,
+)
+
+
+@photo_del.handle()
+async def handle_photo_del(event: GroupMessageEvent):
+    if not event.reply:
+        await photo_del.finish("用法：回复她发的照片，发 photodel")
+    session_id = str(event.group_id)
+    msg_id = str(event.reply.message_id)
+    session = get_session(event.group_id)
+    # 刚发的可能还没落库
+    buffered = (
+        next((m for m in session.short_term_memory.access() if m.id == msg_id), None)
+        if session
+        else None
+    )
+    content = buffered.content if buffered else await message_content(session_id, msg_id)
+    removed = await remove_photo_by_message(session_id, content)
+    await photo_del.finish("已从相册删掉" if removed else "相册里没有这张")
 
 
 rag_debug = on_command(

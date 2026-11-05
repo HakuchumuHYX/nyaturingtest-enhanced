@@ -10,6 +10,7 @@ from .config import get_data_dir
 from .memory.episodes import setup_episode_job
 from .memory.maintenance import setup_maintenance_job
 from .messages.image import setup_image_cache_job
+from .messages.photos import setup_photo_prune_job
 from .messages.stickers import load_stickers, setup_sticker_prune_job
 from .storage.backup import setup_backup_job
 from .webconsole_api import setup_console_api
@@ -42,6 +43,7 @@ async def init_db():
     setup_status_job()
     setup_image_cache_job()
     setup_sticker_prune_job()
+    setup_photo_prune_job()
     setup_maintenance_job()
     setup_backup_job()
     setup_console_api()

@@ -2,23 +2,43 @@
 
 import asyncio
 import random
-from datetime import datetime
+import time
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from pathlib import Path
 
 from nonebot import logger
 from nonebot.adapters.onebot.v11 import Bot, Event, Message, MessageSegment
 from nonebot.adapters.onebot.v11.exception import ActionFailed
 
+from ..messages import photos
 from ..messages.faces import Reaction
 from ..messages.stickers import Sticker, mark_sent, pick
 from ..metrics import log_event
+from ..prompts import PHOTO_BLOCKED_NOTE, PHOTO_FAILED_NOTE, PRESETS
+from ..storage.db import get_photo
 from .engagement import SPEAK_COOLDOWN_SECONDS
-from .orchestrator import Poke, Reply
+from .orchestrator import PhotoWish, Poke, Reply
 from .session import Session
+from .status import describe_now
 
 REACT_COOLDOWN_SECONDS = 60
 # 戳一戳会给对方弹提醒，比贴表情打扰人，间隔放长些
 POKE_COOLDOWN_SECONDS = 120
 STICKER_COOLDOWN_SECONDS = 120
+PHOTO_COOLDOWN_SECONDS = 3600
+# 上游挂了时每轮都卡一次超时，等一会儿再试
+PHOTO_FAILED_COOLDOWN_SECONDS = 600
+
+
+@dataclass
+class _ReadyPhoto:
+    """这一项要发的照片：新拍的还没入库，photo_id 为 None。"""
+
+    path: Path
+    caption: str
+    new: photos.NewPhoto | None = None
+    photo_id: int | None = None
 
 
 def _delay_seconds(part: str) -> float:
@@ -80,6 +100,77 @@ async def _pick_sticker(
     return None
 
 
+def _photo_cooldown(session: Session, seconds: int) -> None:
+    session.photo_ready_at = datetime.now() + timedelta(seconds=seconds)
+
+
+async def _ready_photo(
+    session: Session, wish: PhotoWish, generation: int
+) -> _ReadyPhoto | None:
+    """拿到这一项要发的照片：翻相册或现拍。拿不到返回 None，这一项的文字也不发。"""
+
+    fields = {"session_id": session.id, "kind": wish.kind, "photo_id": wish.photo_id}
+    if datetime.now() < session.photo_ready_at:
+        log_event("photo", **fields, outcome="cooldown")
+        return None
+
+    if wish.photo_id is not None:
+        row = await get_photo(session.id, wish.photo_id)
+        if row is None or not photos.photo_path(row.digest).is_file():
+            log_event("photo", **fields, outcome="failed", error="missing")
+            return None
+        return _ReadyPhoto(photos.photo_path(row.digest), row.caption, photo_id=row.id)
+
+    preset = session.state.preset
+    started_at = time.perf_counter()
+    outcome, new, error = await photos.take(
+        session.id,
+        PRESETS[preset],
+        wish.kind,
+        wish.describe,
+        describe_now(preset, datetime.max),
+    )
+    latency_ms = int((time.perf_counter() - started_at) * 1000)
+    if outcome == "ok" and session.stale(generation, "photo"):
+        photos.discard(new)
+        outcome = "stale"
+    log_event(
+        "photo",
+        "WARNING" if outcome in ("blocked", "failed", "no_portrait") else "INFO",
+        **fields,
+        describe=wish.describe,
+        latency_ms=latency_ms,
+        outcome=outcome,
+        error=error or None,
+    )
+    if outcome == "blocked":
+        # 群友换着花样要时别一直试
+        _photo_cooldown(session, PHOTO_COOLDOWN_SECONDS)
+        session.note_photo_problem(PHOTO_BLOCKED_NOTE)
+    elif outcome == "failed":
+        _photo_cooldown(session, PHOTO_FAILED_COOLDOWN_SECONDS)
+        session.note_photo_problem(PHOTO_FAILED_NOTE)
+    elif outcome == "no_portrait":
+        session.note_photo_problem(PHOTO_FAILED_NOTE)
+    if outcome != "ok":
+        return None
+    return _ReadyPhoto(photos.photo_path(new.digest), new.caption, new=new)
+
+
+async def _after_photo_send(session: Session, photo: _ReadyPhoto, sent: bool) -> None:
+    if sent:
+        _photo_cooldown(session, PHOTO_COOLDOWN_SECONDS)
+        if photo.new is not None:
+            await photos.save(session.id, session.state.preset, photo.new)
+        else:
+            await photos.mark_sent(photo.photo_id)
+        return
+    if photo.new is not None:
+        photos.discard(photo.new)
+    _photo_cooldown(session, PHOTO_FAILED_COOLDOWN_SECONDS)
+    session.note_photo_problem(PHOTO_FAILED_NOTE)
+
+
 async def dispatch_replies(
     *,
     session: Session,
@@ -102,11 +193,29 @@ async def dispatch_replies(
     # 一轮最多一张表情包
     sticker_requested = False
     for reply_index, reply in enumerate(replies):
-        # (消息, 写进短期记忆的文本, 表情包和挑图分数)；reply 的一项就是一条消息，
+        # 先拿图再发字：拿不到图时这一项的文字也不发，不留下「给你看」却没有图
+        photo = None
+        if reply.photo is not None:
+            photo = await _ready_photo(session, reply.photo, generation)
+            if photo is None:
+                continue
+        # (消息, 写进短期记忆的文本, 表情包和挑图分数, 照片)；reply 的一项就是一条消息，
         # 文字原样按纯文本发，不切分、不解析 CQ 码
-        outgoing: list[tuple[Message, str, tuple[Sticker, float | None] | None]] = []
+        outgoing: list[
+            tuple[Message, str, tuple[Sticker, float | None] | None, _ReadyPhoto | None]
+        ] = []
         if reply.text:
-            outgoing.append((Message(MessageSegment.text(reply.text)), reply.text, None))
+            outgoing.append((Message(MessageSegment.text(reply.text)), reply.text, None, None))
+        if photo is not None:
+            # 普通图片，不带 sub_type=1；路径在 SnowLuma 容器挂载的目录里
+            outgoing.append(
+                (
+                    Message(MessageSegment("image", {"file": photo.path.as_uri()})),
+                    photos.memory_text(photo.caption),
+                    None,
+                    photo,
+                )
+            )
         if reply.sticker is not None and not sticker_requested:
             sticker_requested = True
             picked = await _pick_sticker(session, *reply.sticker)
@@ -116,10 +225,12 @@ async def dispatch_replies(
                 segment = MessageSegment(
                     "image", {"file": sticker.path.as_uri(), "sub_type": 1}
                 )
-                outgoing.append((Message(segment), f"[表情包: {sticker.caption}]", picked))
+                outgoing.append((Message(segment), f"[表情包: {sticker.caption}]", picked, None))
 
-        for part_index, (message, memory_text, picked_sticker) in enumerate(outgoing):
+        for part_index, (message, memory_text, picked_sticker, part_photo) in enumerate(outgoing):
             if session.stale(generation, "send_loop"):
+                if photo is not None and photo.new is not None:
+                    photos.discard(photo.new)
                 break
             if reply.target_id is not None and part_index == 0:
                 message.insert(0, MessageSegment.reply(reply.target_id))
@@ -132,6 +243,8 @@ async def dispatch_replies(
                 memory_text=memory_text,
                 generation=generation,
             )
+            if part_photo is not None:
+                await _after_photo_send(session, part_photo, sent)
             if sent:
                 sent_count += 1
                 if picked_sticker is not None:

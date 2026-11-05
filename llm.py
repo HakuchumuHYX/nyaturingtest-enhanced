@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import re
 import ssl
@@ -8,7 +9,7 @@ from typing import Any
 
 import httpx
 from nonebot import logger
-from openai import APIConnectionError, APITimeoutError, AsyncOpenAI
+from openai import APIConnectionError, APITimeoutError, AsyncOpenAI, BadRequestError
 
 from .config import EndpointSettings, get_app_settings
 from .metrics import log_event, record_token_usage
@@ -311,6 +312,74 @@ async def web_search(query: str, ori_question: str, *, session_id: str) -> list[
             f"{text[:WEB_RESULT_CHARS]}"
         )
     return lines
+
+
+@dataclass(frozen=True)
+class ImageResult:
+    # ok / blocked（上游拒绝这条请求，多半是内容审核）/ failed（超时、上游故障）
+    outcome: str
+    image: bytes = field(default=b"", repr=False)
+    error: str = ""
+
+
+_image_client: AsyncOpenAI | None = None
+# 出图动辄几十秒，全局限 2 张，一个群卡住不至于把上游占满
+_IMAGE_SEMAPHORE = asyncio.Semaphore(2)
+
+
+async def _request_image(prompt: str, reference: bytes | None) -> bytes:
+    global _image_client
+    settings = get_app_settings().image
+    if _image_client is None:
+        _image_client = AsyncOpenAI(
+            api_key=settings.api_key,
+            base_url=settings.base_url,
+            http_client=get_http_client(),
+            # 超时的请求上游可能还在出图，重试会重复出图
+            max_retries=0,
+        )
+    options: dict[str, Any] = {
+        "model": settings.model,
+        "prompt": prompt,
+        "n": 1,
+        "timeout": settings.timeout,
+    }
+    if settings.quality:
+        options["quality"] = settings.quality
+    if reference is None:
+        response = await _image_client.images.generate(**options)
+    else:
+        response = await _image_client.images.edit(
+            image=("portrait.jpg", reference, "image/jpeg"), **options
+        )
+    if not response.data:
+        raise ValueError("上游没有返回图片")
+    item = response.data[0]
+    if item.b64_json:
+        return base64.b64decode(item.b64_json)
+    if not item.url:
+        raise ValueError("上游返回的图片既没有数据也没有地址")
+    download = await get_http_client().get(item.url, timeout=settings.timeout)
+    download.raise_for_status()
+    return download.content
+
+
+async def generate_image(prompt: str, reference: bytes | None, *, session_id: str) -> ImageResult:
+    """有参考图走 images/edits，没有走 images/generations；不抛异常，结果分 ok / blocked / failed。"""
+
+    model = get_app_settings().image.model
+    started = time.perf_counter()
+    try:
+        async with _IMAGE_SEMAPHORE:
+            image = await _request_image(prompt, reference)
+    except Exception as e:
+        latency_ms = int((time.perf_counter() - started) * 1000)
+        outcome = "blocked" if isinstance(e, BadRequestError) else "failed"
+        record_llm_call("image", model, session_id, False, latency_ms, type(e).__name__)
+        return ImageResult(outcome, error=f"{type(e).__name__}: {e}"[:300])
+    latency_ms = int((time.perf_counter() - started) * 1000)
+    record_llm_call("image", model, session_id, True, latency_ms)
+    return ImageResult("ok", image)
 
 
 def _parse_json_object(text: str) -> dict | None:

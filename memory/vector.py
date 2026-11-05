@@ -190,7 +190,7 @@ async def embed_texts(texts: list[str], *, instruction: str = "") -> np.ndarray:
     return vectors / np.linalg.norm(vectors, axis=1, keepdims=True)
 
 
-async def _rerank(query: str, documents: list[str]) -> list[dict[str, Any]]:
+async def rerank(query: str, documents: list[str]) -> list[dict[str, Any]]:
     global _rerank_client
     settings = get_app_settings()
     if _rerank_client is None:
@@ -389,7 +389,7 @@ class VectorMemory:
                 picked = candidates[:RAG_PER_QUERY_RECALL_K]
                 fallback_reason = "rerank_disabled"
             else:
-                rerank_results = await _rerank(
+                rerank_results = await rerank(
                     unique_queries[0], [item.row.content for item in candidates]
                 )
                 if not rerank_results:

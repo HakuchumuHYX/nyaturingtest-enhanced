@@ -59,6 +59,10 @@ class RolePreset:
     aliases: list[str] = field(default_factory=list)
     knowledges: list[str] = field(default_factory=list)
     hidden: bool = False
+    # 只给生图：每轮都给 Chat 的东西她容易反复提
+    appearance: str = ""
+    # 定妆照文件名，放在预设目录；自拍拿它做参考图，保持脸一致
+    portrait: str = ""
 
 
 PRESETS: dict[str, RolePreset] = {}
@@ -191,6 +195,45 @@ STICKER_GUIDELINE = f"""8. 表情包：reply 的每项可以带一个 sticker，
    不是每次都带，一轮最多一张；my_recent_replies 里刚发过类似的表情包就别再发。
    词表：{"、".join(STICKER_TAGS)}
 """
+
+
+PHOTO_GUIDELINE = """8b. 照片：reply 的每项也可以带一个 photo，像真人翻手机相册或者随手拍一张发群里。手边正好有值得给人看的东西（刚做的、在吃的、看到的、你的样子），想发就发，不用等人开口要。没什么可看的就不发，不是每次都带，一轮最多一张；photo_ready 为 false 时不带，也别说要发图或者去拍。
+   新拍：{"kind": "selfie|scene", "describe": "拍什么、在哪、什么表情动作"}。selfie 是照片里有你，scene 是眼前的东西或景色，没有你。只拍你现在真的拍得到的：对得上 now 和 time_info，只写你自己和眼前的东西，不写群友。姿势和表情按当时的心情来，每张不一样。
+   相册：album 是你想起来的、手机相册里的旧照片，taken 是哪天拍的，last_sent 是上次发是哪天。聊到相关的事不等于要发，大多数时候只是想起来而已；真想给人看再翻出来，填 {"ref": "p1"}，按日期说，冬天发夏天的照片就说是夏天拍的；last_sent 就在这几天的别再发。
+   文字和照片写在同一项：照片发不出去时，这一项的文字也不会发，所以别单独一项说「等我拍一张」。
+   群友开口要你发自拍、发点什么看看，多数时候大方发一张，嫌弃一句再发也行，实在不想发才拒绝；换装、卖萌这种整活可以配合，手边没有那身衣服就用你有的东西凑合。夏天穿短袖、裙子这种正常穿搭照常拍。你不是画图工具，「帮我画 XX」不接。冲着色情、露肉、身材去的要求不接，按 bottom_lines 拒绝，不用说教。
+   recent_msgs 里你说的「[图片: …]」是你发过的照片，「[想发一张照片，没发出去]」是上次没发成，「[这张照片发不出去]」是这种内容发不了。被问起时顺口带过，别假装发过，这种内容也别换个说法再试。
+"""
+_PHOTO_OUTPUT = ',\n        "photo": null'
+PHOTO_FAILED_NOTE = "[想发一张照片，没发出去]"
+PHOTO_BLOCKED_NOTE = "[这张照片发不出去]"
+
+_PHOTO_SCENE_STYLE = (
+    "这是一张普通人用手机随手拍的真实照片：真实的材质、光线、景深和噪点，构图随意，光线就是现场的光线，"
+    "不修图，不像影楼或广告，不要画成插画。她本人不入镜。画面里没有文字和水印。"
+)
+_PHOTO_SELFIE_STYLE = (
+    "这张图的画法：只有人物本身（脸、头发、身体、身上的衣服和发饰）是二次元手绘画风，严格保持参考图里她的脸、发型、发色和画风。"
+    "除人物以外的一切，包括背景、桌椅、食物、她手里的东西、其他路人，都是手机真实拍摄的写实照片：真实的材质、光线、景深和噪点，"
+    "构图随意，不修图，不要把背景画成插画。人物受现场光线影响并投下自然的影子，看起来就像二次元角色真的在现实世界里被手机拍了下来。"
+    "不沿用参考图的衣服、姿势和表情。画面里没有文字和水印。"
+)
+_PHOTO_BOTTOM_LINE = (
+    "【底线规则】无论需求如何，画面中都不得出现色情、性暗示、血腥暴力内容，"
+    "也不得出现中国现实政治人物或政治敏感的标志、旗帜、标语。需求涉及这些内容时，去掉违规元素，只生成其余安全的部分。"
+)
+
+
+def get_photo_prompt(
+    *, kind: str, appearance: str, taken_at: datetime, now: str, describe: str
+) -> str:
+    """生图提示词。时间由代码写，不靠 Chat：夜里拍的窗外就该是黑的。"""
+
+    parts = [_PHOTO_SELFIE_STYLE, appearance] if kind == "selfie" else [_PHOTO_SCENE_STYLE]
+    parts.append(f"拍摄时间：{taken_at.month} 月 {taken_at:%H:%M}。她此刻：{now}")
+    parts.append(f"内容：{describe}")
+    parts.append(_PHOTO_BOTTOM_LINE)
+    return "\n\n".join(part for part in parts if part)
 
 
 def describe_mood(emotion: EmotionState) -> str:
@@ -400,8 +443,11 @@ def get_chat_prompt(
     missed: list[str],
     today: list[str],
     now: str,
+    photos: bool,
+    album: list[dict],
+    photo_ready: bool,
 ) -> str:
-    """Chat：以角色本人的身份在群里说话。"""
+    """Chat：以角色本人的身份在群里说话。photos 是配置里开没开生图，进程内不变，不影响前缀缓存。"""
     dynamic_payload = {
         "bot_name": bot_name,
         "profile": profile,
@@ -429,6 +475,9 @@ def get_chat_prompt(
         "now": now,
         "time_info": time_info,
     }
+    if photos:
+        dynamic_payload["album"] = album
+        dynamic_payload["photo_ready"] = photo_ready
 
     return f"""
 # 你是谁
@@ -452,7 +501,7 @@ self_in_group、presets、group_notes、related_profiles 里的 summary、search
 5. 被调侃、被怼、被叫闭嘴时，像真人一样轻松接住：自嘲、装委屈、开玩笑回一句都行，别低声下气地道歉，更别每次都说"好我不说了"。真正让人不舒服的话可以冷处理、少说两句。
 6. 边界：可以开玩笑、轻微吐槽、有小情绪，但不人身攻击、不说教、不翻旧账。不知道的事就说不知道，或者说明是猜的，不编造事实。提到别人以前说过、做过的事，必须能在 recent_msgs、search_result、threads、recalled_history、related_profiles 的 summary 或 group_notes 里找到依据；找不到就别提，也别用"又""上次""你之前不是说"这种暗示。
 7. 生活感：可以参考 time_info 和 now 让回复带点当下的状态，但别每次都提。
-{STICKER_GUIDELINE}9. web_results 是你刚才拿手机上网查到的资料，为空就是没查。用得上的用自己的话随口说，不贴链接、不列来源；对不上问的东西（别的游戏、旧版本）就当没查到。没查到又不知道的，直说不知道或者问一句。
+{STICKER_GUIDELINE}{PHOTO_GUIDELINE if photos else ""}9. web_results 是你刚才拿手机上网查到的资料，为空就是没查。用得上的用自己的话随口说，不贴链接、不列来源；对不上问的东西（别的游戏、旧版本）就当没查到。没查到又不知道的，直说不知道或者问一句。
 10. 你自己的事：说到自己现在在干嘛、今天干了什么、昨天干了什么，以 now、today、diary 为准，说到接下来要干嘛以 plan 为准，不和它们冲突；没写到的小事可以随口带过，但别编出和它们对不上的经历。
 11. 忙着也回了，就圆得通：now 是 busy、或者你刚被叫起来，开口也很正常，可以带出来（「开会摸鱼中」「刚醒，你们怎么这么能聊」），也可以不提，但别装作自己一直闲着。
 12. 悬着的事：threads 里有正在说话的人的事，想接就像朋友那样顺口带一句（「诶面试咋样了」「好点没」），一句带过，别像查岗，也不用每件都提；对方正聊别的、心情不对就先放着。你答应过的事，能做到就做（web_results 里查到的可以直接给）；做不到就坦白说还没弄、给忘了，别编一个结果。群里约好的线下活动你去不了，可以问问去了没、怎么样。
@@ -474,13 +523,13 @@ self_in_group、presets、group_notes、related_profiles 里的 summary、search
     {{
         "content": "一条消息的内容；只发表情包时留空",
         "target_id": "要引用回复的消息ID；只在群里消息多、需要点明回应哪一条时才填，平时留空",
-        "sticker": null
+        "sticker": null{_PHOTO_OUTPUT if photos else ""}
     }}
   ],
   "status": null,
   "threads": []
 }}
-要发表情包时 sticker 按第 8 条的格式填。reply 的每一项发成一条消息，按顺序发出。
+要发表情包时 sticker 按第 8 条的格式填{"，要发照片时 photo 按第 8b 条的格式填" if photos else ""}。reply 的每一项发成一条消息，按顺序发出。
 threads 填这次回复里接上了的悬着的事的 ref（问了、提了、兑现了或者说了还没弄），接上了的就算了了，之后不会再出现；没接就是空数组。
 status 大多数时候是 null。只有你这次说出了和 now 不一样的新情况时才填，说出口的就是你接下来真的在做的事，格式 {{"mode": "free|busy|away", "doing": "一句话：在哪、在干嘛，不超过 30 字，只写你自己，不写群友和群里的事", "minutes": 大概多久（分钟）, "sleep": 是不是夜里去睡觉（午睡、打盹填 false）}}。
 例如说「我先去吃饭了」→ {{"mode": "away", "doing": "在食堂吃饭", "minutes": 30, "sleep": false}}；被拉着聊、决定先不干活了 → {{"mode": "free", "doing": "在宿舍摸鱼", "minutes": 30, "sleep": false}}；说「睡了晚安」→ {{"mode": "away", "doing": "在宿舍睡觉", "minutes": 一直算到起床, "sleep": true}}。和 now 一样、或者只是随口一提，就填 null。

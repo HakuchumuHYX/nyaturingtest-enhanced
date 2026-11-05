@@ -10,6 +10,7 @@ from nonebot.exception import NetworkError
 
 from ..memory.vector import VectorMemory
 from ..messages.message import ChatMessage, Memory
+from ..messages.photos import clear_session as clear_session_photos
 from ..metrics import log_event
 from ..prompts import PRESETS, resolve_preset
 from ..storage.db import (
@@ -93,6 +94,8 @@ class Session:
         self.last_react_time: datetime = datetime.min
         self.last_poke_time: datetime = datetime.min
         self.last_sticker_time: datetime = datetime.min
+        # 到这个时间才能再发照片
+        self.photo_ready_at: datetime = datetime.min
         # 她被禁言到什么时候（全员禁言记到解除为止），只存内存：重启后禁言期内发送会失败，失败记日志
         self.muted_until: datetime | None = None
         # 「群名 X；现在 N 人，上限 M」和拉取时间；拉取失败也记时间，空串就是省略
@@ -133,6 +136,7 @@ class Session:
         # 旧 generation 的后台写入要么已在删除前完成，要么拿锁后被跳过。
         async with self.save_lock:
             await delete_session_data(self.id)
+            await clear_session_photos(self.id)
             await self._save_session_locked()
         await self._apply_preset()
         logger.info(f"[Session {self.id}] 已完全重置（含数据库清理）")
@@ -347,6 +351,18 @@ class Session:
             f"现在 {info.get('member_count')} 人，上限 {info.get('max_member_count')}"
         )
         return self.group_info
+
+    def note_photo_problem(self, content: str) -> None:
+        """照片没发成：记一条给下一轮看，她被问起时自己圆，不算说的话，也不叫醒 worker。"""
+
+        self.record_action(
+            ChatMessage(
+                time=datetime.now(),
+                user_name=self.state.name,
+                content=content,
+                notice=True,
+            )
+        )
 
     def record_action(self, record: ChatMessage) -> None:
         """贴表情、群通知这类记录只进短期记忆、不进队列；贴表情并进旧记录的挪到末尾，重新算未读。

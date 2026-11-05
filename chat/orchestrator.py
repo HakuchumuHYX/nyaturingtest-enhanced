@@ -20,6 +20,7 @@ from ..memory.vector import (
 )
 from ..messages.faces import Reaction, reaction_emoji
 from ..messages.message import SHORT_CONTEXT_LIMIT, SHORT_TERM_BUFFER_SIZE, ChatMessage
+from ..messages.photos import PHOTO_KINDS, candidates as photo_candidates, enabled as photos_enabled
 from ..metrics import log_event
 from ..prompts import (
     CHAT_SYSTEM_PROMPT,
@@ -85,13 +86,23 @@ class Poke:
 
 
 @dataclass(frozen=True)
+class PhotoWish:
+    """Chat 想发的一张照片：要么新拍（kind + describe），要么翻相册（photo_id）。"""
+
+    kind: str = ""
+    describe: str = ""
+    photo_id: int | None = None
+
+
+@dataclass(frozen=True)
 class Reply:
-    """Chat 输出的一项：先发文字，再发表情包。"""
+    """Chat 输出的一项：先发文字，再发照片、表情包。带照片时拿不到图，这一项的文字也不发。"""
 
     text: str
     target_id: int | None = None
     # (tag, want)，tag 已核对过词表
     sticker: tuple[str, str] | None = None
+    photo: PhotoWish | None = None
 
 
 @dataclass(frozen=True)
@@ -404,8 +415,27 @@ def parse_feedback(
     )
 
 
-def parse_reply(data: dict | None) -> list[Reply]:
-    """校验 Chat 输出：reply 里的每个对象发成一条消息，发几条由模型定；引用 id 和表情包标签在这里核对。"""
+def _parse_photo(raw, album: list[dict]) -> PhotoWish | None:
+    """ref 必须是这轮给过的 album 里的；新拍的 kind 要在白名单内、describe 不能空。"""
+
+    if not isinstance(raw, dict):
+        return None
+    ref = str(raw.get("ref") or "").strip()
+    if ref:
+        if any(item["ref"] == ref for item in album):
+            return PhotoWish(photo_id=int(ref[1:]))
+        logger.debug(f"照片 ref 不在这轮的 album 里，丢弃: {ref}")
+        return None
+    kind = str(raw.get("kind") or "").strip()
+    describe = str(raw.get("describe") or "").strip()
+    if kind in PHOTO_KINDS and describe:
+        return PhotoWish(kind=kind, describe=describe)
+    logger.debug(f"照片字段无效，丢弃: {raw}")
+    return None
+
+
+def parse_reply(data: dict | None, album: list[dict]) -> list[Reply]:
+    """校验 Chat 输出：reply 里的每个对象发成一条消息，发几条由模型定；引用 id、表情包标签和照片在这里核对。"""
 
     items = data.get("reply") if data else None
     replies = []
@@ -427,10 +457,11 @@ def parse_reply(data: dict | None) -> list[Reply]:
                 sticker = (tag, str(raw_sticker.get("want") or "").strip())
             else:
                 logger.debug(f"表情包标签不在词表里，丢弃: {tag}")
+        photo = _parse_photo(item.get("photo"), album)
         text = str(item.get("content") or "").strip()
-        if not text and sticker is None:
+        if not text and sticker is None and photo is None:
             continue
-        replies.append(Reply(text=text, target_id=target_id, sticker=sticker))
+        replies.append(Reply(text=text, target_id=target_id, sticker=sticker, photo=photo))
     return replies
 
 
@@ -722,19 +753,23 @@ async def _look(
     return TurnResult(replies=replies, react=react, poke=poke)
 
 
-async def search_stage(session: Session, unread: list[ChatMessage]) -> MemoryContext:
-    """按这段未读检索。每次看群都可能开口，所以都重排：不重排时只能按向量分取前 k，闲聊上它分不出相关和无关。"""
-
-    started_at = time.perf_counter()
-    state = session.state
-
+def _search_queries(state: SessionState, unread: list[ChatMessage]) -> list[str]:
     # Reranker 使用第一条 query 作为主 query，因此必须最新消息优先；
     # 回复引用、表情、戳一戳这类群友没说什么的不拿去检索，
     # 取最近 3 条说了东西的，免得一段以表情包结尾就没得查
     queries = [msg.content.strip() for msg in reversed(unread) if msg.substantive][:3]
     if state.chat_summary.strip():
         queries.append(state.chat_summary.strip())
-    queries = list(dict.fromkeys(queries))
+    return list(dict.fromkeys(queries))
+
+
+async def search_stage(session: Session, unread: list[ChatMessage]) -> MemoryContext:
+    """按这段未读检索。每次看群都可能开口，所以都重排：不重排时只能按向量分取前 k，闲聊上它分不出相关和无关。"""
+
+    started_at = time.perf_counter()
+    state = session.state
+
+    queries = _search_queries(state, unread)
     rag_stats = {
         "session_id": session.id,
         "query_count": len(queries),
@@ -960,6 +995,12 @@ async def chat_stage(
     recalled_str = "\n".join(recalled_history) or "无"
     related_profiles = _related_profiles(session, look.last_seen, for_chat=True)
     state.global_emotion.settle()
+    photos_on = photos_enabled()
+    album = (
+        await photo_candidates(session.id, state.preset, _search_queries(state, unread))
+        if photos_on
+        else []
+    )
     prompt = get_chat_prompt(
         bot_name=state.name,
         profile=state.profile,
@@ -990,6 +1031,9 @@ async def chat_stage(
         missed=look.missed,
         today=today_lines(state.preset),
         now=look.now,
+        photos=photos_on,
+        album=album,
+        photo_ready=datetime.now() >= session.photo_ready_at,
     )
     log_event(
         "rag_prompt_budget",
@@ -1017,7 +1061,7 @@ async def chat_stage(
         # 只附想接的那条的图：一段未读里可能有好几张，全附上既占内存，也让模型分不清该接哪句
         images=list(focus.image_inputs) if focus else [],
     )
-    replies = parse_reply(data)
+    replies = parse_reply(data, album)
     if session.stale(generation, "chat_reply"):
         return []
 
