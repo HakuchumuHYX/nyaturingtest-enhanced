@@ -174,7 +174,7 @@ class PersonaGroupModel(Model):
 class PersonaStatusModel(Model):
     """她自己的时间线：每个预设一份，各群共享。
 
-    timeline、until、nights 由 chat/status.py 随时写；diary、diary_until 只由每日整理写，两边各写各的列。
+    timeline、until、nights 由 chat/status.py 随时写；diary、diary_until、plan 只由每日整理写，两边各写各的列。
     """
 
     preset = fields.CharField(pk=True, max_length=255)
@@ -188,6 +188,8 @@ class PersonaStatusModel(Model):
     diary = fields.JSONField(default=list)
     # 日记写到的最后一个自然日
     diary_until = fields.DateField(null=True)
+    # 接下来几天的打算，只留最新一份。不放进 diary：日记会进人生线，打算还没发生
+    plan = fields.TextField(default="")
 
     class Meta:
         table = "nyabot_persona_status"

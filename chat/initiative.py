@@ -32,7 +32,7 @@ from .orchestrator import (  # noqa: E402
 )
 from .send import dispatch_replies  # noqa: E402
 from .session import Session  # noqa: E402
-from .status import describe_now, is_away, recent_diary, today_lines  # noqa: E402
+from .status import describe_now, is_away, recent_diary, recent_plan, today_lines  # noqa: E402
 
 SCAN_INTERVAL_MINUTES = 10
 # 群里最后一条消息距今至少这么久才算冷场
@@ -153,6 +153,7 @@ async def _initiate(session: Session, silence: int) -> None:
         silence_minutes=silence,
         time_info=get_time_description(datetime.now()),
         diary=recent_diary(state.preset, CHAT_DIARY_DAYS),
+        plan=recent_plan(state.preset),
         group_info=await session.refresh_group_info(),
         today=today_lines(state.preset),
         now=describe_now(state.preset, max(state.last_look_time, state.last_read_time or datetime.min)),

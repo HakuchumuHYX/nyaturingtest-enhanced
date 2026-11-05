@@ -121,6 +121,7 @@ async def load_persona_status(preset: str) -> dict | None:
         "nights": _parse_times(row.nights, ("sleep", "wake")),
         "diary": row.diary,
         "diary_until": row.diary_until,
+        "plan": row.plan,
     }
 
 
@@ -134,8 +135,8 @@ async def save_persona_status(
         await PersonaStatusModel.create(preset=preset, **values)
 
 
-async def save_persona_diary(preset: str, diary: list[dict], diary_until: date) -> None:
-    await PersonaStatusModel.filter(preset=preset).update(diary=diary, diary_until=diary_until)
+async def save_persona_diary(preset: str, diary: list[dict], plan: str, diary_until: date) -> None:
+    await PersonaStatusModel.filter(preset=preset).update(diary=diary, plan=plan, diary_until=diary_until)
 
 
 async def load_life_text(preset: str) -> str:

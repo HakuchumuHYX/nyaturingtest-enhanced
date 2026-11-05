@@ -67,6 +67,8 @@ class PersonaStatus:
     # 每天 {"day": "YYYY-MM-DD", "text"}，只由每日整理写
     diary: list[dict] = field(default_factory=list)
     diary_until: date | None = None
+    # 接下来几天的打算，只由每日整理写
+    plan: str = ""
     # 每次改状态加一；调模型前记下，回来时变了说明这期间她在群里自己说了新情况，以她说的为准
     version: int = 0
     deciding: asyncio.Task | None = None
@@ -117,6 +119,7 @@ async def _load(preset: str) -> PersonaStatus:
         status.nights = data["nights"]
         status.diary = data["diary"]
         status.diary_until = data["diary_until"]
+        status.plan = data["plan"]
     # await 期间可能已经有别的调用载入过
     return _statuses.setdefault(preset, status)
 
@@ -151,6 +154,11 @@ def _night_lines(status: PersonaStatus) -> list[str]:
 def recent_diary(preset: str, days: int) -> list[str]:
     status = _statuses.get(preset)
     return [diary_line(entry) for entry in status.diary[-days:]] if status else []
+
+
+def recent_plan(preset: str) -> str:
+    status = _statuses.get(preset)
+    return status.plan if status else ""
 
 
 def _just_back(status: PersonaStatus, last_look: datetime) -> str:
@@ -310,6 +318,7 @@ async def _status_background(status: PersonaStatus, now: datetime) -> dict:
     return {
         "life": await load_life_text(status.preset),
         "diary": [diary_line(entry) for entry in status.diary[-STATUS_DIARY_DAYS:]],
+        "plan": status.plan,
         "nights": _night_lines(status),
         "timeline": _timeline_lines(status),
         "speak_times": _speak_times(status.preset, now),
@@ -420,7 +429,7 @@ async def reload_diaries() -> None:
         data = await load_persona_status(status.preset)
         if data is None:
             continue
-        status.diary, status.diary_until = data["diary"], data["diary_until"]
+        status.diary, status.diary_until, status.plan = data["diary"], data["diary_until"], data["plan"]
         _prune(status, datetime.now())
         await _save(status)
 
@@ -458,6 +467,8 @@ def status_text(preset: str) -> list[str]:
     lines = [f"现在：{segment_line(status.current, None)}，到 {status.until:%H:%M}"]
     if status.calls:
         lines.append(f"放下手机以来被叫了 {len(status.calls)} 次")
+    if status.plan:
+        lines.append(f"打算：{status.plan}")
     today = today_lines(preset)
     if today:
         lines.append("今天：")

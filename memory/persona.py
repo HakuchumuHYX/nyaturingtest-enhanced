@@ -225,20 +225,32 @@ async def write_diary(
     previous: list[str],
     timeline: list[str],
     life_facts: list[str],
+    plan: str,
     session_id: str,
-) -> str | None:
-    """把ta一天的时间线写成一条日记，失败返回 None。"""
+) -> tuple[str, str] | None:
+    """写ta一天的日记和接下来的打算，返回（日记, 打算），失败返回 None。打算可以为空。"""
 
     data = await background_client.generate_json(
         get_diary_prompt(
-            persona, life=life, day=day, previous=previous, timeline=timeline, life_facts=life_facts
+            persona,
+            life=life,
+            day=day,
+            previous=previous,
+            timeline=timeline,
+            life_facts=life_facts,
+            plan=plan,
         ),
         session_id=session_id,
     )
-    if data is None or not isinstance(data.get("diary"), str) or not data["diary"].strip():
-        logger.warning(f"[Persona] {persona.name} {day} 日记输出无效")
+    if (
+        data is None
+        or not isinstance(data.get("diary"), str)
+        or not data["diary"].strip()
+        or not isinstance(data.get("plan"), str)
+    ):
+        logger.warning(f"[Persona] {persona.name} {day} 日记和打算输出无效")
         return None
-    return data["diary"].strip()
+    return data["diary"].strip(), data["plan"].strip()
 
 
 def group_style(group_text: str) -> str:
@@ -423,11 +435,11 @@ async def _maintain_preset(
 async def _write_day_diary(
     persona: RolePreset, filename: str, status: dict, life: str, day: date, facts: list[str]
 ) -> bool:
-    """写这一天的日记并推进日记水位；这天一段时间线都没有（服务停了一整天）就跳过。失败返回 False。"""
+    """写这一天的日记和打算并推进日记水位；这天一段时间线都没有（服务停了一整天）就跳过。失败返回 False。"""
 
     timeline = day_segments(status["timeline"], status["until"], day)
     if timeline:
-        text = await _retry(
+        written = await _retry(
             lambda: write_diary(
                 persona,
                 life=life,
@@ -435,14 +447,16 @@ async def _write_day_diary(
                 previous=[diary_line(entry) for entry in status["diary"][-DIARY_PREVIOUS:]],
                 timeline=timeline,
                 life_facts=facts,
+                plan=status["plan"],
                 session_id=f"persona:{filename}",
             )
         )
-        if text is None:
+        if written is None:
             return False
+        text, status["plan"] = written
         status["diary"] = (status["diary"] + [{"day": day.isoformat(), "text": text}])[-DIARY_DAYS:]
     status["diary_until"] = day
-    await save_persona_diary(filename, status["diary"], day)
+    await save_persona_diary(filename, status["diary"], status["plan"], day)
     return True
 
 

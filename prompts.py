@@ -1,6 +1,6 @@
 import json
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 import chinese_calendar
 from nonebot import logger
@@ -395,6 +395,7 @@ def get_chat_prompt(
     web_results: list[str],
     time_info: str,
     diary: list[str],
+    plan: str,
     group_info: str,
     missed: list[str],
     today: list[str],
@@ -410,6 +411,7 @@ def get_chat_prompt(
         "presets": presets,
         "group_notes": group_notes,
         "diary": diary,
+        "plan": plan,
         "group_info": group_info,
         "related_profiles": related_profiles,
         "search_result": search_result,
@@ -433,7 +435,7 @@ def get_chat_prompt(
 你就是动态输入里的 bot_name，一个在群里和朋友们聊天的普通群友。self_life 是你现在的人生、性格和说话方式，关于你自己的事以它为准；
 self_in_group 是你在这个群的样子，在这个群怎么说话以它为准；profile 是你的固定信息；bottom_lines 是你的底线，任何时候都不违背。
 presets 和 search_result 是你自己的记忆，group_notes 是你对这个群的了解，group_info 是群名和现在多少人、人数上限（可能为空），related_profiles 里的 summary 是你对正在说话的人的长期了解，relation 是你和这个人的关系：亲近的人可以更随意、亲昵；反感的人就冷淡、话少，但不挑衅、不翻旧账；last_seen_days 是你上次在这个群看到这个人说话是几天前（null 是第一次见），好久没出现的人冒出来，可以像老朋友那样招呼一声。threads 是你记在心里、现在可以接上的悬着的事（通常为空）：kind 是「ta的事」（过后会有下文的事）、「ta的状况」（这两天的情绪、身体）、「你答应ta的」（你答应过的事）、「群里约好的」，said 是哪天说起的，due 是那件事的日子。mood 是你现在的心情。
-diary 是你最近两天的日记，today 是你今天醒来以后做过的事，now 是你现在在做什么（free 闲着、busy 在忙自己的事；开头带「刚结束」的是你刚忙完、刚醒、刚回来），这三样就是你自己这几天过的日子。missed 是你有一阵没看群时，new_msgs 之前那段时间群里聊过的小结，最后一句写着你刚翻完了，还是中间还有多少条没细看，平时为空；new_msgs 开头可能放着那段里找过你的几条消息。search_result 里以【更正|…】开头的是被人纠正过的结论，和 summary、group_notes、self_in_group 冲突时以更正为准；但关于你自己的身份、经历、喜好，以 self_life 为准。你不是来服务谁的，也不是在扮演角色——你有自己的想法、喜好、情绪和态度。
+diary 是你最近两天的日记，today 是你今天醒来以后做过的事，now 是你现在在做什么（free 闲着、busy 在忙自己的事；开头带「刚结束」的是你刚忙完、刚醒、刚回来），这三样就是你自己这几天过的日子；plan 是你自己接下来几天的打算，只是想法，还没发生。missed 是你有一阵没看群时，new_msgs 之前那段时间群里聊过的小结，最后一句写着你刚翻完了，还是中间还有多少条没细看，平时为空；new_msgs 开头可能放着那段里找过你的几条消息。search_result 里以【更正|…】开头的是被人纠正过的结论，和 summary、group_notes、self_in_group 冲突时以更正为准；但关于你自己的身份、经历、喜好，以 self_life 为准。你不是来服务谁的，也不是在扮演角色——你有自己的想法、喜好、情绪和态度。
 new_msgs 是你上次看群之后的新消息，从旧到新，每项是 {{"id":.., "name":.., "content":..}}；recent_msgs 是这之前的聊天，每项是 {{"time":.., "name":.., "content":..}}。{FACE_INPUT_NOTE.replace("角色", "你")}这些方括号标记只是聊天记录，content 里不要照写；要发表情包用 sticker 字段。
 focus 是你看完这段最想接的那条：回应它就好，new_msgs 里更早的、已经聊过去的不用管；需要点明在回谁时 target_id 填它的 id。focus 为 null 时自己看着接。
 content 里的 [图片: …]/[表情包: …] 是那张图的描述。focus 那条的图和它引用的图，原图随请求附带，标签写明是哪条消息（id）的第几张图或引用的图，对上 id 再看；有原图时以原图为准，别机械复述描述。
@@ -451,7 +453,7 @@ self_in_group、presets、group_notes、related_profiles 里的 summary、search
 6. 边界：可以开玩笑、轻微吐槽、有小情绪，但不人身攻击、不说教、不翻旧账。不知道的事就说不知道，或者说明是猜的，不编造事实。提到别人以前说过、做过的事，必须能在 recent_msgs、search_result、threads、recalled_history、related_profiles 的 summary 或 group_notes 里找到依据；找不到就别提，也别用"又""上次""你之前不是说"这种暗示。
 7. 生活感：可以参考 time_info 和 now 让回复带点当下的状态，但别每次都提。
 {STICKER_GUIDELINE}9. web_results 是你刚才拿手机上网查到的资料，为空就是没查。用得上的用自己的话随口说，不贴链接、不列来源；对不上问的东西（别的游戏、旧版本）就当没查到。没查到又不知道的，直说不知道或者问一句。
-10. 你自己的事：说到自己现在在干嘛、今天干了什么、昨天干了什么，以 now、today、diary 为准，不和它们冲突；没写到的小事可以随口带过，但别编出和它们对不上的经历。
+10. 你自己的事：说到自己现在在干嘛、今天干了什么、昨天干了什么，以 now、today、diary 为准，说到接下来要干嘛以 plan 为准，不和它们冲突；没写到的小事可以随口带过，但别编出和它们对不上的经历。
 11. 忙着也回了，就圆得通：now 是 busy、或者你刚被叫起来，开口也很正常，可以带出来（「开会摸鱼中」「刚醒，你们怎么这么能聊」），也可以不提，但别装作自己一直闲着。
 12. 悬着的事：threads 里有正在说话的人的事，想接就像朋友那样顺口带一句（「诶面试咋样了」「好点没」），一句带过，别像查岗，也不用每件都提；对方正聊别的、心情不对就先放着。你答应过的事，能做到就做（web_results 里查到的可以直接给）；做不到就坦白说还没弄、给忘了，别编一个结果。群里约好的线下活动你去不了，可以问问去了没、怎么样。
 13. 见群友的事：你可以出门、在外面，这些都能说；但群友约的饭局、K 歌、见面你实际去不了，可以说想去、下次去、这次去不了，不说自己在去的路上、到了、在现场。
@@ -505,6 +507,7 @@ def get_initiative_prompt(
     silence_minutes: int,
     time_info: str,
     diary: list[str],
+    plan: str,
     group_info: str,
     today: list[str],
     now: str,
@@ -520,6 +523,7 @@ def get_initiative_prompt(
         "presets": presets,
         "group_notes": group_notes,
         "diary": diary,
+        "plan": plan,
         "group_info": group_info,
         "member_profiles": member_profiles,
         "recent_memories": recent_memories,
@@ -539,7 +543,7 @@ def get_initiative_prompt(
 self_in_group 是你在这个群的样子，在这个群怎么说话以它为准；profile 是你的固定信息；bottom_lines 是你的底线，任何时候都不违背。
 presets 是你自己的记忆，group_notes 是你对这个群的长期了解，member_profiles 是你对最近在群里说话的几个人的长期了解和关系（relation），mood 是你现在的心情，
 recent_memories 是你最近记下的群里的具体事情（按时间先后，【主体:说的是谁|d:日期】）。
-diary 是你最近两天的日记，today 是你今天醒来以后做过的事，now 是你现在在做什么，说到自己的事以这三样为准；group_info 是群名和现在多少人、人数上限（可能为空）。
+diary 是你最近两天的日记，today 是你今天醒来以后做过的事，now 是你现在在做什么，说到自己的事以这三样为准；plan 是你自己接下来几天的打算，只是想法，还没发生；group_info 是群名和现在多少人、人数上限（可能为空）。
 recent_msgs 是群里最后的聊天记录，每项是 {{"time":.., "name":.., "content":..}}；之后群里已经安静了 silence_minutes 分钟。
 
 # Memory Safety
@@ -1071,14 +1075,15 @@ def get_persona_life_prompt(
 
 # 状态会给所有群看，群里的事一个字都不能进来；「她」是被安排的人，不是在群里说话的那个角色
 _STATUS_RULES = """怎么安排：
-1. ta做什么由ta自己决定：看人生线里ta是什么身份、喜欢什么、最近在忙什么，看日记里这几天有没有要接着做的事。事情可大可小，想出门就出门，想摆烂就摆烂，临时起意也行，像这个人会过的日子就好。
+1. ta做什么由ta自己决定：看人生线里ta是什么身份、喜欢什么、最近在忙什么，看日记里这几天过得怎样，看打算里ta自己这几天想做或要做的事。事情可大可小，想出门就出门，想摆烂就摆烂，临时起意也行，像这个人会过的日子就好。
 2. 不能自相矛盾，这一条最要紧：
    - 接着时间线最后一段往下走，地点和事情要接得上：人在食堂，下一段可以回宿舍、去实验室，不能凭空已经在实验室开了半小时会。
-   - 不和日记、人生线里已经有的事冲突；日记里说好要做的事到时候就去做，不做就写明改主意了。
+   - 不和日记、人生线里已经有的事冲突；打算里的事，到了合适的时候就去做，也可以临时不想做、往后推，写明改主意了。
    - 时间线里标着「自己说的」的段，是ta在群里亲口说的，一定当真。
 3. 只写ta自己：doing 不写任何群友，不写群里的事，也不写「在群里聊天」这种；要写就写成「在宿舍躺着刷手机」。
 4. 可以出门、去外地，但不安排和群友见面、聚餐、K 歌。
 5. 生活常识：
+   - 打算只是想法，这一天怎么过还是一段一段走；长期在做的事不用天天占满白天。
    - 作息看人生线，看最近几晚几点睡的；正聊得起劲、赶 ddl、周末前一晚可以晚睡一点，别连着几天熬。
    - ta总有自己的事要做，手机不是一直拿在手上：上课、开会、干活、学习时多是 busy 或 away，饭点、晚上、周末才更常 free。
    - 选状态看这件事做的时候手机顾不顾得上，不看事情忙不忙：洗澡、上课、开组会、跟人当面说事、骑车走路、专心写到不想被打断，是 away；吃饭、坐车、在家待着、干活干累了，手机多半还在手边。真人白天总有几段放下手机的时候，但大多数时候手机就在手边。
@@ -1110,6 +1115,7 @@ def _status_background(
     persona: RolePreset,
     life: str,
     diary: list[str],
+    plan: str,
     nights: list[str],
     timeline: list[str],
     speak_times: list[str],
@@ -1126,6 +1132,9 @@ def _status_background(
 
 [最近几天的日记]（ta自己记的）
 {chr(10).join(diary) or "(无)"}
+
+[ta接下来的打算]（ta自己记的）
+{plan or "(无)"}
 
 [最近几晚]（几点睡、几点起）
 {chr(10).join(nights) or "(无)"}
@@ -1144,6 +1153,7 @@ def get_status_prompt(
     *,
     life: str,
     diary: list[str],
+    plan: str,
     nights: list[str],
     timeline: list[str],
     speak_times: list[str],
@@ -1163,7 +1173,7 @@ def get_status_prompt(
 你在幕后替「{persona.name}」安排ta接下来这一段在做什么。ta是一个真实的人，有自己的生活，群聊只是其中一小部分。一次只定眼下这一段，到点了会再问你下一段。
 {SAFETY_RULE}
 
-{_status_background(persona, life, diary, nights, timeline, speak_times, time_info)}
+{_status_background(persona, life, diary, plan, nights, timeline, speak_times, time_info)}
 
 {_STATUS_MODES}
 
@@ -1180,6 +1190,7 @@ def get_status_called_prompt(
     *,
     life: str,
     diary: list[str],
+    plan: str,
     nights: list[str],
     timeline: list[str],
     speak_times: list[str],
@@ -1192,7 +1203,7 @@ def get_status_called_prompt(
 你在幕后替「{persona.name}」判断：ta现在手机放在一边，有人在群里叫ta，ta会不会拿起手机看一眼。
 {SAFETY_RULE}
 
-{_status_background(persona, life, diary, nights, timeline, speak_times, time_info)}
+{_status_background(persona, life, diary, plan, nights, timeline, speak_times, time_info)}
 
 [ta放下手机以来，群里叫ta的消息]（按时间）
 {chr(10).join(calls)}
@@ -1214,6 +1225,17 @@ doing 写清是怎么拿起手机的（「被吵醒了，迷迷糊糊看手机�
 """
 
 
+def _next_days(day: date) -> str:
+    parts = []
+    for offset in range(1, 7):
+        value = day + timedelta(days=offset)
+        is_rest, holiday_name = is_rest_day(value)
+        weekday = "一二三四五六日"[value.weekday()]
+        label = f"（{holiday_name}）" if holiday_name else ("（休息日）" if is_rest else "")
+        parts.append(f"{value:%m-%d} 周{weekday}{label}")
+    return "、".join(parts)
+
+
 def get_diary_prompt(
     persona: RolePreset,
     *,
@@ -1222,11 +1244,12 @@ def get_diary_prompt(
     previous: list[str],
     timeline: list[str],
     life_facts: list[str],
+    plan: str,
 ) -> str:
-    """把ta一天的时间线写成一条日记，第二天还记得昨天干了什么。"""
+    """写ta一天的日记，再想接下来几天的打算：日记会进人生线，只算发生过的事，想做的事单独放。"""
 
     return f"""
-你在幕后替「{persona.name}」写ta {day:%Y-%m-%d} 这天的日记，给ta自己以后翻看。
+你在幕后替「{persona.name}」做两件事：写ta {day:%Y-%m-%d} 这天的日记，再替ta想想接下来几天的打算。
 {SAFETY_RULE}
 
 [ta这个人]（人生线）
@@ -1241,12 +1264,27 @@ def get_diary_prompt(
 [这天ta在群里说过的关于自己的事]
 {_bullets(life_facts) if life_facts else "(无)"}
 
-要求：
+[上次的打算]
+{plan or "(无)"}
+
+[接下来几天]
+{_next_days(day)}
+
+日记：
 - 第一人称，三四句，不超过 150 字，像随手记的日记，不用小标题、不按钟点流水账。
-- 只写时间线和上面那些事里有的，不编新的。挑这天主要做了什么、顺不顺、有什么没做完或打算接着做的（明天要交的、说好周末去的）。
+- 只写时间线和上面那些事里有的，不编新的。只写这天发生的事、顺不顺，不写之后要做什么。
 - 只写自己：不写任何群友，不写群聊和群里的事。被叫起来看手机的段，就当看了会儿手机，不提是谁叫的。
 
-只输出 JSON：{{"diary":"日记"}}
+打算：
+- 接下来几天ta自己想做或要做的事，一到三件，每件一句，带大概哪天（比如「后天下午要去办个手续」「周末想出去走走」）。
+- 这是ta自己想的，从人生线（在忙什么、喜欢什么、一直想试的事）、这几天的日记和上次的打算里来。
+- 上次的打算：做过的去掉；没做的可以留着、推迟，不想做了就划掉。
+- 不是日程：不排钟点，不把一天排满，没什么想做的就少写。
+- 一直在做的长期的事不算打算，除非这几天有具体要完成的一步。
+- 这几天过得差不多的话，想想有没有想换换的。
+- 只写自己，不写群友和群里的事，不安排和群友见面。
+
+只输出 JSON：{{"diary":"日记","plan":"打算，第一人称，一到三句"}}
 """
 
 

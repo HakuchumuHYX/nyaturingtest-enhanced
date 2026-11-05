@@ -53,6 +53,7 @@ from .status import (
     is_glancing,
     note_call,
     recent_diary,
+    recent_plan,
     today_lines,
 )
 
@@ -984,6 +985,7 @@ async def chat_stage(
         web_results=web_results,
         time_info=get_time_description(datetime.now()),
         diary=recent_diary(state.preset, CHAT_DIARY_DAYS),
+        plan=recent_plan(state.preset),
         group_info=look.group_info,
         missed=look.missed,
         today=today_lines(state.preset),
