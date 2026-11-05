@@ -1,4 +1,4 @@
-"""一轮对话的编排：短时记忆 → 看不看群（away 时只记下谁在叫她）→ 补看 → RAG → Feedback（沉淀 + 说不说）→ Chat。"""
+"""一轮对话的编排：短时记忆 → 看不看群（away 时只记下谁在叫她）→ 爬楼 → RAG → Feedback（沉淀 + 说不说）→ Chat。"""
 
 import math
 import re
@@ -33,7 +33,7 @@ from ..prompts import (
     get_time_description,
     truncate_text,
 )
-from ..storage.db import get_catch_up, get_history_before
+from ..storage.db import get_catch_up, get_history_before, get_messages_between
 from ..storage.models import ThreadModel
 from ..webconsole_store import record_look
 from .domain import EmotionState, PersonProfile
@@ -45,14 +45,21 @@ from .engagement import (
     decide_look,
     unread_count,
 )
-from .session import Session
-from .status import apply_said, describe_now, is_away, note_call, recent_diary, today_lines
+from .session import Session, SessionState
+from .status import (
+    apply_said,
+    describe_now,
+    is_away,
+    is_glancing,
+    note_call,
+    recent_diary,
+    today_lines,
+)
 
 HISTORY_RECALL_LIMIT = 20
-# 补看：被挤出未读的那段里捞回几条找过她的消息；错过的分段小结最多几条、几个字
+# 补看：被挤出未读的那段里捞回几条找过她的消息；错过的分段小结最多几个字，放不下时留最新的
 CATCH_UP_CALLS = 5
-CATCH_UP_EPISODES = 8
-MISSED_CHARS = 1200
+MISSED_CHARS = 4000
 # 被叫到时交给状态模型的每条消息最多几个字
 CALL_LINE_CHARS = 100
 # Chat / 主动话题读几天日记
@@ -458,7 +465,7 @@ async def process_chunk(
             )
         unread = session.unread()
         context = _read_context(session, unread) if unread else []
-        calls, missed = ([], []) if away else await _catch_up(session, unread)
+        calls, missed, climb_from = ([], [], None) if away else await _catch_up(session, unread)
         trigger = decide_look(state, calls + unread, datetime.now(), away)
         if trigger is None:
             log_event(
@@ -470,8 +477,16 @@ async def process_chunk(
                 unread=unread_count(state, unread),
             )
             return None
+        # 要在爬楼前算：爬楼会推水位，算晚了 now 里就没有「刚醒」
+        previous_look = max(state.last_look_time, state.last_read_time or datetime.min)
         try:
-            return await _look(session, calls + unread, context, missed, trigger, generation)
+            if climb_from is not None and not await _climb(
+                session, climb_from, unread[0].time, previous_look, generation
+            ):
+                return None
+            return await _look(
+                session, calls + unread, context, missed, previous_look, trigger, generation
+            )
         finally:
             # 看过这段就放掉原图；失败也放：描述还在消息里，留着只会越攒越多
             for message in unread:
@@ -482,34 +497,45 @@ async def process_chunk(
 
 async def _catch_up(
     session: Session, unread: list[ChatMessage]
-) -> tuple[list[ChatMessage], list[str]]:
-    """未读超过 LOOK_MAX_MESSAGES 条时，水位到这些未读之间被挤掉的那段：找过她的消息、那段时间的分段小结。
+) -> tuple[list[ChatMessage], list[str], datetime | None]:
+    """有消息没细看时，被挤掉的那段：找过她的消息、那段时间的分段小结、从哪开始爬楼（不爬是 None）。
 
     睡醒、忙完、群里刷得太快走同一套。找过她的消息接在未读最前面，被点名照常按点名看群。
-    醒来时还在聊的那段，前半截可能既没整理成小结、也不在未读里，就略过：真人醒来翻群也是扫一眼。
+    被叫起来看一眼不爬，只看最新的；爬楼水位留在原地，等真回来再爬。
     """
 
-    watermark = session.state.last_read_time
-    if watermark is None or len(unread) < LOOK_MAX_MESSAGES:
-        return [], []
+    state = session.state
+    glancing = is_glancing(state.preset)
+    after = state.last_read_time if glancing else state.climbed_until
+    if (
+        after is None
+        or not unread
+        or (len(unread) < LOOK_MAX_MESSAGES and after >= state.last_read_time)
+    ):
+        return [], [], None
+    # 点名只捞已读水位之后的：看一眼时已经看过的，爬楼时不再当成新的找她
     calls, episodes, skipped = await get_catch_up(
         session.id,
-        watermark,
+        after,
         unread[0].time,
+        calls_after=state.last_read_time,
         calls_limit=CATCH_UP_CALLS,
-        episodes_limit=CATCH_UP_EPISODES,
     )
     if not skipped:
-        return [], []
-    missed = []
+        return [], [], None
+    kept = []
     remaining = MISSED_CHARS
-    for episode in episodes:
+    for episode in reversed(episodes):
         if remaining <= 0:
             break
-        missed.append(truncate_text(episode, remaining))
-        remaining -= len(missed[-1])
-    missed.append(f"中间还有 {skipped} 条没细看")
-    return calls, missed
+        kept.append(truncate_text(episode, remaining))
+        remaining -= len(kept[-1])
+    missed = kept[::-1]
+    if glancing:
+        missed.append(f"中间还有 {skipped} 条没细看")
+        return calls, missed, None
+    missed.append(f"这段一共 {skipped} 条，你都翻过了")
+    return calls, missed, after
 
 
 @dataclass(frozen=True)
@@ -524,11 +550,65 @@ class LookContext:
     threads: list[ThreadModel]
 
 
+async def _climb(
+    session: Session,
+    after: datetime,
+    before: datetime,
+    previous_look: datetime,
+    generation: int,
+) -> bool:
+    """爬楼：把 after 到 before 之间被挤出未读的消息按批读完，不开口。
+
+    内容分段整理已经记下了，这里是她本人读一遍：只沉淀心情、摘要、记忆更正；
+    那些人不是在跟她说话，不算好感和互动。每批推进水位，重启后接着爬。
+    某批 Feedback 失败就跳过，内容小结里有。返回 False 是爬到一半又放下手机或会话作废，下次接着爬。
+    """
+
+    state = session.state
+    recent: list[ChatMessage] = []
+    batch_number = 0
+    while batch := await get_messages_between(session.id, after, before, LOOK_MAX_MESSAGES):
+        if session.stale(generation, "climb") or is_away(state.preset):
+            return False
+        look = LookContext(
+            recent=recent,
+            missed=[],
+            now=describe_now(state.preset, previous_look),
+            group_info=await session.refresh_group_info(),
+            last_seen=_last_seen_days(session, batch),
+            threads=await open_threads(
+                session.id, _speaker_ids(batch, state.name), datetime.now()
+            ),
+        )
+        memories = await search_stage(session, batch)
+        feedback = await _ask_feedback(session, batch, look, False, memories)
+        if session.stale(generation, "climb_sediment"):
+            return False
+        if feedback is not None:
+            _settle_reading(session, feedback, batch, generation, memories.refs)
+        after = batch[-1].time
+        _mark_read(state, after)
+        state.climbed_until = after
+        session.schedule_save()
+        recent = batch[-SHORT_CONTEXT_LIMIT:]
+        batch_number += 1
+        log_event(
+            "climb",
+            session_id=session.id,
+            batch=batch_number,
+            messages=len(batch),
+            until=f"{after:%m-%d %H:%M}",
+            ok=feedback is not None,
+        )
+    return True
+
+
 async def _look(
     session: Session,
     unread: list[ChatMessage],
     context: list[ChatMessage],
     missed: list[str],
+    previous_look: datetime,
     trigger: LookTrigger,
     generation: int,
 ) -> TurnResult | None:
@@ -538,8 +618,7 @@ async def _look(
     """
 
     state = session.state
-    # 刚回来要按上次看这个群的时间判断；重启后 last_look_time 清零，已读水位还在
-    previous_look = max(state.last_look_time, state.last_read_time or datetime.min)
+    glancing = is_glancing(state.preset)
     state.last_look_time = datetime.now()
     # 水位推到这一刻读到的最后一条：看群途中合并转发读完会把那条的时间改成现在（move_to_latest），
     # 按读完时的最大时间推进，就会把它和途中新来的消息一起误标成已读
@@ -574,6 +653,8 @@ async def _look(
     )
     if session.stale(generation, "feedback"):
         return None
+    if feedback is not None and not glancing:
+        state.climbed_until = read_until
 
     # 被点名也交给 willing 判断；Feedback 失败时只有被点名才回
     if feedback is None:
@@ -754,6 +835,45 @@ async def _ask_feedback(
     return parse_feedback(data, unread, session)
 
 
+def _settle_reading(
+    session: Session,
+    feedback: FeedbackOutput,
+    messages: list[ChatMessage],
+    generation: int,
+    refs: dict[str, str],
+) -> None:
+    """读过一段消息都要沉淀的：心情、摘要、记忆更正。看群和爬楼共用；refs 是本轮检索行编号 → 记忆 id。"""
+
+    state = session.state
+
+    # parse_feedback 已校验范围，apply 再限制每轮步长
+    state.global_emotion.apply(feedback.emotion)
+
+    if feedback.summary is not None:
+        state.chat_summary = feedback.summary
+
+    if feedback.corrections:
+        # 上下文里每个 QQ 号的当前群名片：先放被 @/被回复的人，再放发言人（未读在后、以最新为准）
+        context = [*session.short_term_memory.access(), *messages]
+        known_users = {uid: name for msg in context for uid, name in msg.mentions.items()}
+        known_users.update({msg.user_id: msg.user_name for msg in context if msg.user_id})
+        session.spawn(
+            save_memory_candidates(
+                session,
+                feedback.corrections,
+                messages=messages,
+                known_users=known_users,
+                refs=refs,
+                generation=generation,
+            )
+        )
+
+
+def _mark_read(state: SessionState, read_until: datetime) -> None:
+    if state.last_read_time is None or read_until > state.last_read_time:
+        state.last_read_time = read_until
+
+
 def _apply_sediment(
     session: Session,
     feedback: FeedbackOutput,
@@ -762,15 +882,10 @@ def _apply_sediment(
     generation: int,
     refs: dict[str, str],
 ) -> None:
-    """应用 Feedback 的沉淀结果：情绪、画像、摘要、记忆更正，最后把已读水位推到 read_until。
-
-    refs 是本轮检索行编号 → 记忆 id。
-    """
+    """看群时应用 Feedback 的沉淀结果：读过的那部分、画像，最后把已读水位推到 read_until。"""
 
     state = session.state
-
-    # parse_feedback 已校验范围，apply 再限制每轮步长
-    state.global_emotion.apply(feedback.emotion)
+    _settle_reading(session, feedback, unread, generation, refs)
 
     # 互动计数按消息记；好感度只改 Feedback 点名的人（parse_feedback 只收这段的发言人）
     now = datetime.now()
@@ -781,27 +896,7 @@ def _apply_sediment(
     for uid, delta in feedback.affinity_changes.items():
         state.profiles[uid].add_affinity(delta)
 
-    if feedback.summary is not None:
-        state.chat_summary = feedback.summary
-
-    if feedback.corrections:
-        # 上下文里每个 QQ 号的当前群名片：先放被 @/被回复的人，再放发言人（未读在后、以最新为准）
-        context = [*session.short_term_memory.access(), *unread]
-        known_users = {uid: name for msg in context for uid, name in msg.mentions.items()}
-        known_users.update({msg.user_id: msg.user_name for msg in context if msg.user_id})
-        session.spawn(
-            save_memory_candidates(
-                session,
-                feedback.corrections,
-                messages=unread,
-                known_users=known_users,
-                refs=refs,
-                generation=generation,
-            )
-        )
-
-    if state.last_read_time is None or read_until > state.last_read_time:
-        state.last_read_time = read_until
+    _mark_read(state, read_until)
     session.schedule_save()
 
 

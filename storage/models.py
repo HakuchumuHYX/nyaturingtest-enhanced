@@ -20,6 +20,8 @@ class SessionModel(Model):
     last_speak_time = fields.DatetimeField(null=True)
     # 已读水位：Feedback 读到的最后一条消息时间
     last_read_time = fields.DatetimeField(null=True)
+    # 爬楼水位：这之前的消息都细看过；被叫起来看一眼时不动
+    climbed_until = fields.DatetimeField(null=True)
     # 群志只由每日整理任务写入；水位是已整理到的最新碎片 created_at
     group_notes = fields.TextField(default="")
     notes_summarized_until = fields.DatetimeField(null=True)

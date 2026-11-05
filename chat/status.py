@@ -98,6 +98,13 @@ def is_away(preset: str) -> bool:
     return status is not None and status.away
 
 
+def is_glancing(preset: str) -> bool:
+    """现在这一段是被叫起来看手机：只看最新的，不爬楼。"""
+
+    status = _statuses.get(preset)
+    return status is not None and status.current is not None and status.current["source"] == SOURCE_CALLED
+
+
 async def _load(preset: str) -> PersonaStatus:
     status = _statuses.get(preset)
     if status is not None:

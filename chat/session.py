@@ -56,6 +56,8 @@ class SessionState:
     conversation_partners: set[str] = field(default_factory=set)
     # 已读水位：Feedback 读到的最后一条消息时间，之后的都是未读
     last_read_time: datetime | None = None
+    # 爬楼水位：这之前的都细看过。被叫起来看一眼时已读水位会跳过去，这个不动，等真回来从这里爬
+    climbed_until: datetime | None = None
     last_look_time: datetime = datetime.min
     generation: int = 0
 
@@ -191,6 +193,7 @@ class Session:
                     "chat_summary": self.state.chat_summary,
                     "last_speak_time": self.state.last_speak_time,
                     "last_read_time": self.state.last_read_time,
+                    "climbed_until": self.state.climbed_until,
                 },
             )
 
@@ -245,6 +248,7 @@ class Session:
                 t = t.astimezone(None).replace(tzinfo=None)
             self.state.last_speak_time = t
         self.state.last_read_time = session_db.last_read_time
+        self.state.climbed_until = session_db.climbed_until
 
         self.state.profiles = {}
         self.state.user_summaries = {

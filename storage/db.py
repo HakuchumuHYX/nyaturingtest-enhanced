@@ -82,6 +82,7 @@ async def save_session_state(session_id: str, data: dict):
             "chat_summary": sanitize_text(data.get("chat_summary", "")),
             "last_speak_time": data.get("last_speak_time"),
             "last_read_time": data.get("last_read_time"),
+            "climbed_until": data.get("climbed_until"),
         },
     )
 
@@ -286,6 +287,30 @@ async def message_sender_name(session_id: str, msg_id: str) -> str | None:
     return row.user_name if row else None
 
 
+def _row_message(row: GlobalMessageModel) -> ChatMessage:
+    return ChatMessage(
+        time=row.time,
+        user_name=row.user_name,
+        content=row.content,
+        id=row.msg_id,
+        user_id=row.user_id or "",
+        to_me=row.to_me,
+    )
+
+
+async def get_messages_between(
+    session_id: str, after: datetime, before: datetime, limit: int
+) -> list[ChatMessage]:
+    """after 之后、before 之前最早的 limit 条，从旧到新。"""
+
+    rows = (
+        await GlobalMessageModel.filter(session_id=session_id, time__gt=after, time__lt=before)
+        .order_by("time")
+        .limit(limit)
+    )
+    return [_row_message(row) for row in rows]
+
+
 async def get_history_before(
     session_id: str, time_point: datetime, limit: int = 20
 ) -> list[ChatMessage]:
@@ -302,41 +327,35 @@ async def get_history_before(
         .limit(limit)
     )
 
-    return [
-        ChatMessage(
-            time=m.time,
-            user_name=m.user_name,
-            content=m.content,
-            id=m.msg_id,
-            user_id=m.user_id or "",
-            to_me=m.to_me,
-        )
-        for m in sorted(history_rows, key=lambda x: x.time)
-    ]
+    return [_row_message(m) for m in sorted(history_rows, key=lambda x: x.time)]
 
 
 async def get_catch_up(
-    session_id: str, after: datetime, before: datetime, *, calls_limit: int, episodes_limit: int
+    session_id: str,
+    after: datetime,
+    before: datetime,
+    *,
+    calls_after: datetime,
+    calls_limit: int,
 ) -> tuple[list[ChatMessage], list[str], int]:
-    """已读水位到 before 之间被挤出未读的那段：找过她的消息（最近几条）、水位之后写成的分段小结、这段一共多少条。"""
+    """after 到 before 之间被挤出未读的那段：calls_after 之后找过她的消息（最近几条）、after 之后写成的分段小结、这段一共多少条。"""
 
     rows = GlobalMessageModel.filter(session_id=session_id, time__gt=after, time__lt=before)
-    calls = await rows.filter(to_me=True).order_by("-time").limit(calls_limit)
+    calls = await (
+        GlobalMessageModel.filter(
+            session_id=session_id, time__gt=calls_after, time__lt=before, to_me=True
+        )
+        .order_by("-time")
+        .limit(calls_limit)
+    )
     episodes = (
         await MemoryModel.filter(session_id=session_id, category="episode", created_at__gt=after)
-        .order_by("-created_at")
-        .limit(episodes_limit)
+        .order_by("created_at")
         .values_list("content", flat=True)
     )
     return (
-        [
-            ChatMessage(
-                time=m.time, user_name=m.user_name, content=m.content, id=m.msg_id,
-                user_id=m.user_id, to_me=True,
-            )
-            for m in reversed(calls)
-        ],
-        list(reversed(episodes)),
+        [_row_message(m) for m in reversed(calls)],
+        list(episodes),
         await rows.count(),
     )
 
