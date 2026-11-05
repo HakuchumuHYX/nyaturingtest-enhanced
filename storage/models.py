@@ -239,9 +239,10 @@ class StickerModel(Model):
 
 
 class PhotoModel(Model):
-    """她的相册，每个（群, 预设）一份；文件在 data 目录的 photos/<digest>.jpg。发送成功才入库。"""
+    """她的相册，每个预设一份，各群共用；文件在 data 目录的 photos/<digest>.jpg。发送成功才入库。"""
 
     id = fields.IntField(pk=True)
+    # 在哪个群拍的
     session_id = fields.CharField(max_length=255, index=True)
     preset = fields.CharField(max_length=255)
     # selfie / scene

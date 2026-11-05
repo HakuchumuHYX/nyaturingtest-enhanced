@@ -1,6 +1,6 @@
-"""她的相册：拍照、检索、清理。按（群, 预设）隔离，照片可能带着这个群的话题，不能串到别的群。
+"""她的相册：拍照、检索、清理。她就一部手机，同一个预设各群共用，只拍自己和眼前的东西，不带群友。
 
-旧照片和印象一样，话题碰到才想起：决定开口后检索本群相册，重排通过的才给 Chat，由她决定发不发。
+旧照片和印象一样，话题碰到才想起：决定开口后检索相册，重排通过的才给 Chat，由她决定发不发。
 """
 
 import base64
@@ -167,10 +167,10 @@ async def _vectors(rows: list) -> list[np.ndarray]:
     return [np.frombuffer(row.embedding, dtype=np.float32) for row in rows]
 
 
-async def candidates(session_id: str, preset: str, queries: list[str]) -> list[dict]:
+async def candidates(preset: str, queries: list[str]) -> list[dict]:
     """相册里和这段聊天有关的照片，给 Chat 的 album；没有或检索失败都是空列表。"""
 
-    rows = await db.load_photos(session_id, preset)
+    rows = await db.load_photos(preset)
     if not rows or not queries:
         return []
     try:
@@ -228,18 +228,12 @@ async def remove_by_message(session_id: str, content: str | None) -> bool:
     prefix, suffix = "[图片: ", "]"
     if not content or not content.startswith(prefix) or not content.endswith(suffix):
         return False
-    row = await db.find_photo_by_caption(session_id, content[len(prefix) : -len(suffix)])
+    row = await db.find_photo_by_caption(content[len(prefix) : -len(suffix)])
     if row is None:
         return False
     await _delete([row])
     log_event("photo_removed", session_id=session_id, photo_id=row.id)
     return True
-
-
-async def clear_session(session_id: str) -> None:
-    """reset 时清掉这个群的相册。"""
-
-    await _delete(await db.session_photos(session_id))
 
 
 async def prune_photos() -> None:

@@ -197,7 +197,7 @@ STICKER_GUIDELINE = f"""8. 表情包：reply 的每项可以带一个 sticker，
 """
 
 
-PHOTO_GUIDELINE = """8b. 照片：reply 的每项也可以带一个 photo，像真人翻手机相册或者随手拍一张发群里。手边正好有值得给人看的东西（刚做的、在吃的、看到的、你的样子），想发就发，不用等人开口要。没什么可看的就不发，不是每次都带，一轮最多一张；photo_ready 为 false 时不带，也别说要发图或者去拍。
+PHOTO_GUIDELINE = """8b. 照片：reply 的每项也可以带一个 photo，像真人翻手机相册或者随手拍一张发群里。手边正好有值得给人看的东西（刚做的、在吃的、看到的、你的样子），想发就发，不用等人开口要。没什么可看的就不发，不是每次都带，一轮最多一张。photos_last_hour 是你最近一小时在这个群发过几张照片，发得勤不勤自己掂量。photo_ready 为 false 是手机这会儿拍不了，不带，也别说要发图或者去拍。
    新拍：{"kind": "selfie|scene", "describe": "拍什么、在哪、什么表情动作"}。selfie 是照片里有你，scene 是眼前的东西或景色，没有你。只拍你现在真的拍得到的：对得上 now 和 time_info，只写你自己和眼前的东西，不写群友。姿势和表情按当时的心情来，每张不一样。
    相册：album 是你想起来的、手机相册里的旧照片，taken 是哪天拍的，last_sent 是上次发是哪天。聊到相关的事不等于要发，大多数时候只是想起来而已；真想给人看再翻出来，填 {"ref": "p1"}，按日期说，冬天发夏天的照片就说是夏天拍的；last_sent 就在这几天的别再发。
    文字和照片写在同一项：照片发不出去时，这一项的文字也不会发，所以别单独一项说「等我拍一张」。
@@ -445,6 +445,7 @@ def get_chat_prompt(
     now: str,
     photos: bool,
     album: list[dict],
+    photos_last_hour: int,
     photo_ready: bool,
 ) -> str:
     """Chat：以角色本人的身份在群里说话。photos 是配置里开没开生图，进程内不变，不影响前缀缓存。"""
@@ -477,6 +478,7 @@ def get_chat_prompt(
     }
     if photos:
         dynamic_payload["album"] = album
+        dynamic_payload["photos_last_hour"] = photos_last_hour
         dynamic_payload["photo_ready"] = photo_ready
 
     return f"""

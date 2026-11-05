@@ -513,16 +513,16 @@ async def add_photo(**values) -> PhotoModel:
     return await PhotoModel.create(**values)
 
 
-async def load_photos(session_id: str, preset: str) -> list[PhotoModel]:
-    return await PhotoModel.filter(session_id=session_id, preset=preset)
+async def load_photos(preset: str) -> list[PhotoModel]:
+    return await PhotoModel.filter(preset=preset)
 
 
-async def get_photo(session_id: str, photo_id: int) -> PhotoModel | None:
-    return await PhotoModel.get_or_none(session_id=session_id, id=photo_id)
+async def get_photo(preset: str, photo_id: int) -> PhotoModel | None:
+    return await PhotoModel.get_or_none(preset=preset, id=photo_id)
 
 
-async def find_photo_by_caption(session_id: str, caption: str) -> PhotoModel | None:
-    return await PhotoModel.filter(session_id=session_id, caption=caption).first()
+async def find_photo_by_caption(caption: str) -> PhotoModel | None:
+    return await PhotoModel.filter(caption=caption).first()
 
 
 async def mark_photo_sent(photo_id: int, sent_at: datetime) -> None:
@@ -537,10 +537,6 @@ async def save_photo_embedding(photo_id: int, embedding: bytes, embedding_model:
 
 async def expired_photos(before: datetime) -> list[PhotoModel]:
     return await PhotoModel.filter(last_sent_at__lt=before)
-
-
-async def session_photos(session_id: str) -> list[PhotoModel]:
-    return await PhotoModel.filter(session_id=session_id)
 
 
 async def delete_photos(photo_ids: list[int]) -> None:

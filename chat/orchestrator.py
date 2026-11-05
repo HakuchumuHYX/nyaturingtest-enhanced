@@ -997,7 +997,7 @@ async def chat_stage(
     state.global_emotion.settle()
     photos_on = photos_enabled()
     album = (
-        await photo_candidates(session.id, state.preset, _search_queries(state, unread))
+        await photo_candidates(state.preset, _search_queries(state, unread))
         if photos_on
         else []
     )
@@ -1033,6 +1033,7 @@ async def chat_stage(
         now=look.now,
         photos=photos_on,
         album=album,
+        photos_last_hour=session.photos_last_hour(),
         photo_ready=datetime.now() >= session.photo_ready_at,
     )
     log_event(

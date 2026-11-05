@@ -92,7 +92,7 @@ COMMANDS: tuple[CommandMeta, ...] = (
     CommandMeta("reset confirm", "先备份再完全重置本群", "reset <群号> confirm"),
     CommandMeta("token统计", "查看当前 chat / feedback / background 模型的 Token 用量"),
     CommandMeta("stickerdel", "回复一张图：从表情包库删掉并拉黑，以后只描述不收"),
-    CommandMeta("photodel", "回复她发的照片：从本群相册删掉"),
+    CommandMeta("photodel", "回复她发的照片：从相册删掉，各群都翻不到了"),
     CommandMeta("backup_data", "手动触发数据备份", "backup_data"),
     CommandMeta("help", "显示帮助", "help"),
 )

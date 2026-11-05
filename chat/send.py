@@ -26,8 +26,7 @@ REACT_COOLDOWN_SECONDS = 60
 # 戳一戳会给对方弹提醒，比贴表情打扰人，间隔放长些
 POKE_COOLDOWN_SECONDS = 120
 STICKER_COOLDOWN_SECONDS = 120
-PHOTO_COOLDOWN_SECONDS = 3600
-# 上游挂了时每轮都卡一次超时，等一会儿再试
+# 只管拍不出来的时候：上游挂了时每轮都卡一次超时，等一会儿再试。发得勤不勤她自己看 photos_last_hour
 PHOTO_FAILED_COOLDOWN_SECONDS = 600
 
 
@@ -100,8 +99,8 @@ async def _pick_sticker(
     return None
 
 
-def _photo_cooldown(session: Session, seconds: int) -> None:
-    session.photo_ready_at = datetime.now() + timedelta(seconds=seconds)
+def _photo_cooldown(session: Session) -> None:
+    session.photo_ready_at = datetime.now() + timedelta(seconds=PHOTO_FAILED_COOLDOWN_SECONDS)
 
 
 async def _ready_photo(
@@ -115,7 +114,7 @@ async def _ready_photo(
         return None
 
     if wish.photo_id is not None:
-        row = await get_photo(session.id, wish.photo_id)
+        row = await get_photo(session.state.preset, wish.photo_id)
         if row is None or not photos.photo_path(row.digest).is_file():
             log_event("photo", **fields, outcome="failed", error="missing")
             return None
@@ -144,11 +143,9 @@ async def _ready_photo(
         error=error or None,
     )
     if outcome == "blocked":
-        # 群友换着花样要时别一直试
-        _photo_cooldown(session, PHOTO_COOLDOWN_SECONDS)
         session.note_photo_problem(PHOTO_BLOCKED_NOTE)
     elif outcome == "failed":
-        _photo_cooldown(session, PHOTO_FAILED_COOLDOWN_SECONDS)
+        _photo_cooldown(session)
         session.note_photo_problem(PHOTO_FAILED_NOTE)
     elif outcome == "no_portrait":
         session.note_photo_problem(PHOTO_FAILED_NOTE)
@@ -159,7 +156,7 @@ async def _ready_photo(
 
 async def _after_photo_send(session: Session, photo: _ReadyPhoto, sent: bool) -> None:
     if sent:
-        _photo_cooldown(session, PHOTO_COOLDOWN_SECONDS)
+        session.photo_sent_times.append(datetime.now())
         if photo.new is not None:
             await photos.save(session.id, session.state.preset, photo.new)
         else:
@@ -167,7 +164,7 @@ async def _after_photo_send(session: Session, photo: _ReadyPhoto, sent: bool) ->
         return
     if photo.new is not None:
         photos.discard(photo.new)
-    _photo_cooldown(session, PHOTO_FAILED_COOLDOWN_SECONDS)
+    _photo_cooldown(session)
     session.note_photo_problem(PHOTO_FAILED_NOTE)
 
 
@@ -192,10 +189,15 @@ async def dispatch_replies(
     sent_count = 0
     # 一轮最多一张表情包
     sticker_requested = False
+    # 一轮最多一张：新拍的每张都要等半分钟，这期间 worker 不看新消息
+    photo_requested = False
     for reply_index, reply in enumerate(replies):
         # 先拿图再发字：拿不到图时这一项的文字也不发，不留下「给你看」却没有图
         photo = None
         if reply.photo is not None:
+            if photo_requested:
+                continue
+            photo_requested = True
             photo = await _ready_photo(session, reply.photo, generation)
             if photo is None:
                 continue
