@@ -45,7 +45,7 @@ GROUP_MIN_MESSAGES = 30
 LIFE_INTERVAL = timedelta(days=7)
 # ta自己的日记留几天、写日记时看前几天
 DIARY_DAYS = 14
-DIARY_PREVIOUS = 2
+DIARY_PREVIOUS = 7
 
 _NOISE = {"[图片]", "[表情包]"}
 

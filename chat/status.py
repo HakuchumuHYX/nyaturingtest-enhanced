@@ -2,8 +2,9 @@
 
 一个预设一份，所有群共用：她是一个人，在 A 群说去开组会了，B 群也不能还在水。
 一次只定眼下这一段，每段都从上一段接着走，不在一天开始时排好。状态只在这几种时候变：
-到点（due）、她在群里自己说了（said）、away 时被叫到并拿起了手机（called）、启动或断了很久（start）、/calm（calm）。
+到点（due）、聊天时她自己定了（chat）、away 时被叫到并拿起了手机（called）、启动或断了很久（start）、/calm（calm）。
 状态里只有她自己在做什么，不带任何群的内容：被叫到时不给群名，状态模型只看她开口的时间、不看说了什么。
+能看到聊天内容的只有 Chat，所以聊天要改她接下来做什么走 Chat 的 status。
 """
 
 import asyncio
@@ -25,7 +26,12 @@ from ..prompts import (  # noqa: E402
     get_time_description,
     segment_line,
 )
-from ..storage.db import load_life_text, load_persona_status, save_persona_status  # noqa: E402
+from ..storage.db import (  # noqa: E402
+    load_life_text,
+    load_persona_status,
+    save_persona_status,
+    self_speak_times,
+)
 from .groups import is_shutting_down, sessions  # noqa: E402
 
 MODES = ("free", "busy", "away")
@@ -40,17 +46,16 @@ RETRY_MINUTES = 10
 GAP_NOTE_MINUTES = 30
 # 被叫到时最多这么久问一次状态模型；节流期间攒下的到点一起问
 CALL_THROTTLE = timedelta(minutes=10)
-# 给状态模型看的：时间线最近几段、几天日记、她最近几次开口（只给时间）
+# 给状态模型看的：时间线最近几段、几天日记；开口情况按两个窗口比，看得出聊天是热起来还是冷下去
 TIMELINE_PROMPT_SEGMENTS = 16
 STATUS_DIARY_DAYS = 7
-SPEAK_TIMES_LIMIT = 6
-SPEAK_TIMES_WINDOW = timedelta(hours=2)
+CHAT_ACTIVITY_WINDOW = timedelta(minutes=30)
 # 时间线写进日记后只留最近这么久；还没写日记的那几天整段留着
 TIMELINE_KEEP = timedelta(hours=18)
 NIGHTS_KEEP = 7
 
 SOURCE_DUE = "due"
-SOURCE_SAID = "said"
+SOURCE_CHAT = "chat"
 SOURCE_CALLED = "called"
 SOURCE_START = "start"
 SOURCE_CALM = "calm"
@@ -69,7 +74,7 @@ class PersonaStatus:
     diary_until: date | None = None
     # 接下来几天的打算，只由每日整理写
     plan: str = ""
-    # 每次改状态加一；调模型前记下，回来时变了说明这期间她在群里自己说了新情况，以她说的为准
+    # 每次改状态加一；调模型前记下，回来时变了说明这期间她聊天时自己定了，以她定的为准
     version: int = 0
     deciding: asyncio.Task | None = None
     # 这次放下手机以来叫她的消息，问过的条数，上次问的时间
@@ -204,15 +209,28 @@ def today_lines(preset: str) -> list[str]:
 # ---------- 定下一段 ----------
 
 
-def _speak_times(preset: str, now: datetime) -> list[str]:
-    times = {
-        message.time
-        for session in list(sessions.values())
-        if session.state.preset == preset and session.state.name
-        for message in session.short_term_memory.messages_after(now - SPEAK_TIMES_WINDOW, 200)
-        if message.user_name == session.state.name and not message.is_action
-    }
-    return [f"{moment:%H:%M}" for moment in sorted(times)[-SPEAK_TIMES_LIMIT:]]
+async def _chat_activity(preset: str, now: datetime) -> str:
+    """她这会儿在群里说话的情况，只有时间。数开口的分钟而不是条数：一句话拆成几条发时条数会虚高。
+
+    查库不用短时记忆：每群只留 200 条，热闹时撑不满两个窗口。
+    """
+
+    times: list[datetime] = []
+    for session in list(sessions.values()):
+        if session.state.preset == preset and session.state.name:
+            since = now - 2 * CHAT_ACTIVITY_WINDOW
+            times += await self_speak_times(session.id, session.state.name, since)
+    if not times:
+        return "这一小时没在群里说话"
+    window = int(CHAT_ACTIVITY_WINDOW.total_seconds() // 60)
+    recent = {f"{moment:%H:%M}" for moment in times if moment >= now - CHAT_ACTIVITY_WINDOW}
+    earlier = {f"{moment:%H:%M}" for moment in times if moment < now - CHAT_ACTIVITY_WINDOW}
+    # now 是调用方先取的，查库前她可能又说了一句
+    last = max(0, int((now - max(times)).total_seconds() // 60))
+    return (
+        f"上一句 {last} 分钟前；最近 {window} 分钟里有 {len(recent)} 分钟在说话，"
+        f"再往前 {window} 分钟里有 {len(earlier)} 分钟"
+    )
 
 
 def parse_segment(data) -> dict | None:
@@ -321,7 +339,7 @@ async def _status_background(status: PersonaStatus, now: datetime) -> dict:
         "plan": status.plan,
         "nights": _night_lines(status),
         "timeline": _timeline_lines(status),
-        "speak_times": _speak_times(status.preset, now),
+        "chat_activity": await _chat_activity(status.preset, now),
         "time_info": get_time_description(now),
     }
 
@@ -404,15 +422,15 @@ def note_call(preset: str, lines: list[str]) -> None:
         status.call_task.add_done_callback(_log_task_error)
 
 
-async def apply_said(preset: str, raw) -> None:
-    """Chat 的 status 字段：她在群里说出了和现在不同的新情况，直接成为新的一段。"""
+async def apply_chat_status(preset: str, raw) -> None:
+    """Chat 的 status 字段：聊天改变了她接下来要做的事，直接成为新的一段。"""
 
     segment = parse_segment(raw)
     if segment is None:
         if raw is not None:
             logger.debug(f"Chat 的 status 无效，丢弃: {raw}")
         return
-    await _apply(await _load(preset), segment, SOURCE_SAID, "她在群里说的")
+    await _apply(await _load(preset), segment, SOURCE_CHAT, "聊天时定的")
 
 
 async def redecide(preset: str) -> None:

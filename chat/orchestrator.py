@@ -48,7 +48,7 @@ from .engagement import (
 )
 from .session import Session, SessionState
 from .status import (
-    apply_said,
+    apply_chat_status,
     describe_now,
     is_away,
     is_glancing,
@@ -1067,8 +1067,8 @@ async def chat_stage(
         return []
 
     if replies:
-        # 她说出口的新情况就是她接下来真的在做的事，各群共用
-        await apply_said(state.preset, data.get("status"))
+        # 聊天改变了她接下来要做的事，说没说出口都算，各群共用
+        await apply_chat_status(state.preset, data.get("status"))
         # 这次接上了的当场了结：等分段整理来了结，中间她会看不到自己问过、再问一遍
         closed = await close_threads(look.threads, data.get("threads"))
         if closed:
