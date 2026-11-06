@@ -89,10 +89,6 @@ class Session:
         self.new_message_signal = asyncio.Event()
         # 发送到写进短期记忆之间持有：这个号的 message_sent 上报可能比发送返回早到，等它放开再按 id 认是不是她发的
         self.send_lock = asyncio.Lock()
-        # 贴表情、戳一戳、表情包的冷却只存内存，重启后重新计时
-        self.last_react_time: datetime = datetime.min
-        self.last_poke_time: datetime = datetime.min
-        self.last_sticker_time: datetime = datetime.min
         # 拍照出问题后，到这个时间才再试
         self.photo_ready_at: datetime = datetime.min
         # 这个群发照片的时间，算 photos_last_hour 用，只存内存：没有硬性间隔，重启后重新数无妨

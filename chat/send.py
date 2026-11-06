@@ -1,4 +1,4 @@
-"""回复发送、表情包、贴表情、戳一戳，以及各自的冷却。"""
+"""回复发送、表情包、贴表情、戳一戳。"""
 
 import asyncio
 import random
@@ -22,10 +22,6 @@ from .orchestrator import PhotoWish, Poke, Reply
 from .session import Session
 from .status import describe_now
 
-REACT_COOLDOWN_SECONDS = 60
-# 戳一戳会给对方弹提醒，比贴表情打扰人，间隔放长些
-POKE_COOLDOWN_SECONDS = 120
-STICKER_COOLDOWN_SECONDS = 120
 # 只管拍不出来的时候：上游挂了时每轮都卡一次超时，等一会儿再试。发得勤不勤她自己看 photos_last_hour
 PHOTO_FAILED_COOLDOWN_SECONDS = 600
 
@@ -83,20 +79,14 @@ async def send_one(
 async def _pick_sticker(
     session: Session, tag: str, want: str
 ) -> tuple[Sticker, float | None] | None:
-    """挑一张要发的表情包和它的分数；冷却中或标签下没图返回 None。"""
+    """挑一张要发的表情包和它的分数；标签下没图返回 None。"""
 
-    since_last = (datetime.now() - session.last_sticker_time).total_seconds()
-    if since_last < STICKER_COOLDOWN_SECONDS:
-        outcome = "cooldown"
-    else:
-        picked = await pick(tag, want)
-        if picked is not None:
-            return picked
-        outcome = "empty"
-    log_event(
-        "sticker", session_id=session.id, tag=tag, want=want, outcome=outcome
-    )
-    return None
+    picked = await pick(tag, want)
+    if picked is None:
+        log_event(
+            "sticker", session_id=session.id, tag=tag, want=want, outcome="empty"
+        )
+    return picked
 
 
 def _photo_cooldown(session: Session) -> None:
@@ -250,7 +240,6 @@ async def dispatch_replies(
             if sent:
                 sent_count += 1
                 if picked_sticker is not None:
-                    session.last_sticker_time = datetime.now()
                     await mark_sent(picked_sticker[0])
             if picked_sticker is not None:
                 sticker, score = picked_sticker
@@ -278,26 +267,21 @@ async def dispatch_replies(
 async def send_reaction(
     session: Session, bot: Bot, react: Reaction, generation: int
 ) -> None:
-    """贴表情不等发言冷却；同一个群两次之间至少隔 REACT_COOLDOWN_SECONDS。"""
+    """贴表情不等发言冷却。"""
 
-    now = datetime.now()
-    if (now - session.last_react_time).total_seconds() < REACT_COOLDOWN_SECONDS:
-        outcome = "cooldown"
-    elif session.stale(generation, "react"):
+    if session.stale(generation, "react"):
         return
-    else:
-        session.last_react_time = now
-        try:
-            await bot.call_api(
-                "set_msg_emoji_like",
-                message_id=int(react.target_id),
-                emoji_id=react.emoji_id,
-                set=True,
-            )
-            outcome = "ok"
-        except ActionFailed as e:
-            logger.warning(f"贴表情失败: {e}")
-            outcome = "failed"
+    try:
+        await bot.call_api(
+            "set_msg_emoji_like",
+            message_id=int(react.target_id),
+            emoji_id=react.emoji_id,
+            set=True,
+        )
+        outcome = "ok"
+    except ActionFailed as e:
+        logger.warning(f"贴表情失败: {e}")
+        outcome = "failed"
     log_event(
         "react",
         session_id=session.id,
@@ -311,28 +295,21 @@ async def send_reaction(
 async def send_poke(
     session: Session, bot: Bot, event: Event, target: Poke, generation: int
 ) -> None:
-    """戳一戳不等发言冷却；同一个群两次之间至少隔 POKE_COOLDOWN_SECONDS。
+    """戳一戳不等发言冷却。
 
     自己戳的那条记录不在这里写：SnowLuma 会上报 bot 自己的戳一戳通知，由 handlers 按通知原文写进短期记忆。
     """
 
-    now = datetime.now()
-    if target.user_id == str(bot.self_id):
+    if target.user_id == str(bot.self_id) or session.stale(generation, "poke"):
         return
-    if (now - session.last_poke_time).total_seconds() < POKE_COOLDOWN_SECONDS:
-        outcome = "cooldown"
-    elif session.stale(generation, "poke"):
-        return
-    else:
-        session.last_poke_time = now
-        try:
-            await bot.call_api(
-                "group_poke", group_id=event.group_id, user_id=int(target.user_id)
-            )
-            outcome = "ok"
-        except ActionFailed as e:
-            logger.warning(f"戳一戳失败: {e}")
-            outcome = "failed"
+    try:
+        await bot.call_api(
+            "group_poke", group_id=event.group_id, user_id=int(target.user_id)
+        )
+        outcome = "ok"
+    except ActionFailed as e:
+        logger.warning(f"戳一戳失败: {e}")
+        outcome = "failed"
     log_event(
         "poke",
         session_id=session.id,
