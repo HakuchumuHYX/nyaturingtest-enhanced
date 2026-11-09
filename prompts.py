@@ -11,10 +11,11 @@ from .messages.faces import face_lines
 
 
 def is_rest_day(value: date) -> tuple[bool, str]:
-    """(是否休息日, 节日名)；按法定节假日与调休算。chinese_calendar 只覆盖到发布当年，超出就退回周末判断。"""
+    """(是否休息日, 节日名)；按法定节假日与调休算。chinese_calendar 只覆盖到发布当年，超出就退回周末判断。
+    调休上班日也带节日名（如国庆前补班的周六），所以「不休息 + 有节日名」就是调休上班。"""
 
     try:
-        _, holiday_name = chinese_calendar.get_holiday_detail(value)
+        _, holiday_name = chinese_calendar.get_holiday_detail(value, in_english=False)
         return chinese_calendar.is_holiday(value), holiday_name or ""
     except NotImplementedError as e:
         logger.warning(f"节假日判断失败: {e}")
@@ -38,7 +39,7 @@ def get_time_description(value: datetime) -> str:
         period = "晚上"
     is_rest, holiday_name = is_rest_day(value.date())
     if not is_rest:
-        status = "工作日"
+        status = f"{holiday_name}调休上班" if holiday_name else "工作日"
     elif holiday_name:
         status = f"节假日({holiday_name})"
     else:
@@ -1318,7 +1319,10 @@ def _next_days(day: date) -> str:
         value = day + timedelta(days=offset)
         is_rest, holiday_name = is_rest_day(value)
         weekday = "一二三四五六日"[value.weekday()]
-        label = f"（{holiday_name}）" if holiday_name else ("（休息日）" if is_rest else "")
+        if holiday_name:
+            label = f"（{holiday_name}）" if is_rest else f"（{holiday_name}调休上班）"
+        else:
+            label = "（休息日）" if is_rest else ""
         parts.append(f"{value:%m-%d} 周{weekday}{label}")
     return "、".join(parts)
 
