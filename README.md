@@ -98,12 +98,16 @@
 
 ## 安装
 
-把整个目录放进 NoneBot 项目的插件目录，并安装依赖：
+把整个目录放进 NoneBot 项目的插件目录，并安装依赖（Python 3.10+）：
 
-- Python 3.10+
-- `nonebot2[fastapi]`、`nonebot-adapter-onebot`、`nonebot-plugin-apscheduler`
-- `tortoise-orm`、`openai`、`httpx`、`json-repair`
-- `numpy`、`pillow`、`chinese-calendar`、`playwright`
+```bash
+pip install -r requirements.txt
+```
+
+**`chinese-calendar` 要每年升级。** 它按国务院每年公布的放假安排判断法定节假日和调休，
+用在时间描述、日记里的未来几天，以及冷场开话题挑工作日还是休息日的时段。库里只有已公布的年份，
+新一年的安排一般在 11 月前后公布，随后发新版；没升级就跨了年，它会退回只按周末判断，每次都打一条 warning。
+最好在每次启动前跑一次 `pip install -U chinese-calendar`（用 uv 就是 `uv sync --upgrade-package chinese-calendar`）。
 
 群志卡片和 Token 统计卡片都是网页截图，需要 playwright 的 Chromium（`playwright install chromium`），
 以及系统字体思源宋体、思源黑体（Debian 系装 `fonts-noto-cjk`）。
