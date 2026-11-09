@@ -33,12 +33,8 @@ from ..prompts import (  # noqa: E402
 )
 from .domain import PersonProfile  # noqa: E402
 from .groups import is_shutting_down, sessions  # noqa: E402
-from .orchestrator import (  # noqa: E402
-    CHAT_DIARY_DAYS,
-    MY_RECENT_REPLIES_LIMIT,
-    Reply,
-    format_history,
-)
+from .orchestrator import CHAT_DIARY_DAYS, MY_RECENT_REPLIES_LIMIT, format_history  # noqa: E402
+from .outputs import Reply  # noqa: E402
 from .send import dispatch_replies  # noqa: E402
 from .session import Session  # noqa: E402
 

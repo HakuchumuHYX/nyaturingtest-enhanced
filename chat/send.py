@@ -19,7 +19,7 @@ from ..persona.status import describe_now
 from ..prompts import PHOTO_BLOCKED_NOTE, PHOTO_FAILED_NOTE, PRESETS
 from ..storage.db import get_photo
 from .engagement import SPEAK_COOLDOWN_SECONDS
-from .orchestrator import PhotoWish, Poke, Reply
+from .outputs import PhotoWish, Poke, Reply
 from .session import Session
 
 # 只管拍不出来的时候：上游挂了时每轮都卡一次超时，等一会儿再试。发得勤不勤她自己看 photos_last_hour
