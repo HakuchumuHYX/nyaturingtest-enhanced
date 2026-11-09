@@ -25,7 +25,7 @@ from ..prompts import (
 require("nonebot_plugin_apscheduler")
 from nonebot_plugin_apscheduler import scheduler  # noqa: E402  必须在 require 之后导入
 
-MAX_IMAGE_BYTES = 8 * 1024 * 1024
+MAX_IMAGE_BYTES = 16 * 1024 * 1024
 MAX_IMAGE_PIXELS = 4096 * 4096
 MAX_IMAGE_SIDE = 1280
 MAX_CACHE_KEY_LEN = 128
