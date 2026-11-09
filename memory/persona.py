@@ -3,6 +3,7 @@
 群里的事不出群，也改不了人生事实。群层每天写一条观察日记，跨天反复出现的才收进群层。
 性格变化只认外部证据：ta说的话是按档案生成的，拿来证明性格会自我强化。ta的话只用来固定事实。
 ta自己的日记（时间线写成的）同理：是ta自己生成的，只算发生过的事。
+刷到的东西（feed）每晚按人生线和打算联网取一批，是外部来源：能带来兴趣和生活上的变化，不算性格证据。
 """
 
 from collections import defaultdict
@@ -12,19 +13,25 @@ from datetime import date, datetime, timedelta
 
 from nonebot import logger
 
-from ..llm import background_client
+from ..config import get_app_settings
+from ..llm import background_client, weather_on, web_search
+from ..messages.message import is_action_text
 from ..prompts import (
+    FEED_ITEMS,
+    FEED_QUERIES,
     JOURNAL_DAYS,
     MAX_LIFE_FACTS,
     PRESETS,
     RolePreset,
     diary_line,
     get_diary_prompt,
+    get_feed_pick_prompt,
+    get_feed_queries_prompt,
     get_persona_group_prompt,
     get_persona_life_prompt,
     segment_line,
 )
-from ..storage.db import load_persona_status, save_persona_diary
+from ..storage.db import load_persona_status, save_persona_diary, save_persona_feed
 from ..storage.models import (
     GlobalMessageModel,
     PersonaGroupModel,
@@ -46,6 +53,9 @@ LIFE_INTERVAL = timedelta(days=7)
 # ta自己的日记留几天、写日记时看前几天
 DIARY_DAYS = 14
 DIARY_PREVIOUS = 7
+# 刷到的东西留几天；每条字数上限只挡离谱的输出
+FEED_DAYS = 3
+FEED_ITEM_CHARS = 150
 
 _NOISE = {"[图片]", "[表情包]"}
 
@@ -87,25 +97,30 @@ def group_due(rows: list[dict], bot_name: str) -> bool:
 def group_material(rows: list[dict], bot_name: str) -> str:
     """一天的群聊素材：ta参与的对话（每次开口前几条 + ta的话），剩余预算均匀抽样群里其他时候的聊天。
 
+    ta的话放不下时先减少开口前的条数，连一条上下文都不带还放不下，才均匀丢掉整段。
+
     rows 按时间升序，每项含 time、user_name、content。
     """
 
-    # ta连续发的几条算一次开口
+    # ta连续发的几条算一次开口；ta贴表情、戳人的记录不算开口，归到其他聊天里抽样，不和ta的话抢预算
     turns: list[list[int]] = []
     for index, row in enumerate(rows):
-        if row["user_name"] != bot_name:
+        if row["user_name"] != bot_name or is_action_text(row["content"]):
             continue
         if turns and turns[-1][-1] == index - 1:
             turns[-1].append(index)
         else:
             turns.append([index])
 
-    windows = [
-        list(range(max(0, turn[0] - CONTEXT_BEFORE_TURN), turn[-1] + 1)) for turn in turns
-    ]
+    # 预算不够时先缩每次开口前的上下文，她说的话尽量一句不漏：认识的人、安排这些自我陈述只能从这里摘。
+    # 整段丢弃时热闹的日子只剩三分之一，而且最后一段几乎总被丢掉
     own_budget = int(GROUP_MATERIAL_CHARS * OWN_CONTEXT_SHARE)
-    size = sum(len(_line(rows[i])) for window in windows for i in window)
-    if size > own_budget:
+    for before in range(CONTEXT_BEFORE_TURN, -1, -1):
+        windows = [list(range(max(0, turn[0] - before), turn[-1] + 1)) for turn in turns]
+        size = sum(len(_line(rows[i])) for window in windows for i in window)
+        if size <= own_budget:
+            break
+    else:
         windows = _evenly(windows, max(1, len(windows) * own_budget // size))
 
     used = {i for window in windows for i in window}
@@ -188,13 +203,14 @@ async def digest_life(
     life_facts: list[str],
     group_styles: list[str],
     diary: list[str],
+    feed: list[str],
     day: date,
     session_id: str,
 ) -> LifeDigest | None:
-    """整理人生线，失败返回 None。diary 是上次整理以来ta自己的日记。"""
+    """整理人生线，失败返回 None。diary 是上次整理以来ta自己的日记，feed 是这几天刷到的。"""
 
     data = await background_client.generate_json(
-        get_persona_life_prompt(persona, life, life_facts, group_styles, diary, day),
+        get_persona_life_prompt(persona, life, life_facts, group_styles, diary, feed, day),
         session_id=session_id,
     )
     if data is None or not isinstance(data.get("life"), str):
@@ -209,12 +225,26 @@ def day_segments(timeline: list[dict], until: datetime, day: date) -> list[str]:
     """时间线里这一天开始的各段；每段到下一段开始为止，最后一段到 until。"""
 
     lines = []
+    previous = None
     for index, segment in enumerate(timeline):
         if segment["start"].date() != day:
             continue
         end = timeline[index + 1]["start"] if index + 1 < len(timeline) else until
-        lines.append(segment_line(segment, end))
+        lines.append(segment_line(segment, end, previous))
+        previous = segment
     return lines
+
+
+async def day_weather(timeline: list[dict], day: date) -> list[str]:
+    """这一天待过的各个城市的天气，按先后；取不到的省掉。"""
+
+    places = {
+        segment["city"]: (segment["lat"], segment["lon"])
+        for segment in timeline
+        if segment["start"].date() == day
+    }
+    texts = [await weather_on(city, lat, lon, day.isoformat()) for city, (lat, lon) in places.items()]
+    return [text for text in texts if text]
 
 
 async def write_diary(
@@ -226,6 +256,7 @@ async def write_diary(
     timeline: list[str],
     life_facts: list[str],
     plan: str,
+    weather: list[str],
     session_id: str,
 ) -> tuple[str, str] | None:
     """写ta一天的日记和接下来的打算，返回（日记, 打算），失败返回 None。打算可以为空。"""
@@ -239,6 +270,7 @@ async def write_diary(
             timeline=timeline,
             life_facts=life_facts,
             plan=plan,
+            weather=weather,
         ),
         session_id=session_id,
     )
@@ -326,6 +358,7 @@ async def _maintain_preset(
                 life_facts=[],
                 group_styles=[],
                 diary=[],
+                feed=[],
                 day=yesterday,
                 session_id=life_session,
             )
@@ -407,6 +440,7 @@ async def _maintain_preset(
                     life_facts=life.pending_facts,
                     group_styles=styles,
                     diary=diary,
+                    feed=[diary_line(entry) for entry in (status["feed"] if status else [])],
                     day=day,
                     session_id=life_session,
                 )
@@ -419,6 +453,11 @@ async def _maintain_preset(
                 life_failed = True
         day += timedelta(days=1)
 
+    # 刷到的东西在人生线之后取：要按最新的兴趣和打算搜（写日记时已把新打算写回 status）
+    feed_count = None
+    if status is not None and get_app_settings().web_search.api_key:
+        feed_count = await refresh_feed(persona, filename, life.text, status)
+
     logger.info(
         f"[Persona] {filename} 整理到 {yesterday}：群层更新 {len(updated)} 个群，"
         f"整理失败停在半路的群 {sorted(blocked) or '无'}"
@@ -429,7 +468,57 @@ async def _maintain_preset(
         "groups_updated": sorted(updated),
         "groups_blocked": sorted(blocked),
         "diary_failed": diary_blocked,
+        "feed": feed_count,
     }
+
+
+async def refresh_feed(persona: RolePreset, filename: str, life: str, status: dict) -> int | None:
+    """按人生线和打算联网搜一次，挑出她今天会刷到的，并入最近 FEED_DAYS 天；返回新收了几条，失败返回 None。
+
+    只看人生线、打算和她在哪个城市，三者都不含群里的内容，所以刷到的东西可以各群共享。
+    """
+
+    today = date.today()
+    session_id = f"persona:{filename}"
+    feed = [
+        entry
+        for entry in status["feed"]
+        if entry["day"] > (today - timedelta(days=FEED_DAYS)).isoformat() and entry["day"] != today.isoformat()
+    ]
+    recent = [diary_line(entry) for entry in feed]
+    city = status["timeline"][-1]["city"] if status["timeline"] else ""
+
+    data = await background_client.generate_json(
+        get_feed_queries_prompt(persona, life=life, plan=status["plan"], city=city, day=today, recent=recent),
+        session_id=session_id,
+    )
+    queries = data.get("queries") if isinstance(data, dict) else None
+    if not isinstance(queries, list):
+        logger.warning(f"[Persona] {persona.name} 刷到的东西：搜索词输出无效")
+        return None
+    results: list[str] = []
+    for item in queries[:FEED_QUERIES]:
+        if isinstance(item, dict) and str(item.get("query") or "").strip():
+            results += await web_search(
+                str(item["query"]).strip(), str(item.get("why") or ""), session_id=session_id
+            )
+    if not results:
+        logger.warning(f"[Persona] {persona.name} 刷到的东西：什么都没搜到")
+        return None
+
+    data = await background_client.generate_json(
+        get_feed_pick_prompt(persona, life=life, day=today, results=results, recent=recent),
+        session_id=session_id,
+    )
+    items = data.get("items") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        logger.warning(f"[Persona] {persona.name} 刷到的东西：挑选输出无效")
+        return None
+    picked = [str(text).strip()[:FEED_ITEM_CHARS] for text in items if str(text).strip()][:FEED_ITEMS]
+    feed += [{"day": today.isoformat(), "text": text} for text in picked]
+    await save_persona_feed(filename, feed)
+    logger.info(f"[Persona] {persona.name} 刷到的东西：搜了 {len(queries)} 次，收 {len(picked)} 条")
+    return len(picked)
 
 
 async def _write_day_diary(
@@ -439,6 +528,7 @@ async def _write_day_diary(
 
     timeline = day_segments(status["timeline"], status["until"], day)
     if timeline:
+        weather = await day_weather(status["timeline"], day)
         written = await _retry(
             lambda: write_diary(
                 persona,
@@ -448,6 +538,7 @@ async def _write_day_diary(
                 timeline=timeline,
                 life_facts=facts,
                 plan=status["plan"],
+                weather=weather,
                 session_id=f"persona:{filename}",
             )
         )

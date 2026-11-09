@@ -310,6 +310,91 @@ async def web_search(query: str, ori_question: str, *, session_id: str) -> list[
     return lines
 
 
+# Open-Meteo：免费、不要 key；按坐标取，城市和坐标由状态模型给（它的按名查坐标常落错地方）
+WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
+WEATHER_TIMEOUT = 10.0
+WEATHER_CACHE_SECONDS = 1800
+_WMO_CODES = {
+    0: "晴", 1: "晴间多云", 2: "多云", 3: "阴", 45: "雾", 48: "雾",
+    51: "毛毛雨", 53: "毛毛雨", 55: "毛毛雨", 56: "冻雨", 57: "冻雨",
+    61: "小雨", 63: "中雨", 65: "大雨", 66: "冻雨", 67: "冻雨",
+    71: "小雪", 73: "中雪", 75: "大雪", 77: "小雪", 80: "阵雨", 81: "阵雨", 82: "强阵雨",
+    85: "阵雪", 86: "阵雪", 95: "雷阵雨", 96: "雷阵雨伴冰雹", 99: "雷阵雨伴冰雹",
+}
+_weather_cache: dict[tuple[float, float], tuple[float, dict]] = {}
+
+
+async def _fetch_weather(lat: float, lon: float) -> dict | None:
+    """当前天气和昨天到明天的逐日天气；失败返回 None。"""
+
+    key = (round(lat, 1), round(lon, 1))
+    cached = _weather_cache.get(key)
+    if cached is not None and time.monotonic() - cached[0] < WEATHER_CACHE_SECONDS:
+        return cached[1]
+    try:
+        response = await get_http_client().get(
+            WEATHER_URL,
+            params={
+                "latitude": key[0],
+                "longitude": key[1],
+                "current": "temperature_2m,apparent_temperature,weather_code",
+                "daily": "weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max",
+                "timezone": "auto",
+                "past_days": 1,
+                "forecast_days": 2,
+            },
+            timeout=WEATHER_TIMEOUT,
+        )
+        response.raise_for_status()
+        data = response.json()
+    except Exception as e:
+        log_event("weather_failed", "WARNING", lat=lat, lon=lon, error=f"{type(e).__name__}: {e}"[:200])
+        return None
+    _weather_cache[key] = (time.monotonic(), data)
+    return data
+
+
+def _day_weather(daily: dict, day: str) -> str:
+    if day not in daily["time"]:
+        return ""
+    index = daily["time"].index(day)
+    text = (
+        f"{round(daily['temperature_2m_min'][index])}～{round(daily['temperature_2m_max'][index])}°C "
+        f"{_WMO_CODES.get(daily['weather_code'][index], '')}"
+    )
+    rain = daily["precipitation_probability_max"][index]
+    if rain:
+        text += f"（降水概率 {rain}%）"
+    return text
+
+
+async def weather_now(city: str, lat: float, lon: float) -> str:
+    """「北京，现在 9°C 晴，体感 6°C；今天 3～12°C 晴；明天 …」；取不到返回空串。"""
+
+    data = await _fetch_weather(lat, lon)
+    if data is None:
+        return ""
+    current, daily = data["current"], data["daily"]
+    # timezone=auto 时日期是当地的；去外地时用当地的「今天」
+    today = current["time"][:10]
+    tomorrow = daily["time"][-1]
+    return (
+        f"{city}，现在 {round(current['temperature_2m'])}°C {_WMO_CODES.get(current['weather_code'], '')}，"
+        f"体感 {round(current['apparent_temperature'])}°C；今天 {_day_weather(daily, today)}；"
+        f"明天 {_day_weather(daily, tomorrow)}"
+    )
+
+
+async def weather_on(city: str, lat: float, lon: float, day: str) -> str:
+    """「北京 3～12°C 晴」，给日记用；day 是 YYYY-MM-DD，只有昨天到明天取得到，取不到返回空串。"""
+
+    data = await _fetch_weather(lat, lon)
+    if data is None:
+        return ""
+    text = _day_weather(data["daily"], day)
+    return f"{city} {text}" if text else ""
+
+
 @dataclass(frozen=True)
 class ImageResult:
     # ok / blocked（上游拒绝这条请求，多半是内容审核）/ failed（超时、上游故障）

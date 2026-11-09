@@ -3,8 +3,9 @@
 一个预设一份，所有群共用：她是一个人，在 A 群说去开组会了，B 群也不能还在水。
 一次只定眼下这一段，每段都从上一段接着走，不在一天开始时排好。状态只在这几种时候变：
 到点（due）、聊天时她自己定了（chat）、away 时被叫到并拿起了手机（called）、启动或断了很久（start）、/calm（calm）。
-状态里只有她自己在做什么，不带任何群的内容：被叫到时不给群名，状态模型只看她开口的时间、不看说了什么。
+状态里只有她自己的生活（可以有她身边的人，不能有群友和群里的事）：被叫到时不给群名，状态模型只看她开口的时间、不看说了什么。
 能看到聊天内容的只有 Chat，所以聊天要改她接下来做什么走 Chat 的 status。
+每段带着她在哪个城市和坐标：她会回家、出去玩，天气跟着她走。城市由状态模型或 Chat 给，不填就是没换。
 """
 
 import asyncio
@@ -16,7 +17,9 @@ from nonebot import logger, require
 require("nonebot_plugin_apscheduler")
 from nonebot_plugin_apscheduler import scheduler  # noqa: E402  必须在 require 之后导入
 
-from ..llm import background_client  # noqa: E402
+from ..config import get_app_settings  # noqa: E402
+from ..llm import background_client, weather_now  # noqa: E402
+from ..memory.vector import rerank  # noqa: E402
 from ..metrics import log_event  # noqa: E402
 from ..prompts import (  # noqa: E402
     PRESETS,
@@ -40,19 +43,22 @@ CHECK_INTERVAL_SECONDS = 60
 MIN_MINUTES = 10
 MAX_MINUTES = 720
 DOING_CHARS = 40
+CITY_CHARS = 20
 # 模型失败或输出无效时，原状态先延长这么久再定
 RETRY_MINUTES = 10
 # 到点后过了这么久才定下一段，说明服务停过，要告诉模型中间断了多久
 GAP_NOTE_MINUTES = 30
 # 被叫到时最多这么久问一次状态模型；节流期间攒下的到点一起问
 CALL_THROTTLE = timedelta(minutes=10)
-# 给状态模型看的：时间线最近几段、几天日记；开口情况按两个窗口比，看得出聊天是热起来还是冷下去
-TIMELINE_PROMPT_SEGMENTS = 16
-STATUS_DIARY_DAYS = 7
+# 给状态模型看的：几天日记；开口情况按两个窗口比，看得出聊天是热起来还是冷下去
+# 只给最近几天：一周的日记摆在面前，它会照着过成同一天
+STATUS_DIARY_DAYS = 3
 CHAT_ACTIVITY_WINDOW = timedelta(minutes=30)
 # 时间线写进日记后只留最近这么久；还没写日记的那几天整段留着
 TIMELINE_KEEP = timedelta(hours=18)
 NIGHTS_KEEP = 7
+# 给 Chat 的刷到的东西：和这段聊天沾边的最多几条
+FEED_CHAT_K = 2
 
 SOURCE_DUE = "due"
 SOURCE_CHAT = "chat"
@@ -64,7 +70,7 @@ SOURCE_CALM = "calm"
 @dataclass
 class PersonaStatus:
     preset: str
-    # 每段 {"start", "mode", "doing", "sleep", "source"}，最后一段是现在
+    # 每段 {"start", "mode", "doing", "sleep", "source", "city", "lat", "lon"}，最后一段是现在
     timeline: list[dict] = field(default_factory=list)
     until: datetime = datetime.min
     # 每晚 {"sleep", "wake"}，还没醒时 wake 为 None
@@ -72,8 +78,9 @@ class PersonaStatus:
     # 每天 {"day": "YYYY-MM-DD", "text"}，只由每日整理写
     diary: list[dict] = field(default_factory=list)
     diary_until: date | None = None
-    # 接下来几天的打算，只由每日整理写
+    # 接下来几天的打算、最近几天刷到的东西，只由每日整理写
     plan: str = ""
+    feed: list[dict] = field(default_factory=list)
     # 每次改状态加一；调模型前记下，回来时变了说明这期间她聊天时自己定了，以她定的为准
     version: int = 0
     deciding: asyncio.Task | None = None
@@ -125,6 +132,7 @@ async def _load(preset: str) -> PersonaStatus:
         status.diary = data["diary"]
         status.diary_until = data["diary_until"]
         status.plan = data["plan"]
+        status.feed = data["feed"]
     # await 期间可能已经有别的调用载入过
     return _statuses.setdefault(preset, status)
 
@@ -138,14 +146,21 @@ def _segment_end(status: PersonaStatus, index: int) -> datetime:
 
 
 def _timeline_lines(status: PersonaStatus) -> list[str]:
-    start = max(0, len(status.timeline) - TIMELINE_PROMPT_SEGMENTS)
+    """从上一次睡下开始的各段，最后一段是现在。
+
+    只给最近十几段时，一段二三十分钟，到傍晚上午的事就掉出去了：上午取过的快递，晚上又去取一次。
+    """
+
+    sleeps = [index for index, segment in enumerate(status.timeline[:-1]) if segment["sleep"]]
+    start = sleeps[-1] if sleeps else 0
     lines = []
     for index in range(start, len(status.timeline)):
         segment = status.timeline[index]
+        previous = status.timeline[index - 1] if index > start else None
         if index == len(status.timeline) - 1:
-            lines.append(f"{segment_line(segment, None)}（原定到 {status.until:%H:%M}）")
+            lines.append(f"{segment_line(segment, None, previous)}（原定到 {status.until:%H:%M}）")
         else:
-            lines.append(segment_line(segment, _segment_end(status, index)))
+            lines.append(segment_line(segment, _segment_end(status, index), previous))
     return lines
 
 
@@ -164,6 +179,41 @@ def recent_diary(preset: str, days: int) -> list[str]:
 def recent_plan(preset: str) -> str:
     status = _statuses.get(preset)
     return status.plan if status else ""
+
+
+def recent_feed(preset: str) -> list[str]:
+    status = _statuses.get(preset)
+    return [diary_line(entry) for entry in status.feed] if status else []
+
+
+async def current_weather(preset: str) -> str:
+    """她现在所在城市的天气；还没定过状态或取不到返回空串。"""
+
+    status = _statuses.get(preset)
+    if status is None or status.current is None:
+        return ""
+    current = status.current
+    return await weather_now(current["city"], current["lat"], current["lon"])
+
+
+async def feed_candidates(preset: str, queries: list[str]) -> list[str]:
+    """刷到的东西里和这段聊天沾边的，给 Chat；和相册一样话题碰到才想起，每轮都给她会反复提。
+
+    一共十几条，不做向量召回，直接重排；第一条 query 是最新的消息。
+    """
+
+    feed = recent_feed(preset)
+    if not feed or not queries:
+        return []
+    try:
+        results = await rerank(queries[0], feed)
+    except Exception as e:
+        logger.warning(f"重排刷到的东西失败，这轮不给: {e}")
+        return []
+    threshold = get_app_settings().rerank_threshold
+    return [
+        feed[item["index"]] for item in results if item.get("relevance_score", 0.0) >= threshold
+    ][:FEED_CHAT_K]
 
 
 def _just_back(status: PersonaStatus, last_look: datetime) -> str:
@@ -199,10 +249,14 @@ def today_lines(preset: str) -> list[str]:
     today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
     woke = [night["wake"] for night in status.nights if night["wake"] and night["wake"] >= today]
     since = woke[-1] if woke else today
+    indexes = [index for index in range(len(status.timeline) - 1) if _segment_end(status, index) > since]
     return [
-        segment_line(segment, _segment_end(status, index))
-        for index, segment in enumerate(status.timeline[:-1])
-        if _segment_end(status, index) > since
+        segment_line(
+            status.timeline[index],
+            _segment_end(status, index),
+            status.timeline[index - 1] if index != indexes[0] else None,
+        )
+        for index in indexes
     ]
 
 
@@ -233,10 +287,27 @@ async def _chat_activity(preset: str, now: datetime) -> str:
     )
 
 
-def parse_segment(data) -> dict | None:
-    """状态模型和 Chat 的 status 字段共用的入口校验；无效返回 None。返回 {"mode", "doing", "minutes", "sleep"}。"""
+def parse_segment(data, need_place: bool = False) -> dict | None:
+    """状态模型和 Chat 的 status 字段共用的入口校验；无效返回 None。
+
+    返回 {"mode", "doing", "minutes", "sleep", "place"}；place 是 {"city", "lat", "lon"}，没换城市时为 None。
+    need_place：还没有任何一段（第一次定状态），必须给出城市。
+    """
 
     if not isinstance(data, dict):
+        return None
+    place = None
+    city = str(data.get("city") or "").strip()
+    if city:
+        try:
+            lat, lon = float(data.get("lat")), float(data.get("lon"))
+        except (TypeError, ValueError):
+            return None
+        # 城市换了、天气没换，比没有天气更糟：坐标不对整段作废
+        if len(city) > CITY_CHARS or not (-90 <= lat <= 90 and -180 <= lon <= 180):
+            return None
+        place = {"city": city, "lat": lat, "lon": lon}
+    elif need_place:
         return None
     mode = data.get("mode")
     doing = str(data.get("doing") or "").strip()[:DOING_CHARS]
@@ -252,6 +323,7 @@ def parse_segment(data) -> dict | None:
         "doing": doing,
         "minutes": max(MIN_MINUTES, min(MAX_MINUTES, minutes)),
         "sleep": sleep,
+        "place": place,
     }
 
 
@@ -302,6 +374,7 @@ async def _apply(status: PersonaStatus, segment: dict, source: str, reason: str)
 
     now = datetime.now()
     was_away = status.away
+    place = segment["place"] or {key: status.current[key] for key in ("city", "lat", "lon")}
     status.timeline.append(
         {
             "start": now,
@@ -309,6 +382,7 @@ async def _apply(status: PersonaStatus, segment: dict, source: str, reason: str)
             "doing": segment["doing"],
             "sleep": segment["sleep"],
             "source": source,
+            **place,
         }
     )
     status.until = now + timedelta(minutes=segment["minutes"])
@@ -323,6 +397,7 @@ async def _apply(status: PersonaStatus, segment: dict, source: str, reason: str)
         source=source,
         mode=segment["mode"],
         doing=segment["doing"],
+        city=place["city"],
         until=f"{status.until:%m-%d %H:%M}",
         sleep=segment["sleep"],
         reason=reason,
@@ -341,6 +416,8 @@ async def _status_background(status: PersonaStatus, now: datetime) -> dict:
         "timeline": _timeline_lines(status),
         "chat_activity": await _chat_activity(status.preset, now),
         "time_info": get_time_description(now),
+        "weather": await current_weather(status.preset),
+        "feed": recent_feed(status.preset),
     }
 
 
@@ -362,7 +439,7 @@ async def _decide(status: PersonaStatus, source: str) -> None:
     if status.version != version:
         log_event("status_discarded", "DEBUG", preset=status.preset, source=source)
         return
-    segment = parse_segment(data)
+    segment = parse_segment(data, need_place=status.current is None)
     if segment is None:
         log_event("status_invalid", "WARNING", preset=status.preset, source=source, data=data)
         status.until = max(status.until, now) + timedelta(minutes=RETRY_MINUTES)
@@ -425,12 +502,13 @@ def note_call(preset: str, lines: list[str]) -> None:
 async def apply_chat_status(preset: str, raw) -> None:
     """Chat 的 status 字段：聊天改变了她接下来要做的事，直接成为新的一段。"""
 
-    segment = parse_segment(raw)
+    status = await _load(preset)
+    segment = parse_segment(raw, need_place=status.current is None)
     if segment is None:
         if raw is not None:
             logger.debug(f"Chat 的 status 无效，丢弃: {raw}")
         return
-    await _apply(await _load(preset), segment, SOURCE_CHAT, "聊天时定的")
+    await _apply(status, segment, SOURCE_CHAT, "聊天时定的")
 
 
 async def redecide(preset: str) -> None:
@@ -447,7 +525,8 @@ async def reload_diaries() -> None:
         data = await load_persona_status(status.preset)
         if data is None:
             continue
-        status.diary, status.diary_until, status.plan = data["diary"], data["diary_until"], data["plan"]
+        status.diary, status.diary_until = data["diary"], data["diary_until"]
+        status.plan, status.feed = data["plan"], data["feed"]
         _prune(status, datetime.now())
         await _save(status)
 
@@ -477,7 +556,7 @@ async def check_statuses() -> None:
 
 
 def status_text(preset: str) -> list[str]:
-    """/status 里的几行：现在在干嘛、今天的各段。"""
+    """/status 里的几行：现在在哪、在干嘛，今天的各段，刷到的东西。"""
 
     status = _statuses.get(preset)
     if status is None or status.current is None:
@@ -491,6 +570,9 @@ def status_text(preset: str) -> list[str]:
     if today:
         lines.append("今天：")
         lines.extend(f"- {line}" for line in today)
+    if status.feed:
+        lines.append("这两天刷到的：")
+        lines.extend(f"- {line}" for line in recent_feed(preset))
     return lines
 
 

@@ -9,6 +9,15 @@ SHORT_TERM_BUFFER_SIZE = 200
 # 但不是群友，不建档案、不算好感、不当记忆主体；按 id 认，群友改名片冒充不了
 GROUP_BOT_ID = "group_bot"
 GROUP_BOT_NAME = "群里的bot"
+# 戳一戳、贴表情记录的写法（convert 按这个写）；库里不存 is_action，读库时只能按写法认
+POKE_PREFIX = "[戳一戳: "
+REACTION_MARK = "贴了表情:"
+
+
+def is_action_text(content: str) -> bool:
+    """从库里读出的一条是不是戳一戳、贴表情的记录。"""
+
+    return content.startswith(POKE_PREFIX) or (content.startswith("[给") and REACTION_MARK in content)
 
 
 @dataclass

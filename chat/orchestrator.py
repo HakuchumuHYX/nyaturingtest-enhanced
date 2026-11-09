@@ -49,7 +49,9 @@ from .engagement import (
 from .session import Session, SessionState
 from .status import (
     apply_chat_status,
+    current_weather,
     describe_now,
+    feed_candidates,
     is_away,
     is_glancing,
     note_call,
@@ -1033,6 +1035,8 @@ async def chat_stage(
         missed=look.missed,
         today=today_lines(state.preset),
         now=look.now,
+        weather=await current_weather(state.preset),
+        feed=await feed_candidates(state.preset, _search_queries(state, unread)),
         photos=photos_on,
         album=album,
         photos_last_hour=session.photos_last_hour(),

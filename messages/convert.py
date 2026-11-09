@@ -29,7 +29,7 @@ from ..prompts import truncate_text
 from ..storage.db import get_latest_user_names, message_sender_name
 from .faces import ensure_faces, face_name
 from .image import cached_caption, caption_image, caption_sticker, fetch_image_input
-from .message import GROUP_BOT_ID, GROUP_BOT_NAME, ChatMessage, Reacted
+from .message import GROUP_BOT_ID, GROUP_BOT_NAME, POKE_PREFIX, REACTION_MARK, ChatMessage, Reacted
 from .stickers import collect, note_seen
 
 CARD_CHARS = 120
@@ -427,7 +427,7 @@ async def read_poke(bot: Bot, event: PokeNotifyEvent, bot_name: str) -> ChatMess
     return ChatMessage(
         time=datetime.now(),
         user_name=poker,
-        content=f"[戳一戳: {data.get('action') or '戳了戳'} {target}{data.get('suffix') or ''}]",
+        content=f"{POKE_PREFIX}{data.get('action') or '戳了戳'} {target}{data.get('suffix') or ''}]",
         user_id=poker_id,
         mentions={} if target_id == self_id else {target_id: target},
         to_me=target_id == self_id,
@@ -482,7 +482,7 @@ async def read_reaction(
         record.mentions = {uid: n for uid, n in reactors.items() if uid != user_id}
 
     owner = "你" if target.user_name == bot_name else f" {target.user_name} "
-    content = f"[给{owner}的消息「{target.content[:20]}」贴了表情:{face_name(emoji_id) or '未知'}"
+    content = f"[给{owner}的消息「{target.content[:20]}」{REACTION_MARK}{face_name(emoji_id) or '未知'}"
     if not by_bot and count > 1:
         content += f"，共 {count} 人：{'、'.join(reactors.values())}"
     record.content = content + "]"

@@ -32,7 +32,15 @@ from .orchestrator import (  # noqa: E402
 )
 from .send import dispatch_replies  # noqa: E402
 from .session import Session  # noqa: E402
-from .status import describe_now, is_away, recent_diary, recent_plan, today_lines  # noqa: E402
+from .status import (  # noqa: E402
+    current_weather,
+    describe_now,
+    is_away,
+    recent_diary,
+    recent_feed,
+    recent_plan,
+    today_lines,
+)
 
 SCAN_INTERVAL_MINUTES = 10
 # 群里最后一条消息距今至少这么久才算冷场
@@ -157,6 +165,8 @@ async def _initiate(session: Session, silence: int) -> None:
         group_info=await session.refresh_group_info(),
         today=today_lines(state.preset),
         now=describe_now(state.preset, max(state.last_look_time, state.last_read_time or datetime.min)),
+        weather=await current_weather(state.preset),
+        feed=recent_feed(state.preset),
     )
     parsed = await chat_client.generate_json(
         prompt,

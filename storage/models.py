@@ -174,11 +174,11 @@ class PersonaGroupModel(Model):
 class PersonaStatusModel(Model):
     """她自己的时间线：每个预设一份，各群共享。
 
-    timeline、until、nights 由 chat/status.py 随时写；diary、diary_until、plan 只由每日整理写，两边各写各的列。
+    timeline、until、nights 由 chat/status.py 随时写；diary、diary_until、plan、feed 只由每日整理写，两边各写各的列。
     """
 
     preset = fields.CharField(pk=True, max_length=255)
-    # 还没写进日记的各段，最后一段是现在：{"start": ISO 时间, "mode", "doing", "sleep", "source"}
+    # 还没写进日记的各段，最后一段是现在：{"start": ISO 时间, "mode", "doing", "sleep", "source", "city", "lat", "lon"}
     timeline = fields.JSONField(default=list)
     # 现在这一段大概到几点
     until = fields.DatetimeField(null=True)
@@ -190,6 +190,8 @@ class PersonaStatusModel(Model):
     diary_until = fields.DateField(null=True)
     # 接下来几天的打算，只留最新一份。不放进 diary：日记会进人生线，打算还没发生
     plan = fields.TextField(default="")
+    # 最近几天刷到的东西：{"day": "YYYY-MM-DD", "text"}，每晚按兴趣联网取一批
+    feed = fields.JSONField(default=list)
 
     class Meta:
         table = "nyabot_persona_status"

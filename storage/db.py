@@ -123,6 +123,7 @@ async def load_persona_status(preset: str) -> dict | None:
         "diary": row.diary,
         "diary_until": row.diary_until,
         "plan": row.plan,
+        "feed": row.feed,
     }
 
 
@@ -138,6 +139,10 @@ async def save_persona_status(
 
 async def save_persona_diary(preset: str, diary: list[dict], plan: str, diary_until: date) -> None:
     await PersonaStatusModel.filter(preset=preset).update(diary=diary, plan=plan, diary_until=diary_until)
+
+
+async def save_persona_feed(preset: str, feed: list[dict]) -> None:
+    await PersonaStatusModel.filter(preset=preset).update(feed=feed)
 
 
 async def load_life_text(preset: str) -> str:
