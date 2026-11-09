@@ -61,8 +61,12 @@ def photo_path(digest: str):
     return PHOTO_DIR / f"{digest}.jpg"
 
 
+# 她发的照片写进短期记忆的样子；photodel 按它认出是哪张
+PHOTO_MARK = "[图片: {}]"
+
+
 def memory_text(caption: str) -> str:
-    return f"[图片: {caption}]"
+    return PHOTO_MARK.format(caption)
 
 
 def _search_text(caption: str, taken_at: datetime) -> str:
@@ -179,18 +183,13 @@ async def candidates(preset: str, queries: list[str]) -> list[dict]:
         scores = (matrix @ query_vectors.T).max(axis=1)
         top = [rows[index] for index in np.argsort(-scores)[:RECALL_K]]
         # 向量分在闲聊上分不出相关和无关，和记忆检索一样靠重排；第一条 query 是最新的消息
-        results = await rerank(
+        reranked = await rerank(
             queries[0], [_search_text(row.caption, row.created_at) for row in top]
         )
     except Exception as e:
         logger.warning(f"检索相册失败，这轮不给旧照片: {e}")
         return []
-    threshold = get_app_settings().rerank_threshold
-    picked = [
-        top[item["index"]]
-        for item in results
-        if item.get("relevance_score", 0.0) >= threshold
-    ][:ALBUM_K]
+    picked = [top[index] for index, _ in reranked or []][:ALBUM_K]
     return [
         {
             "ref": f"p{row.id}",
@@ -225,7 +224,7 @@ async def _delete(rows: list) -> None:
 async def remove_by_message(session_id: str, content: str | None) -> bool:
     """photodel：普通图片经 QQ 后字节可能变，按被回复那条消息记的 [图片: 描述] 找到相册里那张。"""
 
-    prefix, suffix = "[图片: ", "]"
+    prefix, suffix = PHOTO_MARK.split("{}")
     if not content or not content.startswith(prefix) or not content.endswith(suffix):
         return False
     row = await db.find_photo_by_caption(content[len(prefix) : -len(suffix)])

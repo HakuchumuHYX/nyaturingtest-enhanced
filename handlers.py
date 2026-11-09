@@ -40,12 +40,8 @@ from .chat.groups import (
     sessions,
 )
 from .chat.session import Session
-from .config import get_app_settings, get_token_stats_model_names
-from .llm import background_client, chat_client, feedback_client
-from .memory.digest import GROUP_NOTES_REFRESH_MIN_NEW, count_new_group_fragments
-from .memory.maintenance import refresh_group_notes
+from .config import get_token_stats_model_names
 from .memory.query import acquire_query_slot, impression_text, query_memory_profile
-from .memory.vector import RAG_FINAL_K, RetrievedMemory
 from .messages.convert import (
     forward_id,
     member_name,
@@ -81,12 +77,11 @@ class CommandMeta:
 COMMANDS: tuple[CommandMeta, ...] = (
     CommandMeta("autochat <enable/disable>", "在本群启用或禁用 Autochat"),
     CommandMeta(
-        "status", "查看她现在在做什么、今天的时间线、Bot 状态和 provider 错误", "status <群号>"
+        "status", "查看她现在在做什么、今天的时间线和本群状态", "status <群号>"
     ),
     CommandMeta("presets", "查看可用预设", "presets <群号>"),
     CommandMeta("set_preset <文件名>", "加载预设", "set_preset <群号> <文件名>"),
     CommandMeta("persona", "查看人生线、本群的她和最近的改动", "persona <群号>"),
-    CommandMeta("rag_debug <query>", "诊断 RAG 记忆检索"),
     CommandMeta("group_notes", "查看本群群志原文", "group_notes <群号>"),
     CommandMeta("calm", "重置心情、退出当前对话，并重新定一次她在做什么", "calm <群号>"),
     CommandMeta("reset confirm", "先备份再完全重置本群", "reset <群号> confirm"),
@@ -528,7 +523,6 @@ async def _do_status(matcher: type[Matcher], group_id: int, _args: str):
     last_look = "（本次启动还没看过）"
     if state.last_look_time != datetime.min:
         last_look = f"{state.last_look_time:%H:%M:%S}"
-    settings = get_app_settings()
     muted = f"，禁言到 {session.muted_until:%m-%d %H:%M}" if session.muted else ""
     lines = [
         "",
@@ -540,25 +534,7 @@ async def _do_status(matcher: type[Matcher], group_id: int, _args: str):
         f"摘要：{state.chat_summary}",
         "最近消息：",
         recent or "无",
-        "",
-        "Provider:",
-        f"- Chat reasoning_effort: {settings.chat.reasoning_effort or '未指定（由上游决定）'}",
-        f"- Feedback reasoning_effort: {settings.feedback.reasoning_effort or '未指定（由上游决定）'}",
-        f"- Background reasoning_effort: {settings.background.reasoning_effort or '未指定（由上游决定）'}",
-        f"- Queue length: {len(session.messages_chunk)}",
     ]
-    for name, client in (
-        ("Chat", chat_client),
-        ("Feedback", feedback_client),
-        ("Background", background_client),
-    ):
-        provider_status = client.provider_status
-        if provider_status.last_error_type:
-            lines.append(
-                f"- {name} last_error={provider_status.last_error_type} "
-                "circuit_remaining="
-                f"{provider_status.circuit_remaining_seconds}s"
-            )
     await matcher.finish("\n".join(lines))
 
 
@@ -635,14 +611,6 @@ get_persona = _dual_command("persona", {"人设"}, _do_persona)
 
 async def _do_group_notes(matcher: type[Matcher], group_id: int, _args: str):
     await _session_or_finish(matcher, group_id)
-    pending = await count_new_group_fragments(str(group_id))
-    if pending >= GROUP_NOTES_REFRESH_MIN_NEW:
-        await matcher.send(f"有 {pending} 条新记忆还没整理进群志，正在整理，稍等一下")
-        try:
-            await refresh_group_notes(group_id, min_new=GROUP_NOTES_REFRESH_MIN_NEW)
-        except Exception as e:
-            # 整理失败照常发旧群志，水位没动，下次查看或夜里再整理
-            logger.warning(f"群 {group_id} 手动整理群志失败: {e}")
     # 读库而不是内存副本：要带上整理水位做日期
     session_db = await SessionModel.get_or_none(id=str(group_id))
     if session_db is None or not session_db.group_notes:
@@ -790,67 +758,6 @@ async def handle_photo_del(event: GroupMessageEvent):
     content = buffered.content if buffered else await message_content(session_id, msg_id)
     removed = await remove_photo_by_message(session_id, content)
     await photo_del.finish("已从相册删掉" if removed else "相册里没有这张")
-
-
-rag_debug = on_command(
-    "rag_debug",
-    aliases={"记忆诊断"},
-    rule=is_group_message,
-    permission=SUPERUSER,
-    priority=0,
-    block=True,
-)
-
-
-def _format_rag_debug_score(value: float | None) -> str:
-    return "-" if value is None else f"{value:.4f}"
-
-
-def _format_rag_debug_record(index: int, record: RetrievedMemory) -> str:
-    row = record.row
-    content = row.content.replace("\n", " ")
-    return (
-        f"{index}. ref={row.id} "
-        f"category={row.category} "
-        f"subject={row.subject_user_id or '-'} "
-        f"speaker={row.speaker_user_id or '-'} "
-        f"scope={record.scope} "
-        f"adjusted_score={_format_rag_debug_score(record.adjusted_score)} "
-        f"retrieval_score={_format_rag_debug_score(record.retrieval_score)} "
-        f"rerank_score={_format_rag_debug_score(record.rerank_score)}\n"
-        f"   preview={content[:80]}"
-    )
-
-
-@rag_debug.handle()
-async def handle_rag_debug(
-    event: GroupMessageEvent,
-    args: Message = CommandArg(),
-):
-    query = args.extract_plain_text().strip()
-    if not query:
-        await rag_debug.finish("用法: rag_debug <query>")
-    session = await _session_or_finish(rag_debug, event.group_id)
-
-    result = await session.vector_memory.retrieve([query], k=RAG_FINAL_K)
-    lines = [
-        "RAG debug",
-        f"query: {query}",
-        f"candidate_count: {result.stats.get('candidate_count', 0)}",
-        f"returned_count: {result.stats.get('returned_count', 0)}",
-        f"fallback_reason: {result.stats.get('fallback_reason') or 'none'}",
-        "score_fields: adjusted_score, retrieval_score, rerank_score",
-        "top_records:",
-    ]
-    records = result.records[:5]
-    if records:
-        lines.extend(
-            _format_rag_debug_record(index, record)
-            for index, record in enumerate(records, start=1)
-        )
-    else:
-        lines.append("(none)")
-    await rag_debug.finish("\n".join(lines))
 
 
 query_memory = on_command(

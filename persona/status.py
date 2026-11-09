@@ -18,7 +18,6 @@ require("nonebot_plugin_apscheduler")
 from nonebot_plugin_apscheduler import scheduler  # noqa: E402  必须在 require 之后导入
 
 from ..chat.groups import is_shutting_down, sessions  # noqa: E402
-from ..config import get_app_settings  # noqa: E402
 from ..llm import background_client, weather_now  # noqa: E402
 from ..memory.vector import rerank  # noqa: E402
 from ..metrics import log_event  # noqa: E402
@@ -205,15 +204,8 @@ async def feed_candidates(preset: str, queries: list[str]) -> list[str]:
     feed = recent_feed(preset)
     if not feed or not queries:
         return []
-    try:
-        results = await rerank(queries[0], feed)
-    except Exception as e:
-        logger.warning(f"重排刷到的东西失败，这轮不给: {e}")
-        return []
-    threshold = get_app_settings().rerank_threshold
-    return [
-        feed[item["index"]] for item in results if item.get("relevance_score", 0.0) >= threshold
-    ][:FEED_CHAT_K]
+    # 重排失败就这轮不给
+    return [feed[index] for index, _ in await rerank(queries[0], feed) or []][:FEED_CHAT_K]
 
 
 def _just_back(status: PersonaStatus, last_look: datetime) -> str:

@@ -6,7 +6,7 @@ from nonebot import logger
 from tortoise import Tortoise
 from tortoise.transactions import in_transaction
 
-from ..messages.message import SHORT_TERM_BUFFER_SIZE, ChatMessage
+from ..messages.message import SHORT_TERM_BUFFER_SIZE, ChatMessage, is_action_text
 from .models import (
     DailyTokenUsageModel,
     EnabledGroupModel,
@@ -328,20 +328,12 @@ async def get_messages_between(
 async def get_history_before(
     session_id: str, time_point: datetime, limit: int = 20
 ) -> list[ChatMessage]:
-    session_db = await SessionModel.get_or_none(id=session_id)
-    if not session_db:
-        return []
-
-    history_rows = (
-        await GlobalMessageModel.filter(
-            session=session_db,
-            time__lt=time_point,
-        )
+    rows = (
+        await GlobalMessageModel.filter(session_id=session_id, time__lt=time_point)
         .order_by("-time")
         .limit(limit)
     )
-
-    return [_row_message(m) for m in sorted(history_rows, key=lambda x: x.time)]
+    return [_row_message(m) for m in reversed(rows)]
 
 
 async def get_catch_up(
@@ -374,38 +366,13 @@ async def get_catch_up(
     )
 
 
-async def get_recent_messages_by_user(
-    session_id: str,
-    user_id: str = "",
-    user_name: str = "",
-    limit: int = 10,
-) -> list[str]:
-    session_db = await SessionModel.get_or_none(id=session_id)
-    if not session_db:
-        return []
-
-    db_msgs = []
-    if user_id and str(user_id).strip():
-        db_msgs = (
-            await GlobalMessageModel.filter(
-                session=session_db,
-                user_id=str(user_id),
-            )
-            .order_by("-time")
-            .limit(limit)
-        )
-
-    if not db_msgs and user_name:
-        db_msgs = (
-            await GlobalMessageModel.filter(
-                session=session_db,
-                user_name=user_name,
-            )
-            .order_by("-time")
-            .limit(limit)
-        )
-
-    return [m.content for m in reversed(db_msgs)]
+async def get_recent_messages_by_user(session_id: str, user_id: str, limit: int) -> list[str]:
+    rows = (
+        await GlobalMessageModel.filter(session_id=session_id, user_id=user_id)
+        .order_by("-time")
+        .limit(limit)
+    )
+    return [m.content for m in reversed(rows)]
 
 
 async def get_latest_user_names(session_id: str) -> dict[str, str]:
@@ -667,13 +634,12 @@ async def message_buckets(since: datetime) -> list[dict]:
 async def self_speak_times(session_id: str, name: str, since: datetime) -> list[datetime]:
     """她从 since 起开口的时刻。她名下还有戳一戳、贴表情的记录，那些不是说的话；表情包算开口。"""
 
-    return await (
+    rows = await (
         GlobalMessageModel.filter(session_id=session_id, user_name=name, time__gte=since)
-        .exclude(content__startswith="[戳一戳:")
-        .exclude(content__startswith="[给")
         .order_by("time")
-        .values_list("time", flat=True)
+        .values_list("time", "content")
     )
+    return [time for time, content in rows if not is_action_text(content)]
 
 
 async def load_life(preset: str) -> dict:

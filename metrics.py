@@ -35,7 +35,7 @@ USAGE_DRAIN_TIMEOUT_SECONDS = 10.0
 
 
 def record_token_usage(session_id: str, model_name: str, usage: dict) -> None:
-    task =asyncio.create_task(log_token_usage(session_id, model_name, usage))
+    task = asyncio.create_task(log_token_usage(session_id, model_name, usage))
     _PENDING_USAGE_TASKS.add(task)
     task.add_done_callback(_log_usage_task_error)
 

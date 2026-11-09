@@ -244,10 +244,7 @@ class Session:
         )
 
         if session_db.last_speak_time:
-            t = session_db.last_speak_time
-            if t.tzinfo is not None:
-                t = t.astimezone(None).replace(tzinfo=None)
-            self.state.last_speak_time = t
+            self.state.last_speak_time = session_db.last_speak_time
         self.state.last_read_time = session_db.last_read_time
         self.state.climbed_until = session_db.climbed_until
 

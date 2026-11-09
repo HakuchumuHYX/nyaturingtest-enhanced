@@ -227,7 +227,7 @@ async def scan_groups() -> None:
         try:
             await _digest_pending(session)
         except Exception as e:
-            logger.warning(f"群 {group_id} 分段整理失败: {e}")
+            logger.opt(exception=e).warning(f"群 {group_id} 分段整理失败: {e}")
 
 
 def setup_episode_job() -> None:

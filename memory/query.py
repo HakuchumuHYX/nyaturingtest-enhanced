@@ -8,7 +8,7 @@ from ..chat.session import Session
 from ..llm import chat_client
 from ..prompts import describe_relation, get_impression_prompt
 from ..storage.db import get_recent_messages_by_user
-from .vector import RAG_ITEM_CHARS, RAG_MEMORY_CHAR_BUDGET
+from .vector import RAG_FINAL_K, RAG_ITEM_CHARS, RAG_MEMORY_CHAR_BUDGET
 
 MEMORY_QUERY_USER_COOLDOWN_SECONDS = 30.0
 MEMORY_QUERY_GROUP_COOLDOWN_SECONDS = 3.0
@@ -93,15 +93,11 @@ async def query_memory_profile(
     first_interaction_at = profile.first_interaction_at if profile else None
 
     target_records, unscoped_records = await _retrieve(
-        session.vector_memory,
-        target_id=target_id,
-        target_name=target_name,
-        interactions=interactions,
-        first_interaction_at=first_interaction_at,
+        session.vector_memory, target_id=target_id, target_name=target_name
     )
-    recent = await get_recent_messages_by_user(
-        session.id, user_id=target_id, user_name=target_name, limit=10
-    ) or ["(暂无最近发言记录)"]
+    recent = await get_recent_messages_by_user(session.id, target_id, limit=10) or [
+        "(暂无最近发言记录)"
+    ]
 
     if interactions == 0 and not summary and not target_records and not unscoped_records:
         if target_id == sender_id:
@@ -145,21 +141,10 @@ async def query_memory_profile(
 
 
 async def _retrieve(
-    vector_memory,
-    *,
-    target_id: str,
-    target_name: str,
-    interactions: int,
-    first_interaction_at: datetime | None,
+    vector_memory, *, target_id: str, target_name: str
 ) -> tuple[list[str], list[str]]:
     """返回 (和目标有关的记忆, 不挂任何人的背景记忆)，按 RAG 字符预算截断。"""
 
-    memory_count = await vector_memory.count_by_user(target_id)
-    if first_interaction_at and first_interaction_at.tzinfo is not None:
-        first_interaction_at = first_interaction_at.replace(tzinfo=None)
-    days_since_first = (
-        (datetime.now() - first_interaction_at).days if first_interaction_at else 0
-    )
     result = await vector_memory.retrieve(
         [
             f"关于{target_name}的记忆",
@@ -167,7 +152,7 @@ async def _retrieve(
             f"{target_name}做过的事",
             f"{target_name}的性格特点",
         ],
-        k=calculate_dynamic_k(interactions, memory_count, days_since_first),
+        k=RAG_FINAL_K,
         user_ids={target_id, ""},
         active_user_ids={target_id},
     )
@@ -190,29 +175,3 @@ async def _retrieve(
             break
     return target_records, unscoped_records
 
-
-def calculate_dynamic_k(
-    interaction_count: int,
-    memory_count: int,
-    days_since_first: int,
-) -> int:
-    if memory_count <= 10:
-        max_limit = memory_count
-    elif memory_count <= 30:
-        max_limit = 20
-    elif memory_count <= 50:
-        max_limit = 30
-    else:
-        max_limit = 40
-    interaction_bonus = min(interaction_count // 50, 6)
-    memory_bonus = min(memory_count // 10, 8)
-    time_bonus = (
-        4
-        if days_since_first > 90
-        else 3
-        if days_since_first > 30
-        else 2
-        if days_since_first > 7
-        else 0
-    )
-    return max(5, min(5 + interaction_bonus + memory_bonus + time_bonus, max_limit))

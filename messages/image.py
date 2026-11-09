@@ -111,6 +111,10 @@ async def fetch_image_input(
                 for attempt in range(2):
                     try:
                         resp = await client.get(url, timeout=10.0)
+                        if 400 <= resp.status_code < 500:
+                            # 多是链接过期，再下一次还是一样
+                            logger.warning(f"下载图片失败: HTTP {resp.status_code}")
+                            break
                         resp.raise_for_status()
                         content_type = (
                             (resp.headers.get("content-type") or "")
@@ -138,9 +142,7 @@ async def fetch_image_input(
             if not image_bytes:
                 return ("[图片下载失败]", None, None)
 
-            payload = await _prepare_native_image_payload(
-                image_bytes, max_side=MAX_IMAGE_SIDE
-            )
+            payload = await _prepare_native_image_payload(image_bytes)
             if not payload:
                 return (placeholder, None, None)
             payload_bytes, image_format = payload
@@ -303,9 +305,7 @@ async def sticker_vision_input(image_bytes: bytes, ref_id: str) -> VisionInput |
 
     payload = await _sticker_grid_payload(image_bytes)
     if payload is None:
-        payload = await _prepare_native_image_payload(
-            image_bytes, max_side=MAX_IMAGE_SIDE
-        )
+        payload = await _prepare_native_image_payload(image_bytes)
     if not payload:
         return None
     payload_bytes, image_format = payload
@@ -364,11 +364,7 @@ def _sticker_grid_payload(image_bytes: bytes) -> tuple[bytes, str] | None:
 
 
 @run_sync
-def _prepare_native_image_payload(
-    image_bytes: bytes,
-    *,
-    max_side: int,
-) -> tuple[bytes, str] | None:
+def _prepare_native_image_payload(image_bytes: bytes) -> tuple[bytes, str] | None:
     """校验、缩放并转码图片，产出可直接发送的 data URL 负载。"""
 
     try:
@@ -379,14 +375,14 @@ def _prepare_native_image_payload(
         raw_format = (image.format or "JPEG").lower()
         if raw_format == "jpg":
             raw_format = "jpeg"
-        # 动图只取第一帧：上游（grok）只接受 JPG/PNG/WebP，原样透传 GIF 会让整轮请求 400。
+        # 动图只取第一帧：上游只接受 JPG/PNG/WebP，原样透传 GIF 会让整轮请求 400。
         # 只有 GIF/WebP 这类多帧插件才有 is_animated，JPEG 上这个属性不存在
         if getattr(image, "is_animated", False):
             image.seek(0)
 
         w, h = image.size
-        if max(w, h) > max_side:
-            ratio = max_side / max(w, h)
+        if max(w, h) > MAX_IMAGE_SIDE:
+            ratio = MAX_IMAGE_SIDE / max(w, h)
             image = image.resize(
                 (max(1, int(w * ratio)), max(1, int(h * ratio))),
                 Image.Resampling.LANCZOS,
@@ -437,13 +433,9 @@ def _clean_old_image_caches_sync():
         logger.error(f"清理图片缓存任务执行异常: {e}")
 
 
-async def cleanup_image_cache_task():
-    await _clean_old_image_caches_sync()
-
-
 def setup_image_cache_job():
     scheduler.add_job(
-        cleanup_image_cache_task,
+        _clean_old_image_caches_sync,
         "cron",
         hour=3,
         minute=0,

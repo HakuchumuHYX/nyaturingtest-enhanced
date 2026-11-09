@@ -190,7 +190,9 @@ async def embed_texts(texts: list[str], *, instruction: str = "") -> np.ndarray:
     return vectors / np.linalg.norm(vectors, axis=1, keepdims=True)
 
 
-async def rerank(query: str, documents: list[str]) -> list[dict[str, Any]]:
+async def rerank(query: str, documents: list[str]) -> list[tuple[int, float]] | None:
+    """过了 rerank_threshold 的 (下标, 分数)，分数高的在前；全被筛掉是 []，接口失败是 None。"""
+
     global _rerank_client
     settings = get_app_settings()
     if _rerank_client is None:
@@ -211,15 +213,18 @@ async def rerank(query: str, documents: list[str]) -> list[dict[str, Any]]:
             },
         )
         response.raise_for_status()
-        results = response.json().get("results", [])
+        # 接口按分数从高到低返回
+        scored = [
+            (item["index"], item["relevance_score"]) for item in response.json()["results"]
+        ]
     except Exception as e:
         record_llm_call(
             "rerank", settings.rerank_model, None, False, _elapsed_ms(started), type(e).__name__
         )
         logger.error(f"Rerank API Error: {e}")
-        return []
+        return None
     record_llm_call("rerank", settings.rerank_model, None, True, _elapsed_ms(started))
-    return results
+    return [(index, score) for index, score in scored if score >= settings.rerank_threshold]
 
 
 async def close_clients() -> None:
@@ -307,11 +312,6 @@ class VectorMemory:
             .limit(limit)
         )
 
-    async def count_by_user(self, user_id: str) -> int:
-        return await MemoryModel.filter(
-            session_id=self.session_id, subject_user_id=user_id
-        ).count()
-
     async def retrieve(
         self,
         queries: list[str],
@@ -382,35 +382,22 @@ class VectorMemory:
             if not candidates:
                 return RetrievalResult([], _retrieval_stats([], []))
 
-            # Rerank 加阈值；接口失败或没配 rerank_model 时按向量分取前若干条。
+            # Rerank 加阈值；接口失败时按向量分取前若干条。
             # search_stage 已把最新有效消息排在第一位；summary query 只做补充召回。
-            settings = get_app_settings()
-            if not settings.rerank_model:
+            reranked = await rerank(unique_queries[0], [item.row.content for item in candidates])
+            if reranked is None:
                 picked = candidates[:RAG_PER_QUERY_RECALL_K]
-                fallback_reason = "rerank_disabled"
-            else:
-                rerank_results = await rerank(
-                    unique_queries[0], [item.row.content for item in candidates]
+                fallback_reason = "rerank_api_empty"
+            elif not reranked:
+                return RetrievalResult(
+                    [], _retrieval_stats(candidates, [], "rerank_all_filtered")
                 )
-                if not rerank_results:
-                    picked = candidates[:RAG_PER_QUERY_RECALL_K]
-                    fallback_reason = "rerank_api_empty"
-                else:
-                    picked = []
-                    for res in rerank_results:
-                        score = res.get("relevance_score", 0.0)
-                        if score < settings.rerank_threshold:
-                            continue
-                        item = candidates[res["index"]]
-                        item.rerank_score = score
-                        picked.append(item)
-                        if len(picked) >= RAG_PER_QUERY_RECALL_K:
-                            break
-                    if not picked:
-                        return RetrievalResult(
-                            [], _retrieval_stats(candidates, [], "rerank_all_filtered")
-                        )
-                    fallback_reason = "none"
+            else:
+                picked = []
+                for index, score in reranked[:RAG_PER_QUERY_RECALL_K]:
+                    candidates[index].rerank_score = score
+                    picked.append(candidates[index])
+                fallback_reason = "none"
 
             # 时间衰减与加权，取前 k
             active_scope_ids = set(active_user_ids)

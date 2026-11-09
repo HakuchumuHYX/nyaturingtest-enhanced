@@ -24,7 +24,6 @@ class VisionInput:
     ref_id: str
     data_url: str = field(repr=False)
     is_sticker: bool = False
-    detail: str = "auto"
     # 原始字节的 SHA-1，描述缓存的 key：同一张图换人发、换 fileid 也一样
     digest: str = ""
 
@@ -34,13 +33,7 @@ class VisionInput:
                 "type": "text",
                 "text": f"[{self.ref_id}]",
             },
-            {
-                "type": "image_url",
-                "image_url": {
-                    "url": self.data_url,
-                    "detail": self.detail,
-                },
-            },
+            {"type": "image_url", "image_url": {"url": self.data_url}},
         ]
 
 
@@ -110,13 +103,8 @@ def _usage_to_dict(usage: Any, finish_reason: str) -> dict[str, int | str]:
 
 def _classify_exception(exc: Exception) -> str:
     status_code = int(getattr(exc, "status_code", 0) or 0)
-    text = str(exc).lower()
     if status_code == 429:
         return "rate_limit"
-    if "content_filter" in text:
-        return "content_filter"
-    if "insufficient_system_resource" in text:
-        return "insufficient_system_resource"
     if status_code >= 500:
         return "server_error"
     return "api_error"
@@ -181,7 +169,7 @@ class LLMClient:
             user_content = [{"type": "text", "text": prompt}]
             for image in images:
                 user_content.extend(image.to_openai_content())
-        # 按群固定：grok 按这个值把请求分到同一台机器，前缀缓存才命中；不传时每次请求分到哪台都不定，线上量小几乎命中不了
+        # 按群固定：上游按这个值把请求分到同一台机器，前缀缓存才命中；不传时每次请求分到哪台都不定，线上量小几乎命中不了
         extra: dict[str, Any] = {"prompt_cache_key": f"nyaturingtest-{session_id}"}
         if self.settings.reasoning_effort:
             extra["reasoning_effort"] = self.settings.reasoning_effort
@@ -226,8 +214,7 @@ class LLMClient:
                         time.time() + RATE_LIMIT_CIRCUIT_SECONDS
                     )
                     return ""
-                retryable = error_type in {"insufficient_system_resource", "server_error"}
-                if last_attempt or not retryable:
+                if last_attempt or error_type != "server_error":
                     return ""
                 await asyncio.sleep(LLM_RETRY_BASE_DELAY * (attempt + 1))
                 continue

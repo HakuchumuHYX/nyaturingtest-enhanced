@@ -1,7 +1,6 @@
 """回复发送、表情包、贴表情、戳一戳。"""
 
 import asyncio
-import random
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -66,11 +65,7 @@ async def send_one(
                 )
         return True
     except ActionFailed as e:
-        if getattr(e, "retcode", 0) == 1200 or "120" in str(e):
-            logger.warning("风控拦截 (1200), 冷却中...")
-            await asyncio.sleep(random.uniform(5.0, 10.0))
-        else:
-            logger.error(f"发送失败: {e}")
+        logger.error(f"发送失败: {e}")
     except Exception as e:
         logger.error(f"发送未知错误: {e}")
     return False

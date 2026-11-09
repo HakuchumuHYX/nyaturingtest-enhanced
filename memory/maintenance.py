@@ -28,11 +28,11 @@ def _generation_guard(group_id: int) -> Callable[[], bool]:
     )
 
 
-async def refresh_group_notes(group_id: int, *, min_new: int = 1) -> tuple[str | None, bool]:
+async def refresh_group_notes(group_id: int) -> tuple[str | None, bool]:
     """把新碎片整理进群志，返回（新群志, 整理是否失败）；群志不随 save_session 回写，这里同步内存副本。"""
 
     still_current = _generation_guard(group_id)
-    notes, failed = await digest_group_notes(str(group_id), still_current, min_new=min_new)
+    notes, failed = await digest_group_notes(str(group_id), still_current)
     session = sessions.get(group_id)
     if notes is not None and session is not None and still_current():
         session.state.group_notes = notes
@@ -69,7 +69,7 @@ async def maintain_long_term_memory() -> None:
             notes, result["notes_failed"] = await refresh_group_notes(group_id)
             result["notes"] = notes is not None
         except Exception as e:
-            logger.warning(f"群 {group_id} 档案/群志整理失败: {e}")
+            logger.opt(exception=e).warning(f"群 {group_id} 档案/群志整理失败: {e}")
             detail["errors"].append(f"群 {group_id} 档案/群志: {type(e).__name__}: {e}")
             continue
         # 档案不随 save_session 回写，要同步内存副本
@@ -82,13 +82,13 @@ async def maintain_long_term_memory() -> None:
     try:
         detail["memories"] = await maintain_memories()
     except Exception as e:
-        logger.warning(f"长期记忆定时维护失败: {e}")
+        logger.opt(exception=e).warning(f"长期记忆定时维护失败: {e}")
         detail["errors"].append(f"过期清理: {type(e).__name__}: {e}")
     try:
         detail["threads_forgotten"] = await drop_forgotten()
         logger.info(f"忘掉了 {detail['threads_forgotten']} 件悬着的事")
     except Exception as e:
-        logger.warning(f"清理悬着的事失败: {e}")
+        logger.opt(exception=e).warning(f"清理悬着的事失败: {e}")
         detail["errors"].append(f"悬着的事: {type(e).__name__}: {e}")
     for session in sessions.values():
         session.vector_memory.drop_cache()
@@ -113,7 +113,7 @@ async def _maintain_personas(detail: dict) -> None:
     try:
         lives, group_texts, detail["personas"] = await maintain_personas(group_ids, guards)
     except Exception as e:
-        logger.warning(f"人设成长整理失败: {e}")
+        logger.opt(exception=e).warning(f"人设成长整理失败: {e}")
         detail["errors"].append(f"人设成长: {type(e).__name__}: {e}")
         return
     # 日记只由每日整理写，时间线那边的内存副本要同步

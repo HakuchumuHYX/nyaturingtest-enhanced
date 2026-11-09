@@ -102,7 +102,7 @@ async def scan_groups() -> None:
         try:
             await _initiate(session, silence)
         except Exception as e:
-            logger.warning(f"群 {group_id} 主动发起话题失败: {e}")
+            logger.opt(exception=e).warning(f"群 {group_id} 主动发起话题失败: {e}")
 
 
 async def _initiate(session: Session, silence: int) -> None:
@@ -136,7 +136,7 @@ async def _initiate(session: Session, silence: int) -> None:
         for row in reversed(rows)
     ]
     my_recent_replies = [
-        m.content for m in messages if m.user_name == state.name
+        m.content for m in messages if m.user_name == state.name and not m.is_action
     ][-MY_RECENT_REPLIES_LIMIT:]
 
     state.global_emotion.settle()

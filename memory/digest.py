@@ -26,16 +26,11 @@ from ..storage.models import MemoryModel, SessionModel, UserProfileModel
 from .vector import IMPRESSION_CATEGORY, VectorMemory
 
 PROFILE_MIN_NEW_MEMORIES = 10
-# 手动查看群志时新碎片攒到这么多才重新整理：群志只在旧稿上小改，几条新碎片通常改不动什么
-GROUP_NOTES_REFRESH_MIN_NEW = 10
 # 用户档案的整理间隔；群志有新碎片就整理，这一两天的事才进得了群志
 DIGEST_INTERVAL = timedelta(days=7)
 PROFILE_CHUNK_CHARS = 8000
 GROUP_NOTES_CHUNK_CHARS = 12000
 POINTS_CONCURRENCY = 4
-
-# 夜间整理和手动查看可能撞上，同一群排队；后到的进来时水位已推进，不会重复整理
-_group_notes_locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 
 _MEMORY_FIELDS = (
     "subject_user_id",
@@ -257,58 +252,40 @@ async def digest_user_profiles(
     return updated, failed
 
 
-def _new_group_fragments(session_id: str, until: datetime | None):
-    query = MemoryModel.filter(session_id=session_id).exclude(category=IMPRESSION_CATEGORY)
-    return query if until is None else query.filter(created_at__gt=until)
-
-
-async def count_new_group_fragments(session_id: str) -> int:
-    """还没整理进群志的碎片数。"""
+async def digest_group_notes(
+    session_id: str, still_current: Callable[[], bool]
+) -> tuple[str | None, bool]:
+    """有新碎片就合进群志，返回（新群志, 整理是否失败）；没有新碎片是 (None, False)。"""
 
     session_db = await SessionModel.get_or_none(id=session_id)
-    until = session_db.notes_summarized_until if session_db else None
-    return await _new_group_fragments(session_id, until).count()
+    if session_db is None:
+        return None, False
+    query = MemoryModel.filter(session_id=session_id).exclude(category=IMPRESSION_CATEGORY)
+    if session_db.notes_summarized_until is not None:
+        query = query.filter(created_at__gt=session_db.notes_summarized_until)
+    rows = await query.order_by("created_at").values(*_MEMORY_FIELDS)
+    if not rows:
+        return None, False
 
-
-async def digest_group_notes(
-    session_id: str, still_current: Callable[[], bool], *, min_new: int = 1
-) -> tuple[str | None, bool]:
-    """新碎片不少于 min_new 条就合进群志，返回（新群志, 整理是否失败）；不到期是 (None, False)。"""
-
-    async with _group_notes_locks[session_id]:
-        session_db = await SessionModel.get_or_none(id=session_id)
-        if session_db is None:
-            return None, False
-        until = session_db.notes_summarized_until
-        rows = (
-            await _new_group_fragments(session_id, until)
-            .order_by("created_at")
-            .values(*_MEMORY_FIELDS)
-        )
-        if not _due(len(rows), until, min_new=min_new):
-            return None, False
-
-        chunks = _chunks(rows, GROUP_NOTES_CHUNK_CHARS)
-        result = await _condense(
-            session_id,
-            chunks,
-            rewrite_prompt=lambda material: get_group_notes_prompt(
-                session_db.group_notes, material
-            ),
-            points_prompt=get_group_points_prompt,
-            key="group_notes",
-        )
-        notes = result["group_notes"].strip() if result else None
-        calls = 1 if len(chunks) == 1 else len(chunks) + 1
-        logger.info(
-            f"[Digest] 群 {session_id} 群志：调用 {calls} 次，"
-            f"{'失败，下次再试' if notes is None else f'{len(notes)} 字'}"
-        )
-        if notes is None:
-            return None, True
-        if not still_current():
-            return None, False
-        await SessionModel.filter(id=session_id).update(
-            group_notes=notes, notes_summarized_until=rows[-1]["created_at"]
-        )
-        return notes, False
+    chunks = _chunks(rows, GROUP_NOTES_CHUNK_CHARS)
+    result = await _condense(
+        session_id,
+        chunks,
+        rewrite_prompt=lambda material: get_group_notes_prompt(session_db.group_notes, material),
+        points_prompt=get_group_points_prompt,
+        key="group_notes",
+    )
+    notes = result["group_notes"].strip() if result else None
+    calls = 1 if len(chunks) == 1 else len(chunks) + 1
+    logger.info(
+        f"[Digest] 群 {session_id} 群志：调用 {calls} 次，"
+        f"{'失败，下次再试' if notes is None else f'{len(notes)} 字'}"
+    )
+    if notes is None:
+        return None, True
+    if not still_current():
+        return None, False
+    await SessionModel.filter(id=session_id).update(
+        group_notes=notes, notes_summarized_until=rows[-1]["created_at"]
+    )
+    return notes, False

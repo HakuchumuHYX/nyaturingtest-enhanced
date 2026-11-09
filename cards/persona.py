@@ -11,15 +11,11 @@ from .notes import parse_sections
 
 _TEMPLATE = Path(__file__).with_name("persona.html")
 PAGE_WIDTH = 600
-# 尺子在页面里的宽度（页宽减左右边距）
-_RULER_WIDTH = PAGE_WIDTH - 64
 # 群层的风格每条以「（自 YYYY-MM-DD）」结尾，约定写在 prompts.get_persona_group_prompt
 _SINCE_RE = re.compile(r"（自\s*(\d{4})-(\d{2})-(\d{2})）")
 _DATED_RE = re.compile(r"(\d{2})-(\d{2})\s*(.*)", re.S)
 # 一条约定或说过的话以「MM-DD」开头，前一条以句号或分号结束
 _DATED_SPLIT_RE = re.compile(r"(?<=[。；])\s*(?=\d{2}-\d{2})")
-# 段名是写给整理模型看的，卡片上换成读着顺的说法
-_GROUP_TITLES = {"在这个群的样子": "沾上的说法"}
 
 
 @dataclass(frozen=True)

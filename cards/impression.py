@@ -47,7 +47,7 @@ async def _avatar_data_uri(user_id: str) -> str:
 def _status_html(page: Impression, now: datetime) -> str:
     parts = [f"{page.relation}（{page.affinity}）"]
     if page.first_interaction_at:
-        days = (now - page.first_interaction_at.replace(tzinfo=None)).days + 1
+        days = (now - page.first_interaction_at).days + 1
         parts.append(f"认识 {days} 天")
     parts.append(f"见过 {page.interactions} 条发言")
     return "".join(f"<span>{escape(part)}</span>" for part in parts)
