@@ -17,6 +17,7 @@ from nonebot import logger, require
 require("nonebot_plugin_apscheduler")
 from nonebot_plugin_apscheduler import scheduler  # noqa: E402  必须在 require 之后导入
 
+from ..chat.groups import is_shutting_down, sessions  # noqa: E402
 from ..config import get_app_settings  # noqa: E402
 from ..llm import background_client, weather_now  # noqa: E402
 from ..memory.vector import rerank  # noqa: E402
@@ -35,7 +36,6 @@ from ..storage.db import (  # noqa: E402
     save_persona_status,
     self_speak_times,
 )
-from .groups import is_shutting_down, sessions  # noqa: E402
 
 MODES = ("free", "busy", "away")
 CHECK_INTERVAL_SECONDS = 60

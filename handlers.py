@@ -40,7 +40,6 @@ from .chat.groups import (
     sessions,
 )
 from .chat.session import Session
-from .chat.status import recent_diary, redecide, status_text
 from .config import get_app_settings, get_token_stats_model_names
 from .llm import background_client, chat_client, feedback_client
 from .memory.digest import GROUP_NOTES_REFRESH_MIN_NEW, count_new_group_fragments
@@ -61,6 +60,7 @@ from .messages.image import fetch_image_input
 from .messages.photos import remove_by_message as remove_photo_by_message
 from .messages.stickers import block as block_sticker
 from .metrics import log_event
+from .persona.status import recent_diary, redecide, status_text
 from .prompts import PRESETS, reload_presets, resolve_preset
 from .storage.backup import backup_task
 from .storage.db import get_token_stats, message_content, recall_message

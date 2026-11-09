@@ -14,6 +14,15 @@ from nonebot_plugin_apscheduler import scheduler  # noqa: E402  必须在 requir
 
 from ..llm import chat_client  # noqa: E402
 from ..metrics import log_event  # noqa: E402
+from ..persona.status import (  # noqa: E402
+    current_weather,
+    describe_now,
+    is_away,
+    recent_diary,
+    recent_feed,
+    recent_plan,
+    today_lines,
+)
 from ..prompts import (  # noqa: E402
     CHAT_SYSTEM_PROMPT,
     describe_mood,
@@ -32,15 +41,6 @@ from .orchestrator import (  # noqa: E402
 )
 from .send import dispatch_replies  # noqa: E402
 from .session import Session  # noqa: E402
-from .status import (  # noqa: E402
-    current_weather,
-    describe_now,
-    is_away,
-    recent_diary,
-    recent_feed,
-    recent_plan,
-    today_lines,
-)
 
 SCAN_INTERVAL_MINUTES = 10
 # 群里最后一条消息距今至少这么久才算冷场

@@ -16,10 +16,10 @@ from nonebot import logger
 from .chat.engagement import unread_count
 from .chat.groups import sessions
 from .chat.session import Session
-from .chat.status import get_status
 from .config import get_app_settings, get_token_stats_model_names
 from .llm import background_client, chat_client, feedback_client
 from .memory.threads import KINDS
+from .persona.status import get_status
 from .prompts import describe_mood
 from .storage.db import (
     get_latest_user_names,

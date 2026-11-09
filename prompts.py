@@ -1024,7 +1024,7 @@ def get_group_points_prompt(span: str, lines: str) -> str:
 
 # ==================== 人设成长 ====================
 
-# 提示词正文里写着这两个数，persona.py 按它们截断，所以放在一起
+# 提示词正文里写着这两个数，persona/growth.py 按它们截断，所以放在一起
 MAX_LIFE_FACTS = 6
 JOURNAL_DAYS = 14
 
@@ -1216,7 +1216,7 @@ _STATUS_MODES = """三种状态：
 - away：手机放下了或顾不上，不看群：睡觉、上课开会、洗澡、骑车走路、跟人当面说着话、专心赶活。"""
 
 
-# 来源写法和 chat/status.py 的 SOURCE_* 对应：她聊天时自己定的、被叫起来的
+# 来源写法和 persona/status.py 的 SOURCE_* 对应：她聊天时自己定的、被叫起来的
 _SOURCE_TAGS = {"chat": "（临时决定）", "called": "（被叫起来）"}
 
 

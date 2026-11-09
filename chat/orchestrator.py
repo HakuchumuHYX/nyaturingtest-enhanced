@@ -22,6 +22,18 @@ from ..messages.faces import Reaction, reaction_emoji
 from ..messages.message import SHORT_CONTEXT_LIMIT, SHORT_TERM_BUFFER_SIZE, ChatMessage
 from ..messages.photos import PHOTO_KINDS, candidates as photo_candidates, enabled as photos_enabled
 from ..metrics import log_event
+from ..persona.status import (
+    apply_chat_status,
+    current_weather,
+    describe_now,
+    feed_candidates,
+    is_away,
+    is_glancing,
+    note_call,
+    recent_diary,
+    recent_plan,
+    today_lines,
+)
 from ..prompts import (
     CHAT_SYSTEM_PROMPT,
     FEEDBACK_SYSTEM_PROMPT,
@@ -47,18 +59,6 @@ from .engagement import (
     unread_count,
 )
 from .session import Session, SessionState
-from .status import (
-    apply_chat_status,
-    current_weather,
-    describe_now,
-    feed_candidates,
-    is_away,
-    is_glancing,
-    note_call,
-    recent_diary,
-    recent_plan,
-    today_lines,
-)
 
 HISTORY_RECALL_LIMIT = 20
 # 补看：被挤出未读的那段里捞回几条找过她的消息；错过的分段小结最多几个字，放不下时留最新的

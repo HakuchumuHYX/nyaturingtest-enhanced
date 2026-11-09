@@ -2,7 +2,7 @@
 
 被点名、聊天对象在接话、被戳就马上看，否则按节奏攒着。
 被点名也不强制回：两个 Bot 互相回复时，只有 Feedback 看着发言量压低 willing 才停得下来。
-她 away（手机放下了）时不自己看群，有人叫她交给 chat/status.py 判断拿不拿起手机。
+她 away（手机放下了）时不自己看群，有人叫她交给 persona/status.py 判断拿不拿起手机。
 """
 
 from datetime import datetime

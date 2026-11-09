@@ -5,13 +5,13 @@ from tortoise import Tortoise
 from . import handlers  # 导入时注册 matcher
 from .chat.groups import cleanup_global_resources, init_enabled_groups
 from .chat.initiative import setup_initiative_job
-from .chat.status import setup_status_job
 from .config import get_data_dir
 from .memory.episodes import setup_episode_job
 from .memory.maintenance import setup_maintenance_job
 from .messages.image import setup_image_cache_job
 from .messages.photos import setup_photo_prune_job
 from .messages.stickers import load_stickers, setup_sticker_prune_job
+from .persona.status import setup_status_job
 from .storage.backup import setup_backup_job
 from .webconsole_api import setup_console_api
 from .webconsole_store import close_store, open_store

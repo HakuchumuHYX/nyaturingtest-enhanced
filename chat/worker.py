@@ -9,12 +9,12 @@ from nonebot.adapters.onebot.v11 import Bot, Event
 
 from ..messages.message import ChatMessage
 from ..metrics import log_event
+from ..persona.status import is_away
 from .engagement import seconds_until_look
 from .groups import is_shutting_down
 from .orchestrator import process_chunk
 from .send import dispatch_replies, send_poke, send_reaction
 from .session import Session
-from .status import is_away
 
 DEBOUNCE_SECONDS = 2.0
 # 一批消息处理前最多等多久图片描述；超时带着占位继续，描述出来后照样补上
@@ -33,7 +33,7 @@ async def next_inbox_batch(session: Session) -> InboxBatch | None:
     """等到静默窗口结束，再一次性取走积压的消息。
 
     有未读时最多等到该看群的时候：群里安静下来，「距上次看群满 180s」早就成立了，只是没有新消息来触发检查。
-    away 时不定时；away 结束时 chat/status.py 会唤醒同一个预设的各群 worker，醒来没有新消息就按未读重新定时，开始补看。
+    away 时不定时；away 结束时 persona/status.py 会唤醒同一个预设的各群 worker，醒来没有新消息就按未读重新定时，开始补看。
     """
 
     # 启动后还没收到过消息就没有 bot / event，不定时

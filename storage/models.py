@@ -174,7 +174,7 @@ class PersonaGroupModel(Model):
 class PersonaStatusModel(Model):
     """她自己的时间线：每个预设一份，各群共享。
 
-    timeline、until、nights 由 chat/status.py 随时写；diary、diary_until、plan、feed 只由每日整理写，两边各写各的列。
+    timeline、until、nights 由 persona/status.py 随时写；diary、diary_until、plan、feed 只由每日整理写，两边各写各的列。
     """
 
     preset = fields.CharField(pk=True, max_length=255)
