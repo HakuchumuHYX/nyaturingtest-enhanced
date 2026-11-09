@@ -1,7 +1,8 @@
 # nyaturingtest
 
-一个会自己混群的 QQ 聊天 bot。有人叫它、@ 它或回复它时一定会回；
-话题对上了也会自己插一句，插了没人接就收住，不会刷屏。它也有自己的日子要过，不是一直挂在群里。
+一个会自己混群的 QQ 聊天 bot。有人叫它、@ 它或回复它时会回；
+话题对上了也会自己插一句，插了没人接就收住，不会刷屏。它也有自己的日子要过，不是一直挂在群里：
+睡觉、洗澡这些手机放下的时候，叫它也不一定理。
 
 它会慢慢记住群友：谁喜欢什么、谁和谁是什么关系、群里有哪些梗。每天凌晨，它把这些零散的印象
 整理成每个人的档案和一份群志。记错了被人纠正，它会把旧说法换掉，而不是对的错的一起记着。
@@ -10,12 +11,14 @@
 [nonebot-plugin-nyaturingtest](https://github.com/shadow3aaa/nonebot-plugin-nyaturingtest) 二次开发，
 运行在 NoneBot2 + OneBot V11 上，对话模型、Embedding 和 Rerank 都走云端 API。
 
+想先装起来试试，直接看[快速开始](#快速开始)。
+
 ## 聊起来是什么样
 
 每个启用的群各自独立：有自己的人设、心情、记忆和对群友的好感，互不串门。
 只有「它这个人此刻在做什么」和它的手机相册是同一个人设各群共用的，前者见下面的「它自己的日子」。
 
-- **被叫到就回。** 叫它的名字或别名、@ 它、回复它的消息，它都会接。
+- **被叫到就回。** 叫它的名字或别名、@ 它、回复它的消息，它都会接；手机放下的时候例外，见下面的「三种状态」。
 - **聊开了不会突然断。** 它说完话后 3 分钟内，刚才和它聊的人再开口，它会优先接住。
 - **自己也会插话。** 群友聊得起劲、它插得上话的时候，会凑个热闹接一句。
 - **冷场了会找话题。** 群里安静了两个小时以上，它会在合适的时段自己开个话题：工作日只在午饭和下班后，
@@ -40,14 +43,14 @@
   大家都在戳某个人时也可能跟着戳一下。
 - **有心情，也记好感。** 群友的话会影响它此刻的心情（过几个小时会自己平复），也会一点点改变它对每个人的好感；两者都会反映在说话的语气上。好感度是长期养成的，不会随时间消失，只有讨厌会慢慢淡掉。
 
-背后是两个模型分工：一个「观察者」负责读消息、判断要不要接话、记下值得记的事；
-另一个「角色」只负责按人设把话说出来。
+背后是三个模型分工：「观察者」（配置里的 `feedback`）负责读消息、判断要不要接话、记下值得记的事；
+「角色」（`chat`）只负责按人设把话说出来；识图、定下一件事做什么、每晚整理这些后台的活交给「后台模型」（`background`）。
 
 ## 它自己的日子
 
 它不是 24 小时挂在群里的。它有自己的事要做：上课、看论文、吃饭、洗澡、出门、睡觉。
 
-- **一段一段往下过。** 一件事做完了，观察者模型再按它的人生线、这几天的日记、它的打算、最近几晚几点睡，
+- **一段一段往下过。** 一件事做完了，后台模型再按它的人生线、这几天的日记、它的打算、最近几晚几点睡，
   定下一件事：在哪、在干嘛、大概多久。不在一天开始时排好，但每一段都接着上一段走，前后不矛盾。
   几点睡也是它自己定的，群里聊得起劲时可能晚睡一会儿。日子不照着前几天过，计划外的小事也会发生。
 - **它在哪，天气就是哪里的。** 它平时在哪个城市看人生线，放假回家、周末出去玩时会跟着行程换城市（中间有路上那一段）。
@@ -100,46 +103,80 @@
 性格只跟着群友的影响和生活里的事变，不拿它自己说过的话当证据，免得越说越极端。
 在一个群里沾上很久、或者好几个群都有的说话方式，会慢慢变成它整体的样子。
 底线和固定信息（比如生日）写在预设里，整理改不了。`/persona` 会发一张图：这两层、最近的日记、最近的改动，还有一把从出发点量到今天的成长尺。
-整理用的是 `background` 模型，换模型会改变它长大的方式（有的模型学得太快、会记混事），换之前先从当前状态往前模拟一小段看看效果。
+整理用的是 `background` 模型，换模型会改变它长大的方式（有的模型学得太快、会记混事）；换了之后过几天看看 `/persona` 上最近的改动，不对劲就换回来。
+
+## 快速开始
+
+先要有一个能跑起来的 NoneBot2 项目，接好 OneBot V11 实现（比如 NapCat、SnowLuma），
+并在 `.env` 里把自己的 QQ 号写进 `SUPERUSERS`：除了 `/查询记忆`，管理命令都只有超级用户能用。
+
+1. 把本仓库放到 NoneBot 项目根目录下的 `plugins/nyaturingtest`（位置有要求，见[安装](#安装)），装依赖：
+   `pip install -r plugins/nyaturingtest/requirements.txt`。
+2. 复制 `config.example.json` 为 `config.json`，至少填好 `chat`、`feedback`、`background` 三个模型和
+   `siliconflow_api_key`。三个模型可以填同一个，其余的先留着示例值或留空，见[配置](#配置)。
+3. 新建 `config/nyaturingtest/nya_presets/小明.json`，照[角色预设](#角色预设)里的示例改。
+4. 启动 bot，在群里发 `/autochat enable 小明`。
+5. @ 它说句话。没反应先看[它为什么不说话](#它为什么不说话)。
 
 ## 安装
 
-把整个目录放进 NoneBot 项目的插件目录，并安装依赖（Python 3.10+）：
+Python 3.10+，在 NoneBot 项目根目录装依赖：
 
 ```bash
-pip install -r requirements.txt
+pip install -r plugins/nyaturingtest/requirements.txt
 ```
+
+**目录位置有要求。** 插件把自己所在目录往上两级当作项目根目录，预设、数据、备份和缓存都按这个根目录放：
+
+```text
+<项目根目录>/
+├── plugins/nyaturingtest/             本仓库，config.json 也放这里
+├── config/nyaturingtest/nya_presets/  角色预设
+├── data/nyaturingtest/                数据库、表情包、照片
+├── data/nyaturingtest_backups/        每日备份
+└── cache/nyaturingtest/               图片缓存
+```
+
+所以插件要放在 `<项目根目录>/plugins/nyaturingtest`。放进 `src/plugins/` 的话，这些目录都会落到 `src/` 下面。
+确认 NoneBot 会加载 `plugins/` 目录：`pyproject.toml` 里写 `plugin_dirs = ["plugins"]`，或在 `bot.py` 里 `nonebot.load_plugins("plugins")`。
+
+**OneBot 实现。** 收发消息只用标准接口。贴表情、戳一戳、读 QQ 表情目录用的是扩展接口
+`set_msg_emoji_like`、`group_poke`、`fetch_sys_faces`，开发时用的是 SnowLuma；换成别的实现时，不支持的那几项会失败并打 warning，其余照常。
 
 **`chinese-calendar` 要每年升级。** 它按国务院每年公布的放假安排判断法定节假日和调休，
 用在时间描述、日记里的未来几天，以及冷场开话题挑工作日还是休息日的时段。库里只有已公布的年份，
 新一年的安排一般在 11 月前后公布，随后发新版；没升级就跨了年，它会退回只按周末判断，每次都打一条 warning。
 最好在每次启动前跑一次 `pip install -U chinese-calendar`（用 uv 就是 `uv sync --upgrade-package chinese-calendar`）。
 
-群志卡片和 Token 统计卡片都是网页截图，需要 playwright 的 Chromium（`playwright install chromium`），
-以及系统字体思源宋体、思源黑体（Debian 系装 `fonts-noto-cjk`）。
+**图片卡片可选。** `/查询记忆`、`/群志`、`/persona`、`/token统计` 发的图都是网页截图，需要 playwright 的 Chromium
+（`playwright install chromium`）和系统字体思源宋体、思源黑体（Debian 系装 `fonts-noto-cjk`）。
+不装也能用，这几条命令会改发文字版。
 
 ## 配置
 
 复制 `config.example.json` 为 `config.json`，填上各家的 API Key：
 
-| 段 | 用途 |
-| --- | --- |
-| `chat` | 角色模型：负责说话 |
-| `feedback` | 看群模型：每轮看群判断说不说、心情好感、摘要和更正，用量最大 |
-| `background` | 后台模型：识图、转发摘要、当天状态、记忆整理和人设成长 |
-| `siliconflow_api_key` | Embedding 和 Rerank 共用的 Key |
-| `embedding` | 记忆检索用的向量模型 |
-| `rerank` | 检索结果重排，`threshold` 以下的结果丢弃 |
-| `web_search` | 联网搜索（DeepSeek Search），`api_key` 留空就不搜 |
-| `image` | 发照片用的生图模型（`api_key`、`base_url`、`model`、`quality`、`timeout`），`model` 留空就不发照片，启动时打一条警告 |
-| `playwright_browsers_path` | 卡片截图用的 Chromium 所在目录，留空用 playwright 默认位置 |
-| `webconsole_db` | WebConsole 的库；留空就不记录 LLM 请求、看群决策、每日整理和警告，聊天不受影响 |
-| `console_token` | WebConsole 拉当前状态时带的 Bearer token；留空就不开放接口 |
+| 段 | 必需 | 用途 |
+| --- | --- | --- |
+| `chat` | 必需 | 角色模型：按人设把话说出来 |
+| `feedback` | 必需 | 观察者模型：每轮看群判断说不说、心情好感、摘要和更正，用量最大 |
+| `background` | 必需 | 后台模型：识图、转发摘要、当天状态、记忆整理和人设成长 |
+| `siliconflow_api_key` | 必需 | Embedding 和 Rerank 共用的 Key；不填的话记忆检索、表情包和照片都匹配不上，每次检索都报错 |
+| `embedding` | 有默认值 | 记忆检索用的向量模型 |
+| `rerank` | 有默认值 | 检索结果重排，`threshold` 以下的结果丢弃 |
+| `web_search` | 可选 | 联网搜索（DeepSeek Search），`api_key` 留空就不搜 |
+| `image` | 可选 | 发照片用的生图模型（`api_key`、`base_url`、`model`、`quality`、`timeout`），`model` 留空就不发照片，启动时打一条警告 |
+| `playwright_browsers_path` | 可选 | 卡片截图用的 Chromium 所在目录，留空用 playwright 默认位置 |
+| `webconsole_db` | 可选 | WebConsole 的库；留空就不记录 LLM 请求、看群决策、每日整理和警告，聊天不受影响 |
+| `console_token` | 可选 | WebConsole 拉当前状态时带的 Bearer token；留空就不开放接口 |
 
-`chat`、`feedback`、`background` 的 `base_url`、`model` 必填，其余缺省有默认值。改配置后要重启。
+三个模型段的 `base_url`、`model` 必填，填同一个模型也行；其余缺省有默认值。改配置后要重启。
 也可以用环境变量 `NYATURINGTEST_CONFIG_FILE` 指定别的配置文件，用 `NYATURINGTEST_DATA_DIR` 指定数据目录。
 
-**角色预设**放在 `config/nyaturingtest/nya_presets/*.json`。群里第一次 `/autochat enable <预设>` 时选定人设，之后换人设用 `/set_preset <文件名>`。
+### 角色预设
+
+预设放在项目根目录下的 `config/nyaturingtest/nya_presets/*.json`，一个文件一个人设。
+群里第一次 `/autochat enable <预设>` 时选定人设，之后换人设用 `/set_preset <预设>`；预设名就是文件名，`.json` 可写可不写。
 预设文件被删或写坏时，这个群只记消息、不说话；目录里一个可用的人设文件都没有时，启动会报 warning。格式：
 
 ```json
@@ -185,7 +222,7 @@ pip install -r requirements.txt
 | `/群志` | `/group_notes` `/查看群志` | 把本群群志做成图片发出来（每天 03:30 整理） |
 | `/status` | `/状态` | 它现在在做什么、今天的经过、未读条数和心情 |
 | `/presets` | `/preset` | 列出可用预设 |
-| `/set_preset <文件名>` | `/set_presets` | 加载预设 |
+| `/set_preset <预设>` | `/set_presets` | 加载预设 |
 | `/persona` | `/人设` | 把人生线、最近的日记、本群的它和最近的改动做成图片发出来 |
 | `/calm` | `/冷静` | 心情回到平静，退出当前对话，并重新定一次它现在在做什么（各群一起生效） |
 | `/reset confirm` | `/重置 confirm` | 先备份，再清空本群的消息、记忆、档案、群志和群里的它，人设保留，**不可撤销** |
@@ -197,6 +234,19 @@ pip install -r requirements.txt
 
 私聊也能管理，命令的第一个参数写群号，比如 `/status 123456`、`/reset 123456 confirm`；
 另外有 `list_groups` 列出启用的群。
+
+## 它为什么不说话
+
+它本来就不是每条都回。启用后一直不说话，按这个顺序查：
+
+1. **本群启用了吗。** 发 `/status`，回「本群 Autochat 未启用」就是还没开。
+2. **预设能用吗。** 预设文件被删或 JSON 写坏时，这个群只记消息、不说话，启动日志里有一条「无法加载预设」或「预设不存在」的 warning。
+3. **它手机放下了吗。** `/status` 能看到它现在在做什么。睡觉、洗澡、开会、走路时它不看群，@ 一两次一般不理，连着叫才可能被吵醒。
+   刚装好时也可能正好赶上它在睡觉。
+4. **还没轮到它看群。** 没人叫它时，未读攒够 8 条或隔 3 分钟它才看一次；@ 它、回复它、戳它会马上看。
+5. **它觉得不该插话。** 主动插嘴要它自己觉得插得上；最近 20 条里它说的超过两成就不再主动开口；两次发言之间至少隔 16 秒。
+6. **模型调用失败了吗。** 日志级别开到 `INFO`，每次看群都有一条 `speak_decision`：`llm_willing` 比 `threshold` 低就是它自己不想说；
+   `llm_willing=None` 说明观察者模型调用失败了，看附近的报错，多半是 Key、地址或模型名填错了。
 
 ## 数据与备份
 
@@ -226,6 +276,9 @@ pip install -r requirements.txt
 NoneBot 自己在 INFO/DEBUG 会给每条消息打十几行匹配器调度日志，开 `DEBUG` 时很吵。想只压掉它们，可以在 `bot.py` 里
 `nonebot.init()` 之前换掉默认的日志输出，其他插件不受影响：
 
+<details>
+<summary>bot.py 里的日志过滤</summary>
+
 ```python
 import sys
 
@@ -250,6 +303,8 @@ logger.add(sys.stdout, level=0, diagnose=False, filter=_log_filter, format=defau
 ```
 
 压掉之后，收到消息的原文（NoneBot 的 SUCCESS 行）也不再输出，插件的 `message` 记的是转换后的文字（图片已换成描述）。
+
+</details>
 
 ## 致谢与许可
 
