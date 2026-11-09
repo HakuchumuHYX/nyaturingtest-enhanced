@@ -41,6 +41,7 @@ class SessionState:
     name: str = ""
     aliases: list[str] = field(default_factory=list)
     profile: list[str] = field(default_factory=list)
+    appearance: str = ""
     bottom_lines: list[str] = field(default_factory=list)
     preset_lines: list[str] = field(default_factory=list)
     self_life: str = ""
@@ -296,6 +297,7 @@ class Session:
             self.state.name = ""
             self.state.aliases = []
             self.state.profile = []
+            self.state.appearance = ""
             self.state.bottom_lines = []
             self.state.preset_lines = []
             self.state.self_life = ""
@@ -305,6 +307,7 @@ class Session:
         self.state.name = preset.name
         self.state.aliases = preset.aliases
         self.state.profile = preset.profile
+        self.state.appearance = preset.appearance
         self.state.bottom_lines = preset.bottom_lines
         # 预设每轮完全相同，排序固定
         self.state.preset_lines = sorted(

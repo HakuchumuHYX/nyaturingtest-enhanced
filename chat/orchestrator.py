@@ -820,6 +820,7 @@ async def _ask_feedback(
     state.global_emotion.settle(now)
     prompt = get_feedback_prompt(
         bot_name=state.name,
+        appearance=state.appearance,
         self_life=state.self_life,
         self_in_group=state.self_in_group,
         summary=state.chat_summary,
@@ -1004,6 +1005,7 @@ async def chat_stage(
     prompt = get_chat_prompt(
         bot_name=state.name,
         profile=state.profile,
+        appearance=state.appearance,
         bottom_lines=state.bottom_lines,
         self_life=state.self_life,
         self_in_group=state.self_in_group,
