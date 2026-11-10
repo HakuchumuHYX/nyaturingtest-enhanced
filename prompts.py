@@ -237,38 +237,58 @@ def get_photo_prompt(
     return "\n\n".join(part for part in parts if part)
 
 
+def _mood_tiers(emotion: EmotionState) -> tuple[int, int, int]:
+    """心情三轴各落在哪一档，0 是最高的那档。给模型的和给人看的说法共用这一套分档。"""
+
+    valence, arousal, dominance = emotion.valence, emotion.arousal, emotion.dominance
+    valence_tier = (
+        0 if valence > 0.6
+        else 1 if valence > 0.2
+        else 2 if valence >= -0.2
+        else 3 if valence >= -0.6
+        else 4
+    )
+    arousal_tier = 0 if arousal > 0.65 else 1 if arousal > 0.4 else 2
+    dominance_tier = (
+        0 if dominance > 0.5
+        else 1 if dominance > 0.15
+        else 2 if dominance >= -0.15
+        else 3 if dominance >= -0.5
+        else 4
+    )
+    return valence_tier, arousal_tier, dominance_tier
+
+
+_MOOD_FOR_MODEL = (
+    (
+        "心情很好，兴致高，爱开玩笑",
+        "心情不错，语气轻快",
+        "心情平稳，正常聊",
+        "有点不开心，话少一点、可以带点小情绪，但不冲着人发火",
+        "心情很差，不太想说话，回得简短冷淡，但不攻击人",
+    ),
+    ("很来劲，反应可以大一点", "有点兴奋", "比较放松"),
+    ("很有底气，敢怼敢表态", "挺有主见", "比较随和", "有点没底气，说话收着点", "很没底气，容易退让"),
+)
+# 给人看的短说法；底气在中间那档时不写，免得一句话里全是「比较」
+_MOOD_FOR_PEOPLE = (
+    ("很开心", "心情不错", "心情平稳", "有点不开心", "心情很差"),
+    ("很来劲", "有点兴奋", "挺放松"),
+    ("很有底气", "挺有主见", "", "有点没底气", "很没底气"),
+)
+
+
 def describe_mood(emotion: EmotionState) -> str:
     """把心情 VAD 合成一句话给 Chat / Initiative；它们不需要原始数值。"""
 
-    if emotion.valence > 0.6:
-        mood = "心情很好，兴致高，爱开玩笑"
-    elif emotion.valence > 0.2:
-        mood = "心情不错，语气轻快"
-    elif emotion.valence >= -0.2:
-        mood = "心情平稳，正常聊"
-    elif emotion.valence >= -0.6:
-        mood = "有点不开心，话少一点、可以带点小情绪，但不冲着人发火"
-    else:
-        mood = "心情很差，不太想说话，回得简短冷淡，但不攻击人"
+    return "；".join(words[tier] for words, tier in zip(_MOOD_FOR_MODEL, _mood_tiers(emotion)))
 
-    if emotion.arousal > 0.65:
-        energy = "很来劲，反应可以大一点"
-    elif emotion.arousal > 0.4:
-        energy = "有点兴奋"
-    else:
-        energy = "比较放松"
 
-    if emotion.dominance > 0.5:
-        stance = "很有底气，敢怼敢表态"
-    elif emotion.dominance > 0.15:
-        stance = "挺有主见"
-    elif emotion.dominance >= -0.15:
-        stance = "比较随和"
-    elif emotion.dominance >= -0.5:
-        stance = "有点没底气，说话收着点"
-    else:
-        stance = "很没底气，容易退让"
-    return f"{mood}；{energy}；{stance}"
+def mood_label(emotion: EmotionState) -> str:
+    """/status 上给群友看的心情，比如「心情不错，挺放松」。"""
+
+    parts = (words[tier] for words, tier in zip(_MOOD_FOR_PEOPLE, _mood_tiers(emotion)))
+    return "，".join(part for part in parts if part)
 
 
 def describe_relation(affinity: int) -> str:
@@ -1217,7 +1237,7 @@ _STATUS_MODES = """三种状态：
 
 
 # 来源写法和 persona/status.py 的 SOURCE_* 对应：她聊天时自己定的、被叫起来的
-_SOURCE_TAGS = {"chat": "（临时决定）", "called": "（被叫起来）"}
+SOURCE_TAGS = {"chat": "（临时决定）", "called": "（被叫起来）"}
 
 
 def segment_line(segment: dict, end: datetime | None, previous: dict | None = None) -> str:
@@ -1228,7 +1248,7 @@ def segment_line(segment: dict, end: datetime | None, previous: dict | None = No
 
     span = f"{segment['start']:%m-%d %H:%M}" + (f"–{end:%H:%M}" if end else " 起")
     city = f"[{segment['city']}] " if previous is None or previous["city"] != segment["city"] else ""
-    return f"{span} {segment['mode']} {city}{segment['doing']}{_SOURCE_TAGS.get(segment['source'], '')}"
+    return f"{span} {segment['mode']} {city}{segment['doing']}{SOURCE_TAGS.get(segment['source'], '')}"
 
 
 def diary_line(entry: dict) -> str:

@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<style>
+:root {
+  --base: {{base}};
+  --photo-h: {{photo_height}}px;
+  --paper: #f4efe6;
+  --paper-soft: rgba(244, 239, 230, 0.62);
+  --paper-faint: rgba(244, 239, 230, 0.38);
+  --paper-dim: rgba(244, 239, 230, 0.5);
+  --amber: #f5b85c;
+  --cool: #9fb4e6;
+  --glass: rgba(255, 255, 255, 0.08);
+  --glass-edge: rgba(255, 255, 255, 0.1);
+  --hand: "LXGW WenKai", "Noto Serif CJK SC", "Noto Color Emoji", serif;
+  --sans: "Noto Sans CJK SC", "Noto Color Emoji", sans-serif;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  position: relative;
+  width: 600px;
+  min-height: 960px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--base);
+  color: var(--paper);
+  font-family: var(--sans);
+  -webkit-font-smoothing: antialiased;
+  line-break: strict;
+  text-wrap: pretty;
+}
+
+/* 壁纸：她最近的自拍铺满宽度（已经在 status.py 里按显示尺寸裁好），上沿压暗托住时钟，下沿淡进底色 */
+.photo { position: absolute; top: 0; left: 0; width: 600px; height: var(--photo-h); }
+.has-photo::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 600px;
+  height: calc(var(--photo-h) + 1px);
+  background: linear-gradient(
+    180deg,
+    rgba(0, 0, 0, 0.42) 0%,
+    rgba(0, 0, 0, 0.08) 30%,
+    transparent 44%,
+    color-mix(in srgb, var(--base) 55%, transparent) 70%,
+    var(--base) 100%
+  );
+  z-index: 1;
+}
+.no-photo { background: radial-gradient(120% 60% at 30% 0%, color-mix(in srgb, var(--base) 70%, #6b7aa6) 0%, var(--base) 70%); }
+main { position: relative; z-index: 2; display: flex; flex: 1; flex-direction: column; padding: 34px 30px 20px; }
+
+/* 时钟一组，左对齐 */
+.date { display: flex; gap: 14px; font-size: 18px; color: var(--paper); text-shadow: 0 1px 8px rgba(0, 0, 0, 0.35); }
+.date span:last-child { color: var(--paper-soft); }
+.clock {
+  margin: 2px 0 0 -4px;
+  font-size: 96px;
+  line-height: 1;
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+  text-shadow: 0 2px 18px rgba(0, 0, 0, 0.3);
+}
+.focus { margin-top: 12px; font-size: 15px; color: var(--paper); text-shadow: 0 1px 8px rgba(0, 0, 0, 0.4); }
+
+/*
+ * 她在做的事：像锁屏签名，直接写在壁纸上。时钟和它在同一个框里，框至少和照片一样高，
+ * 它被推到框底，末尾正好落在照片淡进底色的地方；照片多高都跟着走。
+ */
+.top { display: flex; flex-direction: column; }
+/* 减去的是 main 的上内边距 */
+.has-photo .top { min-height: calc(var(--photo-h) - 34px); }
+.now { margin-top: auto; padding-top: 40px; }
+.no-photo .now { padding-top: 64px; }
+.now .doing {
+  font-family: var(--hand);
+  font-size: 29px;
+  line-height: 1.45;
+  text-shadow: 0 1px 12px rgba(0, 0, 0, 0.35);
+}
+.tag { margin-left: 10px; font-family: var(--sans); font-size: 13.5px; color: var(--paper-soft); vertical-align: 3px; }
+.bar { margin-top: 16px; height: 2px; background: var(--paper-faint); }
+.bar span { display: block; height: 100%; background: var(--amber); }
+.span { display: flex; justify-content: space-between; margin-top: 8px; font-size: 13.5px; color: var(--paper-soft); font-variant-numeric: tabular-nums; }
+
+/* 通知：本群一条、打算一条 */
+.note {
+  margin-top: 30px;
+  padding: 14px 18px 15px;
+  border: 1px solid var(--glass-edge);
+  border-radius: 18px;
+  background: var(--glass);
+}
+.note + .note { margin-top: 10px; }
+.meta { display: flex; align-items: baseline; gap: 12px; font-size: 15px; }
+.meta b { font-weight: 700; overflow-wrap: anywhere; }
+.meta time { margin-left: auto; flex: none; font-size: 13.5px; color: var(--paper-soft); font-variant-numeric: tabular-nums; }
+.count { margin-top: 2px; font-size: 13.5px; color: var(--paper-soft); }
+.note .body { margin-top: 8px; font-family: var(--hand); font-size: 18px; line-height: 1.6; }
+.note .mood { margin-top: 6px; font-size: 14px; line-height: 1.6; color: var(--paper-soft); }
+.note .muted { margin-top: 6px; font-size: 14px; font-weight: 700; color: #ff9a8a; }
+.memo .body {
+  display: -webkit-box;
+  -webkit-line-clamp: 4;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+/*
+ * 今天：一段一个点，竖轨从这一段的点画到下一段的点，正好是这段的时长。
+ * 状态靠三样分开，不靠彩色：轨的样式（有空细实线、在忙粗实线、放下手机虚线、睡觉点线）、
+ * 点的形状（空心圆、方块、小淡点、月牙）、状态变了的那一行写出状态名。
+ * 拿着手机的段亮，放下手机的段淡，睡觉换冷色；现在这一段换成琥珀色。
+ */
+.today { margin-top: 34px; }
+.today .head { font-size: 15px; font-weight: 700; color: var(--paper-soft); }
+.today ol { list-style: none; margin-top: 12px; }
+.today li { position: relative; display: grid; grid-template-columns: 44px 1fr; gap: 30px; padding: 5px 0; }
+.today time { padding-top: 3px; font-size: 14px; color: var(--paper-soft); font-variant-numeric: tabular-nums; }
+.today li p { font-family: var(--hand); font-size: 17px; line-height: 1.55; color: var(--ink-row); }
+.today .mode { margin-right: 8px; font-family: var(--sans); font-size: 13.5px; font-weight: 700; }
+.today .city { margin-right: 8px; font-family: var(--sans); font-size: 13.5px; color: var(--paper-soft); }
+
+.today li::before { content: ""; position: absolute; z-index: 1; }
+.today li:not(:last-child)::after { content: ""; position: absolute; top: 17px; bottom: -17px; left: 55px; width: 1px; }
+
+.today li.m-free { --ink-row: var(--paper); --mark: var(--paper); }
+.today li.m-free::before { top: 12px; left: 51px; width: 9px; height: 9px; border: 2px solid var(--mark); border-radius: 50%; background: var(--base); }
+.today li.m-free::after { background: var(--paper-soft); }
+
+.today li.m-busy { --ink-row: var(--paper); --mark: var(--paper); }
+.today li.m-busy::before { top: 12px; left: 51px; width: 9px; height: 9px; border-radius: 2px; background: var(--mark); }
+.today li.m-busy::after { left: 53.5px; width: 4px; border-radius: 2px; background: var(--paper); }
+
+.today li.m-away { --ink-row: var(--paper-dim); --mark: var(--paper-dim); }
+.today li.m-away::before { top: 14px; left: 53px; width: 5px; height: 5px; border-radius: 50%; background: var(--mark); }
+.today li.m-away::after { background: repeating-linear-gradient(180deg, var(--paper-faint) 0 4px, transparent 4px 8px); }
+
+.today li.m-sleep { --ink-row: color-mix(in srgb, var(--cool) 85%, transparent); --mark: var(--cool); }
+.today li.m-sleep::before { top: 11px; left: 50px; width: 11px; height: 11px; border-radius: 50%; background: var(--base); box-shadow: inset -3.5px -1.5px 0 0 var(--mark); }
+.today li.m-sleep::after { left: 54.5px; width: 2px; background: repeating-linear-gradient(180deg, var(--cool) 0 2px, transparent 2px 6px); }
+
+.today li.is-now { --ink-row: var(--amber); --mark: var(--amber); }
+.today li.is-now time { color: var(--amber); }
+.today li.is-now::before { outline: 4px solid color-mix(in srgb, var(--amber) 25%, transparent); outline-offset: 1px; }
+
+footer { margin-top: auto; padding-top: 30px; text-align: center; font-size: 13px; color: var(--paper-faint); }
+footer::after { content: ""; display: block; width: 134px; height: 5px; margin: 10px auto 0; border-radius: 3px; background: var(--paper-soft); }
+</style>
+</head>
+<body class="{{photo_class}}">
+  {{photo}}
+  <main>
+    <div class="top">
+      <p class="date"><span>{{date}}</span><span>{{city}}</span></p>
+      <p class="clock">{{clock}}</p>
+      {{focus}}
+      {{now}}
+    </div>
+    {{notes}}
+    {{today}}
+    <footer>{{owner}}</footer>
+  </main>
+</body>
+</html>

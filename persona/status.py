@@ -58,6 +58,8 @@ TIMELINE_KEEP = timedelta(hours=18)
 NIGHTS_KEEP = 7
 # 给 Chat 的刷到的东西：和这段聊天沾边的最多几条
 FEED_CHAT_K = 2
+# /status 文字版只列今天最近几段，全天放不下一条消息
+STATUS_TODAY_SHOWN = 3
 
 SOURCE_DUE = "due"
 SOURCE_CHAT = "chat"
@@ -232,8 +234,8 @@ def describe_now(preset: str, last_look: datetime) -> str:
     return f"刚结束：{back}；现在：{now}" if back else now
 
 
-def today_lines(preset: str) -> list[str]:
-    """今天醒来以后的各段（还没醒过就是今天 0 点以后的），不含现在这一段。"""
+def today_segments(preset: str) -> list[tuple[dict, datetime]]:
+    """今天醒来以后的各段和各自的结束时间（还没醒过就是今天 0 点以后的），不含现在这一段。"""
 
     status = _statuses.get(preset)
     if status is None:
@@ -241,14 +243,18 @@ def today_lines(preset: str) -> list[str]:
     today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
     woke = [night["wake"] for night in status.nights if night["wake"] and night["wake"] >= today]
     since = woke[-1] if woke else today
-    indexes = [index for index in range(len(status.timeline) - 1) if _segment_end(status, index) > since]
     return [
-        segment_line(
-            status.timeline[index],
-            _segment_end(status, index),
-            status.timeline[index - 1] if index != indexes[0] else None,
-        )
-        for index in indexes
+        (status.timeline[index], _segment_end(status, index))
+        for index in range(len(status.timeline) - 1)
+        if _segment_end(status, index) > since
+    ]
+
+
+def today_lines(preset: str) -> list[str]:
+    segments = today_segments(preset)
+    return [
+        segment_line(segment, end, segments[index - 1][0] if index else None)
+        for index, (segment, end) in enumerate(segments)
     ]
 
 
@@ -548,7 +554,7 @@ async def check_statuses() -> None:
 
 
 def status_text(preset: str) -> list[str]:
-    """/status 里的几行：现在在哪、在干嘛，今天的各段，刷到的东西。"""
+    """/status 文字版里的几行：现在在哪、在干嘛、打算，今天最近几段。"""
 
     status = _statuses.get(preset)
     if status is None or status.current is None:
@@ -559,12 +565,11 @@ def status_text(preset: str) -> list[str]:
     if status.plan:
         lines.append(f"打算：{status.plan}")
     today = today_lines(preset)
-    if today:
+    if len(today) > STATUS_TODAY_SHOWN:
+        lines.append(f"今天醒来以后 {len(today)} 段，最近 {STATUS_TODAY_SHOWN} 段：")
+    elif today:
         lines.append("今天：")
-        lines.extend(f"- {line}" for line in today)
-    if status.feed:
-        lines.append("这两天刷到的：")
-        lines.extend(f"- {line}" for line in recent_feed(preset))
+    lines.extend(f"- {line}" for line in today[-STATUS_TODAY_SHOWN:])
     return lines
 
 

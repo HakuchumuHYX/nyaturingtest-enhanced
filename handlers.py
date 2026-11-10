@@ -30,6 +30,8 @@ from .cards.impression import render_impression_card
 from .cards.notes import render_group_notes_card
 from .cards.persona import Change as PersonaChange
 from .cards.persona import render_persona_card
+from .cards.status import GroupView as StatusGroup
+from .cards.status import render_status_card
 from .cards.token_stats import render_token_stats_card
 from .chat.engagement import unread_count
 from .chat.groups import (
@@ -54,10 +56,12 @@ from .messages.convert import (
 from .messages.forward import digest_forward
 from .messages.image import fetch_image_input
 from .messages.photos import remove_by_message as remove_photo_by_message
+from .messages.photos import wallpaper as photo_wallpaper
 from .messages.stickers import block as block_sticker
 from .metrics import log_event
-from .persona.status import recent_diary, redecide, status_text
-from .prompts import PRESETS, reload_presets, resolve_preset
+from .persona.status import get_status as get_persona_status
+from .persona.status import recent_diary, redecide, status_text, today_segments
+from .prompts import PRESETS, mood_label, reload_presets, resolve_preset
 from .storage.backup import backup_task
 from .storage.db import get_token_stats, message_content, recall_message
 from .storage.models import PersonaHistoryModel, SessionModel
@@ -77,7 +81,7 @@ class CommandMeta:
 COMMANDS: tuple[CommandMeta, ...] = (
     CommandMeta("autochat <enable/disable>", "在本群启用或禁用 Autochat"),
     CommandMeta(
-        "status", "查看她现在在做什么、今天的时间线和本群状态", "status <群号>"
+        "status", "查看她现在在做什么、今天最近几段和本群状态", "status <群号>"
     ),
     CommandMeta("presets", "查看可用预设", "presets <群号>"),
     CommandMeta("set_preset <文件名>", "加载预设", "set_preset <群号> <文件名>"),
@@ -516,24 +520,41 @@ async def _do_status(matcher: type[Matcher], group_id: int, _args: str):
     session = await _session_or_finish(matcher, group_id)
     state = session.state
     state.global_emotion.settle()
-    emotion = state.global_emotion
-    recent = "\n".join(
-        f"{m.user_name}: {m.content}" for m in session.short_term_memory.access()
+    looked = state.last_look_time != datetime.min
+    group = StatusGroup(
+        name=await _group_name(group_id),
+        unread=unread_count(state, session.unread()),
+        last_look=state.last_look_time if looked else None,
+        mood=mood_label(state.global_emotion),
+        summary=state.chat_summary,
+        muted_until=session.muted_until if session.muted else None,
     )
-    last_look = "（本次启动还没看过）"
-    if state.last_look_time != datetime.min:
-        last_look = f"{state.last_look_time:%H:%M:%S}"
-    muted = f"，禁言到 {session.muted_until:%m-%d %H:%M}" if session.muted else ""
+    status = get_persona_status(state.preset)
+    if state.name and status is not None:
+        try:
+            image = await render_status_card(
+                name=state.name,
+                current=status.current,
+                until=status.until,
+                calls=len(status.calls),
+                plan=status.plan,
+                today=today_segments(state.preset),
+                group=group,
+                wallpaper=await photo_wallpaper(state.preset),
+            )
+        except Exception as e:
+            logger.error(f"渲染状态卡片失败: {e}")
+        else:
+            await matcher.finish(MessageSegment.image(image))
+
+    last_look = f"上次看群 {group.last_look:%H:%M}" if looked else "本次启动还没看过群"
+    muted = f"，禁言到 {group.muted_until:%m-%d %H:%M}" if group.muted_until else ""
     lines = [
         "",
         f"人设：{state.preset or '未设（不说话）'}{muted}",
         *status_text(state.preset),
-        f"未读：{unread_count(state, session.unread())} 条，上次看群 {last_look}",
-        f"心情：V{emotion.valence:.2f} A{emotion.arousal:.2f} D{emotion.dominance:.2f}",
-        f"后台任务数: {len(session.background_tasks)}",
-        f"摘要：{state.chat_summary}",
-        "最近消息：",
-        recent or "无",
+        f"本群：未读 {group.unread} 条，{last_look}；{group.mood}",
+        f"摘要：{group.summary or '无'}",
     ]
     await matcher.finish("\n".join(lines))
 

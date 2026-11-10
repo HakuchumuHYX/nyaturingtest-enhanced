@@ -61,6 +61,15 @@ def photo_path(digest: str):
     return PHOTO_DIR / f"{digest}.jpg"
 
 
+async def wallpaper(preset: str):
+    """/status 锁屏的壁纸：最近一张自拍，没有自拍就用最近一张照片；相册空的返回 None。"""
+
+    rows = sorted(await db.load_photos(preset), key=lambda row: row.created_at, reverse=True)
+    selfies = [row for row in rows if row.kind == "selfie"]
+    picked = (selfies or rows or [None])[0]
+    return photo_path(picked.digest) if picked else None
+
+
 # 她发的照片写进短期记忆的样子；photodel 按它认出是哪张
 PHOTO_MARK = "[图片: {}]"
 
