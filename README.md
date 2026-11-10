@@ -235,7 +235,6 @@ pip install -r plugins/nyaturingtest/requirements.txt
 | `/presets` | `/preset` | 列出可用预设 |
 | `/set_preset <预设>` | `/set_presets` | 加载预设 |
 | `/persona` | `/人设` | 把人生线、最近的日记、本群的它和最近的改动做成图片发出来 |
-| `/calm` | `/冷静` | 心情回到平静，退出当前对话，并重新定一次它现在在做什么（各群一起生效） |
 | `/reset confirm` | `/重置 confirm` | 先备份，再清空本群的消息、记忆、档案、群志和群里的它，人设保留，**不可撤销** |
 | `/token统计` | `/autochat token统计` | 当前 chat / feedback / background 模型的 Token 用量卡片 |
 | `stickerdel` | | 回复一条带图的消息：把图从表情包库删掉并拉黑，以后见到只看不收 |

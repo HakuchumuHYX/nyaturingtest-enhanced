@@ -2,7 +2,7 @@
 
 一个预设一份，所有群共用：她是一个人，在 A 群说去开组会了，B 群也不能还在水。
 一次只定眼下这一段，每段都从上一段接着走，不在一天开始时排好。状态只在这几种时候变：
-到点（due）、聊天时她自己定了（chat）、away 时被叫到并拿起了手机（called）、启动或断了很久（start）、/calm（calm）。
+到点（due）、聊天时她自己定了（chat）、away 时被叫到并拿起了手机（called）、启动或断了很久（start）。
 状态里只有她自己的生活（可以有她身边的人，不能有群友和群里的事）：被叫到时不给群名，状态模型只看她开口的时间、不看说了什么。
 能看到聊天内容的只有 Chat，所以聊天要改她接下来做什么走 Chat 的 status。
 每段带着她在哪个城市和坐标：她会回家、出去玩，天气跟着她走。城市由状态模型或 Chat 给，不填就是没换。
@@ -65,7 +65,6 @@ SOURCE_DUE = "due"
 SOURCE_CHAT = "chat"
 SOURCE_CALLED = "called"
 SOURCE_START = "start"
-SOURCE_CALM = "calm"
 
 
 @dataclass
@@ -420,7 +419,7 @@ async def _status_background(status: PersonaStatus, now: datetime) -> dict:
 
 
 async def _decide(status: PersonaStatus, source: str) -> None:
-    """到点、启动、/calm：让状态模型定下一段。"""
+    """到点、启动：让状态模型定下一段。"""
 
     persona = PRESETS.get(status.preset)
     if persona is None:
@@ -507,13 +506,6 @@ async def apply_chat_status(preset: str, raw) -> None:
             logger.debug(f"Chat 的 status 无效，丢弃: {raw}")
         return
     await _apply(status, segment, SOURCE_CHAT, "聊天时定的")
-
-
-async def redecide(preset: str) -> None:
-    """/calm：不管这一段到没到点，现在重新定一次。"""
-
-    status = await _load(preset)
-    await _decide(status, SOURCE_CALM)
 
 
 async def reload_diaries() -> None:

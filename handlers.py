@@ -60,7 +60,7 @@ from .messages.photos import wallpaper as photo_wallpaper
 from .messages.stickers import block as block_sticker
 from .metrics import log_event
 from .persona.status import get_status as get_persona_status
-from .persona.status import recent_diary, redecide, status_text, today_segments
+from .persona.status import recent_diary, status_text, today_segments
 from .prompts import PRESETS, mood_label, reload_presets, resolve_preset
 from .storage.backup import backup_task
 from .storage.db import get_token_stats, message_content, recall_message
@@ -87,7 +87,6 @@ COMMANDS: tuple[CommandMeta, ...] = (
     CommandMeta("set_preset <文件名>", "加载预设", "set_preset <群号> <文件名>"),
     CommandMeta("persona", "查看人生线、本群的她和最近的改动", "persona <群号>"),
     CommandMeta("group_notes", "查看本群群志原文", "group_notes <群号>"),
-    CommandMeta("calm", "重置心情、退出当前对话，并重新定一次她在做什么", "calm <群号>"),
     CommandMeta("reset confirm", "先备份再完全重置本群", "reset <群号> confirm"),
     CommandMeta("token统计", "查看当前 chat / feedback / background 模型的 Token 用量"),
     CommandMeta("stickerdel", "回复一张图：从表情包库删掉并拉黑，以后只描述不收"),
@@ -649,19 +648,6 @@ async def _do_group_notes(matcher: type[Matcher], group_id: int, _args: str):
 
 
 get_group_notes = _dual_command("group_notes", {"群志", "查看群志"}, _do_group_notes)
-
-
-async def _do_calm_down(matcher: type[Matcher], group_id: int, _args: str):
-    session = await _session_or_finish(matcher, group_id)
-    async with session.admin_lock:
-        await session.calm_down()
-    # 状态按人存，重新定一次各群一起生效
-    if session.state.name:
-        session.spawn(redecide(session.state.preset))
-    await matcher.finish("已老实")
-
-
-calm_down = _dual_command("calm", {"冷静"}, _do_calm_down)
 
 
 async def _do_reset(matcher: type[Matcher], group_id: int, args: str):

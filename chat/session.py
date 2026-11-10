@@ -84,7 +84,7 @@ class Session:
         self.event: Event | None = None
         self.messages_chunk: deque[ChatMessage] = deque(maxlen=QUEUE_MAX_SIZE)
         self.data_lock = asyncio.Lock()
-        # 管理命令（load_preset / reset / calm_down）之间互斥；
+        # 管理命令（load_preset / reset）之间互斥；
         # 一轮对话不持锁，靠 generation 判断过期
         self.admin_lock = asyncio.Lock()
         self.new_message_signal = asyncio.Event()
@@ -137,14 +137,6 @@ class Session:
             await self._save_session_locked()
         await self._apply_preset()
         logger.info(f"[Session {self.id}] 已完全重置（含数据库清理）")
-
-    async def calm_down(self):
-        """心情回到基线、退出对话窗口；好感度是长期养成的，不在这里清"""
-        self.bump_generation("calm_down")
-        self.state.global_emotion = EmotionState()
-        self.state.last_speak_time = datetime.min
-        logger.info(f"[Session {self.id}] 已冷静：心情重置、退出对话")
-        await self.save_session()
 
     def spawn(self, coro) -> asyncio.Task:
         """创建受 drain_background_tasks 管理、异常会记日志的后台任务"""
