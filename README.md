@@ -9,7 +9,7 @@
 
 基于 [shadow3aaa](https://github.com/shadow3aaa/) 的
 [nonebot-plugin-nyaturingtest](https://github.com/shadow3aaa/nonebot-plugin-nyaturingtest) 二次开发，
-运行在 NoneBot2 + OneBot V11 上，对话模型、Embedding 和 Rerank 都走云端 API。
+运行在 NoneBot2 + OneBot V11 上，对话模型、Embedding 和 Rerank 都通过 HTTP 接口调用，云端或本地部署的都行。
 
 想先装起来试试，直接看[快速开始](#快速开始)。
 
@@ -113,7 +113,8 @@
 1. 把本仓库放到 NoneBot 项目根目录下的 `plugins/nyaturingtest`（位置有要求，见[安装](#安装)），装依赖：
    `pip install -r plugins/nyaturingtest/requirements.txt`。
 2. 复制 `config.example.json` 为 `config.json`，至少填好 `chat`、`feedback`、`background` 三个模型和
-   `siliconflow_api_key`。三个模型可以填同一个，其余的先留着示例值或留空，见[配置](#配置)。
+   `embedding`、`rerank` 两个检索模型（示例是硅基流动，换别家或本地的也行）。
+   三个对话模型可以填同一个，其余的先留着示例值或留空，见[配置](#配置)。
 3. 新建 `config/nyaturingtest/nya_presets/小明.json`，照[角色预设](#角色预设)里的示例改。
 4. 启动 bot，在群里发 `/autochat enable 小明`。
 5. @ 它说句话。没反应先看[它为什么不说话](#它为什么不说话)。
@@ -161,9 +162,8 @@ pip install -r plugins/nyaturingtest/requirements.txt
 | `chat` | 必需 | 角色模型：按人设把话说出来 |
 | `feedback` | 必需 | 观察者模型：每轮看群判断说不说、心情好感、摘要和更正，用量最大 |
 | `background` | 必需 | 后台模型：识图、转发摘要、当天状态、记忆整理和人设成长 |
-| `siliconflow_api_key` | 必需 | Embedding 和 Rerank 共用的 Key；不填的话记忆检索、表情包和照片都匹配不上，每次检索都报错 |
-| `embedding` | 有默认值 | 记忆检索用的向量模型 |
-| `rerank` | 有默认值 | 检索结果重排，`threshold` 以下的结果丢弃 |
+| `embedding` | 必需 | 记忆、表情包、照片检索用的向量模型，接口要求见下 |
+| `rerank` | 必需 | 检索结果重排，`threshold` 以下的结果丢弃，接口要求见下 |
 | `web_search` | 可选 | 联网搜索（DeepSeek Search），`api_key` 留空就不搜 |
 | `image` | 可选 | 发照片用的生图模型（`api_key`、`base_url`、`model`、`quality`、`timeout`），`model` 留空就不发照片，启动时打一条警告 |
 | `playwright_browsers_path` | 可选 | 卡片截图用的 Chromium 所在目录，留空用 playwright 默认位置 |
@@ -172,6 +172,17 @@ pip install -r plugins/nyaturingtest/requirements.txt
 
 三个模型段的 `base_url`、`model` 必填，填同一个模型也行；其余缺省有默认值。改配置后要重启。
 也可以用环境变量 `NYATURINGTEST_CONFIG_FILE` 指定别的配置文件，用 `NYATURINGTEST_DATA_DIR` 指定数据目录。
+
+**Embedding 和 Rerank 不限服务商。** 示例里填的是硅基流动，换成别家的，或者本地部署的（比如用 vLLM 起的服务）都行，接口对得上就可以：
+
+- `embedding` 走 OpenAI 兼容的 Embeddings 接口，`base_url` 填到 `/v1` 这一级，请求发到 `<base_url>/embeddings`。
+- `rerank` 走 Jina / Cohere 风格的重排接口，`base_url` 填完整地址（比如 `.../v1/rerank`）。
+  请求体带 `model`、`query`、`documents`、`top_n`，返回里要有 `results[].index` 和 `results[].relevance_score`。
+- 本地服务不用鉴权的话 `api_key` 留空。调用失败时，embedding 那边记忆检索、表情包和照片都匹配不上；
+  rerank 那边退回按向量分取前几条。
+- `threshold` 是按示例模型的分数定的，换了 rerank 模型，分数尺度可能不一样，要跟着调。
+- embedding 模型最好第一次启动前就定下来。攒了记忆之后再换，插件不会重算记忆的向量，那些群的记忆检索会直接报错；
+  表情包和照片会自动补算。
 
 ### 角色预设
 

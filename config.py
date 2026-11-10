@@ -40,12 +40,21 @@ class EndpointSettings:
 
 
 @dataclass(frozen=True)
-class MemoryEndpointSettings:
-    model: str
+class EmbeddingSettings:
+    api_key: str
     base_url: str
+    model: str
     timeout: float
-    rerank_base_url: str
-    rerank_timeout: float
+
+
+@dataclass(frozen=True)
+class RerankSettings:
+    api_key: str
+    # 完整的接口地址，不是前缀
+    base_url: str
+    model: str
+    timeout: float
+    threshold: float
 
 
 @dataclass(frozen=True)
@@ -71,12 +80,10 @@ class AppSettings:
     chat: EndpointSettings
     feedback: EndpointSettings
     background: EndpointSettings
-    rerank_model: str
-    rerank_threshold: float
-    memory: MemoryEndpointSettings
+    embedding: EmbeddingSettings
+    rerank: RerankSettings
     web_search: WebSearchSettings
     image: ImageSettings
-    siliconflow_api_key: str
     playwright_browsers_path: str
     webconsole_db: str
     console_token: str
@@ -107,13 +114,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "max_tokens": 2048,
         "timeout": 60,
     },
-    "siliconflow_api_key": "",
     "embedding": {
+        "api_key": "",
         "model": "Qwen/Qwen3-Embedding-0.6B",
         "base_url": "https://api.siliconflow.cn/v1",
         "timeout": 30,
     },
     "rerank": {
+        "api_key": "",
         "model": "Qwen/Qwen3-Reranker-4B",
         "base_url": "https://api.siliconflow.cn/v1/rerank",
         "timeout": 10,
@@ -181,14 +189,18 @@ def build_settings(config: dict[str, Any]) -> AppSettings:
         chat=_endpoint(cfg, "chat"),
         feedback=_endpoint(cfg, "feedback"),
         background=_endpoint(cfg, "background"),
-        rerank_model=str(rerank["model"] or ""),
-        rerank_threshold=float(rerank["threshold"]),
-        memory=MemoryEndpointSettings(
-            model=str(embedding["model"]),
+        embedding=EmbeddingSettings(
+            api_key=str(embedding["api_key"] or ""),
             base_url=str(embedding["base_url"]).rstrip("/"),
+            model=str(embedding["model"]),
             timeout=float(embedding["timeout"]),
-            rerank_base_url=str(rerank["base_url"]).rstrip("/"),
-            rerank_timeout=float(rerank["timeout"]),
+        ),
+        rerank=RerankSettings(
+            api_key=str(rerank["api_key"] or ""),
+            base_url=str(rerank["base_url"]).rstrip("/"),
+            model=str(rerank["model"] or ""),
+            timeout=float(rerank["timeout"]),
+            threshold=float(rerank["threshold"]),
         ),
         web_search=WebSearchSettings(
             api_key=str(web_search["api_key"] or ""),
@@ -202,7 +214,6 @@ def build_settings(config: dict[str, Any]) -> AppSettings:
             quality=str(image["quality"] or ""),
             timeout=float(image["timeout"]),
         ),
-        siliconflow_api_key=str(cfg["siliconflow_api_key"] or ""),
         playwright_browsers_path=str(cfg["playwright_browsers_path"] or ""),
         webconsole_db=str(cfg["webconsole_db"] or ""),
         console_token=str(cfg["console_token"] or ""),
@@ -217,6 +228,8 @@ def _load_settings() -> AppSettings:
         ("chat", settings.chat),
         ("feedback", settings.feedback),
         ("background", settings.background),
+        ("embedding", settings.embedding),
+        ("rerank", settings.rerank),
     ):
         key_state = "set" if endpoint.api_key else "missing"
         logger.info(

@@ -23,13 +23,14 @@
         "max_tokens": 2048,
         "timeout": 60
     },
-    "siliconflow_api_key": "YOUR_SILICONFLOW_API_KEY",
     "embedding": {
+        "api_key": "YOUR_EMBEDDING_API_KEY",
         "model": "Qwen/Qwen3-Embedding-0.6B",
         "base_url": "https://api.siliconflow.cn/v1",
         "timeout": 30
     },
     "rerank": {
+        "api_key": "YOUR_RERANK_API_KEY",
         "model": "Qwen/Qwen3-Reranker-4B",
         "base_url": "https://api.siliconflow.cn/v1/rerank",
         "timeout": 10,

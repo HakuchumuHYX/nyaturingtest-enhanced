@@ -168,44 +168,49 @@ async def embed_texts(texts: list[str], *, instruction: str = "") -> np.ndarray:
     settings = get_app_settings()
     if _embedding_client is None:
         _embedding_client = AsyncOpenAI(
-            api_key=settings.siliconflow_api_key,
-            base_url=settings.memory.base_url,
-            timeout=settings.memory.timeout,
+            api_key=settings.embedding.api_key,
+            base_url=settings.embedding.base_url,
+            timeout=settings.embedding.timeout,
             max_retries=0,
         )
     started = time.perf_counter()
     try:
         response = await _embedding_client.embeddings.create(
-            model=settings.memory.model,
+            model=settings.embedding.model,
             input=[instruction + text.replace("\n", " ") for text in texts],
             encoding_format="float",
         )
     except Exception as e:
         record_llm_call(
-            "embedding", settings.memory.model, None, False, _elapsed_ms(started), type(e).__name__
+            "embedding",
+            settings.embedding.model,
+            None,
+            False,
+            _elapsed_ms(started),
+            type(e).__name__,
         )
         raise
-    record_llm_call("embedding", settings.memory.model, None, True, _elapsed_ms(started))
+    record_llm_call("embedding", settings.embedding.model, None, True, _elapsed_ms(started))
     vectors = np.asarray([item.embedding for item in response.data], dtype=np.float32)
     return vectors / np.linalg.norm(vectors, axis=1, keepdims=True)
 
 
 async def rerank(query: str, documents: list[str]) -> list[tuple[int, float]] | None:
-    """过了 rerank_threshold 的 (下标, 分数)，分数高的在前；全被筛掉是 []，接口失败是 None。"""
+    """过了 rerank.threshold 的 (下标, 分数)，分数高的在前；全被筛掉是 []，接口失败是 None。"""
 
     global _rerank_client
     settings = get_app_settings()
     if _rerank_client is None:
         _rerank_client = httpx.AsyncClient(
-            timeout=settings.memory.rerank_timeout, trust_env=False
+            timeout=settings.rerank.timeout, trust_env=False
         )
     started = time.perf_counter()
     try:
         response = await _rerank_client.post(
-            settings.memory.rerank_base_url,
-            headers={"Authorization": f"Bearer {settings.siliconflow_api_key}"},
+            settings.rerank.base_url,
+            headers={"Authorization": f"Bearer {settings.rerank.api_key}"},
             json={
-                "model": settings.rerank_model,
+                "model": settings.rerank.model,
                 "query": query,
                 "documents": documents,
                 "top_n": len(documents),  # 全排，然后本地过滤
@@ -219,12 +224,12 @@ async def rerank(query: str, documents: list[str]) -> list[tuple[int, float]] | 
         ]
     except Exception as e:
         record_llm_call(
-            "rerank", settings.rerank_model, None, False, _elapsed_ms(started), type(e).__name__
+            "rerank", settings.rerank.model, None, False, _elapsed_ms(started), type(e).__name__
         )
         logger.error(f"Rerank API Error: {e}")
         return None
-    record_llm_call("rerank", settings.rerank_model, None, True, _elapsed_ms(started))
-    return [(index, score) for index, score in scored if score >= settings.rerank_threshold]
+    record_llm_call("rerank", settings.rerank.model, None, True, _elapsed_ms(started))
+    return [(index, score) for index, score in scored if score >= settings.rerank.threshold]
 
 
 async def close_clients() -> None:
@@ -257,7 +262,7 @@ class VectorMemory:
         ).values_list(
             "id", "embedding", "embedding_model", "participant_ids"
         )
-        model = get_app_settings().memory.model
+        model = get_app_settings().embedding.model
         mismatched = {row[2] for row in rows if row[2] != model}
         if mismatched:
             # 不同模型的向量混在一起检索会静默变成噪声，必须先重嵌入
@@ -482,7 +487,7 @@ class VectorMemory:
             logger.error(f"[Memory] Embedding 失败，记忆先不带向量落库: {e}")
             vectors = None
 
-        embedding_model = get_app_settings().memory.model
+        embedding_model = get_app_settings().embedding.model
         async with self._lock:
             new_rows: list[MemoryModel] = []
             for index, memory in enumerate(valid):
@@ -588,7 +593,7 @@ async def maintain_memories() -> dict:
 
     deleted = await MemoryModel.filter(expires_at__lt=datetime.now()).delete()
     pending = await MemoryModel.filter(embedding__isnull=True)
-    embedding_model = get_app_settings().memory.model
+    embedding_model = get_app_settings().embedding.model
     filled = 0
     for start in range(0, len(pending), EMBEDDING_BATCH_SIZE):
         batch = pending[start : start + EMBEDDING_BATCH_SIZE]

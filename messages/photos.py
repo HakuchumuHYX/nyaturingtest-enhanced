@@ -138,7 +138,7 @@ def discard(photo: NewPhoto) -> None:
 
 
 async def save(session_id: str, preset: str, photo: NewPhoto) -> None:
-    model = get_app_settings().memory.model
+    model = get_app_settings().embedding.model
     try:
         vector = (await embed_texts([_search_text(photo.caption, photo.taken_at)]))[0]
     except Exception as e:
@@ -161,7 +161,7 @@ async def save(session_id: str, preset: str, photo: NewPhoto) -> None:
 async def _vectors(rows: list) -> list[np.ndarray]:
     """每张的向量；没算成或换过 embedding 模型的这里补算，补算失败抛异常。"""
 
-    model = get_app_settings().memory.model
+    model = get_app_settings().embedding.model
     stale = [row for row in rows if row.embedding is None or row.embedding_model != model]
     if stale:
         vectors = await embed_texts([_search_text(row.caption, row.created_at) for row in stale])

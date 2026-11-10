@@ -69,7 +69,7 @@ _collecting: set[str] = set()
 async def load_stickers() -> None:
     """启动时载入；没有向量或向量是旧 embedding 模型算的，补算一遍。"""
 
-    model = get_app_settings().memory.model
+    model = get_app_settings().embedding.model
     _stickers.clear()
     for row in await db.load_stickers():
         fresh = row.embedding is not None and row.embedding_model == model
@@ -158,7 +158,7 @@ async def collect(image_bytes: bytes, result: StickerCaption, source: str) -> bo
         async with await anyio.open_file(path, "wb") as f:
             await f.write(image_bytes)
 
-        model = get_app_settings().memory.model
+        model = get_app_settings().embedding.model
         now = datetime.now()
         try:
             vector = (await embed_texts([result.reaction]))[0]
