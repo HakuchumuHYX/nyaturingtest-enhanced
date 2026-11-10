@@ -8,6 +8,7 @@ from nonebot import logger
 from .chat.domain import EmotionState
 from .config import PRESET_DIR
 from .messages.faces import face_lines
+from .metrics import error_text
 
 
 def is_rest_day(value: date) -> tuple[bool, str]:
@@ -18,7 +19,7 @@ def is_rest_day(value: date) -> tuple[bool, str]:
         _, holiday_name = chinese_calendar.get_holiday_detail(value, in_english=False)
         return chinese_calendar.is_holiday(value), holiday_name or ""
     except NotImplementedError as e:
-        logger.warning(f"节假日判断失败: {e}")
+        logger.warning(f"节假日判断失败: {error_text(e)}")
         return value.weekday() >= 5, ""
 
 
@@ -78,7 +79,7 @@ def reload_presets() -> None:
             with open(path, encoding="utf-8") as f:
                 loaded[path.name] = RolePreset(**json.load(f))
         except Exception as e:
-            logger.warning(f"无法加载预设 {path.name}: {e}")
+            logger.warning(f"无法加载预设 {path.name}: {error_text(e)}")
     if not loaded:
         logger.warning(f"预设目录 {PRESET_DIR} 下没有可用的人设文件，没设人设的群不会说话，格式见 README")
     PRESETS.clear()

@@ -17,7 +17,7 @@ from PIL import Image
 
 from ..config import get_app_settings, get_data_dir
 from ..memory.vector import EMBEDDING_BATCH_SIZE, embed_texts
-from ..metrics import log_event
+from ..metrics import error_text, log_event
 from ..storage import db
 from .image import StickerCaption, cached_caption, forget_caption, join_sticker_caption
 
@@ -94,7 +94,7 @@ async def load_stickers() -> None:
         try:
             vectors = await embed_texts([sticker.reaction for sticker in batch])
         except Exception as e:
-            logger.error(f"表情包补算向量失败，下次启动再试: {e}")
+            logger.warning(f"表情包补算向量失败，下次启动再试: {error_text(e)}")
             break
         for sticker, vector in zip(batch, vectors):
             sticker.vector = vector
@@ -108,7 +108,7 @@ def _image_ext(image_bytes: bytes) -> str | None:
     try:
         return _FORMAT_EXT.get(Image.open(io.BytesIO(image_bytes)).format or "")
     except Exception as e:
-        logger.warning(f"识别表情包格式失败: {e}")
+        logger.warning(f"识别表情包格式失败: {error_text(e)}")
         return None
 
 
@@ -163,7 +163,7 @@ async def collect(image_bytes: bytes, result: StickerCaption, source: str) -> bo
         try:
             vector = (await embed_texts([result.reaction]))[0]
         except Exception as e:
-            logger.warning(f"表情包向量没算成，先不带向量入库: {e}")
+            logger.warning(f"表情包向量没算成，先不带向量入库: {error_text(e)}")
             vector = None
         await db.add_sticker(
             digest=digest,
@@ -217,7 +217,7 @@ async def pick(tag: str, want: str) -> tuple[Sticker, float | None] | None:
             candidates = [scored[index] for index in top]
             scores = {scored[index].digest: float(similarities[index]) for index in top}
         except Exception as e:
-            logger.warning(f"表情包挑图算向量失败，退回标签内最久没发过的: {e}")
+            logger.warning(f"表情包挑图算向量失败，退回标签内最久没发过的: {error_text(e)}")
     chosen = min(candidates, key=lambda sticker: sticker.last_sent_at or datetime.min)
     return chosen, scores.get(chosen.digest)
 
@@ -238,7 +238,7 @@ def _delete_files(digest: str) -> bool:
         try:
             path.unlink()
         except Exception as e:
-            logger.warning(f"删除表情包文件失败 {path}: {e}")
+            logger.warning(f"删除表情包文件失败 {path}: {error_text(e)}")
     forget_caption(digest)
     return bool(files)
 

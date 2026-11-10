@@ -9,6 +9,7 @@ from nonebot import logger
 
 from ..llm import get_http_client
 from ..memory.query import Impression
+from ..metrics import error_text
 from .browser import screenshot
 
 _TEMPLATE = Path(__file__).with_name("impression.html")
@@ -38,7 +39,7 @@ async def _avatar_data_uri(user_id: str) -> str:
         )
         response.raise_for_status()
     except Exception as e:
-        logger.warning(f"印象卡片头像获取失败 {user_id}: {e}")
+        logger.warning(f"印象卡片头像获取失败 {user_id}: {error_text(e)}")
         return ""
     mime = response.headers.get("content-type", "image/jpeg").split(";")[0]
     return f"data:{mime};base64,{base64.b64encode(response.content).decode()}"

@@ -184,7 +184,7 @@ async def digest_group(
         or not isinstance(data.get("observation"), str)
         or not isinstance(data.get("life_facts"), list)
     ):
-        logger.warning(f"[Persona] 群 {session_id} {day} 群层整理输出无效")
+        logger.warning(f"群 {session_id} {day} 群层整理输出无效")
         return None
     return GroupDigest(
         text=data["group_self"].strip(),
@@ -214,7 +214,7 @@ async def digest_life(
         session_id=session_id,
     )
     if data is None or not isinstance(data.get("life"), str):
-        logger.warning(f"[Persona] {persona.name} {day} 人生线整理输出无效")
+        logger.warning(f"{persona.name} {day} 人生线整理输出无效")
         return None
     return LifeDigest(
         text=data["life"].strip(), changes=str(data.get("changes") or "").strip()
@@ -280,7 +280,7 @@ async def write_diary(
         or not data["diary"].strip()
         or not isinstance(data.get("plan"), str)
     ):
-        logger.warning(f"[Persona] {persona.name} {day} 日记和打算输出无效")
+        logger.warning(f"{persona.name} {day} 日记和打算输出无效")
         return None
     return data["diary"].strip(), data["plan"].strip()
 
@@ -459,7 +459,7 @@ async def _maintain_preset(
         feed_count = await refresh_feed(persona, filename, life.text, status)
 
     logger.info(
-        f"[Persona] {filename} 整理到 {yesterday}：群层更新 {len(updated)} 个群，"
+        f"{filename} 整理到 {yesterday}：群层更新 {len(updated)} 个群，"
         f"整理失败停在半路的群 {sorted(blocked) or '无'}"
     )
     return life, updated, {
@@ -494,7 +494,7 @@ async def refresh_feed(persona: RolePreset, filename: str, life: str, status: di
     )
     queries = data.get("queries") if isinstance(data, dict) else None
     if not isinstance(queries, list):
-        logger.warning(f"[Persona] {persona.name} 刷到的东西：搜索词输出无效")
+        logger.warning(f"{persona.name} 刷到的东西：搜索词输出无效")
         return None
     results: list[str] = []
     for item in queries[:FEED_QUERIES]:
@@ -503,7 +503,7 @@ async def refresh_feed(persona: RolePreset, filename: str, life: str, status: di
                 str(item["query"]).strip(), str(item.get("why") or ""), session_id=session_id
             )
     if not results:
-        logger.warning(f"[Persona] {persona.name} 刷到的东西：什么都没搜到")
+        logger.warning(f"{persona.name} 刷到的东西：什么都没搜到")
         return None
 
     data = await background_client.generate_json(
@@ -512,12 +512,12 @@ async def refresh_feed(persona: RolePreset, filename: str, life: str, status: di
     )
     items = data.get("items") if isinstance(data, dict) else None
     if not isinstance(items, list):
-        logger.warning(f"[Persona] {persona.name} 刷到的东西：挑选输出无效")
+        logger.warning(f"{persona.name} 刷到的东西：挑选输出无效")
         return None
     picked = [str(text).strip()[:FEED_ITEM_CHARS] for text in items if str(text).strip()][:FEED_ITEMS]
     feed += [{"day": today.isoformat(), "text": text} for text in picked]
     await save_persona_feed(filename, feed)
-    logger.info(f"[Persona] {persona.name} 刷到的东西：搜了 {len(queries)} 次，收 {len(picked)} 条")
+    logger.info(f"{persona.name} 刷到的东西：搜了 {len(queries)} 次，收 {len(picked)} 条")
     return len(picked)
 
 
@@ -565,7 +565,7 @@ async def maintain_personas(
         if session.preset in PRESETS:
             by_preset[session.preset].append(session.id)
         else:
-            logger.warning(f"[Persona] 群 {session.id} 的预设 {session.preset} 不存在，跳过整理")
+            logger.warning(f"群 {session.id} 的预设 {session.preset} 不存在，跳过人设整理")
 
     yesterday = date.today() - timedelta(days=1)
     lives: dict[str, str] = {}

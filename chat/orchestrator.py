@@ -734,7 +734,7 @@ async def chat_stage(
         recalled_history = [
             f"[{m.time:%H:%M}] {m.user_name}: {m.content}" for m in recalled_msgs
         ]
-        logger.debug(f"[Session {session.id}] 回溯了 {len(recalled_history)} 条历史消息")
+        logger.debug(f"群 {session.id} 回溯了 {len(recalled_history)} 条历史消息")
 
     new_msgs = [
         {"id": msg.id, "name": msg.user_name, "content": msg.content}

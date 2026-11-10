@@ -102,7 +102,7 @@ def _due(
 async def _generate(session_id: str, prompt: str, key: str) -> dict | None:
     data = await background_client.generate_json(prompt, session_id=session_id)
     if data is None or not isinstance(data.get(key), str):
-        logger.warning(f"[Digest] 群 {session_id} 整理输出无效，跳过，下次再试")
+        logger.warning(f"群 {session_id} 整理输出无效，跳过，下次再试")
         return None
     return data
 
@@ -247,7 +247,7 @@ async def digest_user_profiles(
         updated[user_id] = summary
 
     logger.info(
-        f"[Digest] 群 {session_id} 用户档案：更新 {len(updated)} 人，调用 {calls} 次"
+        f"群 {session_id} 用户档案：更新 {len(updated)} 人，调用 {calls} 次"
     )
     return updated, failed
 
@@ -278,7 +278,7 @@ async def digest_group_notes(
     notes = result["group_notes"].strip() if result else None
     calls = 1 if len(chunks) == 1 else len(chunks) + 1
     logger.info(
-        f"[Digest] 群 {session_id} 群志：调用 {calls} 次，"
+        f"群 {session_id} 群志：调用 {calls} 次，"
         f"{'失败，下次再试' if notes is None else f'{len(notes)} 字'}"
     )
     if notes is None:

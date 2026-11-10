@@ -24,7 +24,7 @@ from nonebot.exception import NetworkError
 
 from ..chat.session import Session
 from ..llm import VisionInput
-from ..metrics import log_event
+from ..metrics import error_text, log_event
 from ..prompts import truncate_text
 from ..storage.db import get_latest_user_names, message_sender_name
 from .faces import ensure_faces, face_name
@@ -59,7 +59,7 @@ async def member_name(bot: Bot, group_id: int, user_id: str, bot_name: str) -> s
     try:
         info = await bot.get_group_member_info(group_id=group_id, user_id=int(user_id))
     except (ActionFailed, NetworkError, ValueError) as e:
-        logger.debug(f"查群 {group_id} 成员 {user_id} 的名片失败: {e}")
+        logger.debug(f"查群 {group_id} 成员 {user_id} 的名片失败: {error_text(e)}")
         return None
     return distinct_name(info.get("card") or info.get("nickname") or user_id, user_id, bot_name)
 
@@ -70,7 +70,7 @@ def _card_text(raw) -> str:
     try:
         card = json.loads(raw) if isinstance(raw, str) else raw
     except json.JSONDecodeError as e:
-        logger.warning(f"卡片 JSON 解析失败: {e}")
+        logger.warning(f"卡片 JSON 解析失败: {error_text(e)}")
         return "[卡片]"
     if not isinstance(card, dict):
         return "[卡片]"
@@ -232,7 +232,7 @@ async def _reply_part(
     try:
         source_msg = await bot.get_msg(message_id=int(reply_id))
     except (ActionFailed, NetworkError, ValueError) as e:
-        logger.warning(f"获取回复内容失败: {e}")
+        logger.warning(f"群 {session.id} 获取回复内容失败: {error_text(e)}")
         return _Part(" [回复] ")
 
     sender_info = source_msg.get("sender", {})

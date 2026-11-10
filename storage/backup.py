@@ -13,6 +13,7 @@ require("nonebot_plugin_apscheduler")
 from nonebot_plugin_apscheduler import scheduler  # noqa: E402  必须在 require 之后导入
 
 from ..config import BACKUP_DIR, get_data_dir
+from ..metrics import error_text
 from .models import GlobalMessageModel, TokenUsageModel
 
 # 原始明细保留天数
@@ -41,11 +42,11 @@ async def cleanup_raw_data_retention() -> dict[str, int]:
             ),
         }
     except Exception as e:
-        logger.error(f"[Retention] 原始数据库行清理失败: {e}")
+        logger.warning(f"原始数据库行清理失败: {error_text(e)}")
         raise
 
     if any(result.values()):
-        logger.info(f"[Retention] 清理原始数据库行: {result}")
+        logger.info(f"清理原始数据库行: {result}")
     return result
 
 
@@ -88,7 +89,7 @@ def _backup_data_sync() -> bool:
     backup_dir = BACKUP_DIR
 
     if not data_dir.exists():
-        logger.warning(f"备份失败：数据目录 {data_dir} 不存在。")
+        logger.error(f"备份失败：数据目录 {data_dir} 不存在。")
         return False
 
     backup_dir.mkdir(parents=True, exist_ok=True)
@@ -109,7 +110,7 @@ def _backup_data_sync() -> bool:
                         zipf.write(file_path, file_path.relative_to(staging_dir))
         logger.info(f"备份完成: {backup_filepath}")
     except Exception as e:
-        logger.error(f"备份过程发生异常: {e}")
+        logger.error(f"备份过程发生异常: {error_text(e)}")
         if backup_filepath.exists():
             backup_filepath.unlink(missing_ok=True)
         return False
@@ -135,7 +136,7 @@ def _clean_old_backups_sync():
             logger.info(f"删除过期的备份文件: {old_file}")
             old_file.unlink()
     except Exception as e:
-        logger.error(f"清理过期备份时发生异常: {e}")
+        logger.warning(f"清理过期备份时发生异常: {error_text(e)}")
 
 
 async def backup_task() -> bool:
@@ -148,7 +149,7 @@ async def backup_task() -> bool:
         await cleanup_raw_data_retention()
     except Exception as e:
         # 备份已经落盘，清理失败不算备份失败，也不该拦住随后的 reset
-        logger.error(f"备份后清理原始数据库行失败: {e}")
+        logger.warning(f"备份后清理原始数据库行失败: {error_text(e)}")
     return True
 
 

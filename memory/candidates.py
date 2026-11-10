@@ -134,7 +134,7 @@ def _parse_memory_candidate(
     action = str(item.get("action") or "add").strip().lower()
     if action not in ("add", "correct"):
         if action != "ignore":
-            logger.debug(f"[Memory] 暂不处理的记忆 action: {action}")
+            logger.debug(f"暂不处理的记忆 action: {action}")
         return None
 
     sources = source_messages(item, messages)
@@ -227,7 +227,7 @@ async def save_memory_candidates(
     result = {**store_result, "rejected": skipped_quality}
     if result["added"] or skipped_quality or result["skipped_dedup"]:
         logger.info(
-            f"[Memory] 存储结果: 成功 {result['added']}, 质量过滤 {skipped_quality}, "
+            f"群 {session.id} 记忆入库: 成功 {result['added']}, 质量过滤 {skipped_quality}, "
             f"去重跳过 {result['skipped_dedup']}, 更正替换 {result['corrected']}"
         )
     return result

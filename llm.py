@@ -11,7 +11,7 @@ from nonebot import logger
 from openai import APIConnectionError, APITimeoutError, AsyncOpenAI, BadRequestError
 
 from .config import EndpointSettings, get_app_settings
-from .metrics import log_event, record_token_usage
+from .metrics import error_text, log_event, record_token_usage
 from .prompts import JSON_SYSTEM_PROMPT
 from .webconsole_store import record_llm_call
 
@@ -198,7 +198,7 @@ class LLMClient:
                 httpx.ReadTimeout,
             ) as e:
                 logger.warning(
-                    f"[LLM] 网络请求失败 (尝试 {attempt + 1}/{LLM_MAX_ATTEMPTS}): {type(e).__name__} - {e}"
+                    f"{self.name} 网络请求失败（第 {attempt + 1}/{LLM_MAX_ATTEMPTS} 次）: {error_text(e)}"
                 )
                 self._fail("network_error", str(e))
                 if last_attempt:
@@ -207,7 +207,7 @@ class LLMClient:
                 continue
             except Exception as e:
                 error_type = _classify_exception(e)
-                logger.error(f"[LLM] API 调用失败 [{error_type}]: {e}")
+                logger.error(f"{self.name} 调用失败（{error_type}）: {error_text(e)}")
                 self._fail(error_type, str(e))
                 if error_type == "rate_limit":
                     self.provider_status.circuit_until = (
@@ -273,7 +273,7 @@ async def web_search(query: str, ori_question: str, *, session_id: str) -> list[
             "WARNING",
             session_id=session_id,
             query=query,
-            error=f"{type(e).__name__}: {e}"[:200],
+            error=error_text(e)[:200],
         )
         return []
     latency_ms = int((time.perf_counter() - started) * 1000)
@@ -335,7 +335,7 @@ async def _fetch_weather(lat: float, lon: float) -> dict | None:
         response.raise_for_status()
         data = response.json()
     except Exception as e:
-        log_event("weather_failed", "WARNING", lat=lat, lon=lon, error=f"{type(e).__name__}: {e}"[:200])
+        log_event("weather_failed", "WARNING", lat=lat, lon=lon, error=error_text(e)[:200])
         return None
     _weather_cache[key] = (time.monotonic(), data)
     return data
@@ -444,7 +444,7 @@ async def generate_image(prompt: str, reference: bytes | None, *, session_id: st
         latency_ms = int((time.perf_counter() - started) * 1000)
         outcome = "blocked" if isinstance(e, BadRequestError) else "failed"
         record_llm_call("image", model, session_id, False, latency_ms, type(e).__name__)
-        return ImageResult(outcome, error=f"{type(e).__name__}: {e}"[:300])
+        return ImageResult(outcome, error=error_text(e)[:300])
     latency_ms = int((time.perf_counter() - started) * 1000)
     record_llm_call("image", model, session_id, True, latency_ms)
     return ImageResult("ok", image)
@@ -469,6 +469,6 @@ def _parse_json_object(text: str) -> dict | None:
 
             parsed = repair_json(payload, return_objects=True)
         except Exception as e:
-            logger.warning(f"json_repair 失败: {e}")
+            logger.warning(f"json_repair 失败: {error_text(e)}")
             return None
     return parsed if isinstance(parsed, dict) else None

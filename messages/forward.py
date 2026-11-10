@@ -15,7 +15,7 @@ from nonebot.exception import NetworkError
 
 from ..chat.session import Session
 from ..llm import VisionInput, background_client
-from ..metrics import log_event
+from ..metrics import error_text, log_event
 from ..prompts import get_forward_prompt
 from .convert import FORWARD_PLACEHOLDER, is_sticker_segment, segment_text
 from .image import fetch_image_input
@@ -48,7 +48,7 @@ async def _node_text(bot: Bot, node: dict, depth: int, out: _Expansion) -> str:
             try:
                 await _expand(bot, str(data.get("id") or ""), depth + 1, out)
             except (ActionFailed, NetworkError) as e:
-                logger.warning(f"[Forward] 拉取嵌套转发失败，留占位: {e}")
+                logger.warning(f"拉取嵌套转发失败，留占位: {error_text(e)}")
                 out.lines.append(f"{indent}  {FORWARD_PLACEHOLDER}")
             continue
         text = segment_text(seg_type, data)
@@ -131,7 +131,7 @@ async def digest_forward(
         )
         summary = str(parsed.get("summary") or "").strip() if parsed else ""
         if not summary:
-            logger.warning(f"[Forward] 群 {session.id} 转发摘要输出无效，留着占位")
+            logger.warning(f"群 {session.id} 转发摘要输出无效，留着占位")
             outcome = "failed"
         elif session.stale(generation, "forward_digest"):
             outcome = "stale"
@@ -145,7 +145,7 @@ async def digest_forward(
             await session.enqueue(message, bot, event)
             outcome = "ok"
     except (ActionFailed, NetworkError) as e:
-        logger.warning(f"[Forward] 群 {session.id} 拉取转发内容失败，留着占位: {e}")
+        logger.warning(f"群 {session.id} 拉取转发内容失败，留着占位: {error_text(e)}")
         outcome = "failed"
     log_event(
         "forward_digest",

@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from nonebot import logger
 from nonebot.adapters.onebot.v11 import Bot
 
+from ..metrics import error_text
+
 # 连着发的拼接部件，单独发没有意义
 _COMBO_PARTS = {"中龙舟", "大龙舟", "新年中龙", "新年大龙", "中火车", "大火车", "蛇身", "蛇尾"}
 
@@ -87,7 +89,7 @@ async def ensure_faces(bot: Bot) -> None:
     try:
         result = await bot.call_api("fetch_sys_faces")
     except Exception as e:
-        logger.warning(f"获取 QQ 表情目录失败: {e}")
+        logger.warning(f"获取 QQ 表情目录失败: {error_text(e)}")
         return
     _catalog = _build_catalog(result["packs"])
     logger.info(

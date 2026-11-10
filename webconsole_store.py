@@ -17,6 +17,7 @@ from urllib.parse import quote
 from nonebot import logger
 
 from .config import get_app_settings
+from .metrics import error_text
 
 TABLES = ("diagnostic_logs", "autochat_llm_calls", "autochat_looks", "autochat_maintenance_runs")
 SUMMARY_LIMIT = 2_000
@@ -92,7 +93,7 @@ def open_store() -> None:
     try:
         connection = _connect(path)
     except sqlite3.Error as e:
-        logger.warning(f"WebConsole 的库不可用，不记录历史和警告: {path}: {e}")
+        logger.warning(f"WebConsole 的库不可用，不记录历史和警告: {path}: {error_text(e)}")
         return
     _thread = threading.Thread(
         target=_write_loop, args=(connection,), name="webconsole-writer", daemon=True
@@ -130,7 +131,7 @@ def _write_loop(connection: sqlite3.Connection) -> None:
             if not failing:
                 failing = True
                 _internal_logger.warning(
-                    f"写 WebConsole 的库失败，恢复前不再提示，这期间的记录丢弃: {type(e).__name__}: {e}"
+                    f"写 WebConsole 的库失败，恢复前不再提示，这期间的记录丢弃: {error_text(e)}"
                 )
             continue
         if failing:

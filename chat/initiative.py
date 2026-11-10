@@ -102,7 +102,7 @@ async def scan_groups() -> None:
         try:
             await _initiate(session, silence)
         except Exception as e:
-            logger.opt(exception=e).warning(f"群 {group_id} 主动发起话题失败: {e}")
+            logger.opt(exception=e).warning(f"群 {group_id} 主动发起话题失败")
 
 
 async def _initiate(session: Session, silence: int) -> None:

@@ -19,6 +19,7 @@ from .chat.session import Session
 from .config import get_app_settings, get_token_stats_model_names
 from .llm import background_client, chat_client, feedback_client
 from .memory.threads import KINDS
+from .metrics import error_text
 from .persona.status import get_status
 from .prompts import describe_mood
 from .storage.db import (
@@ -66,7 +67,7 @@ async def _refresh_group_names() -> None:
     try:
         groups = await bots[0].get_group_list()
     except Exception as e:
-        logger.warning(f"拉取群名失败，先用旧的: {type(e).__name__}: {e}")
+        logger.warning(f"拉取群名失败，先用旧的: {error_text(e)}")
         return
     _group_names = {str(group["group_id"]): group["group_name"] for group in groups}
 

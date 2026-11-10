@@ -158,7 +158,7 @@ async def _digest_batch(
         )
         parsed = await background_client.generate_json(prompt, session_id=session.id)
         if parsed is None:
-            logger.warning(f"[Episode] 群 {session.id} 整理输出无效，下轮重试")
+            logger.warning(f"群 {session.id} 分段整理输出无效，下轮重试")
             return False
 
         facts = parsed.get("facts")
@@ -227,7 +227,7 @@ async def scan_groups() -> None:
         try:
             await _digest_pending(session)
         except Exception as e:
-            logger.opt(exception=e).warning(f"群 {group_id} 分段整理失败: {e}")
+            logger.opt(exception=e).warning(f"群 {group_id} 分段整理失败")
 
 
 def setup_episode_job() -> None:

@@ -15,7 +15,7 @@ from PIL import Image
 
 from ..config import IMAGE_CACHE_DIR
 from ..llm import VisionInput, background_client, get_http_client
-from ..metrics import log_event
+from ..metrics import error_text, log_event
 from ..prompts import (
     STICKER_TAGS,
     get_image_caption_prompt,
@@ -70,7 +70,7 @@ async def _read_cached(key: str) -> bytes | None:
         async with await anyio.open_file(path, "rb") as f:
             return await f.read()
     except Exception as e:
-        logger.warning(f"读取图片缓存失败: {e}")
+        logger.warning(f"读取图片缓存失败: {error_text(e)}")
         return None
 
 
@@ -81,7 +81,7 @@ async def _write_cached(key: str, data: bytes) -> None:
         async with await anyio.open_file(path, "wb") as f:
             await f.write(data)
     except Exception as e:
-        logger.warning(f"写入图片缓存失败: {e}")
+        logger.warning(f"写入图片缓存失败: {error_text(e)}")
 
 
 async def fetch_image_input(
@@ -134,7 +134,7 @@ async def fetch_image_input(
                         image_bytes = resp.content
                         break
                     except Exception as e:
-                        logger.warning(f"下载图片失败（第 {attempt + 1} 次）: {e}")
+                        logger.warning(f"下载图片失败（第 {attempt + 1} 次）: {error_text(e)}")
                         await asyncio.sleep(0.5)
                 if image_bytes and key:
                     await _write_cached(key, image_bytes)
@@ -158,7 +158,7 @@ async def fetch_image_input(
                 image_bytes,
             )
         except Exception as e:
-            logger.error(f"Image fetch error: {e}")
+            logger.warning(f"处理图片失败，留占位: {error_text(e)}")
             return ("[图片处理出错]", None, None)
 
 
@@ -177,7 +177,7 @@ async def cached_caption(digest: str) -> str | None:
             caption = await f.read()
         os.utime(path)
     except Exception as e:
-        logger.warning(f"读取图片描述缓存失败: {e}")
+        logger.warning(f"读取图片描述缓存失败: {error_text(e)}")
         return None
     return caption or None
 
@@ -215,7 +215,7 @@ async def _write_caption(digest: str, caption: str) -> None:
         async with await anyio.open_file(path, "w", encoding="utf-8") as f:
             await f.write(caption)
     except Exception as e:
-        logger.warning(f"写入图片描述缓存失败: {e}")
+        logger.warning(f"写入图片描述缓存失败: {error_text(e)}")
 
 
 def forget_caption(digest: str) -> None:
@@ -224,7 +224,7 @@ def forget_caption(digest: str) -> None:
     try:
         _caption_path(digest).unlink(missing_ok=True)
     except Exception as e:
-        logger.warning(f"删除图片描述缓存失败: {e}")
+        logger.warning(f"删除图片描述缓存失败: {error_text(e)}")
 
 
 def _log_caption(session_id: str, ok: bool, started_at: float) -> None:
@@ -359,7 +359,7 @@ def _sticker_grid_payload(image_bytes: bytes) -> tuple[bytes, str] | None:
         sheet.save(output, format="JPEG", quality=90)
         return output.getvalue(), "jpeg"
     except Exception as exc:
-        logger.warning(f"动图拼九宫格失败: {exc}")
+        logger.warning(f"动图拼九宫格失败: {error_text(exc)}")
         return None
 
 
@@ -400,7 +400,7 @@ def _prepare_native_image_payload(image_bytes: bytes) -> tuple[bytes, str] | Non
         image.save(output, format="JPEG", quality=90)
         return output.getvalue(), "jpeg"
     except Exception as exc:
-        logger.warning(f"图片预处理失败: {exc}")
+        logger.warning(f"图片预处理失败: {error_text(exc)}")
         return None
 
 
@@ -426,11 +426,11 @@ def _clean_old_image_caches_sync():
                         file_path.unlink()
                         count += 1
                     except Exception as e:
-                        logger.warning(f"删除过期图片缓存失败 {file_path}: {e}")
+                        logger.warning(f"删除过期图片缓存失败 {file_path}: {error_text(e)}")
             if count > 0:
                 logger.info(f"清理了 {count} 个过期的图片缓存文件（{name}）")
     except Exception as e:
-        logger.error(f"清理图片缓存任务执行异常: {e}")
+        logger.warning(f"清理图片缓存任务执行异常: {error_text(e)}")
 
 
 def setup_image_cache_job():

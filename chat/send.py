@@ -13,7 +13,7 @@ from nonebot.adapters.onebot.v11.exception import ActionFailed
 from ..messages import photos
 from ..messages.faces import Reaction
 from ..messages.stickers import Sticker, mark_sent, pick
-from ..metrics import log_event
+from ..metrics import error_text, log_event
 from ..persona.status import describe_now
 from ..prompts import PHOTO_BLOCKED_NOTE, PHOTO_FAILED_NOTE, PRESETS
 from ..storage.db import get_photo
@@ -65,9 +65,9 @@ async def send_one(
                 )
         return True
     except ActionFailed as e:
-        logger.error(f"发送失败: {e}")
+        logger.error(f"群 {session.id} 发送失败: {error_text(e)}")
     except Exception as e:
-        logger.error(f"发送未知错误: {e}")
+        logger.error(f"群 {session.id} 发送未知错误: {error_text(e)}")
     return False
 
 
@@ -275,7 +275,7 @@ async def send_reaction(
         )
         outcome = "ok"
     except ActionFailed as e:
-        logger.warning(f"贴表情失败: {e}")
+        logger.warning(f"群 {session.id} 贴表情失败: {error_text(e)}")
         outcome = "failed"
     log_event(
         "react",
@@ -303,7 +303,7 @@ async def send_poke(
         )
         outcome = "ok"
     except ActionFailed as e:
-        logger.warning(f"戳一戳失败: {e}")
+        logger.warning(f"群 {session.id} 戳一戳失败: {error_text(e)}")
         outcome = "failed"
     log_event(
         "poke",

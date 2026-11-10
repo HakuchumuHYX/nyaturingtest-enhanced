@@ -14,6 +14,7 @@ from openai import AsyncOpenAI
 from tortoise.transactions import in_transaction
 
 from ..config import get_app_settings
+from ..metrics import error_text
 from ..storage.models import MemoryModel
 from ..webconsole_store import record_llm_call
 
@@ -226,7 +227,7 @@ async def rerank(query: str, documents: list[str]) -> list[tuple[int, float]] | 
         record_llm_call(
             "rerank", settings.rerank.model, None, False, _elapsed_ms(started), type(e).__name__
         )
-        logger.error(f"Rerank API Error: {e}")
+        logger.warning(f"Rerank 失败，只按向量排序: {error_text(e)}")
         return None
     record_llm_call("rerank", settings.rerank.model, None, True, _elapsed_ms(started))
     return [(index, score) for index, score in scored if score >= settings.rerank.threshold]
@@ -451,7 +452,7 @@ class VectorMemory:
             return RetrievalResult(final_results, stats)
 
         except Exception as e:
-            logger.error(f"Vector retrieve failed: {e}")
+            logger.warning(f"群 {self.session_id} 检索记忆失败，这轮不带记忆: {error_text(e)}")
             return RetrievalResult([], _retrieval_stats([], [], "retrieve_error"))
 
     async def add_memories(
@@ -484,7 +485,7 @@ class VectorMemory:
         try:
             vectors = await embed_texts([memory.content for memory in valid])
         except Exception as e:
-            logger.error(f"[Memory] Embedding 失败，记忆先不带向量落库: {e}")
+            logger.warning(f"群 {self.session_id} 记忆向量没算成，先不带向量落库: {error_text(e)}")
             vectors = None
 
         embedding_model = get_app_settings().embedding.model
@@ -527,7 +528,10 @@ class VectorMemory:
                     else []
                 )
                 for row in replaced_rows:
-                    logger.info(f"[Memory] 更正替换: 旧「{row.content}」→ 新「{replaces[row.id]}」")
+                    logger.info(
+                        f"群 {self.session_id} 记忆更正替换: "
+                        f"旧「{row.content}」→ 新「{replaces[row.id]}」"
+                    )
                     await row.delete()
                 result["corrected"] = len(replaced_rows)
                 if new_rows:
@@ -600,13 +604,13 @@ async def maintain_memories() -> dict:
         try:
             vectors = await embed_texts([row.content for row in batch])
         except Exception as e:
-            logger.error(f"[Memory] 补算 embedding 失败，明天再试: {e}")
+            logger.warning(f"补算记忆向量失败，明天再试: {error_text(e)}")
             break
         for row, vector in zip(batch, vectors):
             row.embedding = vector.tobytes()
             row.embedding_model = embedding_model
             await row.save(update_fields=["embedding", "embedding_model", "updated_at"])
         filled += len(batch)
-    logger.info(f"[Memory] 维护完成：删除过期 {deleted} 条，补算向量 {filled}/{len(pending)} 条")
+    logger.info(f"记忆维护完成：删除过期 {deleted} 条，补算向量 {filled}/{len(pending)} 条")
     return {"deleted": deleted, "filled": filled, "pending": len(pending) - filled}
 

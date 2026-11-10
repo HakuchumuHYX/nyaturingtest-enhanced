@@ -15,7 +15,14 @@ def log_event(event: str, level: str = "INFO", **fields):
         for key, value in fields.items()
         if value is not None
     )
-    logger.log(level, " ".join(parts))
+    logger.opt(depth=1).log(level, " ".join(parts))
+
+
+def error_text(e: BaseException) -> str:
+    """日志里的异常：类型加说明。超时这类异常的 str 是空的，只写类型。"""
+
+    text = str(e)
+    return f"{type(e).__name__}: {text}" if text else type(e).__name__
 
 
 def _format_value(value) -> str:
@@ -46,7 +53,7 @@ def _log_usage_task_error(task: asyncio.Task) -> None:
         return
     exc = task.exception()
     if exc:
-        logger.error(f"记录 Token 消耗失败: {exc}")
+        logger.error(f"记录 Token 消耗失败: {error_text(exc)}")
 
 
 async def drain_usage_tasks() -> None:

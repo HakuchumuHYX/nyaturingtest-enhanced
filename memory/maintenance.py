@@ -8,6 +8,7 @@ require("nonebot_plugin_apscheduler")
 from nonebot_plugin_apscheduler import scheduler  # noqa: E402  必须在 require 之后导入
 
 from ..chat.groups import sessions  # noqa: E402
+from ..metrics import error_text  # noqa: E402
 from ..persona.growth import maintain_personas  # noqa: E402
 from ..persona.status import reload_diaries  # noqa: E402
 from ..webconsole_store import now_ms, record_maintenance  # noqa: E402
@@ -69,8 +70,8 @@ async def maintain_long_term_memory() -> None:
             notes, result["notes_failed"] = await refresh_group_notes(group_id)
             result["notes"] = notes is not None
         except Exception as e:
-            logger.opt(exception=e).warning(f"群 {group_id} 档案/群志整理失败: {e}")
-            detail["errors"].append(f"群 {group_id} 档案/群志: {type(e).__name__}: {e}")
+            logger.opt(exception=e).warning(f"群 {group_id} 档案/群志整理失败")
+            detail["errors"].append(f"群 {group_id} 档案/群志: {error_text(e)}")
             continue
         # 档案不随 save_session 回写，要同步内存副本
         session = sessions.get(group_id)
@@ -82,14 +83,14 @@ async def maintain_long_term_memory() -> None:
     try:
         detail["memories"] = await maintain_memories()
     except Exception as e:
-        logger.opt(exception=e).warning(f"长期记忆定时维护失败: {e}")
-        detail["errors"].append(f"过期清理: {type(e).__name__}: {e}")
+        logger.opt(exception=e).warning(f"长期记忆定时维护失败")
+        detail["errors"].append(f"过期清理: {error_text(e)}")
     try:
         detail["threads_forgotten"] = await drop_forgotten()
         logger.info(f"忘掉了 {detail['threads_forgotten']} 件悬着的事")
     except Exception as e:
-        logger.opt(exception=e).warning(f"清理悬着的事失败: {e}")
-        detail["errors"].append(f"悬着的事: {type(e).__name__}: {e}")
+        logger.opt(exception=e).warning(f"清理悬着的事失败")
+        detail["errors"].append(f"悬着的事: {error_text(e)}")
     for session in sessions.values():
         session.vector_memory.drop_cache()
     record_maintenance(started_at_ms, "partial" if _has_failure(detail) else "ok", detail)
@@ -113,8 +114,8 @@ async def _maintain_personas(detail: dict) -> None:
     try:
         lives, group_texts, detail["personas"] = await maintain_personas(group_ids, guards)
     except Exception as e:
-        logger.opt(exception=e).warning(f"人设成长整理失败: {e}")
-        detail["errors"].append(f"人设成长: {type(e).__name__}: {e}")
+        logger.opt(exception=e).warning(f"人设成长整理失败")
+        detail["errors"].append(f"人设成长: {error_text(e)}")
         return
     # 日记只由每日整理写，时间线那边的内存副本要同步
     await reload_diaries()

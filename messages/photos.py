@@ -18,7 +18,7 @@ from PIL import Image
 from ..config import PRESET_DIR, get_app_settings, get_data_dir
 from ..llm import VisionInput, generate_image
 from ..memory.vector import embed_texts, rerank
-from ..metrics import log_event
+from ..metrics import error_text, log_event
 from ..prompts import RolePreset, get_photo_prompt
 from ..storage import db
 from .image import caption_image, forget_caption
@@ -121,7 +121,7 @@ async def take(
     try:
         jpeg = await _to_jpeg(result.image)
     except Exception as e:
-        return "failed", None, f"{type(e).__name__}: {e}"[:300]
+        return "failed", None, error_text(e)[:300]
 
     digest = hashlib.sha1(jpeg).hexdigest()
     PHOTO_DIR.mkdir(parents=True, exist_ok=True)
@@ -151,7 +151,7 @@ async def save(session_id: str, preset: str, photo: NewPhoto) -> None:
     try:
         vector = (await embed_texts([_search_text(photo.caption, photo.taken_at)]))[0]
     except Exception as e:
-        logger.warning(f"照片向量没算成，先不带向量入库: {e}")
+        logger.warning(f"照片向量没算成，先不带向量入库: {error_text(e)}")
         vector = None
     await db.add_photo(
         session_id=session_id,
@@ -196,7 +196,7 @@ async def candidates(preset: str, queries: list[str]) -> list[dict]:
             queries[0], [_search_text(row.caption, row.created_at) for row in top]
         )
     except Exception as e:
-        logger.warning(f"检索相册失败，这轮不给旧照片: {e}")
+        logger.warning(f"检索相册失败，这轮不给旧照片: {error_text(e)}")
         return []
     picked = [top[index] for index, _ in reranked or []][:ALBUM_K]
     return [
@@ -218,7 +218,7 @@ def _delete_files(digest: str) -> None:
     try:
         photo_path(digest).unlink(missing_ok=True)
     except Exception as e:
-        logger.warning(f"删除照片文件失败 {digest}: {e}")
+        logger.warning(f"删除照片文件失败 {digest}: {error_text(e)}")
     forget_caption(digest)
 
 

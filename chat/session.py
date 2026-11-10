@@ -10,7 +10,7 @@ from nonebot.exception import NetworkError
 
 from ..memory.vector import VectorMemory
 from ..messages.message import ChatMessage, Memory
-from ..metrics import log_event
+from ..metrics import error_text, log_event
 from ..prompts import PRESETS, resolve_preset
 from ..storage.db import (
     delete_session_data,
@@ -136,7 +136,7 @@ class Session:
             await delete_session_data(self.id)
             await self._save_session_locked()
         await self._apply_preset()
-        logger.info(f"[Session {self.id}] 已完全重置（含数据库清理）")
+        logger.info(f"群 {self.id} 已完全重置（含数据库清理）")
 
     def spawn(self, coro) -> asyncio.Task:
         """创建受 drain_background_tasks 管理、异常会记日志的后台任务"""
@@ -151,7 +151,7 @@ class Session:
             return
         exc = task.exception()
         if exc:
-            logger.error(f"[Session {self.id}] 后台任务异常: {exc}")
+            logger.opt(exception=exc).error(f"群 {self.id} 后台任务异常")
 
     def schedule_save(self) -> None:
         self._save_pending = True
@@ -212,14 +212,14 @@ class Session:
 
             return True
         except Exception as e:
-            logger.warning(f"[Session {self.id}] 数据库保存警告: {e}")
+            logger.error(f"群 {self.id} 保存会话失败: {error_text(e)}")
             return False
 
     async def load_session(self):
         data = await load_full_session_data(self.id)
 
         if not data:
-            logger.info(f"[Session {self.id}] 初始化新会话")
+            logger.info(f"群 {self.id} 初始化新会话")
             return
 
         session_db = data["session"]
@@ -260,7 +260,7 @@ class Session:
 
         self.short_term_memory = Memory(messages=data["messages"])
 
-        logger.info(f"[Session {self.id}] 加载完成")
+        logger.info(f"群 {self.id} 加载完成")
 
     async def load_preset(self, filename: str) -> bool:
         filename = resolve_preset(filename)
@@ -282,7 +282,7 @@ class Session:
         if preset is None:
             # 文件名留着，可能只是 json 暂时写坏了；名字为空就不说话
             if self.state.preset:
-                logger.warning(f"[Session {self.id}] 预设 {self.state.preset} 不存在，按没设人设处理")
+                logger.warning(f"群 {self.id} 预设 {self.state.preset} 不存在，按没设人设处理")
             self.state.name = ""
             self.state.aliases = []
             self.state.profile = []
@@ -331,7 +331,7 @@ class Session:
         try:
             info = await self.bot.get_group_info(group_id=int(self.id), no_cache=True)
         except (ActionFailed, NetworkError) as e:
-            logger.warning(f"[Session {self.id}] 拉取群信息失败: {e}")
+            logger.warning(f"群 {self.id} 拉取群信息失败: {error_text(e)}")
             self.group_info = ""
             return ""
         self.group_info = (
@@ -420,7 +420,7 @@ class Session:
             )
         except asyncio.TimeoutError:
             logger.warning(
-                f"[Session {self.id}] 等待后台任务超时，取消 {len(pending)} 个任务"
+                f"群 {self.id} 等待后台任务超时，取消 {len(pending)} 个任务"
             )
             for task in pending:
                 if not task.done():

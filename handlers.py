@@ -58,7 +58,7 @@ from .messages.image import fetch_image_input
 from .messages.photos import remove_by_message as remove_photo_by_message
 from .messages.photos import wallpaper as photo_wallpaper
 from .messages.stickers import block as block_sticker
-from .metrics import log_event
+from .metrics import error_text, log_event
 from .persona.status import get_status as get_persona_status
 from .persona.status import recent_diary, status_text, today_segments
 from .prompts import PRESETS, mood_label, reload_presets, resolve_preset
@@ -129,7 +129,7 @@ async def _group_name(group_id: int) -> str:
     try:
         group_info = await get_bot().get_group_info(group_id=group_id)
     except (ActionFailed, NetworkError, ValueError) as e:
-        logger.debug(f"查群 {group_id} 的群名失败: {e}")
+        logger.debug(f"查群 {group_id} 的群名失败: {error_text(e)}")
         return f"群 {group_id}"
     return group_info.get("group_name") or f"群 {group_id}"
 
@@ -542,7 +542,7 @@ async def _do_status(matcher: type[Matcher], group_id: int, _args: str):
                 wallpaper=await photo_wallpaper(state.preset),
             )
         except Exception as e:
-            logger.error(f"渲染状态卡片失败: {e}")
+            logger.warning(f"渲染状态卡片失败: {error_text(e)}")
         else:
             await matcher.finish(MessageSegment.image(image))
 
@@ -610,7 +610,7 @@ async def _do_persona(matcher: type[Matcher], group_id: int, _args: str):
             diary=recent_diary(preset, PERSONA_DIARY_DAYS),
         )
     except Exception as e:
-        logger.error(f"渲染人设卡片失败: {e}")
+        logger.warning(f"渲染人设卡片失败: {error_text(e)}")
         changes = "\n".join(
             f"- {change.day:%m-%d} {'人生线' if change.scope == 'life' else '本群'}：{change.text}"
             for change in recent
@@ -642,7 +642,7 @@ async def _do_group_notes(matcher: type[Matcher], group_id: int, _args: str):
             updated_at=session_db.notes_summarized_until,
         )
     except Exception as e:
-        logger.error(f"渲染群志卡片失败: {e}")
+        logger.warning(f"渲染群志卡片失败: {error_text(e)}")
         await matcher.finish(f"群志：\n{session_db.group_notes}")
     await matcher.finish(MessageSegment.image(image))
 
@@ -686,7 +686,7 @@ async def handle_token_stats(event: GroupMessageEvent):
     try:
         image = await render_token_stats_card(stats)
     except Exception as e:
-        logger.error(f"渲染 Token 统计卡片失败: {e}")
+        logger.warning(f"渲染 Token 统计卡片失败: {error_text(e)}")
         lines = [
             f"{label} {item['model']}: {item['total']:,}"
             for label, view in (("今日本群", "1d_local"), ("今日全部", "1d_global"))
@@ -809,13 +809,13 @@ async def handle_query_memory(
             sender_id=str(event.user_id),
         )
     except Exception as e:
-        logger.error(f"查询记忆失败: {e}")
+        logger.error(f"查询记忆失败: {error_text(e)}")
         await query_memory.finish("大脑处理过载，记忆读取失败，请稍后再试。")
     if isinstance(page, str):
         await query_memory.finish(page)
     try:
         image = await render_impression_card(page)
     except Exception as e:
-        logger.error(f"渲染印象卡片失败: {e}")
+        logger.warning(f"渲染印象卡片失败: {error_text(e)}")
         await query_memory.finish(impression_text(page))
     await query_memory.finish(MessageSegment.image(image))

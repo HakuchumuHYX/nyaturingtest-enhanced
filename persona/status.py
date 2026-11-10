@@ -523,7 +523,7 @@ async def reload_diaries() -> None:
 
 def _log_task_error(task: asyncio.Task) -> None:
     if not task.cancelled() and task.exception():
-        logger.opt(exception=task.exception()).error(f"状态任务异常: {task.exception()}")
+        logger.opt(exception=task.exception()).error("状态任务异常")
 
 
 async def check_statuses() -> None:

@@ -5,7 +5,7 @@ from tortoise import Tortoise
 
 from ..llm import close_http_client
 from ..memory.vector import close_clients
-from ..metrics import drain_usage_tasks
+from ..metrics import drain_usage_tasks, error_text
 from ..storage.db import disable_group, enable_group, load_enabled_group_ids
 from .session import Session
 
@@ -58,7 +58,7 @@ async def _stop_worker(session: Session) -> None:
     except (asyncio.CancelledError, asyncio.TimeoutError):
         pass
     except Exception as e:
-        logger.error(f"取消任务时发生错误: {e}")
+        logger.warning(f"取消任务时发生错误: {error_text(e)}")
 
 
 async def enable_autochat(group_id: int, preset: str | None = None) -> None:
@@ -91,7 +91,7 @@ async def cleanup_global_resources():
         try:
             await session.drain_background_tasks()
         except Exception as e:
-            logger.warning(f"排空群会话后台任务失败: {e}")
+            logger.warning(f"排空群会话后台任务失败: {error_text(e)}")
 
     save_tasks = []
     for group_id, session in sessions.items():
@@ -106,7 +106,7 @@ async def cleanup_global_resources():
             )
             logger.info("会话保存完毕")
         except Exception as e:
-            logger.error(f"关机保存错误: {e}")
+            logger.error(f"关机保存错误: {error_text(e)}")
 
     await drain_usage_tasks()
 

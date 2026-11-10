@@ -125,5 +125,5 @@ async def run_worker(session: Session):
             logger.info(f"群 {session.id} 的后台任务已取消")
             break
         except Exception as e:
-            logger.exception(f"群 worker 异常: {e}")
+            logger.exception(f"群 {session.id} 的 worker 异常")
             await asyncio.sleep(5.0)
