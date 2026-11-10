@@ -316,18 +316,23 @@ class VectorMemory:
         self,
         queries: list[str],
         *,
+        recall_queries: list[str] = (),
         k: int,
         user_ids: set[str] | None = None,
         active_user_ids: set[str] = frozenset(),
     ) -> RetrievalResult:
         """检索后按时间衰减/类型/置信度/作用域加权排序，取前 k 条。
 
+        queries 召回后每条各重排一次，同一条记忆取最高分；recall_queries 只参与召回，不重排。
         user_ids 不为 None 时只在参与者含这些人的记忆里找；带 "" 时参与者为空的记忆也算。
-        rerank 接口失败时回退到向量分；rerank 把候选全筛掉不回退：向量分在闲聊上挤在 0.5 上下分不出好坏，回退只会塞进无关记忆。
+        rerank 接口全失败时回退到向量分；rerank 把候选全筛掉不回退：向量分在闲聊上挤在 0.5 上下分不出好坏，回退只会塞进无关记忆。
         """
 
-        unique_queries = _dedupe_preserve_order([q for q in queries if q.strip()])
-        if not unique_queries:
+        rerank_queries = _dedupe_preserve_order([q for q in queries if q.strip()])
+        unique_queries = _dedupe_preserve_order(
+            rerank_queries + [q for q in recall_queries if q.strip()]
+        )
+        if not rerank_queries:
             return RetrievalResult([], _retrieval_stats([], []))
 
         try:
@@ -382,19 +387,31 @@ class VectorMemory:
             if not candidates:
                 return RetrievalResult([], _retrieval_stats([], []))
 
-            # Rerank 加阈值；接口失败时按向量分取前若干条。
-            # search_stage 已把最新有效消息排在第一位；summary query 只做补充召回。
-            reranked = await rerank(unique_queries[0], [item.row.content for item in candidates])
-            if reranked is None:
+            # 各条分开重排：拼成一条时几句话互相摊薄，相关的记忆分数也被压低。
+            # 有一次成功就按成功的算，全失败才按向量分取前若干条
+            documents = [item.row.content for item in candidates]
+            reranked = [
+                result
+                for result in await asyncio.gather(
+                    *(rerank(query, documents) for query in rerank_queries)
+                )
+                if result is not None
+            ]
+            best_rerank: dict[int, float] = {}
+            for result in reranked:
+                for index, score in result:
+                    best_rerank[index] = max(score, best_rerank.get(index, score))
+            if not reranked:
                 picked = candidates[:RAG_PER_QUERY_RECALL_K]
                 fallback_reason = "rerank_api_empty"
-            elif not reranked:
+            elif not best_rerank:
                 return RetrievalResult(
                     [], _retrieval_stats(candidates, [], "rerank_all_filtered")
                 )
             else:
+                ranked = sorted(best_rerank.items(), key=lambda item: item[1], reverse=True)
                 picked = []
-                for index, score in reranked[:RAG_PER_QUERY_RECALL_K]:
+                for index, score in ranked[:RAG_PER_QUERY_RECALL_K]:
                     candidates[index].rerank_score = score
                     picked.append(candidates[index])
                 fallback_reason = "none"
@@ -405,7 +422,7 @@ class VectorMemory:
             scope_counts: dict[str, int] = {}
             for item in picked:
                 row = item.row
-                scope, scope_weight = _memory_scope(row, active_scope_ids, queries)
+                scope, scope_weight = _memory_scope(row, active_scope_ids, unique_queries)
                 scope_counts[scope] = scope_counts.get(scope, 0) + 1
 
                 days_ago = max(0, (today_dt - _parse_date(row.date)).days)

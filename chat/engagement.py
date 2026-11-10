@@ -5,18 +5,22 @@
 她 away（手机放下了）时不自己看群，有人叫她交给 persona/status.py 判断拿不拿起手机。
 """
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import Enum
 
 from ..messages.message import ChatMessage
 
 # 两次发送之间的最小间隔，在发送前等
 SPEAK_COOLDOWN_SECONDS = 16.0
-# 看群节奏：未读攒够这么多条，或有未读且距上次看群满这么久，就看一次；一次最多读这么多条
+# 看群节奏：未读攒够这么多条，或有未读且距上次看群满这么久，就看一次
 LOOK_UNREAD_THRESHOLD = 8
 LOOK_INTERVAL_SECONDS = 180.0
+# 一次最多读这么多条、这么多字（未读和爬楼每批都是）；放不下的留给爬楼，不丢
 LOOK_MAX_MESSAGES = 60
-# 最近 SHORT_CONTEXT_LIMIT 条消息里自己的发言占比达到该值，就不主动插嘴（被点名/聊天对象接话/被戳不受限）
+LOOK_MAX_CHARS = 6000
+# 发言占比和给 Feedback 的 group_heat 只数这段时间里她的开口
+OWN_TURN_WINDOW_SECONDS = 900
+# 自己的开口占比（见 self_share）达到该值，就不主动插嘴（被点名/聊天对象接话/被戳不受限）
 SELF_SHARE_LIMIT = 0.2
 # Feedback willing 的开口门槛：被点名 / 聊天对象在接话或被戳 / 按节奏看群时主动插嘴
 SPEAK_THRESHOLD_ADDRESSED = 0.3
@@ -49,6 +53,47 @@ def unread_count(state, unread: list[ChatMessage]) -> int:
     """未读里群友的消息条数；她自己刚发出去的不算。直接数，不另记计数器，免得和水位对不上。"""
 
     return sum(message.user_name != state.name for message in unread)
+
+
+def fit_count(messages: list[ChatMessage]) -> int:
+    """按给定顺序数，合计不超过 LOOK_MAX_CHARS 的有几条；第一条再长也算，不然水位卡在它前面推不动。"""
+
+    total = 0
+    for count, message in enumerate(messages):
+        total += len(message.content)
+        if count and total > LOOK_MAX_CHARS:
+            return count
+    return len(messages)
+
+
+def own_turns(messages: list[ChatMessage], bot_name: str) -> list[ChatMessage | None]:
+    """她的每次开口接的是谁（开口前最后一个群友，前面没人是 None）；连续发的几条算一次开口。"""
+
+    turns: list[ChatMessage | None] = []
+    last_other: ChatMessage | None = None
+    previous_is_own = False
+    for message in messages:
+        if message.user_name != bot_name:
+            last_other = message
+            previous_is_own = False
+            continue
+        if not previous_is_own:
+            turns.append(last_other)
+        previous_is_own = True
+    return turns
+
+
+def self_share(messages: list[ChatMessage], bot_name: str, now: datetime) -> float:
+    """她近 OWN_TURN_WINDOW_SECONDS 的开口次数 ÷（开口次数 + 群友条数），messages 是最近说的话。
+
+    数开口不数条数：一次回复由 Chat 决定发几条。她更早的开口不算，慢群里很久以前说的话不拦着她；
+    群友不限时间，窗口里只剩三四条消息时占比也不会虚高。
+    """
+
+    since = now - timedelta(seconds=OWN_TURN_WINDOW_SECONDS)
+    turns = len(own_turns([m for m in messages if m.time >= since], bot_name))
+    others = sum(m.user_name != bot_name for m in messages)
+    return turns / max(turns + others, 1)
 
 
 def seconds_until_look(

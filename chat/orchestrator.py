@@ -49,10 +49,14 @@ from ..webconsole_store import record_look
 from .domain import PersonProfile
 from .engagement import (
     LOOK_MAX_MESSAGES,
+    OWN_TURN_WINDOW_SECONDS,
     SELF_SHARE_LIMIT,
     LookTrigger,
     calls_me,
     decide_look,
+    fit_count,
+    own_turns,
+    self_share,
     unread_count,
 )
 from .outputs import FeedbackOutput, Poke, Reply, parse_feedback, parse_reply
@@ -67,7 +71,6 @@ CALL_LINE_CHARS = 100
 # Chat / 主动话题读几天日记
 CHAT_DIARY_DAYS = 2
 MY_RECENT_REPLIES_LIMIT = 6
-GROUP_HEAT_SECONDS = 900
 
 
 @dataclass(frozen=True)
@@ -106,29 +109,18 @@ def _group_heat(messages: list[ChatMessage], bot_name: str) -> str:
     speakers = {_user_key(m) for m in others}
     heat = f"近15分钟群友 {len(others)} 条、{len(speakers)} 人在说话"
 
-    own_count = 0
-    turns = 0
-    partner_turns: dict[str, int] = {}
-    partner_names: dict[str, str] = {}
-    last_other: ChatMessage | None = None
-    previous_is_own = False
-    for m in messages:
-        if m.user_name != bot_name:
-            last_other = m
-            previous_is_own = False
-            continue
-        own_count += 1
-        if not previous_is_own:
-            turns += 1
-            if last_other is not None:
-                key = _user_key(last_other)
-                partner_turns[key] = partner_turns.get(key, 0) + 1
-                partner_names[key] = last_other.user_name
-        previous_is_own = True
-
+    own_count = len(messages) - len(others)
     if not own_count:
         return f"{heat}；你一句没说"
-    heat += f"；你开口 {turns} 次、共 {own_count} 条"
+    turns = own_turns(messages, bot_name)
+    partner_turns: dict[str, int] = {}
+    partner_names: dict[str, str] = {}
+    for partner in turns:
+        if partner is not None:
+            key = _user_key(partner)
+            partner_turns[key] = partner_turns.get(key, 0) + 1
+            partner_names[key] = partner.user_name
+    heat += f"；你开口 {len(turns)} 次、共 {own_count} 条"
     if partner_turns:
         top_key = max(partner_turns, key=partner_turns.get)
         if partner_turns[top_key] >= 2:
@@ -293,12 +285,14 @@ async def _catch_up(
     state = session.state
     glancing = is_glancing(state.preset)
     after = state.last_read_time if glancing else state.climbed_until
-    if (
-        after is None
-        or not unread
-        or (len(unread) < LOOK_MAX_MESSAGES and after >= state.last_read_time)
-    ):
+    # 被条数或字数挤出未读的，都还在缓冲里水位之后
+    squeezed = len(
+        session.short_term_memory.messages_after(state.last_read_time, SHORT_TERM_BUFFER_SIZE)
+    ) > len(unread)
+    if after is None or not unread or (not squeezed and after >= state.last_read_time):
         return [], [], None
+    # 补看和爬楼都从库里读：这一批刚写进缓冲、还没落库，被挤掉的正好在里面就查不到，水位却会推过去
+    await session.save_session()
     # 点名只捞已读水位之后的：看一眼时已经看过的，爬楼时不再当成新的找她
     calls, episodes, skipped = await get_catch_up(
         session.id,
@@ -354,6 +348,8 @@ async def _climb(
     recent: list[ChatMessage] = []
     batch_number = 0
     while batch := await get_messages_between(session.id, after, before, LOOK_MAX_MESSAGES):
+        # 字数放不下的留给下一批，水位只推到读了的最后一条
+        batch = batch[: fit_count(batch)]
         if session.stale(generation, "climb") or is_away(state.preset):
             return False
         look = LookContext(
@@ -411,7 +407,7 @@ async def _look(
     read_until = max(m.time for m in unread)
     # 只数说的话：贴表情、戳一戳记录算进来，她动一下手占比就被抬高，群友互贴又把占比拉低
     recent = [m for m in session.short_term_memory.access() if not m.is_action]
-    self_share = sum(m.user_name == state.name for m in recent) / max(len(recent), 1)
+    share = self_share(recent, state.name, datetime.now())
     is_relevant = trigger is LookTrigger.RELEVANT
     look = LookContext(
         recent=context,
@@ -448,7 +444,7 @@ async def _look(
     else:
         speak = feedback.willing >= trigger.speak_threshold
         # 频率归代码管：自己说多了就不主动插嘴；被点名、接话、被戳不受限
-        if trigger is LookTrigger.RHYTHM and self_share >= SELF_SHARE_LIMIT:
+        if trigger is LookTrigger.RHYTHM and share >= SELF_SHARE_LIMIT:
             speak = False
     # 禁言期间平台发不出去：照常看群、沉淀，只是不开口
     muted = session.muted
@@ -461,7 +457,7 @@ async def _look(
         unread=unread_count(state, unread),
         llm_willing=feedback.willing if feedback else None,
         threshold=trigger.speak_threshold,
-        self_share=round(self_share, 2),
+        self_share=round(share, 2),
         focus=f"{focus.user_name}: {focus.content[:30]}" if focus else None,
         muted=muted,
         speak=speak,
@@ -474,7 +470,7 @@ async def _look(
         unread=unread_count(state, unread),
         willing=feedback.willing if feedback else None,
         threshold=trigger.speak_threshold,
-        self_share=self_share,
+        self_share=share,
         muted=muted,
         speak=speak,
         focus=f"{focus.user_name}: {focus.content[:100]}" if focus else None,
@@ -507,14 +503,16 @@ async def _look(
     return TurnResult(replies=replies, react=react, poke=poke)
 
 
-def _search_queries(state: SessionState, unread: list[ChatMessage]) -> list[str]:
-    # Reranker 使用第一条 query 作为主 query，因此必须最新消息优先；
-    # 回复引用、表情、戳一戳这类群友没说什么的不拿去检索，
-    # 取最近 3 条说了东西的，免得一段以表情包结尾就没得查
-    queries = [msg.content.strip() for msg in reversed(unread) if msg.substantive][:3]
-    if state.chat_summary.strip():
-        queries.append(state.chat_summary.strip())
-    return list(dict.fromkeys(queries))
+def _search_queries(state: SessionState, unread: list[ChatMessage]) -> tuple[list[str], list[str]]:
+    """(最近 3 条说了东西的、新的在前, 话题摘要)。
+
+    回复引用、表情、戳一戳这类群友没说什么的不算，免得一段以表情包结尾就没得查。
+    记忆检索每条消息各重排一次，摘要只帮着召回：它和这些人的每条记忆都沾边，重排筛不掉。
+    """
+
+    messages = list(dict.fromkeys(m.content.strip() for m in reversed(unread) if m.substantive))
+    summary = state.chat_summary.strip()
+    return messages[:3], [summary] if summary else []
 
 
 async def search_stage(session: Session, unread: list[ChatMessage]) -> MemoryContext:
@@ -523,11 +521,12 @@ async def search_stage(session: Session, unread: list[ChatMessage]) -> MemoryCon
     started_at = time.perf_counter()
     state = session.state
 
-    queries = _search_queries(state, unread)
+    queries, recall_queries = _search_queries(state, unread)
     rag_stats = {
         "session_id": session.id,
         "query_count": len(queries),
         "queries": queries,
+        "recall_queries": recall_queries,
         "skip_reason": "none",
     }
 
@@ -544,6 +543,7 @@ async def search_stage(session: Session, unread: list[ChatMessage]) -> MemoryCon
     else:
         retrieval = await session.vector_memory.retrieve(
             queries,
+            recall_queries=recall_queries,
             k=RAG_FINAL_K,
             user_ids=user_ids,
             active_user_ids=speaker_ids,
@@ -608,7 +608,7 @@ async def _ask_feedback(
         ],
         group_heat=_group_heat(
             session.short_term_memory.messages_after(
-                now - timedelta(seconds=GROUP_HEAT_SECONDS),
+                now - timedelta(seconds=OWN_TURN_WINDOW_SECONDS),
                 limit=SHORT_TERM_BUFFER_SIZE,
             ),
             state.name,
@@ -751,11 +751,10 @@ async def chat_stage(
     related_profiles = _related_profiles(session, look.last_seen, for_chat=True)
     state.global_emotion.settle()
     photos_on = photos_enabled()
-    album = (
-        await photo_candidates(state.preset, _search_queries(state, unread))
-        if photos_on
-        else []
-    )
+    # 相册和刷到的东西只按第一条（最新的消息）重排：话题碰到了才想起来
+    queries, summary = _search_queries(state, unread)
+    topic_queries = [*queries, *summary]
+    album = await photo_candidates(state.preset, topic_queries) if photos_on else []
     prompt = get_chat_prompt(
         bot_name=state.name,
         profile=state.profile,
@@ -788,7 +787,7 @@ async def chat_stage(
         today=today_lines(state.preset),
         now=look.now,
         weather=await current_weather(state.preset),
-        feed=await feed_candidates(state.preset, _search_queries(state, unread)),
+        feed=await feed_candidates(state.preset, topic_queries),
         photos=photos_on,
         album=album,
         photos_last_hour=session.photos_last_hour(),

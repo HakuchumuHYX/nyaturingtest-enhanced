@@ -146,8 +146,8 @@ async def _retrieve(
     """返回 (和目标有关的记忆, 不挂任何人的背景记忆)，按 RAG 字符预算截断。"""
 
     result = await vector_memory.retrieve(
-        [
-            f"关于{target_name}的记忆",
+        [f"关于{target_name}的记忆"],
+        recall_queries=[
             f"我对{target_name}的看法",
             f"{target_name}做过的事",
             f"{target_name}的性格特点",

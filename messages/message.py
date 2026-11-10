@@ -143,7 +143,11 @@ class Memory:
         self.mark_dirty(message)
 
     def update(self, message_chunk: list[ChatMessage]) -> None:
-        """追加到滚动窗口，按消息 ID 去重。"""
+        """追加到滚动窗口，按消息 ID 去重，再按时间排好。
+
+        她的话发出去就写入，群友的要等 worker 取下一批才写入：她想词、连发时到的消息会追加在她的回复后面，
+        尽管发在前面。稳定排序，时间相同的保持写入顺序。
+        """
 
         existing_ids = {msg.id for msg in self.__messages if msg.id}
         for message in message_chunk:
@@ -153,3 +157,6 @@ class Memory:
                 existing_ids.add(message.id)
             self.__messages.append(message)
             self.mark_dirty(message)
+        self.__messages = deque(
+            sorted(self.__messages, key=lambda m: m.time), maxlen=SHORT_TERM_BUFFER_SIZE
+        )

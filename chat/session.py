@@ -22,7 +22,7 @@ from ..storage.db import (
     update_user_profiles,
 )
 from .domain import EmotionState, PersonProfile
-from .engagement import LOOK_MAX_MESSAGES
+from .engagement import LOOK_MAX_MESSAGES, fit_count
 
 # 后台任务排空超时、保存去抖
 MEMORY_DRAIN_TIMEOUT_SECONDS = 10.0
@@ -396,9 +396,12 @@ class Session:
         self.schedule_save()
 
     def unread(self) -> list[ChatMessage]:
-        """已读水位之后的消息，最多 LOOK_MAX_MESSAGES 条（取最新的）。"""
+        """已读水位之后最新的消息，条数和字数都有上限（见 LOOK_MAX_CHARS）；放不下的留给爬楼。"""
 
-        return self.short_term_memory.messages_after(self.state.last_read_time, LOOK_MAX_MESSAGES)
+        messages = self.short_term_memory.messages_after(
+            self.state.last_read_time, LOOK_MAX_MESSAGES
+        )
+        return messages[len(messages) - fit_count(messages[::-1]) :]
 
     async def enqueue(self, message: ChatMessage, bot: Bot, event: Event) -> None:
         """放进待处理队列并唤醒 worker。

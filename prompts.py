@@ -101,9 +101,9 @@ def resolve_preset(name: str) -> str | None:
 DYNAMIC_INPUT_MARKER = "---- DYNAMIC INPUT ----"
 
 
-# 各段的字符预算
+# 各段的字符预算；new_msgs 不截，一次读多少由 chat/engagement.py 的 LOOK_MAX_CHARS 管，
+# 截了会和 new_msg_speakers、focus 这些下标对不上
 SUMMARY_CHARS = 1200
-RECENT_MESSAGE_CHARS = 1600
 HISTORY_CHARS = 2400
 RECALLED_HISTORY_CHARS = 1200
 
@@ -324,7 +324,7 @@ def get_feedback_prompt(
         "summary": truncate_text(summary, SUMMARY_CHARS),
         "missed": missed,
         "recent_msgs": _truncate_messages(recent_msgs, HISTORY_CHARS),
-        "new_msgs": _truncate_messages(new_msgs, RECENT_MESSAGE_CHARS),
+        "new_msgs": new_msgs,
         "new_msg_speakers": new_msg_speakers,
         "is_relevant": is_relevant,
         "emotion": emotion,
@@ -476,7 +476,7 @@ def get_chat_prompt(
         "missed": missed,
         "recent_msgs": _truncate_messages(recent_msgs, HISTORY_CHARS),
         "my_recent_replies": my_recent_replies,
-        "new_msgs": _truncate_messages(new_msgs, RECENT_MESSAGE_CHARS),
+        "new_msgs": new_msgs,
         "focus": focus,
         "recalled_history": truncate_text(recalled_history, RECALLED_HISTORY_CHARS),
         "web_results": web_results,
