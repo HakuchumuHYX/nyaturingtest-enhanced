@@ -20,8 +20,9 @@ LOOK_MAX_MESSAGES = 60
 LOOK_MAX_CHARS = 6000
 # 发言占比和给 Feedback 的 group_heat 只数这段时间里她的开口
 OWN_TURN_WINDOW_SECONDS = 900
-# 自己的开口占比（见 self_share）达到该值，就不主动插嘴（被点名/聊天对象接话/被戳不受限）
-SELF_SHARE_LIMIT = 0.2
+# 自己的开口占比（见 self_share）达到该值，就不主动插嘴（被点名/聊天对象接话/被戳不受限）；
+# 按开口次数算，0.1 约等于最近 20 条里开口两次
+SELF_SHARE_LIMIT = 0.1
 # Feedback willing 的开口门槛：被点名 / 聊天对象在接话或被戳 / 按节奏看群时主动插嘴
 SPEAK_THRESHOLD_ADDRESSED = 0.3
 SPEAK_THRESHOLD_CONVERSATION = 0.45

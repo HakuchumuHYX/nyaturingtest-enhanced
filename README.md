@@ -173,6 +173,19 @@ pip install -r plugins/nyaturingtest/requirements.txt
 三个模型段的 `base_url`、`model` 必填，填同一个模型也行；其余缺省有默认值。改配置后要重启。
 也可以用环境变量 `NYATURINGTEST_CONFIG_FILE` 指定别的配置文件，用 `NYATURINGTEST_DATA_DIR` 指定数据目录。
 
+**温馨提醒：请按自己的情况调。** 开发者自己用的模型配置是：
+
+| 段 | 模型 | `reasoning_effort` |
+| --- | --- | --- |
+| `chat` | `gemini-3.8-flash` | `medium` |
+| `feedback` | `deepseek-flash` | `medium` |
+| `background` | `gemini-3.8-flash` | `medium` |
+
+提示词、发言门槛、发言占比上限这些，都是开发者照自己的使用体验和自己的人设文件一点点调出来的。
+不同模型读同一段提示词，松紧会差很多（比如有的模型更爱开口、说话更亢奋）；换个性格的人设，合适的发言频率也不一样。
+自己部署时，建议先在一个群里观察几天，再按实际情况调整提示词（`prompts.py`）和策略常量（`chat/engagement.py` 等），
+看群时说不说的依据可以看日志里的 `speak_decision`，见下文「它为什么不说话」。
+
 **Embedding 和 Rerank 不限服务商。** 示例里填的是硅基流动，换成别家的，或者本地部署的（比如用 vLLM 起的服务）都行，接口对得上就可以：
 
 - `embedding` 走 OpenAI 兼容的 Embeddings 接口，`base_url` 填到 `/v1` 这一级，请求发到 `<base_url>/embeddings`。
