@@ -177,9 +177,9 @@ pip install -r plugins/nyaturingtest/requirements.txt
 
 | 段 | 模型 | `reasoning_effort` |
 | --- | --- | --- |
-| `chat` | `gemini-3.8-flash` | `medium` |
+| `chat` | `gemini-4-hydrogen` | `low` |
 | `feedback` | `deepseek-flash` | `medium` |
-| `background` | `gemini-3.8-flash` | `medium` |
+| `background` | `gemini-4-hydrogen` | `medium` |
 
 提示词、发言门槛、发言占比上限这些，都是开发者照自己的使用体验和自己的人设文件一点点调出来的。
 不同模型读同一段提示词，松紧会差很多（比如有的模型更爱开口、说话更亢奋）；换个性格的人设，合适的发言频率也不一样。
