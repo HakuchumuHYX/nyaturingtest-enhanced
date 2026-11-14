@@ -414,11 +414,18 @@ async def _request_image(prompt: str, reference: bytes | None) -> bytes:
     }
     if settings.quality:
         options["quality"] = settings.quality
+    if settings.size:
+        options["size"] = settings.size
+    extra_body = dict(settings.extra_body)
     if reference is None:
-        response = await _image_client.images.generate(**options)
+        response = await _image_client.images.generate(extra_body=extra_body, **options)
+    elif settings.provider == "ark":
+        # 方舟没有 images/edits，参考图以 data URL 放进 generations 的 image 字段
+        extra_body["image"] = "data:image/jpeg;base64," + base64.b64encode(reference).decode()
+        response = await _image_client.images.generate(extra_body=extra_body, **options)
     else:
         response = await _image_client.images.edit(
-            image=("portrait.jpg", reference, "image/jpeg"), **options
+            image=("portrait.jpg", reference, "image/jpeg"), extra_body=extra_body, **options
         )
     if not response.data:
         raise ValueError("上游没有返回图片")
@@ -433,7 +440,8 @@ async def _request_image(prompt: str, reference: bytes | None) -> bytes:
 
 
 async def generate_image(prompt: str, reference: bytes | None, *, session_id: str) -> ImageResult:
-    """有参考图走 images/edits，没有走 images/generations；不抛异常，结果分 ok / blocked / failed。"""
+    """没有参考图走 images/generations；有参考图时 openai 走 images/edits，ark 仍走 generations。
+    不抛异常，结果分 ok / blocked / failed。"""
 
     model = get_app_settings().image.model
     started = time.perf_counter()

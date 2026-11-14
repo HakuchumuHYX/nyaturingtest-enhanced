@@ -14,7 +14,7 @@ from ..messages import photos
 from ..messages.faces import Reaction
 from ..messages.stickers import Sticker, mark_sent, pick
 from ..metrics import error_text, log_event
-from ..persona.status import describe_now
+from ..persona.status import photo_now
 from ..prompts import PHOTO_BLOCKED_NOTE, PHOTO_FAILED_NOTE, PRESETS
 from ..storage.db import get_photo
 from .engagement import SPEAK_COOLDOWN_SECONDS
@@ -112,7 +112,7 @@ async def _ready_photo(
         PRESETS[preset],
         wish.kind,
         wish.describe,
-        describe_now(preset, datetime.max),
+        photo_now(preset),
     )
     latency_ms = int((time.perf_counter() - started_at) * 1000)
     if outcome == "ok" and session.stale(generation, "photo"):

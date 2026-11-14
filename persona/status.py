@@ -233,6 +233,16 @@ def describe_now(preset: str, last_look: datetime) -> str:
     return f"刚结束：{back}；现在：{now}" if back else now
 
 
+def photo_now(preset: str) -> str:
+    """生图提示词里的「她此刻」：只要在干嘛。时间段、忙闲、来源标记对画面是噪音；
+    城市不给，需要时 Chat 会写进 describe。"""
+
+    status = _statuses.get(preset)
+    if status is None or status.current is None:
+        return ""
+    return status.current["doing"]
+
+
 def today_segments(preset: str) -> list[tuple[dict, datetime]]:
     """今天醒来以后的各段和各自的结束时间（还没醒过就是今天 0 点以后的），不含现在这一段。"""
 

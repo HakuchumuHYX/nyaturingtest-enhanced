@@ -68,10 +68,15 @@ class WebSearchSettings:
 @dataclass(frozen=True)
 class ImageSettings:
     # model 留空就是不发照片：提示词里没有生图内容，也不查相册
+    # provider 只影响带定妆照的自拍：openai 走 images/edits；ark（火山方舟）没有 edits，走 generations
+    provider: str
     api_key: str
     base_url: str
     model: str
     quality: str
+    size: str
+    # 上游私有参数原样透传，例如方舟的 watermark、response_format、output_format
+    extra_body: dict[str, Any]
     timeout: float
 
 
@@ -134,11 +139,16 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     # 她发照片用的生图模型；model 留空就关掉这个功能
     "image": {
+        "provider": "openai",
         "api_key": "",
         "base_url": "",
         "model": "",
+        # 方舟没有 quality，填空
         "quality": "medium",
-        # 上游超过约 120s 会被 Cloudflare 以 524 断开，再多等没有意义
+        # 留空不传；方舟按档位填 1K / 1.5K / 2K 时只定总像素，宽高比由模型看提示词定
+        "size": "",
+        "extra_body": {},
+        # 经 cpa 反代时超过约 120s 会被 Cloudflare 以 524 断开，再多等没有意义
         "timeout": 130,
     },
     # 群志卡片截图用的 Chromium 目录；留空用 playwright 默认位置
@@ -185,6 +195,8 @@ def build_settings(config: dict[str, Any]) -> AppSettings:
     rerank = cfg["rerank"]
     web_search = cfg["web_search"]
     image = cfg["image"]
+    if image["provider"] not in ("openai", "ark"):
+        raise RuntimeError(f"image.provider 只能是 openai 或 ark: {image['provider']!r}")
     return AppSettings(
         chat=_endpoint(cfg, "chat"),
         feedback=_endpoint(cfg, "feedback"),
@@ -208,10 +220,13 @@ def build_settings(config: dict[str, Any]) -> AppSettings:
             timeout=float(web_search["timeout"]),
         ),
         image=ImageSettings(
+            provider=image["provider"],
             api_key=str(image["api_key"] or ""),
             base_url=str(image["base_url"] or "").rstrip("/"),
             model=str(image["model"] or ""),
             quality=str(image["quality"] or ""),
+            size=str(image["size"] or ""),
+            extra_body=dict(image["extra_body"]),
             timeout=float(image["timeout"]),
         ),
         playwright_browsers_path=str(cfg["playwright_browsers_path"] or ""),
@@ -241,7 +256,10 @@ def _load_settings() -> AppSettings:
     image = settings.image
     if image.model:
         key_state = "set" if image.api_key else "missing"
-        logger.info(f"image: model={image.model}, base_url={image.base_url}, api_key={key_state}")
+        logger.info(
+            f"image: provider={image.provider}, model={image.model}, "
+            f"base_url={image.base_url}, api_key={key_state}"
+        )
     else:
         logger.warning("配置里没有生图模型（image.model），她不会发照片")
     return settings
