@@ -16,10 +16,10 @@ from nonebot.utils import run_sync
 from PIL import Image
 
 from ..config import PRESET_DIR, get_app_settings, get_data_dir
-from ..llm import VisionInput, generate_image
+from ..llm import VisionInput, background_client, generate_image
 from ..memory.vector import embed_texts, rerank
 from ..metrics import error_text, log_event
-from ..prompts import RolePreset, get_photo_prompt
+from ..prompts import RolePreset, get_photo_request, get_photo_rewrite_prompt
 from ..storage import db
 from .image import caption_image, forget_caption
 
@@ -94,34 +94,56 @@ def _to_jpeg(image: bytes) -> bytes:
     return output.getvalue()
 
 
+async def _rewrite(session_id: str, kind: str, request: str, reference: bytes | None) -> str:
+    """拼好的需求交给 background 改写成生图提示词；自拍带上参考图，它要知道参考图里哪些得换掉。失败返回空串。"""
+
+    images = None
+    if reference is not None:
+        images = [
+            VisionInput(
+                ref_id="她的参考图",
+                data_url=f"data:image/jpeg;base64,{base64.b64encode(reference).decode()}",
+            )
+        ]
+    data = await background_client.generate_json(
+        get_photo_rewrite_prompt(kind=kind, request=request),
+        session_id=session_id,
+        images=images,
+    )
+    prompt = data.get("prompt") if data else None
+    return prompt.strip() if isinstance(prompt, str) else ""
+
+
 async def take(
-    session_id: str, preset: RolePreset, kind: str, describe: str, now: str
-) -> tuple[str, NewPhoto | None, str]:
-    """拍一张并写好文件，返回 (outcome, 照片, 错误)。outcome 是 ok / blocked / failed / no_portrait。"""
+    session_id: str, preset: RolePreset, kind: str, describe: str
+) -> tuple[str, NewPhoto | None, str, str]:
+    """拍一张并写好文件，返回 (outcome, 照片, 错误, 生图提示词)。outcome 是 ok / blocked / failed / no_portrait。"""
 
     reference = None
     if kind == "selfie":
         path = PRESET_DIR / preset.portrait
         if not preset.portrait or not path.is_file():
-            return "no_portrait", None, ""
+            return "no_portrait", None, "", ""
         async with await anyio.open_file(path, "rb") as f:
             reference = await f.read()
 
     taken_at = datetime.now()
-    prompt = get_photo_prompt(
+    request = get_photo_request(
         kind=kind,
         appearance=preset.appearance,
         taken_at=taken_at,
-        now=now,
         describe=describe,
     )
+    prompt = await _rewrite(session_id, kind, request, reference)
+    if not prompt:
+        return "failed", None, "rewrite", ""
     result = await generate_image(prompt, reference, session_id=session_id)
     if result.outcome != "ok":
-        return result.outcome, None, result.error
+        return result.outcome, None, result.error, prompt
     try:
         jpeg = await _to_jpeg(result.image)
     except Exception as e:
-        return "failed", None, error_text(e)[:300]
+        return "failed", None, error_text(e)[:300], prompt
 
     digest = hashlib.sha1(jpeg).hexdigest()
     PHOTO_DIR.mkdir(parents=True, exist_ok=True)
@@ -137,7 +159,7 @@ async def take(
         session_id,
     )
     caption = caption or " ".join(describe.replace("[", "【").replace("]", "】").split())
-    return "ok", NewPhoto(kind, describe, caption, digest, taken_at), ""
+    return "ok", NewPhoto(kind, describe, caption, digest, taken_at), "", prompt
 
 
 def discard(photo: NewPhoto) -> None:

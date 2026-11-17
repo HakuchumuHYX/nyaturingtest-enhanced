@@ -210,32 +210,62 @@ _PHOTO_OUTPUT = ',\n        "photo": null'
 PHOTO_FAILED_NOTE = "[想发一张照片，没发出去]"
 PHOTO_BLOCKED_NOTE = "[这张照片发不出去]"
 
-_PHOTO_SCENE_STYLE = (
-    "这是一张普通人用手机随手拍的真实照片：真实的材质、光线、景深和噪点，构图随意，光线就是现场的光线，"
-    "不修图，不像影楼或广告，不要画成插画。她本人不入镜。画面里没有文字和水印。"
+_PHOTO_SELFIE_CAMERA = (
+    "镜头：取景的就是她手里那部手机的前置摄像头，她伸手拿着手机，一臂远的近距离视角，略带广角，构图随手、可能有点歪；"
+    "所以画面里看得到她，看不到她拿的那部手机。对着镜子拍的除外，那时镜子里能看到她举着手机。"
+)
+_PHOTO_SCENE_CAMERA = (
+    "镜头：她站在镜头后面，用手机拍眼前的东西，画面里只有眼前的东西和景色。"
+    "全写实：普通人发朋友圈的生活照，构图随意，现场的光线，真实的材质、景深和噪点，原图直出。"
 )
 _PHOTO_SELFIE_STYLE = (
-    "这张图的画法：只有人物本身（脸、头发、身体、身上的衣服和发饰）是二次元手绘画风，严格保持参考图里她的脸、发型、发色和画风。"
-    "除人物以外的一切，包括背景、桌椅、食物、她手里的东西、其他路人，都是手机真实拍摄的写实照片：真实的材质、光线、景深和噪点，"
-    "构图随意，不修图，不要把背景画成插画。人物受现场光线影响并投下自然的影子，看起来就像二次元角色真的在现实世界里被手机拍了下来。"
-    "不沿用参考图的衣服、姿势和表情。画面里没有文字和水印。"
+    "画法：她是二次元角色，人物本身（脸、头发、身体、身上的衣服和发饰）是二次元手绘画风，严格保持参考图里她的脸、发型、发色和画风；"
+    "衣服、姿势和表情按上面写的来，和参考图无关。人物以外的一切，包括背景、家具、食物、她手里的东西、路人，"
+    "都是手机实拍的写实照片：现场的光线，真实的材质、景深和噪点。"
+    "人物受现场光照、投下自然的影子，就像二次元角色真的在现实世界里被手机拍了下来。"
 )
-_PHOTO_BOTTOM_LINE = (
-    "【底线规则】无论需求如何，画面中都不得出现色情、性暗示、血腥暴力内容，"
-    "也不得出现中国现实政治人物或政治敏感的标志、旗帜、标语。需求涉及这些内容时，去掉违规元素，只生成其余安全的部分。"
-)
+_PHOTO_CLEAN = "画面上只有拍到的东西本身：屏幕、纸张上的字模糊看不清，没有水印、贴纸和配字。"
 
 
-def get_photo_prompt(
-    *, kind: str, appearance: str, taken_at: datetime, now: str, describe: str
-) -> str:
-    """生图提示词。时间由代码写，不靠 Chat：夜里拍的窗外就该是黑的。"""
+def get_photo_request(*, kind: str, appearance: str, taken_at: datetime, describe: str) -> str:
+    """拍照需求，交给改写变成生图提示词。时间由代码写，不靠 Chat：夜里拍的窗外就该是黑的。
+    不给她此刻在做什么：Chat 写 describe 时已经对着 now，再给一遍会把两段场景都画进去。"""
 
-    parts = [_PHOTO_SELFIE_STYLE, appearance] if kind == "selfie" else [_PHOTO_SCENE_STYLE]
-    parts.append(f"拍摄时间：{taken_at.month} 月 {taken_at:%H:%M}。她此刻：{now}")
-    parts.append(f"内容：{describe}")
-    parts.append(_PHOTO_BOTTOM_LINE)
-    return "\n\n".join(part for part in parts if part)
+    time_line = f"拍摄时间：{taken_at.month} 月 {taken_at:%H:%M}，光线、天色和季节按这个时间来。"
+    if kind == "selfie":
+        parts = [_PHOTO_SELFIE_STYLE, f"一张她用手机自拍的照片：{describe}"]
+        if appearance:
+            parts.append(f"她的样子：{appearance}")
+        parts += [time_line, _PHOTO_SELFIE_CAMERA]
+    else:
+        parts = [f"一张用手机随手拍的照片：{describe}", time_line, _PHOTO_SCENE_CAMERA]
+    parts.append(_PHOTO_CLEAN)
+    return "\n\n".join(parts)
+
+
+def get_photo_rewrite_prompt(*, kind: str, request: str) -> str:
+    """把拍照需求改写成生图提示词。机械拼接时，写明前置镜头自拍就容易连人物也画成真人；
+    改写成基于参考图的改图指令才稳。不写底线：越线的要求 Chat 按 bottom_lines 不接，生图另有审核；
+    列出违禁词反而会触发生图的输入审核和改写模型的安全过滤。"""
+
+    reference = "自拍，附图是她的参考图" if kind == "selfie" else "没有人的照片，没有参考图"
+    return f"""把下面这份拍照需求，改写成给图像模型用的一段提示词。
+
+规则：
+- 自拍有参考图（附图）。图像模型按参考图改图最稳，所以写成基于参考图的改图指令：以参考图里的这个二次元角色为准，保留她的脸、发型、发色和二次元画风，按需求换掉衣服、姿势、表情和场景。你能看到参考图，参考图里需求没要的东西（衣服、配饰、背景、姿势）明确说换成什么。
+- 没有人的照片没有参考图，直接描述画面。
+- 一段连贯的自然语言：先写画面主体和动作，再写环境、光线和天色、镜头视角，最后写画风和质感。需求里的拍摄时间换算成画面上的光线和天色，不写具体时刻。
+- 只写画面里看得到的东西，全部写成正面描述，不出现「不要」「没有」这类否定：图像模型常把被否定的东西画出来。自拍是她伸手用手机前置镜头拍的，画面就是那部手机看到的样子。
+- 需求里的具体细节一个不丢；不加需求里没有的人物、文字、道具和情节。
+- 保持普通人随手拍的质感，不加电影感、精致、大师级、高清这类美化词。
+- 中文，400 字以内。
+
+种类：{reference}
+
+需求：
+{request}
+
+输出 JSON：{{"prompt": "改写后的提示词"}}"""
 
 
 def _mood_tiers(emotion: EmotionState) -> tuple[int, int, int]:

@@ -14,7 +14,6 @@ from ..messages import photos
 from ..messages.faces import Reaction
 from ..messages.stickers import Sticker, mark_sent, pick
 from ..metrics import error_text, log_event
-from ..persona.status import photo_now
 from ..prompts import PHOTO_BLOCKED_NOTE, PHOTO_FAILED_NOTE, PRESETS
 from ..storage.db import get_photo
 from .engagement import SPEAK_COOLDOWN_SECONDS
@@ -107,12 +106,8 @@ async def _ready_photo(
 
     preset = session.state.preset
     started_at = time.perf_counter()
-    outcome, new, error = await photos.take(
-        session.id,
-        PRESETS[preset],
-        wish.kind,
-        wish.describe,
-        photo_now(preset),
+    outcome, new, error, prompt = await photos.take(
+        session.id, PRESETS[preset], wish.kind, wish.describe
     )
     latency_ms = int((time.perf_counter() - started_at) * 1000)
     if outcome == "ok" and session.stale(generation, "photo"):
@@ -123,6 +118,7 @@ async def _ready_photo(
         "WARNING" if outcome in ("blocked", "failed", "no_portrait") else "INFO",
         **fields,
         describe=wish.describe,
+        prompt=prompt or None,
         latency_ms=latency_ms,
         outcome=outcome,
         error=error or None,
