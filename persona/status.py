@@ -42,6 +42,7 @@ CHECK_INTERVAL_SECONDS = 60
 MIN_MINUTES = 10
 MAX_MINUTES = 720
 DOING_CHARS = 40
+FEELING_CHARS = 20
 CITY_CHARS = 20
 # 模型失败或输出无效时，原状态先延长这么久再定
 RETRY_MINUTES = 10
@@ -49,9 +50,10 @@ RETRY_MINUTES = 10
 GAP_NOTE_MINUTES = 30
 # 被叫到时最多这么久问一次状态模型；节流期间攒下的到点一起问
 CALL_THROTTLE = timedelta(minutes=10)
-# 给状态模型看的：几天日记；开口情况按两个窗口比，看得出聊天是热起来还是冷下去
-# 只给最近几天：一周的日记摆在面前，它会照着过成同一天
+# 给状态模型看的：几天日记、几晚睡眠概览；开口情况按两个窗口比，看得出聊天是热起来还是冷下去
+# 只给最近几天：一周的日记摆在面前，它会照着过成同一天；精确分钟摆在面前，作息会锁死在同一个点
 STATUS_DIARY_DAYS = 3
+STATUS_NIGHTS_DAYS = 3
 CHAT_ACTIVITY_WINDOW = timedelta(minutes=30)
 # 时间线写进日记后只留最近这么久；还没写日记的那几天整段留着
 TIMELINE_KEEP = timedelta(hours=18)
@@ -70,7 +72,7 @@ SOURCE_START = "start"
 @dataclass
 class PersonaStatus:
     preset: str
-    # 每段 {"start", "mode", "doing", "sleep", "source", "city", "lat", "lon"}，最后一段是现在
+    # 每段 {"start", "mode", "doing", "sleep", "source", "city", "lat", "lon"}，可选 "feeling"，最后一段是现在
     timeline: list[dict] = field(default_factory=list)
     until: datetime = datetime.min
     # 每晚 {"sleep", "wake"}，还没醒时 wake 为 None
@@ -164,11 +166,34 @@ def _timeline_lines(status: PersonaStatus) -> list[str]:
     return lines
 
 
+def _rough_time(moment: datetime) -> str:
+    if moment.minute < 15:
+        return f"{moment.hour}点左右"
+    if moment.minute < 45:
+        return f"{moment.hour}点半左右"
+    return f"{(moment.hour + 1) % 24}点左右"
+
+
 def _night_lines(status: PersonaStatus) -> list[str]:
-    return [
-        f"{night['sleep']:%m-%d %H:%M} 睡，" + (f"{night['wake']:%H:%M} 起" if night["wake"] else "还在睡")
-        for night in status.nights
-    ]
+    """只给状态模型看最近几晚有没有熬夜或缺觉，不喂精确分钟以免把入睡点锁死。"""
+
+    recent = status.nights[-STATUS_NIGHTS_DAYS:]
+    if not recent:
+        return []
+    notable = []
+    for night in recent:
+        sleep, wake = night["sleep"], night["wake"]
+        if wake is None:
+            notable.append(f"{sleep:%m-%d} {_rough_time(sleep)}睡，还在睡")
+            continue
+        hours = round((wake - sleep).total_seconds() / 1800) / 2
+        if sleep.hour < 6 or hours < 7.0:
+            notable.append(f"{sleep:%m-%d} {_rough_time(sleep)}睡，睡了约 {hours:g} 小时")
+    if not notable:
+        return [f"近 {len(recent)} 晚睡眠充足"]
+    if len(notable) < len(recent):
+        notable.append("其余几晚睡眠充足")
+    return notable
 
 
 def recent_diary(preset: str, days: int) -> list[str]:
@@ -287,7 +312,7 @@ async def _chat_activity(preset: str, now: datetime) -> str:
 def parse_segment(data, need_place: bool = False) -> dict | None:
     """状态模型和 Chat 的 status 字段共用的入口校验；无效返回 None。
 
-    返回 {"mode", "doing", "minutes", "sleep", "place"}；place 是 {"city", "lat", "lon"}，没换城市时为 None。
+    返回 {"mode", "doing", "feeling", "minutes", "sleep", "place"}；place 是 {"city", "lat", "lon"}，没换城市时为 None。
     need_place：还没有任何一段（第一次定状态），必须给出城市。
     """
 
@@ -308,6 +333,7 @@ def parse_segment(data, need_place: bool = False) -> dict | None:
         return None
     mode = data.get("mode")
     doing = str(data.get("doing") or "").strip()[:DOING_CHARS]
+    feeling = str(data.get("feeling") or "").strip()[:FEELING_CHARS]
     sleep = data.get("sleep") is True
     try:
         minutes = int(data.get("minutes"))
@@ -318,6 +344,7 @@ def parse_segment(data, need_place: bool = False) -> dict | None:
     return {
         "mode": mode,
         "doing": doing,
+        "feeling": feeling,
         "minutes": max(MIN_MINUTES, min(MAX_MINUTES, minutes)),
         "sleep": sleep,
         "place": place,
@@ -372,16 +399,18 @@ async def _apply(status: PersonaStatus, segment: dict, source: str, reason: str)
     now = datetime.now()
     was_away = status.away
     place = segment["place"] or {key: status.current[key] for key in ("city", "lat", "lon")}
-    status.timeline.append(
-        {
-            "start": now,
-            "mode": segment["mode"],
-            "doing": segment["doing"],
-            "sleep": segment["sleep"],
-            "source": source,
-            **place,
-        }
-    )
+    feeling = segment["feeling"]
+    entry = {
+        "start": now,
+        "mode": segment["mode"],
+        "doing": segment["doing"],
+        "sleep": segment["sleep"],
+        "source": source,
+        **place,
+    }
+    if feeling:
+        entry["feeling"] = feeling
+    status.timeline.append(entry)
     status.until = now + timedelta(minutes=segment["minutes"])
     status.version += 1
     _note_night(status)
@@ -394,6 +423,7 @@ async def _apply(status: PersonaStatus, segment: dict, source: str, reason: str)
         source=source,
         mode=segment["mode"],
         doing=segment["doing"],
+        **({"feeling": feeling} if feeling else {}),
         city=place["city"],
         until=f"{status.until:%m-%d %H:%M}",
         sleep=segment["sleep"],
