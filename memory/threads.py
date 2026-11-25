@@ -124,14 +124,13 @@ def _about(user_ids) -> Q:
 
 
 async def open_threads(session_id: str, user_ids, now: datetime) -> list[ThreadModel]:
-    """看群时该提起的：关于这些人或全群、到了提起时间还没忘掉的。"""
+    """到了提起时间还没忘掉的悬着的事；user_ids 为 None 时查全群（主动发起用）。
+    按 forget_at 升序：寿命最短的 state / group / 有日子 matter 自然靠前。"""
 
-    return (
-        await ThreadModel.filter(session_id=session_id, ask_from__lte=now, forget_at__gt=now)
-        .filter(_about(user_ids))
-        .order_by("ask_from")
-        .limit(PROMPT_LIMIT)
-    )
+    query = ThreadModel.filter(session_id=session_id, ask_from__lte=now, forget_at__gt=now)
+    if user_ids is not None:
+        query = query.filter(_about(user_ids))
+    return await query.order_by("forget_at").limit(PROMPT_LIMIT)
 
 
 async def pending_threads(session_id: str, user_ids, now: datetime) -> list[ThreadModel]:

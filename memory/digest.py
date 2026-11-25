@@ -222,7 +222,7 @@ async def digest_user_profiles(
                 name, user_id, old_summary, old_impressions, material, bot_name
             ),
             points_prompt=lambda span, lines: get_profile_points_prompt(
-                name, user_id, span, lines
+                name, user_id, span, lines, bot_name
             ),
             key="summary",
         )

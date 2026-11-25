@@ -372,7 +372,7 @@ async def get_recent_messages_by_user(session_id: str, user_id: str, limit: int)
         .order_by("-time")
         .limit(limit)
     )
-    return [m.content for m in reversed(rows)]
+    return [f"[{m.time:%Y-%m-%d}] {m.content}" for m in reversed(rows)]
 
 
 async def get_latest_user_names(session_id: str) -> dict[str, str]:

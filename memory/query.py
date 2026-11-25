@@ -6,7 +6,7 @@ from nonebot import logger
 
 from ..chat.session import Session
 from ..llm import chat_client
-from ..prompts import describe_relation, get_impression_prompt
+from ..prompts import describe_relation, get_impression_prompt, relation_label
 from ..storage.db import get_recent_messages_by_user
 from .vector import RAG_FINAL_K, RAG_ITEM_CHARS, RAG_MEMORY_CHAR_BUDGET
 
@@ -83,12 +83,13 @@ async def query_memory_profile(
     summary = session.state.user_summaries.get(target_id, "")
     bot_name = session.state.name
     self_life = session.state.self_life
+    self_in_group = session.state.self_in_group
     affinity = profile.level() if profile else 0
 
     if not bot_name:
         return "本群还没设人设，先 set_preset 吧。"
 
-    relation = describe_relation(affinity)
+    relation = relation_label(affinity)
     interactions = profile.interaction_count if profile else 0
     first_interaction_at = profile.first_interaction_at if profile else None
 
@@ -109,14 +110,16 @@ async def query_memory_profile(
     prompt = get_impression_prompt(
         bot_name=bot_name,
         self_life=self_life,
+        self_in_group=self_in_group,
         target_name=target_name,
         affinity=affinity,
-        relation=relation,
+        relation=describe_relation(affinity),
         interactions=interactions,
         summary=summary,
         target_text=target_text,
         unscoped_text=unscoped_text,
         recent=recent,
+        today=f"{datetime.now():%Y-%m-%d}",
     )
     result = await chat_client.generate_json(prompt, session_id=session.id)
     if not result or not result.get("headline") or not result.get("impression"):

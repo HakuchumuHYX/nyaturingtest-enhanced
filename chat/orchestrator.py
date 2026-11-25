@@ -188,17 +188,27 @@ def _last_seen_days(session: Session, unread: list[ChatMessage]) -> dict[str, in
 
 
 def _related_profiles(
-    session: Session, last_seen: dict[str, int | None], *, for_chat: bool
+    session: Session,
+    unread: list[ChatMessage],
+    last_seen: dict[str, int | None],
+    *,
+    for_chat: bool,
 ) -> list[dict]:
     """Feedback 要在当前好感度上打分，给数值；Chat 只需要知道关系，给文字。last_seen 的键就是这段的发言人。"""
 
     state = session.state
+    names = {
+        _user_key(msg): msg.user_name
+        for msg in unread
+        if msg.user_name != state.name and not msg.by_group_bot
+    }
     profiles = []
     for uid, days in last_seen.items():
         affinity = state.profiles.get(uid, PersonProfile(user_id=uid)).level()
         profiles.append(
             {
-                "user_id": uid,
+                **({} if for_chat else {"user_id": uid}),
+                "name": names.get(uid, uid),
                 **(
                     {"relation": describe_relation(affinity)}
                     if for_chat
@@ -590,7 +600,7 @@ async def _ask_feedback(
             for msg in unread
         ],
         emotion=state.global_emotion.vad(),
-        related_profiles=_related_profiles(session, look.last_seen, for_chat=False),
+        related_profiles=_related_profiles(session, unread, look.last_seen, for_chat=False),
         search_result=memories.lines,
         threads=thread_items(look.threads),
         is_relevant=is_relevant,
@@ -748,7 +758,7 @@ async def chat_stage(
         if m.user_name == state.name and not m.is_action
     ][-MY_RECENT_REPLIES_LIMIT:]
     recalled_str = "\n".join(recalled_history) or "无"
-    related_profiles = _related_profiles(session, look.last_seen, for_chat=True)
+    related_profiles = _related_profiles(session, unread, look.last_seen, for_chat=True)
     state.global_emotion.settle()
     photos_on = photos_enabled()
     # 相册和刷到的东西只按第一条（最新的消息）重排：话题碰到了才想起来

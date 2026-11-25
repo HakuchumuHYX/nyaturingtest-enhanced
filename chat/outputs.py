@@ -229,32 +229,40 @@ def _parse_photo(raw, album: list[dict]) -> PhotoWish | None:
     return None
 
 
+def parse_reply_item(item, album: list[dict], *, allow_photo: bool = True) -> Reply | None:
+    """校验单条回复项（Chat 的 reply 项与主动发起共用）：引用 id、表情包标签和照片在这里核对。"""
+
+    if not isinstance(item, dict):
+        return None
+    raw_target = item.get("target_id")
+    target_id = None
+    if raw_target:
+        try:
+            target_id = int(raw_target)
+        except (TypeError, ValueError):
+            logger.warning(f"引用ID无效: {raw_target}")
+    sticker = None
+    raw_sticker = item.get("sticker")
+    if isinstance(raw_sticker, dict):
+        tag = str(raw_sticker.get("tag") or "").strip()
+        if tag in STICKER_TAGS:
+            sticker = (tag, str(raw_sticker.get("want") or "").strip())
+        else:
+            logger.debug(f"表情包标签不在词表里，丢弃: {tag}")
+    photo = _parse_photo(item.get("photo"), album) if allow_photo else None
+    text = str(item.get("content") or "").strip()
+    if not text and sticker is None and photo is None:
+        return None
+    return Reply(text=text, target_id=target_id, sticker=sticker, photo=photo)
+
+
 def parse_reply(data: dict | None, album: list[dict]) -> list[Reply]:
-    """校验 Chat 输出：reply 里的每个对象发成一条消息，发几条由模型定；引用 id、表情包标签和照片在这里核对。"""
+    """校验 Chat 输出：reply 里的每个对象发成一条消息，发几条由模型定。"""
 
     items = data.get("reply") if data else None
     replies = []
     for item in items if isinstance(items, list) else []:
-        if not isinstance(item, dict):
-            continue
-        raw_target = item.get("target_id")
-        target_id = None
-        if raw_target:
-            try:
-                target_id = int(raw_target)
-            except (TypeError, ValueError):
-                logger.warning(f"引用ID无效: {raw_target}")
-        sticker = None
-        raw_sticker = item.get("sticker")
-        if isinstance(raw_sticker, dict):
-            tag = str(raw_sticker.get("tag") or "").strip()
-            if tag in STICKER_TAGS:
-                sticker = (tag, str(raw_sticker.get("want") or "").strip())
-            else:
-                logger.debug(f"表情包标签不在词表里，丢弃: {tag}")
-        photo = _parse_photo(item.get("photo"), album)
-        text = str(item.get("content") or "").strip()
-        if not text and sticker is None and photo is None:
-            continue
-        replies.append(Reply(text=text, target_id=target_id, sticker=sticker, photo=photo))
+        reply = parse_reply_item(item, album)
+        if reply is not None:
+            replies.append(reply)
     return replies
