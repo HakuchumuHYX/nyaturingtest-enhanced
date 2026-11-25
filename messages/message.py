@@ -45,6 +45,8 @@ class ChatMessage:
     caption_tasks: list[Any] = field(default_factory=list, repr=False, compare=False)
     # 群友自己说了东西，只有这种才拿去检索记忆
     substantive: bool = field(default=False, repr=False, compare=False)
+    # 去掉 [回复 ...] 引用原文后的消息文本，供 check_relevance 匹配名字用（不落库，重启后回退到 content）
+    own_text: str | None = field(default=None, repr=False, compare=False)
     revision: int = field(default=0, repr=False, compare=False)
     _persistence_id: str = field(default="", repr=False, compare=False)
 
@@ -62,6 +64,7 @@ class ChatMessage:
         """撤回：内容原地改成撤回标记。图片一并清掉，免得进行中这一轮的图片观察再把内容写回去。"""
 
         self.content = content
+        self.own_text = None
         self.image_inputs = []
         self.substantive = False
 

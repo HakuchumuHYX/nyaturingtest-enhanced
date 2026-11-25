@@ -170,7 +170,7 @@ def check_relevance(
         if value and len(value.strip()) >= 2
     ]
     return any(
-        trigger in message.content.lower()
+        trigger in (message.content if message.own_text is None else message.own_text).lower()
         for message in messages
         for trigger in triggers
     )

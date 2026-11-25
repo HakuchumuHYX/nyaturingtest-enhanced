@@ -26,7 +26,7 @@ from ..chat.session import Session
 from ..llm import VisionInput
 from ..metrics import error_text, log_event
 from ..prompts import truncate_text
-from ..storage.db import get_latest_user_names, message_sender_name
+from ..storage.db import get_latest_user_names, message_content, message_sender_name
 from .faces import ensure_faces, face_name
 from .image import cached_caption, caption_image, caption_sticker, fetch_image_input
 from .message import GROUP_BOT_ID, GROUP_BOT_NAME, POKE_PREFIX, REACTION_MARK, ChatMessage, Reacted
@@ -156,9 +156,10 @@ async def fill_caption(
     if session.stale(generation, "image_caption") or job.token not in message.content:
         return
     kind = _image_kind(job.vision_input)
-    message.content = message.content.replace(
-        job.token, f"[{kind}: {caption}]" if caption else f"[{kind}]"
-    )
+    replacement = f"[{kind}: {caption}]" if caption else f"[{kind}]"
+    message.content = message.content.replace(job.token, replacement)
+    if message.own_text is not None and job.token in message.own_text:
+        message.own_text = message.own_text.replace(job.token, replacement)
     session.short_term_memory.mark_dirty(message)
     session.schedule_save()
 
@@ -176,6 +177,8 @@ class _Part:
     mentions: dict[str, str] = field(default_factory=dict)
     jobs: list[CaptionJob] = field(default_factory=list)
     own: str = ""
+    # reply 段指向谁：self（她本人）/ group_bot（同号上的其他程序）/ other / ""
+    reply_target: str = ""
 
 
 async def _image_part(data: dict, label: str, group_id: int, caption: bool) -> _Part:
@@ -220,8 +223,22 @@ async def _own_account_sender(session: Session, msg_id: str) -> str:
     return await message_sender_name(session.id, msg_id) or GROUP_BOT_NAME
 
 
+async def _stored_content(session: Session, msg_id: str) -> str | None:
+    """本群已存的这条消息内容：先查短期记忆，再查库；用于在引用合并转发时复用已写好的摘要。"""
+
+    found = next((m for m in session.short_term_memory.access() if m.id == msg_id), None)
+    if found is not None:
+        return found.content
+    return await message_content(session.id, msg_id)
+
+
 async def _reply_part(
-    bot: Bot, data: dict, message_scope: str, session: Session, caption: bool
+    bot: Bot,
+    data: dict,
+    message_scope: str,
+    session: Session,
+    caption: bool,
+    fallback_sender_id: str = "",
 ) -> _Part:
     """被回复的原文，引用的图和正文的图一样放进附图。"""
 
@@ -229,19 +246,27 @@ async def _reply_part(
     if not reply_id:
         return _Part("")
     group_id = int(session.id)
+    self_id = str(bot.self_id)
     try:
         source_msg = await bot.get_msg(message_id=int(reply_id))
     except (ActionFailed, NetworkError, ValueError) as e:
         logger.warning(f"群 {session.id} 获取回复内容失败: {error_text(e)}")
-        return _Part(" [回复] ")
+        if fallback_sender_id == self_id:
+            sender = await _own_account_sender(session, str(reply_id))
+            target = "self" if sender == session.state.name else "group_bot"
+        else:
+            target = "other"
+        return _Part(" [回复] ", reply_target=target)
 
     sender_info = source_msg.get("sender", {})
     sender_id = str(sender_info.get("user_id") or "")
     part = _Part("")
-    if sender_id == str(bot.self_id):
+    if sender_id == self_id:
         # 这个号的名片是她和群里的bot 共用的，按这条是谁发的称呼；也不进 mentions，免得被当成可以戳的群友
         sender = await _own_account_sender(session, str(reply_id))
+        part.reply_target = "self" if sender == session.state.name else "group_bot"
     else:
+        part.reply_target = "other"
         # 优先群名片，与 @ 和发言人名字保持同一套称呼，否则模型会把昵称当成另一个人
         sender = distinct_name(
             sender_info.get("card") or sender_info.get("nickname", "未知"),
@@ -259,6 +284,14 @@ async def _reply_part(
         for segment in content_data:
             msg_type = segment.get("type")
             seg_data = segment.get("data", {})
+            if msg_type == "forward":
+                stored = await _stored_content(session, str(reply_id))
+                source_text += (
+                    stored
+                    if stored and stored != FORWARD_PLACEHOLDER
+                    else FORWARD_PLACEHOLDER
+                )
+                continue
             text = segment_text(msg_type, seg_data)
             if text is not None:
                 source_text += text
@@ -288,6 +321,7 @@ async def _segment_part(
     session: Session,
     message_scope: str,
     caption: bool,
+    reply_fallback_sender_id: str = "",
 ) -> _Part:
     group_id = int(session.id)
     text = segment_text(seg.type, seg.data)
@@ -302,7 +336,14 @@ async def _segment_part(
     if seg.type == "at":
         return await _at_part(bot, seg.data, group_id, session.state.name)
     if seg.type == "reply":
-        return await _reply_part(bot, seg.data, message_scope, session, caption)
+        return await _reply_part(
+            bot,
+            seg.data,
+            message_scope,
+            session,
+            caption,
+            fallback_sender_id=reply_fallback_sender_id,
+        )
     logger.debug(f"未处理的消息段: {seg.type}")
     return _Part("")
 
@@ -316,18 +357,53 @@ def forward_id(message: Message) -> str:
     )
 
 
-def _addresses_bot(bot: Bot, event: GroupMessageEvent) -> bool:
-    """@Bot 或回复 Bot 的消息。
+def _is_blank_text(seg: MessageSegment) -> bool:
+    return seg.type == "text" and not str(seg.data.get("text", "")).strip()
+
+
+def _reply_auto_at_index(
+    message: Message, parts: list[_Part], self_id: str
+) -> int | None:
+    """QQ 点回复会自动在 reply 旁附带一个 @原发送者；回复群里的bot 时它指向本号，不是在叫她。"""
+
+    reply_index = next(
+        (index for index, part in enumerate(parts) if part.reply_target == "group_bot"),
+        None,
+    )
+    if reply_index is None:
+        return None
+    for step in (1, -1):
+        index = reply_index + step
+        while 0 <= index < len(message) and _is_blank_text(message[index]):
+            index += step
+        if (
+            0 <= index < len(message)
+            and message[index].type == "at"
+            and str(message[index].data.get("qq", "")) == self_id
+        ):
+            return index
+    return None
+
+
+def _addresses_bot(
+    bot: Bot,
+    event: GroupMessageEvent,
+    parts: list[_Part],
+    ignored_at: int | None,
+) -> bool:
+    """@Bot 或回复她自己的消息（回复同号上的群里的bot 及 QQ 自动附带的那个 @ 不算）。
 
     不用 event.to_me：.env 里 NICKNAME=[""] 会让适配器把所有文本开头的消息都判成 to_me。
     """
 
     self_id = str(bot.self_id)
-    if event.reply and str(event.reply.sender.user_id) == self_id:
+    if any(part.reply_target == "self" for part in parts):
         return True
     return any(
-        seg.type == "at" and str(seg.data.get("qq", "")) == self_id
-        for seg in event.original_message
+        index != ignored_at
+        and seg.type == "at"
+        and str(seg.data.get("qq", "")) == self_id
+        for index, seg in enumerate(event.original_message)
     )
 
 
@@ -357,20 +433,31 @@ async def read_message(
     for index, seg in enumerate(message):
         if seg.type == "image" and segment_text(seg.type, seg.data) is None:
             image_numbers[index] = len(image_numbers) + 1
+    reply_fallback_sender_id = (
+        str(event.reply.sender.user_id) if event.reply and event.reply.sender else ""
+    )
 
-    parts = await asyncio.gather(
-        *(
-            _segment_part(
-                seg,
-                image_numbers.get(index, 0),
-                bot=bot,
-                session=session,
-                message_scope=str(event.message_id),
-                caption=bool(bot_name),
+    parts = list(
+        await asyncio.gather(
+            *(
+                _segment_part(
+                    seg,
+                    image_numbers.get(index, 0),
+                    bot=bot,
+                    session=session,
+                    message_scope=str(event.message_id),
+                    caption=bool(bot_name),
+                    reply_fallback_sender_id=reply_fallback_sender_id,
+                )
+                for index, seg in enumerate(message)
             )
-            for index, seg in enumerate(message)
         )
     )
+    ignored_at = (
+        None if group_bot else _reply_auto_at_index(message, parts, str(bot.self_id))
+    )
+    if ignored_at is not None:
+        parts[ignored_at] = _Part("")
 
     if group_bot:
         user_id, user_name = GROUP_BOT_ID, GROUP_BOT_NAME
@@ -395,9 +482,12 @@ async def read_message(
         user_id=user_id,
         image_inputs=[image for part in parts for image in part.images],
         mentions={uid: name for part in parts for uid, name in part.mentions.items()},
-        to_me=not group_bot and _addresses_bot(bot, event),
+        to_me=not group_bot and _addresses_bot(bot, event, parts, ignored_at),
         forward=bool(forward_id(message)),
         substantive=not group_bot and _is_substantive(parts),
+        own_text="".join(
+            part.text for seg, part in zip(message, parts) if seg.type != "reply"
+        ).strip(),
     )
     chat_message.caption_tasks = [
         session.spawn(fill_caption(session, chat_message, job, generation))
