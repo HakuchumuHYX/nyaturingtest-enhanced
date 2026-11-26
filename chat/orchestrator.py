@@ -10,7 +10,7 @@ from nonebot import logger
 from ..config import get_app_settings
 from ..llm import chat_client, feedback_client, web_search
 from ..memory.candidates import save_memory_candidates
-from ..memory.threads import close_threads, open_threads, thread_items
+from ..memory.threads import close_threads, open_threads, recommend_since, thread_items
 from ..memory.vector import (
     RAG_FINAL_K,
     RAG_ITEM_CHARS,
@@ -790,7 +790,9 @@ async def chat_stage(
         my_recent_replies=my_recent_replies,
         web_results=web_results,
         time_info=get_time_description(datetime.now()),
-        diary=recent_diary(state.preset, CHAT_DIARY_DAYS),
+        diary=recent_diary(
+            state.preset, CHAT_DIARY_DAYS, since=recommend_since(look.threads)
+        ),
         plan=recent_plan(state.preset),
         group_info=look.group_info,
         missed=look.missed,

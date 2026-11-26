@@ -13,7 +13,7 @@ require("nonebot_plugin_apscheduler")
 from nonebot_plugin_apscheduler import scheduler  # noqa: E402  必须在 require 之后导入
 
 from ..llm import chat_client  # noqa: E402
-from ..memory.threads import close_threads, open_threads, thread_items  # noqa: E402
+from ..memory.threads import close_threads, open_threads, recommend_since, thread_items  # noqa: E402
 from ..messages.photos import enabled as photos_enabled  # noqa: E402
 from ..metrics import log_event  # noqa: E402
 from ..persona.status import (  # noqa: E402
@@ -178,7 +178,9 @@ async def _initiate(session: Session, silence: int) -> None:
         mood=describe_mood(state.global_emotion),
         silence_minutes=silence,
         time_info=get_time_description(now),
-        diary=recent_diary(state.preset, CHAT_DIARY_DAYS),
+        diary=recent_diary(
+            state.preset, CHAT_DIARY_DAYS, since=recommend_since(threads)
+        ),
         plan=recent_plan(state.preset),
         group_info=await session.refresh_group_info(),
         today=today_lines(state.preset),

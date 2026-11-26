@@ -20,6 +20,7 @@ from ..prompts import (
     FEED_ITEMS,
     FEED_QUERIES,
     JOURNAL_DAYS,
+    MAX_GROUP_WISHES,
     MAX_LIFE_FACTS,
     PRESETS,
     RolePreset,
@@ -65,6 +66,7 @@ class GroupDigest:
     text: str
     observation: str
     life_facts: list[str]
+    wishes: list[str]
     changes: str
 
 
@@ -183,6 +185,7 @@ async def digest_group(
         or not isinstance(data.get("group_self"), str)
         or not isinstance(data.get("observation"), str)
         or not isinstance(data.get("life_facts"), list)
+        or not isinstance(data.get("wishes"), list)
     ):
         logger.warning(f"群 {session_id} {day} 群层整理输出无效")
         return None
@@ -191,6 +194,9 @@ async def digest_group(
         observation=f"{day:%m-%d} {data['observation'].strip()}",
         life_facts=[str(fact).strip() for fact in data["life_facts"] if str(fact).strip()][
             :MAX_LIFE_FACTS
+        ],
+        wishes=[str(wish).strip() for wish in data["wishes"] if str(wish).strip()][
+            :MAX_GROUP_WISHES
         ],
         changes=str(data.get("changes") or "").strip(),
     )
@@ -255,6 +261,7 @@ async def write_diary(
     previous: list[str],
     timeline: list[str],
     life_facts: list[str],
+    wishes: list[str],
     plan: str,
     weather: list[str],
     session_id: str,
@@ -269,6 +276,7 @@ async def write_diary(
             previous=previous,
             timeline=timeline,
             life_facts=life_facts,
+            wishes=wishes,
             plan=plan,
             weather=weather,
         ),
@@ -387,6 +395,7 @@ async def _maintain_preset(
     day = min((next_day(layer) for layer in layers.values()), default=yesterday + timedelta(days=1))
     while day <= yesterday:
         day_facts: list[str] = []
+        day_wishes: list[str] = []
         for session_id, layer in layers.items():
             if session_id in blocked or next_day(layer) > day:
                 continue
@@ -412,17 +421,20 @@ async def _maintain_preset(
                 layer.journal = (layer.journal + [result.observation])[-JOURNAL_DAYS:]
                 life.pending_facts = life.pending_facts + result.life_facts
                 day_facts += result.life_facts
+                day_wishes += result.wishes
                 await life.save()
                 await _history("group", f"{session_id}:{filename}", day, result.text, result.changes)
                 updated[session_id] = layer
             layer.digested_until = day
             await layer.save()
 
-        # 日记在群层之后：要用这天各群抽出的自我陈述；在人生线之前：人生线要读它。失败就停在这天，下一晚接着写
+        # 日记在群层之后：要用这天各群抽出的自我陈述和种草想法；在人生线之前：人生线要读它。失败就停在这天，下一晚接着写
         if status is not None and not diary_blocked and (
             status["diary_until"] is None or day > status["diary_until"]
         ):
-            diary_blocked = not await _write_day_diary(persona, filename, status, life.text, day, day_facts)
+            diary_blocked = not await _write_day_diary(
+                persona, filename, status, life.text, day, day_facts, day_wishes
+            )
 
         if life_due(life.last_digest, day, bool(life.pending_facts)):
             # 风格提升只看现在启用的群：停用、退出的群里沾上的说法不该继续「变老」被提升
@@ -522,7 +534,13 @@ async def refresh_feed(persona: RolePreset, filename: str, life: str, status: di
 
 
 async def _write_day_diary(
-    persona: RolePreset, filename: str, status: dict, life: str, day: date, facts: list[str]
+    persona: RolePreset,
+    filename: str,
+    status: dict,
+    life: str,
+    day: date,
+    facts: list[str],
+    wishes: list[str],
 ) -> bool:
     """写这一天的日记和打算并推进日记水位；这天一段时间线都没有（服务停了一整天）就跳过。失败返回 False。"""
 
@@ -537,6 +555,7 @@ async def _write_day_diary(
                 previous=[diary_line(entry) for entry in status["diary"][-DIARY_PREVIOUS:]],
                 timeline=timeline,
                 life_facts=facts,
+                wishes=wishes,
                 plan=status["plan"],
                 weather=weather,
                 session_id=f"persona:{filename}",

@@ -196,9 +196,17 @@ def _night_lines(status: PersonaStatus) -> list[str]:
     return notable
 
 
-def recent_diary(preset: str, days: int) -> list[str]:
+def recent_diary(preset: str, days: int, *, since: date | None = None) -> list[str]:
     status = _statuses.get(preset)
-    return [diary_line(entry) for entry in status.diary[-days:]] if status else []
+    if not status:
+        return []
+    entries = status.diary[-days:]
+    if since is not None:
+        cutoff = since.isoformat()
+        since_entries = [entry for entry in status.diary if entry["day"] >= cutoff]
+        if len(since_entries) > len(entries):
+            entries = since_entries
+    return [diary_line(entry) for entry in entries]
 
 
 def recent_plan(preset: str) -> str:

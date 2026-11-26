@@ -22,6 +22,7 @@ KINDS = {
     "matter": "ta的事",
     "state": "ta的状况",
     "promise": "你答应ta的",
+    "recommend": "ta安利给你的",
     "group": "群里约好的",
 }
 # 日子最远记到说起后多少天：再远的真人也不会掐着日子问，只当没日子
@@ -35,6 +36,9 @@ MATTER_REMEMBER_DAYS = 30
 # 状况只管这两天：第二天起问一句好点没
 STATE_REMEMBER_DAYS = 3
 PROMISE_REMEMBER_DAYS = 14
+# 安利：次日起可提（留出体验缓冲），14 天后忘掉，与 diary 保留 14 天对齐
+RECOMMEND_ASK_AFTER_DAYS = 1
+RECOMMEND_REMEMBER_DAYS = 14
 CONTENT_MIN_CHARS = 6
 PROMPT_LIMIT = 10
 
@@ -56,6 +60,10 @@ def _schedule(kind: str, said: datetime, due: date | None) -> tuple[datetime, da
         )
     if kind == "promise":
         return said, said + timedelta(days=PROMISE_REMEMBER_DAYS)
+    if kind == "recommend":
+        return _day_start(said.date() + timedelta(days=RECOMMEND_ASK_AFTER_DAYS)), said + timedelta(
+            days=RECOMMEND_REMEMBER_DAYS
+        )
     return said + timedelta(days=MATTER_ASK_AFTER_DAYS), said + timedelta(
         days=MATTER_REMEMBER_DAYS
     )
@@ -165,6 +173,13 @@ async def close_threads(rows: list[ThreadModel], raw_refs) -> int:
 
 async def drop_forgotten() -> int:
     return await ThreadModel.filter(forget_at__lte=datetime.now()).delete()
+
+
+def recommend_since(rows: list[ThreadModel]) -> date | None:
+    """有安利类线程时返回最早那条的创建日期，供 Chat / Initiative 按需补足日记视野。"""
+
+    dates = [row.created_at.date() for row in rows if row.kind == "recommend"]
+    return min(dates) if dates else None
 
 
 def thread_items(rows: list[ThreadModel]) -> list[dict]:
